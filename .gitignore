@@ -1,0 +1,29 @@
+.DS_Store
+*.log
+.env
+.env.*
+!.env.example
+
+# Rust
+/target/
+**/target/
+Cargo.lock.bak
+
+# JavaScript
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+coverage/
+**/coverage/
+*.tsbuildinfo
+/artifacts/
+
+# Editor and local tool state
+.idea/
+.vscode/
+.claude/
+.codex/
+.cursor/
+.gemini/
+.kiro/

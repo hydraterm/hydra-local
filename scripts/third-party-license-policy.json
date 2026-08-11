@@ -1,0 +1,196 @@
+{
+  "schema": "hydra.third-party-license-policy.v2",
+  "cargo_lock_sha256": "5d1034d2ec86b2787445b56ed721d12cf115795b65d141bcfcc14c559243f3cd",
+  "npm_lock_sha256": "f797f86b630338688c0357e0aa9980300d403bb92b768e92dc6457d73a087073",
+  "targets": {
+    "aarch64-apple-darwin": {
+      "family": "macos",
+      "cargo_packages": 252,
+      "cargo_closure_sha256": "ab4af8e60bdc5da0ffd029918025b69b1835e45e2e2149e5170d44d095944f89"
+    },
+    "x86_64-apple-darwin": {
+      "family": "macos",
+      "cargo_packages": 252,
+      "cargo_closure_sha256": "ab4af8e60bdc5da0ffd029918025b69b1835e45e2e2149e5170d44d095944f89"
+    },
+    "aarch64-unknown-linux-gnu": {
+      "family": "linux",
+      "cargo_packages": 296,
+      "cargo_closure_sha256": "43ace126583e2accb1e3564b64d110edfd0160602914a6eb2dfbae002806eafe"
+    },
+    "x86_64-unknown-linux-gnu": {
+      "family": "linux",
+      "cargo_packages": 296,
+      "cargo_closure_sha256": "43ace126583e2accb1e3564b64d110edfd0160602914a6eb2dfbae002806eafe"
+    }
+  },
+  "npm_runtime": {
+    "js-tokens@4.0.0": {
+      "license": "MIT",
+      "resolved": "https://registry.npmjs.org/js-tokens/-/js-tokens-4.0.0.tgz",
+      "integrity": "sha512-RdJUflcE3cUzKiMqQgsCu06FPu9UdIJO0beYbPhHN4k6apgJtifcoCtT9bcxOpYBtpD2kCM6Sbzg4CausW/PKQ==",
+      "dependencies": {},
+      "materials": { "LICENSE": "2213d91c606205c71eb051a199478cdc2adde945893404d7f1421436dd6d5cc1" }
+    },
+    "loose-envify@1.4.0": {
+      "license": "MIT",
+      "resolved": "https://registry.npmjs.org/loose-envify/-/loose-envify-1.4.0.tgz",
+      "integrity": "sha512-lyuxPGr/Wfhrlem2CL/UcnUc1zcqKAImBDzukY7Y5F/yQiNdko6+fRLevlw1HgMySw7f611UIY408EtxRSoK3Q==",
+      "dependencies": { "js-tokens": "^3.0.0 || ^4.0.0" },
+      "materials": { "LICENSE": "4eb7543b08d955a6d23fcc224601d43ff566e775be918805e26210d7f6eb4893" }
+    },
+    "react@18.3.1": {
+      "license": "MIT",
+      "resolved": "https://registry.npmjs.org/react/-/react-18.3.1.tgz",
+      "integrity": "sha512-wS+hAgJShR0KhEvPJArfuPVN1+Hz1t0Y6n5jLrGQbkb4urgPE/0Rve+1kMB1v/oWgHgm4WIcV+i7F2pTVj+2iQ==",
+      "dependencies": { "loose-envify": "^1.1.0" },
+      "materials": { "LICENSE": "52412d7bc7ce4157ea628bbaacb8829e0a9cb3c58f57f99176126bc8cf2bfc85" }
+    },
+    "react-dom@18.3.1": {
+      "license": "MIT",
+      "resolved": "https://registry.npmjs.org/react-dom/-/react-dom-18.3.1.tgz",
+      "integrity": "sha512-5m4nQKp+rZRb09LNH59GM4BxTh9251/ylbKIbpe7TpGxfJ+9kv6BLkLBXIjjspbgbnIBNqlI23tRnTWT0snUIw==",
+      "dependencies": { "loose-envify": "^1.1.0", "scheduler": "^0.23.2" },
+      "materials": { "LICENSE": "52412d7bc7ce4157ea628bbaacb8829e0a9cb3c58f57f99176126bc8cf2bfc85" }
+    },
+    "scheduler@0.23.2": {
+      "license": "MIT",
+      "resolved": "https://registry.npmjs.org/scheduler/-/scheduler-0.23.2.tgz",
+      "integrity": "sha512-UOShsPwz7NrMUqhR6t0hWjFduvOzbtv7toDH1/hIrfRNIDBnnBWd0CwJTGvTpngVlmwGCdP9/Zl/tVrDqcuYzQ==",
+      "dependencies": { "loose-envify": "^1.1.0" },
+      "materials": { "LICENSE": "52412d7bc7ce4157ea628bbaacb8829e0a9cb3c58f57f99176126bc8cf2bfc85" }
+    }
+  },
+  "npm_runtime_closure_sha256": "404e292a6db397b605912fe5502da416cb7299720ecfc6a973267162899d5aa3",
+  "npm_bundle_packages": [
+    "react-dom@18.3.1",
+    "react@18.3.1",
+    "scheduler@0.23.2"
+  ],
+  "fallback_texts": {
+    "Apache-2.0": {
+      "path": "LICENSE",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    "CC0-1.0": {
+      "path": "scripts/third-party-license-texts/CC0-1.0.txt",
+      "sha256": "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499"
+    },
+    "MIT": {
+      "path": "scripts/third-party-license-texts/MIT.txt",
+      "sha256": "cb3f0de6a2bbe8221f6f99cddf0db7a0ec22edc17ab1ad8403f6449250e28a7a"
+    }
+  },
+  "rootless_cargo_fallbacks": {
+    "block@0.1.6": { "license": "MIT", "text": "MIT" },
+    "block2@0.5.1": { "license": "MIT", "text": "MIT" },
+    "block2@0.6.2": { "license": "MIT", "text": "MIT" },
+    "codespan-reporting@0.11.1": { "license": "Apache-2.0", "text": "Apache-2.0" },
+    "dispatch@0.2.0": { "license": "MIT", "text": "MIT" },
+    "dispatch2@0.3.1": { "license": "Zlib OR Apache-2.0 OR MIT", "text": "Apache-2.0" },
+    "dlopen2@0.8.2": { "license": "MIT", "text": "MIT" },
+    "dlopen2_derive@0.4.3": { "license": "MIT", "text": "MIT" },
+    "gpu-alloc@0.6.0": { "license": "MIT OR Apache-2.0", "text": "Apache-2.0" },
+    "gpu-alloc-types@0.3.0": { "license": "MIT OR Apache-2.0", "text": "Apache-2.0" },
+    "gpu-descriptor@0.3.2": { "license": "MIT OR Apache-2.0", "text": "Apache-2.0" },
+    "gpu-descriptor-types@0.2.0": { "license": "MIT OR Apache-2.0", "text": "Apache-2.0" },
+    "hexf-parse@0.2.1": { "license": "CC0-1.0", "text": "CC0-1.0" },
+    "malloc_buf@0.0.6": { "license": "MIT", "text": "MIT" },
+    "naga@22.1.0": { "license": "MIT OR Apache-2.0", "text": "Apache-2.0" },
+    "objc-sys@0.3.5": { "license": "MIT", "text": "MIT" },
+    "objc2@0.5.2": { "license": "MIT", "text": "MIT" },
+    "objc2@0.6.4": { "license": "MIT", "text": "MIT" },
+    "objc2-app-kit@0.2.2": { "license": "MIT", "text": "MIT" },
+    "objc2-app-kit@0.3.2": { "license": "Zlib OR Apache-2.0 OR MIT", "text": "Apache-2.0" },
+    "objc2-core-data@0.2.2": { "license": "MIT", "text": "MIT" },
+    "objc2-core-foundation@0.3.2": { "license": "Zlib OR Apache-2.0 OR MIT", "text": "Apache-2.0" },
+    "objc2-core-image@0.2.2": { "license": "MIT", "text": "MIT" },
+    "objc2-encode@4.1.0": { "license": "MIT", "text": "MIT" },
+    "objc2-exception-helper@0.1.1": { "license": "Zlib OR Apache-2.0 OR MIT", "text": "Apache-2.0" },
+    "objc2-foundation@0.2.2": { "license": "MIT", "text": "MIT" },
+    "objc2-foundation@0.3.2": { "license": "MIT", "text": "MIT" },
+    "objc2-metal@0.2.2": { "license": "MIT", "text": "MIT" },
+    "objc2-quartz-core@0.2.2": { "license": "MIT", "text": "MIT" },
+    "objc2-web-kit@0.3.2": { "license": "Zlib OR Apache-2.0 OR MIT", "text": "Apache-2.0" },
+    "profiling@1.0.18": { "license": "MIT OR Apache-2.0", "text": "Apache-2.0" },
+    "serial@0.4.0": { "license": "MIT", "text": "MIT" },
+    "spirv@0.3.0+sdk-1.3.268.0": { "license": "Apache-2.0", "text": "Apache-2.0" },
+    "svg_fmt@0.4.5": { "license": "MIT/Apache-2.0", "text": "Apache-2.0" }
+  },
+  "nested_material": {
+    "include": [
+      {
+        "package": "regex-syntax@0.8.10",
+        "path": "src/unicode_tables/LICENSE-UNICODE",
+        "targets": ["all"],
+        "kind": "license"
+      },
+      {
+        "package": "tracing-core@0.1.36",
+        "path": "src/spin/LICENSE",
+        "targets": ["all"],
+        "kind": "license"
+      },
+      {
+        "package": "serial@0.4.0",
+        "path": "README.md",
+        "targets": ["all"],
+        "kind": "notice"
+      }
+    ],
+    "exclude": [
+      {
+        "package": "cosmic-text@0.12.1",
+        "path": "fonts/FiraMono-LICENSE",
+        "targets": ["all"],
+        "reason": "test fixture font is not embedded in the shipped binaries"
+      },
+      {
+        "package": "cosmic-text@0.12.1",
+        "path": "fonts/Inter-LICENSE",
+        "targets": ["all"],
+        "reason": "test fixture font is not embedded in the shipped binaries"
+      },
+      {
+        "package": "cosmic-text@0.12.1",
+        "path": "fonts/NotoSans-LICENSE",
+        "targets": ["all"],
+        "reason": "test fixture font is not embedded in the shipped binaries"
+      },
+      {
+        "package": "fontdb@0.16.2",
+        "path": "tests/fonts/LICENSE.txt",
+        "targets": ["all"],
+        "reason": "test fixture font is not embedded in the shipped binaries"
+      },
+      {
+        "package": "libsqlite3-sys@0.30.1",
+        "path": "sqlcipher/LICENSE",
+        "targets": ["all"],
+        "reason": "the locked build uses bundled SQLite, not the SQLCipher source subtree"
+      },
+      {
+        "package": "rustybuzz@0.14.1",
+        "path": "scripts/ms-use/COPYING",
+        "targets": ["all"],
+        "reason": "developer script material is not compiled or packaged"
+      },
+      {
+        "package": "ttf-parser@0.21.1",
+        "path": "tests/fonts/colr_1_LICENSE",
+        "targets": ["all"],
+        "reason": "test fixture font is not embedded in the shipped binaries"
+      },
+      {
+        "package": "winit@0.30.13",
+        "path": "docs/res/ATTRIBUTION.md",
+        "targets": ["all"],
+        "reason": "documentation image attribution is not part of the shipped binaries"
+      }
+    ]
+  },
+  "generated_protocol_sources": [],
+  "mpl_source_packages": {
+    "option-ext@0.2.0": "MPL-2.0"
+  }
+}

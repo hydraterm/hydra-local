@@ -1,0 +1,54 @@
+name: Platform compatibility
+description: Report a macOS or Linux build, packaging, graphics or desktop-host problem
+title: "[Platform]: "
+body:
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Linux
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Exact system details
+      description: Include OS release, architecture, GPU/driver, and Wayland/X11/XWayland where relevant.
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Build or install source
+      options:
+        - Source build
+        - Homebrew
+        - APT
+        - Direct official package
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and reproduction
+      description: Redact usernames, personal paths, account identifiers and terminal contents.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Include only relevant output; never include credentials or private terminal content.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched for an existing issue.
+          required: true
+        - label: This report does not disclose a security vulnerability.
+          required: true
+

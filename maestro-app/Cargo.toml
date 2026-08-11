@@ -1,0 +1,35 @@
+[package]
+name = "maestro-app"
+version = "0.2.8"
+publish = false
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "maestro-app"
+path = "src/main.rs"
+
+[lib]
+name = "maestro_app"
+path = "src/lib.rs"
+
+[features]
+# Community/source builds are network-silent by default. Hydra's signed distribution enables this
+# explicitly to check the two fixed public metadata feeds; there is no runtime origin override.
+default = []
+official-distribution = []
+
+[dependencies]
+maestro-protocol = { path = "../maestro-protocol" }
+maestro-local-services = { path = "../maestro-local-services" }
+maestro-renderer = { path = "../maestro-renderer" }
+maestro-shell = { path = "../maestro-shell" }
+maestro-extension-api = { path = "../maestro-extension-api" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+libc = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

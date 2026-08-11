@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "pty-daemon",
+    "maestro-renderer",
+    "maestro-shell",
+    "maestro-protocol",
+    "maestro-local-services",
+    "maestro-extension-api",
+    "maestro-app",
+    "hydra-launcher",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+# MSRV: 1.88. Current locked security/runtime dependencies (including `time`
+# and `home`) require 1.88, so CI verifies the real floor instead of advertising
+# an older toolchain that Cargo can no longer build.
+rust-version = "1.88"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+portable-pty = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+alacritty_terminal = "0.26"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4", "serde"] }
+libc = "0.2"
+# Daemon-only: inline-capable string for per-cell text. Inlines <=24 bytes on the stack
+# (every realistic terminal cell), avoiding a heap allocation per extracted cell. Its serde
+# impl serializes byte-identically to a plain JSON string, so the wire shape is unchanged.
+compact_str = { version = "0.8", features = ["serde"] }
+sha2 = "0.10"
+
+[profile.release]
+# Release binaries strip symbols and carry no debuginfo. Strip alone does not remove source paths
+# from panic locations; reproducible path-free builds must also set rustc's `--remap-path-prefix`.
+strip = "symbols"
+debug = 0

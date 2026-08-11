@@ -1,0 +1,6 @@
+[toolchain]
+# Exact development/release toolchain. This is intentionally distinct from the workspace MSRV
+# (`rust-version = "1.88"`), which remains the oldest compiler the public crates support.
+channel = "1.96.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

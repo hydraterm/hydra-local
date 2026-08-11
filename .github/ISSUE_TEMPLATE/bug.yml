@@ -1,0 +1,57 @@
+name: Bug report
+description: Report a reproducible non-security defect in the local desktop
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report security vulnerabilities here. Use private vulnerability reporting or email security@hydraterms.com.
+  - type: input
+    id: version
+    attributes:
+      label: Hydra version or commit
+      placeholder: 0.2.8 or a full source commit
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: Include OS version, architecture, and Wayland/X11 on Linux.
+      placeholder: macOS 15 arm64, or Ubuntu 24.04 amd64 on native Wayland
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Use a minimal example and redact usernames, paths, terminal contents and account identifiers.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Redacted evidence
+      description: Paste only the smallest relevant log excerpt. Never include credentials or private terminal content.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched for an existing issue.
+          required: true
+        - label: This report does not disclose a security vulnerability.
+          required: true
+

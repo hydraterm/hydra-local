@@ -1,0 +1,12 @@
+[package]
+name = "maestro-extension-api"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Bounded local capability contract for optional Hydra desktop extensions."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

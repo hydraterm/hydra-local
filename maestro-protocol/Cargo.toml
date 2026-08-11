@@ -1,0 +1,12 @@
+[package]
+name = "maestro-protocol"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Shared Maestro wire protocol: request-side types (SessionId, ChannelId, ChannelEvent, ClientRequest) and a lightweight shell-side daemon-event decoder. Runtime-independent: no daemon grid/session internals, no tokio, no PTY."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

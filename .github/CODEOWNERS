@@ -1,0 +1,15 @@
+* @hydraterm/hydra-local-maintainers
+
+/maestro-extension-api/ @hydraterm/hydra-local-maintainers
+/maestro-local-services/ @hydraterm/hydra-local-maintainers
+/maestro-protocol/ @hydraterm/hydra-local-maintainers
+/maestro-shell/ @hydraterm/hydra-local-maintainers
+/pty-daemon/ @hydraterm/hydra-local-maintainers
+
+/maestro-app/ @hydraterm/hydra-local-maintainers
+/maestro-renderer/ @hydraterm/hydra-local-maintainers
+/.github/ @hydraterm/hydra-local-maintainers
+/Cargo.toml @hydraterm/hydra-local-maintainers
+/Cargo.lock @hydraterm/hydra-local-maintainers
+/SECURITY.md @hydraterm/hydra-local-maintainers
+/docs/public-private-boundary.md @hydraterm/hydra-local-maintainers

@@ -1,0 +1,29 @@
+name: Documentation improvement
+description: Report missing, incorrect or confusing public documentation
+title: "[Docs]: "
+body:
+  - type: input
+    id: location
+    attributes:
+      label: Document or page
+      placeholder: README.md, DEVELOPMENT.md, or a URL
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is unclear or incorrect?
+    validations:
+      required: true
+  - type: textarea
+    id: change
+    attributes:
+      label: Suggested change
+  - type: checkboxes
+    id: security
+    attributes:
+      label: Security check
+      options:
+        - label: This report does not disclose a security vulnerability.
+          required: true
+

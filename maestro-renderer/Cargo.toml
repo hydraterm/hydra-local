@@ -1,0 +1,56 @@
+[package]
+name = "maestro-renderer"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Pure canonical pane-layout engine (CanonicalLayout / PaneLayoutModel / slot_rects). Only the pure
+# `pane_layout` module is used here; maestro-shell carries no renderer/daemon coupling so this stays a
+# leaf, IO-free dependency for the renderer's branching split-geometry derivation.
+maestro-shell = { path = "../maestro-shell" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+wgpu = "22"
+glyphon = "0.6"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+[target.'cfg(target_os = "macos")'.dependencies]
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+core-graphics = "0.23.2"
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "NSColor", "NSResponder", "NSView", "NSWindow"] }
+rfd = "0.15"
+wry = { version = "0.55.1", default-features = false, features = ["devtools", "protocol", "transparent"] }
+# macOS clipboard access for bracketed paste, isolated behind the local `Clipboard`
+# trait (client.rs). Linux uses the already-linked native GTK clipboard instead:
+# arboard's text-only Unix backend is X11-only and can block/fail under native Wayland.
+# `default-features = false` drops image support; Hydra only reads/writes text.
+arboard = { version = "=3.4.1", default-features = false }
+
+# Linux DashboardHost adapter. This is a PLATFORM-GATED HOST BOUNDARY, not a renderer
+# fork: the production renderer stays winit-driven on macOS. On Linux the window + event loop are Tao/GTK so
+# WebKitGTK (wry) can host the React dashboard as a GTK child while the existing WGPU renderer presents into a
+# GTK-owned child surface (Wayland `wl_subsurface` / X11 child XID). Tao/GTK types must NOT leak into renderer
+# core — they live only under `src/linux_host/`. See `src/linux_host/mod.rs`.
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux's owner loop is Tao/GTK. Shared renderer types still compile against winit, but only its
+# X11 backend is needed; disabling the unused Wayland feature removes the ambiguous Plasma protocol
+# binding graph without changing the native Wayland host.
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11"] }
+tao = "0.34"
+# On Linux wry needs its DEFAULT features on so the WebKitGTK backend compiles (dropping them, as the macOS
+# line does, removes the `webkit2gtk` backend and fails to build). wry hosts the WebView as a GTK child, which
+# is why the Linux window/event loop is Tao/GTK here.
+wry = { version = "0.55.1", features = ["devtools"] }
+gtk = "0.18"
+glib = "0.18"
+gdkwayland-sys = "0.18"
+gdkx11-sys = "0.18"
+raw-window-handle = "0.6"
+wayland-sys = { version = "0.31", features = ["client", "dlopen"] }
+# WebKitGTK bindings, pinned to the EXACT version + feature wry 0.55.1 already resolves (=2.0.2, v2_38), so
+# no new crate is downloaded and the `wry::WebViewExtUnix::webview()` return type matches. Used only for the
+# dashboard WebView's web-process-crash / load-failed recovery signals in `linux_host` (presentation-only).
+webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }

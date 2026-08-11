@@ -1,0 +1,19 @@
+#!/usr/bin/env sh
+set -eu
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+# Keep this shell-only derivation aligned with maestro-protocol/src/endpoint.rs. `id -u` reports the
+# effective UID, and `:-` skips empty runtime-directory values just like the Rust resolver.
+runtime_dir=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}
+socket="$runtime_dir/hydra-maestro-$(id -u).sock"
+
+exec "$root/bin/maestro-app" launch \
+  --top-tab-bar \
+  --no-dashboard-panel \
+  --new-tab-default-shell \
+  --product-startup \
+  --title Hydra \
+  --socket "$socket" \
+  --daemon "$root/bin/pty-daemon" \
+  --keep-daemon \
+  "$@"

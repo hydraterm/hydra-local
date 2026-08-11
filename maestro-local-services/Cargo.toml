@@ -1,0 +1,20 @@
+[package]
+name = "maestro-local-services"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Local-only desktop services shared by Hydra's app and authenticated remote bridge."
+
+[dependencies]
+maestro-shell = { path = "../maestro-shell" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+libc = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

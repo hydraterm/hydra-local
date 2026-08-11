@@ -1,0 +1,29 @@
+[package]
+name = "maestro-shell"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Shell-owned product metadata for Maestro: projects, workspaces, durable session/task records, versioned storage, and pure workspace-policy resolution without daemon, PTY, git, or renderer coupling."
+
+# A minimal contributor smoke CLI over `ShellRuntime`: resolve+connect to an ALREADY-RUNNING
+# daemon and start/attach or reconcile one session. It owns no daemon lifecycle.
+[[bin]]
+name = "maestro-shell-smoke"
+path = "src/bin/maestro_shell_smoke.rs"
+
+[dependencies]
+maestro-protocol = { path = "../maestro-protocol" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+libc = { workspace = true }
+# Embedded SQLite (single-file local store; FK cascade). `bundled` vendors SQLite's C source so there is NO system
+# libsqlite3 dependency and the build is reproducible — the user never installs anything.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[dev-dependencies]
+# Test-only: unique temp dirs so tests never touch the real app-support path.
+# `tempfile` is dev-only, so it never enters the shipped crate's dep graph.
+tempfile = "3"

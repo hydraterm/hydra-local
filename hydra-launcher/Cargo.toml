@@ -1,0 +1,15 @@
+[package]
+name = "hydra-launcher"
+version = "0.2.8"
+publish = false
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "hydra-launcher"
+path = "src/main.rs"
+
+[dependencies]
+libc = { workspace = true }
+maestro-protocol = { path = "../maestro-protocol" }

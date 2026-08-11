@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability privately
+    url: https://github.com/hydraterm/hydra-local/security/advisories/new
+    about: Do not disclose vulnerabilities in public issues. If private reporting is unavailable, email security@hydraterms.com.
+  - name: Product support
+    url: mailto:info@hydraterms.com
+    about: Ask for help using an official Hydra release.
