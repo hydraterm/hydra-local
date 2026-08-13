@@ -78,18 +78,12 @@ impl Fixture {
             .unwrap();
     }
 
-    /// Delete like the app does: close the project's window layouts first, then the record
-    /// (FK cascade removes workspaces/sessions/tasks either way — both orders must stay coherent).
+    /// Delete through the same prepared ownership contract as the app. This fixture has no daemon,
+    /// so it explicitly treats the planned ids as already absent before committing.
     fn delete_project(&mut self, id: &str) {
         self.create_project(id);
-        let now = self.tick();
-        if let Some(p) = self.projects().load(id).unwrap() {
-            for wid in &p.window_order {
-                let _ = self.windows().delete(wid);
-            }
-        }
-        let _ = now;
-        self.projects().delete(id).unwrap();
+        let plan = self.projects().plan_delete(id).unwrap();
+        self.projects().commit_delete(&plan, |_| Ok(())).unwrap();
     }
 
     /// The full app-like window chain: Workspace + Session records, empty layout, first pane,
@@ -342,23 +336,16 @@ fn singles_and_full_sequence_keep_the_store_coherent() {
     }
 }
 
-/// Deleting the baseline project must cascade its window/tabs/workspace/sessions away — closed
-/// projects leave NO orphans and the store stays coherent.
+/// Deleting the baseline project must prepare every owned session before cascading its record
+/// graph, and the store stays coherent.
 #[test]
 fn deleting_the_owning_project_cascades_and_stays_coherent() {
     let mut fx = Fixture::new();
     fx.open_pane("w1", "pane-2");
-    for wid in fx
-        .projects()
-        .load("p1")
-        .unwrap()
-        .unwrap()
-        .window_order
-        .clone()
-    {
-        let _ = fx.windows().delete(&wid);
-    }
-    fx.projects().delete("p1").unwrap();
+    let plan = fx.projects().plan_delete("p1").unwrap();
+    assert!(plan.kill_session_ids.contains(&"s-w1-pane-1".to_string()));
+    assert!(plan.kill_session_ids.contains(&"s-w1-pane-2".to_string()));
+    fx.projects().commit_delete(&plan, |_| Ok(())).unwrap();
     assert_healthy(&fx, "delete p1");
     assert!(
         fx.windows().load("w1").unwrap().is_none(),

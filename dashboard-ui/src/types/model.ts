@@ -5,7 +5,7 @@
 //   - The flat envelope mirrors `maestro-app dashboard --view-model`
 //     (active_project / projects[].is_active|active_task_count|window_count /
 //      counts / active_tasks / stashed_tabs).
-//   - The richer tree (windows -> tabs, workspaces, recovered sessions) mirrors
+//   - The richer tree (windows -> tabs and workspaces) mirrors
 //     maestro-shell `DashboardSnapshot` / `ProjectSnapshot` / `DashboardWindow`
 //     / `DashboardTab`, used for the expandable project detail.
 //
@@ -155,11 +155,6 @@ export interface ProjectDetail {
   tasks: AgentTask[]
 }
 
-// session_service.rs RecoveredSession
-export interface RecoveredSession {
-  session_id: string
-}
-
 export type DesktopAccessStatus = 'granted' | 'required' | 'unknown' | 'not_applicable'
 
 export interface DesktopAccessModel {
@@ -222,8 +217,9 @@ export type FilesystemModeMigrationNotice = FilesystemModeMigrationNoticeBase &
   )
 
 // The full payload the prototype renders. `projects` (cards) + `active_project`
-// + `counts` + `active_tasks` come straight from --view-model; `details` and
-// `recovered_sessions` come from the fuller DashboardSnapshot tree.
+// + `counts` + `active_tasks` come straight from --view-model; `details` is native project state.
+// `recovered_sessions` is retained as an always-empty compatibility field. Native reconciliation
+// ids never cross the WebView boundary.
 export interface DashboardModel {
   active_project: ActiveProjectRef | null
   active_window_id?: string | null
@@ -233,7 +229,7 @@ export interface DashboardModel {
   attention_count: number
   active_tasks: AgentTask[]
   details: Record<string, ProjectDetail>
-  recovered_sessions: RecoveredSession[]
+  recovered_sessions: []
   /** True only after the optional private Remote extension negotiated a compatible capability.
    * Absent/false hides every Remote control and is the fail-closed local-only default. */
   remote_available?: boolean

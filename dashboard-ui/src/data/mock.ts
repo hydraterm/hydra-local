@@ -295,5 +295,5 @@ export const mockDashboardModel: DashboardModel = {
       windows: [],
     },
   },
-  recovered_sessions: [{ session_id: 's-orphan-7a3f' }, { session_id: 's-orphan-bc12' }],
+  recovered_sessions: [],
 }

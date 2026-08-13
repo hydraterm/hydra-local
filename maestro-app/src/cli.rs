@@ -85,8 +85,9 @@ pub enum Command {
     /// store; `restore-plan` prints the non-executing restore plan (which slots reattach vs. launch
     /// fresh) as JSON. See [`LayoutPresetCommand`] and `maestro_shell::LayoutPresetService`.
     LayoutPreset(LayoutPresetCommand),
-    /// Project management CRUD over `maestro_shell::ProjectService`. Daemon-free, local-only:
-    /// `create`/`update`/`delete`/`reorder` write `Project` records; `list` is read-only. Backs the
+    /// Project management over `maestro_shell::ProjectService`. Create/update/reorder are local
+    /// record writes and list is read-only; delete additionally contacts the retained PTY daemon so
+    /// it can release the complete prepared session set before cascading records. Backs the
     /// dashboard/sidebar project surface. See [`ProjectCommand`].
     Project(ProjectCommand),
 }
@@ -103,7 +104,8 @@ pub enum ProjectCommand {
     /// [--icon <g>|--clear-icon] [--accent <#rrggbb>|--clear-accent] [--clear-launch-defaults]
     /// [--base <dir>]`: patch a project. Unsupplied fields are unchanged.
     Update(ProjectUpdateArgs),
-    /// `project delete --project-id <id> [--base <dir>]`: delete a project record (idempotent).
+    /// `project delete --project-id <id> [--base <dir>]`: release every unshared owned PTY, then
+    /// delete the project graph (idempotent when the project is absent).
     Delete(ProjectRefArgs),
     /// `project reorder --order <id,id,...> [--base <dir>]`: realize an explicit project order.
     Reorder(ProjectReorderArgs),

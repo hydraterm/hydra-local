@@ -46,6 +46,10 @@ pub enum ShellEvent {
         /// Whether Attach restore grids echo and live forwarders tag the optional output generation.
         #[serde(default)]
         output_generation_echo: bool,
+        /// Whether StartSession consumes the typed child_environment HOME/SHELL pair. Absent on
+        /// retained daemons means false; headless mutation must remain closed.
+        #[serde(default)]
+        child_environment: bool,
     },
     /// Authoritative grid baseline (attach restore / `Snapshot` reply). Only the lightweight
     /// [`GridInfo`] is decoded — never the cell payload.
@@ -103,6 +107,7 @@ mod tests {
                 protocol_version: 1,
                 build_version: "0.1.0".into(),
                 output_generation_echo: false,
+                child_environment: false,
             }
         );
     }

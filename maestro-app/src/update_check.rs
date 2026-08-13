@@ -321,7 +321,7 @@ fn check_and_publish(manifest_url: &str, completion: mpsc::Sender<()>) {
 fn compiled_manifest_url() -> Option<String> {
     #[cfg(feature = "official-distribution")]
     {
-        return manifest_url_for(RELEASE_ORIGIN, STABLE_MANIFEST_PATH);
+        manifest_url_for(RELEASE_ORIGIN, STABLE_MANIFEST_PATH)
     }
     #[cfg(not(feature = "official-distribution"))]
     {

@@ -74,7 +74,30 @@ impl Daemon {
         cols: u16,
         rows: u16,
     ) -> Result<()> {
-        self.start_session_with_restart(id, cwd, command, args, cols, rows, false)
+        self.start_session_with_environment(id, cwd, command, args, None, cols, rows)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_session_with_environment(
+        &mut self,
+        id: SessionId,
+        cwd: &str,
+        command: &str,
+        args: &[String],
+        child_environment: Option<&maestro_protocol::ChildEnvironment>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<()> {
+        self.start_session_with_restart_and_environment(
+            id,
+            cwd,
+            command,
+            args,
+            child_environment,
+            cols,
+            rows,
+            false,
+        )
     }
 
     /// Start a genuinely new id, reattach to a live same-id session, or (only with explicit
@@ -87,6 +110,30 @@ impl Daemon {
         cwd: &str,
         command: &str,
         args: &[String],
+        cols: u16,
+        rows: u16,
+        restart_exited: bool,
+    ) -> Result<()> {
+        self.start_session_with_restart_and_environment(
+            id,
+            cwd,
+            command,
+            args,
+            None,
+            cols,
+            rows,
+            restart_exited,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_session_with_restart_and_environment(
+        &mut self,
+        id: SessionId,
+        cwd: &str,
+        command: &str,
+        args: &[String],
+        child_environment: Option<&maestro_protocol::ChildEnvironment>,
         cols: u16,
         rows: u16,
         restart_exited: bool,
@@ -117,6 +164,7 @@ impl Daemon {
         if command.contains('\0') || args.iter().any(|a| a.contains('\0')) {
             return Err(anyhow!("command and args must not contain NUL bytes"));
         }
+        validate_child_environment(child_environment)?;
         if !cwd.is_empty() && !std::path::Path::new(cwd).is_dir() {
             return Err(anyhow!("cwd is not a directory: {cwd}"));
         }
@@ -151,7 +199,15 @@ impl Daemon {
             ));
         }
 
-        let session = Session::spawn(id.clone(), cwd, command, args, cols, rows)?;
+        let session = Session::spawn(
+            id.clone(),
+            cwd,
+            command,
+            args,
+            child_environment,
+            cols,
+            rows,
+        )?;
 
         if needs_capacity_eviction {
             // The preflight above proved at least one candidate while the daemon mutex was held.
@@ -359,6 +415,55 @@ impl Daemon {
             }
         }
     }
+}
+
+fn validate_child_environment(
+    environment: Option<&maestro_protocol::ChildEnvironment>,
+) -> Result<()> {
+    let Some(environment) = environment else {
+        return Ok(());
+    };
+    let home = std::path::Path::new(&environment.home);
+    let shell = std::path::Path::new(&environment.shell);
+    let normalized_absolute = |path: &std::path::Path| {
+        path.is_absolute()
+            && path.components().all(|component| {
+                matches!(
+                    component,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                )
+            })
+    };
+    if environment.home.is_empty()
+        || environment.shell.is_empty()
+        || environment.home.len() > 4096
+        || environment.shell.len() > 4096
+        || environment.home.contains(['\0', '\n', '\r'])
+        || environment.shell.contains(['\0', '\n', '\r'])
+        || !normalized_absolute(home)
+        || !normalized_absolute(shell)
+        || home == std::path::Path::new("/")
+        || !home.is_dir()
+    {
+        return Err(anyhow!("headless child environment is invalid"));
+    }
+    let metadata =
+        std::fs::metadata(shell).map_err(|_| anyhow!("headless child environment is invalid"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if !metadata.is_file()
+            || metadata.permissions().mode() & 0o111 == 0
+            || metadata.permissions().mode() & 0o022 != 0
+        {
+            return Err(anyhow!("headless child environment is invalid"));
+        }
+    }
+    #[cfg(not(unix))]
+    if !metadata.is_file() {
+        return Err(anyhow!("headless child environment is invalid"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -617,6 +722,47 @@ mod tests {
             retained.attach_state().snapshot.generation,
             ended_generation,
             "failed replacement must not discard or replace the ended generation"
+        );
+    }
+
+    #[test]
+    fn invalid_child_environment_is_rejected_before_exited_snapshot_replacement() {
+        let mut daemon = Daemon::default();
+        let id = sid("invalid-child-environment-retains-snapshot");
+        daemon
+            .start_session(id.clone(), ".", "true", &[], 80, 24)
+            .expect("spawn short-lived session");
+        wait_for_exit(&daemon, &id);
+        let ended_generation = daemon
+            .session(&id)
+            .expect("retained ended session")
+            .attach_state()
+            .snapshot
+            .generation;
+        let environment = maestro_protocol::ChildEnvironment {
+            home: "/definitely/not/a/hydra/home".into(),
+            shell: "/bin/sh".into(),
+        };
+
+        let error = daemon
+            .start_session_with_restart_and_environment(
+                id.clone(),
+                ".",
+                "/bin/sh",
+                &[],
+                Some(&environment),
+                80,
+                24,
+                true,
+            )
+            .expect_err("invalid typed environment must fail before spawn");
+        assert_eq!(error.to_string(), "headless child environment is invalid");
+        let retained = daemon.session(&id).expect("old snapshot remains installed");
+        assert!(retained.exit_state().is_some());
+        assert_eq!(
+            retained.attach_state().snapshot.generation,
+            ended_generation,
+            "validation failure must not evict the retained final grid"
         );
     }
 

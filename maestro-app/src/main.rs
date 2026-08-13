@@ -180,9 +180,10 @@ const DAEMON_CONNECT_POLL: Duration = Duration::from_millis(50);
 /// call, no command unless the strip actually changed.
 const LIVE_TAB_STRIP_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 /// Background/stashed sessions have no renderer attachment to forward their typed exit event.
-/// Reconcile the daemon's live-only set at a bounded low cadence so dashboard status converges and
-/// ordinary focus never silently relaunches an ended session. This runs off the existing listener
-/// tick (no GUI/event-loop heartbeat) and never persists the daemon endpoint on each pass.
+/// Reconcile the daemon's live set at a bounded low cadence so dashboard status converges, live
+/// sessions without panes remain actionable, and ordinary focus never silently relaunches an ended
+/// session. This runs off the existing listener tick (no GUI/event-loop heartbeat) and never
+/// persists the daemon endpoint on each pass.
 const SESSION_STATUS_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Fast wake cadence for the renderer-event listener. Each wake does only CHEAP checks (the remote
@@ -2530,7 +2531,16 @@ fn dashboard_react_model_with_active(
     active_window_id: Option<&str>,
     active_tab_id: Option<&str>,
 ) -> serde_json::Value {
-    let mut model = match DashboardSnapshotService::new(paths).snapshot(None) {
+    dashboard_react_model_with_active_and_report(paths, active_window_id, active_tab_id, None)
+}
+
+fn dashboard_react_model_with_active_and_report(
+    paths: &AppPaths,
+    active_window_id: Option<&str>,
+    active_tab_id: Option<&str>,
+    session_report: Option<&maestro_shell::ReconcileReport>,
+) -> serde_json::Value {
+    let mut model = match DashboardSnapshotService::new(paths).snapshot(session_report) {
         Ok(snapshot) => {
             let session_agents = session_agent_index(paths);
             dashboard_react_model_from_snapshot_with_sessions(&snapshot, &session_agents)
@@ -2651,10 +2661,12 @@ fn dashboard_react_model_from_snapshot_with_sessions(
 
     if let serde_json::Value::Object(ref mut object) = model {
         object.insert("details".to_string(), serde_json::Value::Object(details));
+        // Reconciliation ids stay native-only. The React dashboard is the ownership surface, not
+        // an orphan-classification console; automatic cleanup consumes the complete native
+        // snapshot directly and no recovered id crosses the WebView boundary.
         object.insert(
             "recovered_sessions".to_string(),
-            serde_json::to_value(&snapshot.recovered_sessions)
-                .expect("RecoveredSession list serializes"),
+            serde_json::Value::Array(Vec::new()),
         );
     }
     model
@@ -5711,24 +5723,47 @@ fn start_recorded_pane_session(
 ) -> Result<(), String> {
     let session = match load_one::<SessionRecord>(paths, RecordKind::Session, &tab.session_id)
         .map_err(|e| format!("load session record: {e}"))?
-        .ok_or_else(|| format!("no session record found for {:?}", tab.session_id))?
     {
-        LoadOutcome::Loaded(session) => session,
-        LoadOutcome::FutureVersion { path, .. } => {
+        Some(LoadOutcome::Loaded(session)) => session,
+        Some(LoadOutcome::FutureVersion { path, .. }) => {
             return Err(format!(
                 "session record {:?} is from a newer app version: {}",
                 tab.session_id,
                 path.display()
             ));
         }
-        LoadOutcome::Quarantined {
+        Some(LoadOutcome::Quarantined {
             moved_to, reason, ..
-        } => {
+        }) => {
             return Err(format!(
                 "session record {:?} is corrupt/quarantined at {}: {reason}",
                 tab.session_id,
                 moved_to.display()
             ));
+        }
+        None => {
+            // Explicitly restored recovered panes deliberately have no invented launch record: the
+            // daemon can prove only the live id, not whether it was a shell/agent or how to restart
+            // it. Re-focus may attach that exact live id, but absence is a hard error and never
+            // becomes implicit process creation.
+            let live = maestro_shell::DaemonClient::connect(socket_path)
+                .and_then(|mut client| client.list_sessions())
+                .map_err(|error| {
+                    format!(
+                        "verify restored session {:?} against daemon: {error}",
+                        tab.session_id
+                    )
+                })?
+                .iter()
+                .any(|id| id.0 == tab.session_id);
+            return if live {
+                Ok(())
+            } else {
+                Err(format!(
+                    "restored session {:?} is no longer live and has no launch record",
+                    tab.session_id
+                ))
+            };
         }
     };
     if open_policy == RecordedPaneOpenPolicy::Product {
@@ -6113,35 +6148,6 @@ fn project_first_visible_window_id_except(
                         .map(|window| window.window_id)
                 })
         })
-}
-
-fn project_window_layouts(paths: &AppPaths, project_id: &str) -> Vec<WindowLayout> {
-    let window_ids: std::collections::HashSet<String> = DashboardSnapshotService::new(paths)
-        .snapshot(None)
-        .ok()
-        .and_then(|snapshot| {
-            snapshot
-                .projects
-                .into_iter()
-                .find(|project| project.project_id == project_id)
-                .map(|project| {
-                    project
-                        .windows
-                        .into_iter()
-                        .map(|window| window.window_id)
-                        .collect()
-                })
-        })
-        .unwrap_or_default();
-    window_ids
-        .into_iter()
-        .filter_map(|window_id| {
-            WindowLayoutService::new(paths)
-                .load(&window_id)
-                .ok()
-                .flatten()
-        })
-        .collect()
 }
 
 /// Minimal per-project view `fallback_window_after_deletion` decides over: just the SYSTEM marker and the
@@ -7246,9 +7252,149 @@ fn project_error_failure(
         E::ProjectAlreadyExists { .. } => "conflict",
         E::InvalidField { .. } | E::InvalidOrder { .. } => "invalid",
         E::SystemProjectCannotBeDeleted { .. } => "forbidden",
+        E::DeletionPlanChanged { .. } | E::WindowOwnershipConflict { .. } => "conflict",
+        E::SessionReleaseFailed { .. } => "daemon_cleanup",
         E::FutureVersion { .. } | E::Corrupt { .. } | E::Store(_) => "store",
     };
     ProjectFailure::new(command, stage, err.to_string())
+}
+
+#[derive(Debug)]
+enum ProjectDeleteLifecycleError {
+    Project(maestro_shell::ProjectServiceError),
+    Daemon(String),
+}
+
+impl std::fmt::Display for ProjectDeleteLifecycleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Project(error) => write!(f, "{error}"),
+            Self::Daemon(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+/// Atomically execute the daemon half of a prepared project deletion and commit the same plan.
+///
+/// No database row is removed until every unshared affected id is confirmed absent from the
+/// daemon. The shell service recomputes ownership under `BEGIN IMMEDIATE`, then holds that writer
+/// lock while this caller performs the bounded daemon release. A conforming concurrent start
+/// therefore cannot publish a new owner between release and cascade.
+fn execute_project_delete_plan(
+    paths: &AppPaths,
+    socket_path: &Path,
+    plan: &maestro_shell::ProjectDeletionPlan,
+) -> Result<maestro_shell::ProjectDeletionResult, ProjectDeleteLifecycleError> {
+    let mut client = if plan.kill_session_ids.is_empty() {
+        None
+    } else {
+        Some(
+            maestro_shell::DaemonClient::connect(socket_path).map_err(|error| {
+                ProjectDeleteLifecycleError::Daemon(format!(
+                    "could not connect to the PTY daemon; project records were preserved: {error}"
+                ))
+            })?,
+        )
+    };
+    maestro_shell::ProjectService::new(paths)
+        .commit_delete(plan, |session_ids| {
+            let Some(client) = client.as_mut() else {
+                return if session_ids.is_empty() {
+                    Ok(())
+                } else {
+                    Err("the prepared release client is unexpectedly absent".into())
+                };
+            };
+            for session_id in session_ids {
+                client
+                    .kill_session(maestro_protocol::SessionId(session_id.clone()))
+                    .map_err(|error| {
+                        format!("could not release project session {session_id:?}: {error}")
+                    })?;
+            }
+            Ok(())
+        })
+        .map_err(|error| match error {
+            maestro_shell::ProjectServiceError::SessionReleaseFailed { detail } => {
+                ProjectDeleteLifecycleError::Daemon(detail)
+            }
+            other => ProjectDeleteLifecycleError::Project(other),
+        })
+}
+
+fn load_project_deletion_layouts(
+    paths: &AppPaths,
+    plan: &maestro_shell::ProjectDeletionPlan,
+) -> Result<Vec<WindowLayout>, String> {
+    let service = WindowLayoutService::new(paths);
+    let mut layouts = Vec::with_capacity(plan.window_ids.len());
+    for window_id in &plan.window_ids {
+        let layout = service
+            .load(window_id)
+            .map_err(|error| format!("load project window {window_id:?}: {error}"))?
+            .ok_or_else(|| {
+                format!("project window {window_id:?} changed while deletion was prepared")
+            })?;
+        layouts.push(layout);
+    }
+    Ok(layouts)
+}
+
+/// Apply the dashboard-authoritative orphan policy at the background reconcile boundary.
+/// Candidates must appear in two consecutive complete snapshots before any daemon mutation. The
+/// final per-id decision is re-read under the SQLite writer fence by `SessionService`, so a pane
+/// created after either observation—including a stashed pane—wins and prevents the kill.
+fn release_stably_unrepresented_sessions(
+    paths: &AppPaths,
+    socket_path: &Path,
+    report: &maestro_shell::ReconcileReport,
+    previous: &mut std::collections::BTreeSet<String>,
+) -> Result<Vec<String>, String> {
+    let snapshot = match DashboardSnapshotService::new(paths).snapshot(Some(report)) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            previous.clear();
+            return Err(format!(
+                "build complete dashboard ownership snapshot: {error}"
+            ));
+        }
+    };
+    if !snapshot.skipped_future_windows.is_empty() || !snapshot.quarantined.is_empty() {
+        previous.clear();
+        return Err(
+            "dashboard ownership is incomplete; automatic PTY cleanup was not attempted".into(),
+        );
+    }
+
+    let current: std::collections::BTreeSet<String> = snapshot
+        .recovered_sessions
+        .into_iter()
+        .map(|session| session.session_id)
+        .collect();
+    let stable: Vec<String> = current.intersection(previous).cloned().collect();
+    *previous = current;
+    if stable.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut client = maestro_shell::DaemonClient::connect(socket_path)
+        .map_err(|error| format!("connect for automatic PTY cleanup: {error}"))?;
+    let sessions = maestro_shell::SessionService::new(paths);
+    let mut released = Vec::new();
+    for session_id in stable {
+        match sessions
+            .release_if_unrepresented(&session_id, |id| {
+                client
+                    .kill_session(maestro_protocol::SessionId(id.to_string()))
+                    .map(|_| ())
+            })
+            .map_err(|error| format!("release unrepresented PTY: {error}"))?
+        {
+            maestro_shell::UnrepresentedSessionRelease::Released => released.push(session_id),
+            maestro_shell::UnrepresentedSessionRelease::Represented => {}
+        }
+    }
+    Ok(released)
 }
 
 /// Parse a validated `--policy` wire string (`scratch_cwd`/`worktree`/`repo_write`) into a
@@ -7264,12 +7410,14 @@ fn project_policy_from_wire(wire: &str) -> maestro_shell::WorkspacePolicy {
     }
 }
 
-/// Run a `project` subcommand. Daemon-free and renderer-free; pure record store CRUD over the
-/// project records that back the dashboard/sidebar project surface:
+/// Run a `project` subcommand. Create/list/update/reorder are daemon-free record operations;
+/// delete resolves the retained daemon and uses the same release-before-cascade contract as the
+/// GUI so no command-line path can orphan a PTY:
 /// - `create` writes a new project record (refuses to overwrite an existing id);
 /// - `list` reads all projects (newest-active first, then id);
 /// - `update` mutates only the supplied fields (never creates, never bumps recency);
-/// - `delete` removes one project record (idempotent);
+/// - `delete` prepares complete session ownership, confirms unshared PTYs absent, then removes the
+///   project graph atomically (idempotent when the project is absent);
 /// - `reorder` re-stamps recency to realize a caller-supplied order.
 ///
 /// Each subcommand prints ONE JSON object on success and exits 0; a typed failure is one JSON value
@@ -7372,15 +7520,35 @@ fn run_project(command: ProjectCommand) -> Result<String, ProjectFailure> {
             let (paths, _base) = window_base(args.base);
             let project_id = args.project_id.expect("parser guarantees --project-id");
 
-            let removed = maestro_shell::ProjectService::new(&paths)
-                .delete(&project_id)
+            let plan = maestro_shell::ProjectService::new(&paths)
+                .plan_delete(&project_id)
                 .map_err(|e| project_error_failure(command, e))?;
+            let socket_path = if plan.kill_session_ids.is_empty() {
+                PathBuf::new()
+            } else {
+                maestro_shell::resolve_socket_path(&paths, None, &ProcessEnv).map_err(|error| {
+                    ProjectFailure::new(command, "daemon_cleanup", error.to_string())
+                })?
+            };
+            let result =
+                execute_project_delete_plan(&paths, &socket_path, &plan).map_err(|error| {
+                    match error {
+                        ProjectDeleteLifecycleError::Project(error) => {
+                            project_error_failure(command, error)
+                        }
+                        ProjectDeleteLifecycleError::Daemon(message) => {
+                            ProjectFailure::new(command, "daemon_cleanup", message)
+                        }
+                    }
+                })?;
 
             Ok(serde_json::json!({
                 "ok": true,
                 "command": command,
                 "project_id": project_id,
-                "removed": removed,
+                "removed": result.removed,
+                "released_session_ids": plan.kill_session_ids,
+                "retained_shared_session_ids": result.retained_shared_session_ids,
             })
             .to_string())
         }
@@ -9680,6 +9848,12 @@ fn spawn_window_event_listener(
         // loop itself wakes on the faster LISTENER_TICK_INTERVAL.
         let mut last_full_tick = Instant::now();
         let mut last_session_status_reconcile = Instant::now();
+        // The reconcile report is the fresh daemon authority for both daemon-only live ids and
+        // record-backed live ids whose pane was lost. Retain the latest report for status
+        // projection. Automatic cleanup requires the exact no-pane set to repeat across two
+        // complete periodic snapshots; immediate mutation refreshes never count as observations.
+        let mut latest_session_report: Option<maestro_shell::ReconcileReport> = None;
+        let mut previous_unrepresented_sessions = std::collections::BTreeSet::new();
         // App-owned left-dock UI state for this window. The renderer is a pure projector and emits
         // expand/collapse intents; the app holds the truth and re-projects. Starts all-collapsed
         // (no project expanded) so the dock opens compact.
@@ -9815,60 +9989,69 @@ fn spawn_window_event_listener(
                             "attach-tab: external record-store change observed; refreshing local projections"
                         );
                     }
-                    // RENDERED-WINDOW EXISTENCE GUARD: an external cascade delete (another process removed a
-                    // project → FK cascade removed its window rows) can delete the window this renderer
-                    // is currently showing. The strip/sidebar refreshes below repaint chrome, but nothing
-                    // re-targets the live renderer — the dead window's panes keep rendering. Detect the
-                    // rendered window vanishing from the store (cheap point read, only while it exists)
-                    // and drive the SAME focus machinery a manual tab click uses, preferring the SYSTEM
-                    // Terminal project's window (undeletable → guaranteed to exist). Idempotent: after a
-                    // successful switch the rendered window exists again, so later ticks no-op; we only
-                    // switch when the window row is REALLY gone (never on mere unfocus or read errors).
-                    match WindowLayoutService::new(&listener_paths).load(&listener_window_id) {
-                        Ok(Some(_)) => {} // rendered window still exists — nothing to do
-                        Ok(None) => {
-                            let empty = std::collections::HashSet::new();
-                            match deletion_fallback_window(
-                                &listener_paths,
-                                &empty,
-                                &listener_window_id,
-                            ) {
-                                Some(next_window_id) => {
-                                    match apply_focus_recorded_window_request(
-                                        &listener_paths,
-                                        &listener_socket_path,
-                                        listener_shell_default_argv.as_deref(),
-                                        listener_open_policy,
-                                        &mut tab_runtime,
-                                        &mut listener_window_id,
-                                        &mut listener_selection,
-                                        &mut listener_strip_tabs,
-                                        &next_window_id,
-                                        None,
-                                        "renderedWindowDeleted",
-                                    ) {
-                                        Ok(model) => {
-                                            last_sent_strip = Some(model);
-                                            eprintln!(
-                                                "attach-tab: rendered window left the store; switched to a local fallback"
-                                            );
-                                            eprintln!(
-                                                "attach-tab: rendered window vanished from store (external delete) → focused fallback window={next_window_id:?}"
-                                            );
-                                        }
-                                        Err(e) => eprintln!(
-                                            "attach-tab: rendered window vanished but fallback focus failed to={next_window_id:?} (non-fatal, will retry next tick): {e}"
-                                        ),
-                                    }
-                                }
-                                None => eprintln!(
-                                    "attach-tab: rendered window {listener_window_id:?} gone from store and no fallback window exists (non-fatal, keeping renderer as-is)"
-                                ),
-                            }
+                    // RENDERED-WINDOW OWNERSHIP GUARD: an external cascade can remove the whole
+                    // rendered window, while project deletion can remove a misplaced pane from a
+                    // surviving window. In the latter case that window may become all-stashed or
+                    // empty. Chrome refresh alone is insufficient: the renderer would keep the
+                    // removed PTY attached. Re-target through the same focus path as a manual click,
+                    // preferring Terminal. A healthy window with at least one visible pane is never
+                    // disturbed. For an empty surviving window, exclude that exact row from fallback
+                    // selection so the ordinary "current window exists" no-switch rule cannot retain
+                    // a dead projection.
+                    let fallback_cause = match WindowLayoutService::new(&listener_paths)
+                        .load(&listener_window_id)
+                    {
+                        Ok(Some(layout)) if layout.tabs.iter().any(|tab| !tab.stashed) => None,
+                        Ok(Some(_)) => Some((
+                            "rendered window has no visible panes after an external layout change",
+                            std::collections::HashSet::from([listener_window_id.clone()]),
+                        )),
+                        Ok(None) => Some((
+                            "rendered window left the store",
+                            std::collections::HashSet::new(),
+                        )),
+                        Err(e) => {
+                            eprintln!(
+                                "attach-tab: rendered-window ownership probe failed (non-fatal, not switching): {e}"
+                            );
+                            None
                         }
-                        Err(e) => eprintln!(
-                            "attach-tab: rendered-window existence probe failed (non-fatal, not switching): {e}"
-                        ),
+                    };
+                    if let Some((cause, excluded)) = fallback_cause {
+                        match deletion_fallback_window(
+                            &listener_paths,
+                            &excluded,
+                            &listener_window_id,
+                        ) {
+                            Some(next_window_id) => {
+                                match apply_focus_recorded_window_request(
+                                    &listener_paths,
+                                    &listener_socket_path,
+                                    listener_shell_default_argv.as_deref(),
+                                    listener_open_policy,
+                                    &mut tab_runtime,
+                                    &mut listener_window_id,
+                                    &mut listener_selection,
+                                    &mut listener_strip_tabs,
+                                    &next_window_id,
+                                    None,
+                                    "renderedWindowLostOwnership",
+                                ) {
+                                    Ok(model) => {
+                                        last_sent_strip = Some(model);
+                                        eprintln!(
+                                            "attach-tab: {cause}; focused fallback window={next_window_id:?}"
+                                        );
+                                    }
+                                    Err(e) => eprintln!(
+                                        "attach-tab: {cause}, but fallback focus failed to={next_window_id:?} (non-fatal, will retry next tick): {e}"
+                                    ),
+                                }
+                            }
+                            None => eprintln!(
+                                "attach-tab: {cause} and no visible fallback window exists (non-fatal, keeping renderer as-is)"
+                            ),
+                        }
                     }
                     let active_tab_id: Option<String> =
                         tab_runtime.active_tab_id().map(str::to_owned);
@@ -9941,7 +10124,10 @@ fn spawn_window_event_listener(
                                 &ProcessEnv,
                                 now_ms(),
                             ) {
-                            Ok(_) => last_session_status_reconcile = Instant::now(),
+                            Ok(outcome) => {
+                                last_session_status_reconcile = Instant::now();
+                                latest_session_report = Some(outcome.report);
+                            }
                             Err(e) => eprintln!(
                                 "attach-tab: pending-refresh reconcile failed (non-fatal): {e}"
                             ),
@@ -9949,23 +10135,50 @@ fn spawn_window_event_listener(
                     }
                     // Renderer events cover the active window's attached panes. Reconcile at a
                     // bounded cadence for background windows and stashed panes, which deliberately
-                    // have no renderer reader. ListSessions is now a truthful live-only snapshot;
-                    // this updates status only and never starts, kills, attaches, detaches, or
-                    // removes a retained session.
+                    // have no renderer reader. A live id absent from every active or stashed pane
+                    // in TWO consecutive complete snapshots is automatically released. The final
+                    // no-pane proof runs under the SQLite writer fence, preventing a concurrent
+                    // conforming pane write from racing the exact kill.
                     if last_session_status_reconcile.elapsed() >= SESSION_STATUS_RECONCILE_INTERVAL
                     {
                         last_session_status_reconcile = Instant::now();
-                        if let Err(e) = ShellRuntime::new(&listener_paths)
+                        match ShellRuntime::new(&listener_paths)
                             .without_endpoint_persist()
                             .reconcile_sessions(
                                 Some(listener_socket_path.clone()),
                                 &ProcessEnv,
                                 now_ms(),
-                            )
-                        {
-                            eprintln!(
-                                "attach-tab: background session-status reconcile failed (non-fatal): {e}"
-                            );
+                            ) {
+                            Ok(outcome) => {
+                                match release_stably_unrepresented_sessions(
+                                    &listener_paths,
+                                    &listener_socket_path,
+                                    &outcome.report,
+                                    &mut previous_unrepresented_sessions,
+                                ) {
+                                    Ok(released) if !released.is_empty() => {
+                                        pending_dashboard_refresh = true;
+                                        eprintln!(
+                                            "attach-tab: automatically released {} live PTY(s) with no dashboard pane",
+                                            released.len()
+                                        );
+                                    }
+                                    Ok(_) => {}
+                                    Err(error) => eprintln!(
+                                        "attach-tab: automatic unrepresented-PTY cleanup skipped (non-fatal): {error}"
+                                    ),
+                                }
+                                latest_session_report = Some(outcome.report);
+                            }
+                            Err(e) => {
+                                // "Consecutive complete snapshots" is literal: a failed daemon
+                                // reconcile breaks the observation chain and can never be skipped
+                                // over to authorize a later kill.
+                                previous_unrepresented_sessions.clear();
+                                eprintln!(
+                                    "attach-tab: background session-status reconcile failed (non-fatal): {e}"
+                                );
+                            }
                         }
                     }
                     // SELF-HEAL (systematic): rebuild the React model from disk and re-deliver it ONLY if it differs from
@@ -9973,10 +10186,11 @@ fn spawn_window_event_listener(
                     // stash/revive, pane close/remove, swap/swallow, …) without arming a flag at each — the sidebar and
                     // topbar always converge within ~750ms. Gated on a byte-diff, so an unchanged idle app does nothing.
                     {
-                        let model = dashboard_react_model_with_active(
+                        let model = dashboard_react_model_with_active_and_report(
                             &listener_paths,
                             tab_runtime.active_window_id(),
                             tab_runtime.active_tab_id(),
+                            latest_session_report.as_ref(),
                         );
                         let model_json = model.to_string();
                         if last_sent_react_model.as_deref() != Some(model_json.as_str()) {
@@ -11050,8 +11264,29 @@ fn spawn_window_event_listener(
                                 );
                                 continue;
                             }
-                            let removed_layouts =
-                                project_window_layouts(&listener_paths, &project_id);
+                            let plan = match maestro_shell::ProjectService::new(&listener_paths)
+                                .plan_delete(&project_id)
+                            {
+                                Ok(plan) => plan,
+                                Err(error) => {
+                                    eprintln!(
+                                        "attach-tab: React deleteProject could not prepare complete ownership for {project_id:?}; nothing changed: {error}"
+                                    );
+                                    continue;
+                                }
+                            };
+                            let removed_layouts = match load_project_deletion_layouts(
+                                &listener_paths,
+                                &plan,
+                            ) {
+                                Ok(layouts) => layouts,
+                                Err(error) => {
+                                    eprintln!(
+                                        "attach-tab: React deleteProject could not load every owned window for {project_id:?}; nothing changed: {error}"
+                                    );
+                                    continue;
+                                }
+                            };
                             let removed_window_ids: std::collections::HashSet<String> =
                                 removed_layouts
                                     .iter()
@@ -11072,30 +11307,12 @@ fn spawn_window_event_listener(
                             } else {
                                 None
                             };
-                            match maestro_shell::ProjectService::new(&listener_paths)
-                                .delete(&project_id)
-                            {
-                                Ok(removed) => {
-                                    for layout in &removed_layouts {
-                                        match WindowLayoutService::new(&listener_paths)
-                                            .delete(&layout.window_id)
-                                        {
-                                            Ok(window_removed) => eprintln!(
-                                                "attach-tab: React deleteProject removed_window={window_removed} project={project_id:?} window={:?}",
-                                                layout.window_id
-                                            ),
-                                            Err(e) => eprintln!(
-                                                "attach-tab: React deleteProject failed to remove window project={project_id:?} window={:?} (non-fatal): {e}",
-                                                layout.window_id
-                                            ),
-                                        }
-                                    }
-                                    kill_removed_window_sessions(
-                                        &listener_paths,
-                                        &listener_socket_path,
-                                        &removed_layouts,
-                                        "deleteProject",
-                                    );
+                            match execute_project_delete_plan(
+                                &listener_paths,
+                                &listener_socket_path,
+                                &plan,
+                            ) {
+                                Ok(result) => {
                                     if active_window_removed {
                                         if let Some(next_window_id) = fallback_window_id.as_deref()
                                         {
@@ -11151,12 +11368,15 @@ fn spawn_window_event_listener(
                                     );
                                     pending_dashboard_refresh = true; // + diff-self-heal covers a dropped refresh
                                     eprintln!(
-                                        "attach-tab: React deleteProject removed={removed} project={project_id:?} keep_working_directory={keep_working_directory} close_open_windows={close_open_windows}"
+                                        "attach-tab: React deleteProject removed={} project={project_id:?} released_sessions={} retained_shared_sessions={} keep_working_directory={keep_working_directory} close_open_windows={close_open_windows}",
+                                        result.removed,
+                                        plan.kill_session_ids.len(),
+                                        result.retained_shared_session_ids.len(),
                                     );
                                 }
-                                Err(e) => {
+                                Err(error) => {
                                     eprintln!(
-                                        "attach-tab: React deleteProject failed for {project_id:?} (non-fatal): {e}"
+                                        "attach-tab: React deleteProject failed closed for {project_id:?}; project records were preserved: {error}"
                                     );
                                 }
                             }
@@ -12999,8 +13219,9 @@ fn spawn_window_event_listener(
                     // it owned so the immutable borrow does not outlive the `&mut tab_runtime` close.
                     let current_active_tab_id: Option<String> =
                         tab_runtime.active_tab_id().map(str::to_owned);
-                    // Active close: switch to a remaining tab (record-only — no daemon
-                    // stop/kill/detach). Only-tab close is still deferred.
+                    // Active close: switch to a remaining tab, then run the shared session
+                    // lifecycle below after the durable close succeeds. Only-tab close is still
+                    // handled by its dedicated empty-window branch.
                     if maestro_app::is_active_tab_close(current_active_tab_id.as_deref(), &tab_id) {
                         // Plan the next active tab from the PRE-close strip BEFORE mutating
                         // any record. A missing close target is typed/non-fatal; an only-tab
@@ -13023,9 +13244,8 @@ fn spawn_window_event_listener(
                             // Only-tab close: empty-window terminal state. Mutate the record
                             // (the window record remains with ZERO tabs), then clear the
                             // visible strip and the app's active-tab ownership. NO
-                            // `AttachSession` is sent. The closed tab's daemon session is
-                            // NOT stopped/killed/detached — session lifecycle stays deferred
-                            // and orphan-tolerant.
+                            // `AttachSession` is sent; `run_close_lifecycle` then releases the
+                            // closed tab's unshared daemon session.
                             let updated = match WindowLayoutService::new(&listener_paths).close_tab(
                                 &listener_window_id,
                                 &tab_id,
@@ -17358,6 +17578,19 @@ mod foreground_react_chrome_listener_invariant {
     }
 
     #[test]
+    fn recovered_session_classification_intents_are_retired_at_the_native_boundary() {
+        for retired in [
+            r#"{"type":"restoreRecoveredSession","session_id":"live-only"}"#,
+            r#"{"type":"killRecoveredSession","session_id":"live-only"}"#,
+        ] {
+            assert_eq!(
+                parse_react_chrome_intent(retired).unwrap_err(),
+                ReactChromeIntentDecodeError::Malformed
+            );
+        }
+    }
+
+    #[test]
     fn browser_measured_terminal_geometry_is_not_an_authorized_intent() {
         // Native Rust/GTK allocation owns terminal geometry. A stale dashboard build must not be
         // able to reintroduce the retired browser-owned rectangle path by posting its old wire
@@ -20493,7 +20726,8 @@ mod deletion_fallback_window_tests {
         assert_eq!(deletion_fallback_window(&paths, &none, "w-user"), None);
 
         // Remote-style cascade delete of the user project.
-        assert!(svc.delete("p-user").unwrap());
+        let plan = svc.plan_delete("p-user").unwrap();
+        assert!(svc.commit_delete(&plan, |_| Ok(())).unwrap().removed);
         assert!(
             WindowLayoutService::new(&paths)
                 .load("w-user")
@@ -20509,6 +20743,295 @@ mod deletion_fallback_window_tests {
             Some("w-term".to_string())
         );
         assert_eq!(deletion_fallback_window(&paths, &none, "w-term"), None);
+    }
+
+    #[test]
+    fn store_wrapper_can_exclude_an_existing_empty_rendered_window() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = AppPaths::with_base(tmp.path().join("Maestro"));
+        let svc = ProjectService::new(&paths);
+        for (project_id, name, system) in [
+            ("p-empty", "Empty", false),
+            ("system-terminal", "Terminal", true),
+        ] {
+            svc.create(
+                project_id,
+                name,
+                "/r",
+                NewProject {
+                    system,
+                    ..NewProject::default()
+                },
+                1,
+            )
+            .unwrap();
+        }
+        let windows = WindowLayoutService::new(&paths);
+        windows.create_empty("w-empty", 1).unwrap();
+        ensure_window_in_project_order(&paths, "p-empty", "w-empty", 1);
+        windows.create_empty("w-term", 1).unwrap();
+        windows
+            .open_tab(
+                "w-term",
+                "pane-1",
+                "term-session",
+                "Terminal",
+                false,
+                AttentionState::default(),
+                1,
+            )
+            .unwrap();
+        ensure_window_in_project_order(&paths, "system-terminal", "w-term", 1);
+
+        let excluded = std::collections::HashSet::from(["w-empty".to_string()]);
+        assert_eq!(
+            deletion_fallback_window(&paths, &excluded, "w-empty"),
+            Some("w-term".to_string())
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod project_delete_daemon_regression_tests {
+    use super::run_project;
+    use maestro_app::{ProjectCommand, ProjectRefArgs};
+    use maestro_protocol::{ClientRequest, SessionId};
+    use maestro_shell::{
+        daemon_endpoint::{store_endpoint, DaemonEndpoint},
+        records::{
+            LaunchSpec, SessionKind, SessionRecord, SessionStatus, Workspace, WorkspaceConsent,
+        },
+        store, AppPaths, NewProject, ProjectService, RecordKind, WorkspacePolicy,
+    };
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    fn seed_tabless_project(paths: &AppPaths) {
+        ProjectService::new(paths)
+            .create("owned", "Owned", "/tmp", NewProject::default(), 1)
+            .unwrap();
+        let workspace = Workspace {
+            workspace_id: "owned-workspace".into(),
+            project_id: "owned".into(),
+            root: "/tmp".into(),
+            policy: WorkspacePolicy::ScratchCwd,
+            consent: WorkspaceConsent::default(),
+        };
+        store::write_record(
+            paths,
+            RecordKind::Workspace,
+            "owned-workspace",
+            1,
+            &workspace,
+        )
+        .unwrap();
+        let session = SessionRecord {
+            session_id: "tabless-live".into(),
+            workspace_id: "owned-workspace".into(),
+            kind: SessionKind::Agent,
+            launch: LaunchSpec::OptOut,
+            cwd_resolved: "/tmp".into(),
+            agent_task_id: None,
+            created_at_ms: 1,
+            last_attached_at_ms: 1,
+            last_known_generation: None,
+            status: SessionStatus::Live,
+        };
+        store::write_record(paths, RecordKind::Session, "tabless-live", 1, &session).unwrap();
+    }
+
+    fn serve_one_confirmed_kill(listener: UnixListener) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let request: ClientRequest = serde_json::from_str(line.trim()).unwrap();
+            assert!(matches!(
+                request,
+                ClientRequest::Kill {
+                    id: SessionId(ref id)
+                } if id == "tabless-live"
+            ));
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<ClientRequest>(line.trim()).unwrap(),
+                ClientRequest::ListSessions
+            ));
+            stream
+                .write_all(b"{\"ev\":\"sessions\",\"ids\":[]}\n")
+                .unwrap();
+        })
+    }
+
+    #[test]
+    fn cli_delete_kills_a_workspace_session_with_no_tab_before_cascade() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::with_base(tmp.path().join("Maestro"));
+        seed_tabless_project(&paths);
+        let socket_path = tmp.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = serve_one_confirmed_kill(listener);
+        store_endpoint(
+            &paths,
+            &DaemonEndpoint::new(socket_path.to_string_lossy().into_owned(), None, 1),
+            1,
+        )
+        .unwrap();
+
+        let json = run_project(ProjectCommand::Delete(ProjectRefArgs {
+            project_id: Some("owned".into()),
+            base: Some(paths.base().to_path_buf()),
+        }))
+        .unwrap();
+        server.join().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["removed"], true);
+        assert_eq!(
+            value["released_session_ids"],
+            serde_json::json!(["tabless-live"])
+        );
+        assert!(ProjectService::new(&paths).load("owned").unwrap().is_none());
+        assert!(
+            store::load_one::<SessionRecord>(&paths, RecordKind::Session, "tabless-live")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cli_delete_preserves_the_project_graph_when_daemon_cleanup_is_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::with_base(tmp.path().join("Maestro"));
+        seed_tabless_project(&paths);
+        let missing_socket = tmp.path().join("missing-daemon.sock");
+        store_endpoint(
+            &paths,
+            &DaemonEndpoint::new(missing_socket.to_string_lossy().into_owned(), None, 1),
+            1,
+        )
+        .unwrap();
+
+        let error = run_project(ProjectCommand::Delete(ProjectRefArgs {
+            project_id: Some("owned".into()),
+            base: Some(paths.base().to_path_buf()),
+        }))
+        .unwrap_err();
+        assert_eq!(error.stage, "daemon_cleanup");
+        assert!(ProjectService::new(&paths).load("owned").unwrap().is_some());
+        assert!(
+            store::load_one::<SessionRecord>(&paths, RecordKind::Session, "tabless-live")
+                .unwrap()
+                .is_some(),
+            "failed daemon cleanup must leave the ownership evidence intact"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod automatic_unrepresented_cleanup_tests {
+    use super::release_stably_unrepresented_sessions;
+    use maestro_protocol::{ClientRequest, SessionId};
+    use maestro_shell::{
+        AppPaths, AttentionState, ReconcileReport, RecoveredSession, WindowLayoutService,
+    };
+    use std::collections::BTreeSet;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    fn report(session_id: &str) -> ReconcileReport {
+        ReconcileReport {
+            recovered_sessions: vec![RecoveredSession {
+                session_id: session_id.into(),
+            }],
+            ..ReconcileReport::default()
+        }
+    }
+
+    #[test]
+    fn automatic_cleanup_requires_two_complete_observations_then_kills_exactly_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::with_base(tmp.path().join("Maestro"));
+        let socket_path = tmp.path().join("daemon.sock");
+        let mut previous = BTreeSet::new();
+
+        // First complete observation only arms the exact id and never contacts the daemon.
+        assert!(release_stably_unrepresented_sessions(
+            &paths,
+            &socket_path,
+            &report("orphan"),
+            &mut previous,
+        )
+        .unwrap()
+        .is_empty());
+        assert_eq!(previous, BTreeSet::from(["orphan".to_string()]));
+
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<ClientRequest>(line.trim()).unwrap(),
+                ClientRequest::Kill { id: SessionId(ref id) } if id == "orphan"
+            ));
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<ClientRequest>(line.trim()).unwrap(),
+                ClientRequest::ListSessions
+            ));
+            writeln!(stream, "{}", serde_json::json!({"ev":"sessions","ids":[]})).unwrap();
+        });
+
+        assert_eq!(
+            release_stably_unrepresented_sessions(
+                &paths,
+                &socket_path,
+                &report("orphan"),
+                &mut previous,
+            )
+            .unwrap(),
+            vec!["orphan"]
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn pane_appearing_between_observations_disarms_cleanup_without_daemon_contact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::with_base(tmp.path().join("Maestro"));
+        let missing_socket = tmp.path().join("must-not-connect.sock");
+        let mut previous = BTreeSet::new();
+        let live = report("protected");
+        release_stably_unrepresented_sessions(&paths, &missing_socket, &live, &mut previous)
+            .unwrap();
+
+        let windows = WindowLayoutService::new(&paths);
+        windows.create_empty("window", 1).unwrap();
+        windows
+            .open_stashed_tab(
+                "window",
+                "pane",
+                "protected",
+                "Protected",
+                false,
+                AttentionState::default(),
+                2,
+            )
+            .unwrap();
+
+        assert!(release_stably_unrepresented_sessions(
+            &paths,
+            &missing_socket,
+            &live,
+            &mut previous,
+        )
+        .unwrap()
+        .is_empty());
+        assert!(previous.is_empty());
     }
 }
 
@@ -20538,7 +21061,7 @@ mod product_startup_target_tests {
             SessionRecord, SessionStatus, SplitAxis, SplitFrom, Workspace,
         },
         store::{self, LoadOutcome},
-        NewProject, ProjectService, WindowLayoutService,
+        NewProject, ProjectService, RecoveredSession, WindowLayoutService,
     };
     use std::io::{BufRead, Read, Write};
     use std::os::unix::net::UnixListener;
@@ -21881,9 +22404,12 @@ mod product_startup_target_tests {
                 2,
             )
             .unwrap();
-        let snapshot = maestro_shell::DashboardSnapshotService::new(&paths)
+        let mut snapshot = maestro_shell::DashboardSnapshotService::new(&paths)
             .snapshot(None)
             .unwrap();
+        snapshot.recovered_sessions.push(RecoveredSession {
+            session_id: "native-only-recovery-id".into(),
+        });
         let model = dashboard_react_model_from_snapshot_with_sessions(
             &snapshot,
             &std::collections::HashMap::new(),
@@ -21895,6 +22421,8 @@ mod product_startup_target_tests {
             .all(|project| project["project_id"] != PRODUCT_RECOVERY_PROJECT_ID));
         assert!(model["details"].get(PRODUCT_RECOVERY_PROJECT_ID).is_none());
         assert!(model["details"].get("real-project").is_some());
+        assert_eq!(model["recovered_sessions"], serde_json::json!([]));
+        assert!(!model.to_string().contains("native-only-recovery-id"));
     }
 }
 

@@ -29,6 +29,7 @@ use crate::daemon_client::{AttachedSession, DaemonClient, DaemonClientError};
 use crate::paths::{AppPaths, RecordKind};
 use crate::records::{LaunchSpec, SessionKind, SessionRecord, SessionStatus};
 use crate::store::{self, LoadOutcome, StoreError};
+use rusqlite::OptionalExtension;
 
 /// Everything that can go wrong starting/attaching a record-backed session. Typed so a caller can
 /// tell "the cwd was bad" (nothing was persisted, no daemon call) from "the daemon refused" (the
@@ -174,10 +175,20 @@ pub enum SessionExitObservation {
     Quarantined,
 }
 
+/// Result of one exact automatic cleanup candidate. A durable pane—including a stashed pane—is
+/// authoritative ownership and prevents release; only a session still absent from every tab while
+/// the SQLite writer fence is held may cross the daemon release callback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnrepresentedSessionRelease {
+    Released,
+    Represented,
+}
+
 /// A live daemon session that has NO durable `SessionRecord` this build could load — an orphan
-/// "recovered" session. Surfaced (not mutated) so a future UI/resume flow can let the user
-/// title/keep/kill it. Carries only the daemon-reported id: this build deliberately invents no
-/// metadata for a session it never persisted.
+/// "recovered" session. Reconciliation only reports it; the native app's lifecycle policy may use
+/// repeated complete dashboard snapshots to release it when no active or stashed pane represents
+/// the id. Carries only the daemon-reported id: this build deliberately invents no metadata for a
+/// session it never persisted.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct RecoveredSession {
     pub session_id: String,
@@ -190,10 +201,11 @@ pub struct RecoveredSession {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReconcileReport {
     pub sessions: Vec<ReconciledSession>,
-    /// Live daemon ids with no loaded current-version `SessionRecord`, sorted by `session_id`. These
-    /// are only REPORTED — never written, attached, or killed. A future-version record for an id
-    /// counts as "no loaded current-version record", so a live id whose only record is future-version
-    /// is reported here (its bytes are still left untouched and listed in `skipped_future_version`).
+    /// Live daemon ids with no loaded current-version `SessionRecord`, sorted by `session_id`.
+    /// Reconciliation itself only reports them and never writes, attaches, or kills. A caller may
+    /// apply a separately fenced lifecycle policy. A future-version record for an id counts as "no
+    /// loaded current-version record", so a live id whose only record is future-version is reported
+    /// here (its bytes are still left untouched and listed in `skipped_future_version`).
     pub recovered_sessions: Vec<RecoveredSession>,
     /// Paths of future-version session records that were observed but deliberately not rewritten.
     pub skipped_future_version: Vec<std::path::PathBuf>,
@@ -209,6 +221,47 @@ pub struct SessionService<'a> {
 impl<'a> SessionService<'a> {
     pub fn new(paths: &'a AppPaths) -> Self {
         SessionService { paths }
+    }
+
+    /// Release one previously observed live PTY only if it is still absent from every dashboard
+    /// pane. The exact tab predicate is re-read under `BEGIN IMMEDIATE`, and the writer fence stays
+    /// held through the bounded daemon callback so a conforming pane write cannot race the kill.
+    /// A stashed tab is still a tab and therefore protects its PTY. This method never removes or
+    /// invents records; the next ordinary reconcile marks a retained record `Exited`.
+    pub fn release_if_unrepresented(
+        &self,
+        session_id: &str,
+        release: impl FnOnce(&str) -> Result<(), DaemonClientError>,
+    ) -> Result<UnrepresentedSessionRelease, SessionServiceError> {
+        let _ = self
+            .paths
+            .record_path(RecordKind::Session, session_id)
+            .map_err(|error| SessionServiceError::Store(StoreError::Id(error)))?;
+        let arc = crate::db::conn_for(self.paths.base())
+            .map_err(|error| SessionServiceError::Store(StoreError::Db(error.to_string())))?;
+        let mut conn = arc.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| SessionServiceError::Store(StoreError::Db(error.to_string())))?;
+        let represented = tx
+            .query_row(
+                "SELECT 1 FROM tabs WHERE session_id = ?1 LIMIT 1",
+                [session_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| SessionServiceError::Store(StoreError::Db(error.to_string())))?
+            .is_some();
+        if represented {
+            tx.commit()
+                .map_err(|error| SessionServiceError::Store(StoreError::Db(error.to_string())))?;
+            return Ok(UnrepresentedSessionRelease::Represented);
+        }
+
+        release(session_id).map_err(SessionServiceError::Daemon)?;
+        tx.commit()
+            .map_err(|error| SessionServiceError::Store(StoreError::Db(error.to_string())))?;
+        Ok(UnrepresentedSessionRelease::Released)
     }
 
     /// Persist one generation-attributed exit observation without consulting the daemon's global
@@ -497,10 +550,11 @@ impl<'a> SessionService<'a> {
     /// - Corrupt records were already quarantined by the store on load and simply don't appear.
     /// - A live daemon id with NO loaded current-version record (never persisted, or only present as
     ///   a future-version record this build cannot inspect) is reported in `recovered_sessions`,
-    ///   sorted by id. It is only SURFACED — never written, attached to, or killed.
+    ///   sorted by id. This call only surfaces it; callers must establish their own ownership proof
+    ///   before applying a lifecycle action.
     ///
     /// This does NOT invent or touch UI tabs or AgentTask state — it only repairs `SessionStatus`
-    /// for records it owns and reports daemon-only live ids for a future UI/resume flow.
+    /// for records it owns and reports daemon-only live ids to the native lifecycle owner.
     pub fn reconcile(
         &self,
         client: &mut DaemonClient,
@@ -1601,5 +1655,56 @@ mod tests {
         // And what's on disk matches the redacted in-memory record.
         let on_disk = load_record(&paths, "s1");
         assert_eq!(on_disk.launch, rec.launch);
+    }
+
+    #[test]
+    fn automatic_release_protects_active_and_stashed_panes_under_the_writer_fence() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+        let windows = crate::WindowLayoutService::new(&paths);
+        windows.create_empty("window", 1).unwrap();
+        windows
+            .open_tab(
+                "window",
+                "active-pane",
+                "active-session",
+                "Active",
+                false,
+                crate::AttentionState::default(),
+                1,
+            )
+            .unwrap();
+        windows
+            .open_stashed_tab(
+                "window",
+                "stashed-pane",
+                "stashed-session",
+                "Stashed",
+                false,
+                crate::AttentionState::default(),
+                1,
+            )
+            .unwrap();
+
+        let service = SessionService::new(&paths);
+        for session_id in ["active-session", "stashed-session"] {
+            let outcome = service
+                .release_if_unrepresented(session_id, |_| {
+                    panic!("a durable pane must prevent daemon release")
+                })
+                .unwrap();
+            assert_eq!(outcome, UnrepresentedSessionRelease::Represented);
+        }
+
+        let released = std::cell::Cell::new(false);
+        let outcome = service
+            .release_if_unrepresented("no-pane-session", |id| {
+                assert_eq!(id, "no-pane-session");
+                released.set(true);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(outcome, UnrepresentedSessionRelease::Released);
+        assert!(released.get());
     }
 }

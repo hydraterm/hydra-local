@@ -328,6 +328,58 @@ body.is-resizing-sidebar .sidebar-resizer::before {
   line-height: 1.35;
 }
 
+.recovered-sessions {
+  margin: 4px 4px 8px;
+  padding: 10px;
+  border: 1px solid rgba(251, 191, 36, 0.34);
+  border-radius: 8px;
+  background: rgba(120, 77, 10, 0.18);
+}
+.sidebar--collapsed .recovered-sessions {
+  display: none;
+}
+.recovered-sessions__title {
+  color: #fde68a;
+  font-size: 12px;
+  font-weight: 750;
+}
+.recovered-sessions__hint {
+  margin-top: 4px;
+  color: var(--text-dim);
+  font-size: 10px;
+  line-height: 1.35;
+}
+.recovered-sessions__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 8px;
+  color: var(--text);
+  font-size: 11px;
+}
+.recovered-sessions__actions {
+  display: inline-flex;
+  gap: 5px;
+}
+.recovered-sessions__actions button {
+  padding: 3px 6px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+.recovered-sessions__actions button:hover {
+  background: rgba(255, 255, 255, 0.11);
+}
+.recovered-sessions__actions button.is-confirming {
+  border-color: rgba(248, 113, 113, 0.55);
+  background: rgba(127, 29, 29, 0.34);
+  color: #fecaca;
+}
+
 /* Project groups are structural only: rows + rails, not cards around windows/panes. */
 .tree-project {
   position: relative;
@@ -431,9 +483,12 @@ body.is-resizing-sidebar .sidebar-resizer::before {
 }
 .tree-row--window.is-stashed,
 .tree-row--pane.is-stashed {
+  background: rgba(255, 255, 255, 0.018);
+}
+.tree-row--window.is-stashed > :not(.tree-menu-wrap),
+.tree-row--pane.is-stashed:not(.is-picked) > :not(.tree-menu-wrap) {
   opacity: 0.52;
   filter: grayscale(0.85);
-  background: rgba(255, 255, 255, 0.018);
 }
 .tree-row--window.is-stashed:hover,
 .tree-row--pane.is-stashed:hover {
@@ -477,6 +532,9 @@ body.is-resizing-sidebar .sidebar-resizer::before {
   border: none;
   border-radius: 0;
   background: transparent;
+}
+.tree-window.is-menu-open {
+  z-index: 90;
 }
 .tree-window:hover {
   background: transparent;
@@ -611,8 +669,6 @@ body.is-resizing-sidebar .sidebar-resizer::before {
     0 0 18px color-mix(in srgb, var(--accent) 12%, transparent);
 }
 .tree-row--pane.is-stashed:not(.is-picked) {
-  opacity: 0.52;
-  filter: grayscale(0.9);
   background: rgba(255, 255, 255, 0.018);
   border-color: rgba(255, 255, 255, 0.018);
   color: var(--text-faint);
@@ -806,6 +862,16 @@ body.is-resizing-sidebar .sidebar-resizer::before {
   position: relative;
   flex: none;
   margin-right: 6px;
+}
+.tree-row.is-menu-open,
+.tree-menu-wrap.is-open {
+  z-index: 92;
+}
+.tree-row.is-menu-open .tree-menu-wrap,
+.tree-menu-wrap.is-open,
+.tree-row.is-menu-open .project-menu {
+  opacity: 1;
+  filter: none;
 }
 .tree-more {
   width: 24px;

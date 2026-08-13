@@ -89,7 +89,10 @@ pub use layout_preset::{
 pub use names::unique_name;
 pub use paths::{AppPaths, RecordKind};
 pub use policy::{resolved_cwd, ResolvedCwd, WorkspacePolicy};
-pub use project::{NewProject, ProjectService, ProjectServiceError, ProjectUpdate};
+pub use project::{
+    NewProject, ProjectDeletionPlan, ProjectDeletionResult, ProjectService, ProjectServiceError,
+    ProjectUpdate,
+};
 pub use records::{
     AgentTask, AgentTaskState, Attention, AttentionSource, AttentionState, LaunchSpec,
     LayoutPreset, LayoutPresetTab, PaneRect, Project, ProjectDirectory, ProjectLaunchDefaults,
@@ -103,7 +106,7 @@ pub use restart_recipe::{
 };
 pub use session_service::{
     ReconcileReport, ReconciledSession, RecoveredSession, SessionExitObservation, SessionService,
-    SessionServiceError, StartParams,
+    SessionServiceError, StartParams, UnrepresentedSessionRelease,
 };
 pub use shell_runtime::{ReconcileOutcome, ShellRuntime, ShellRuntimeError, StartSessionOutcome};
 pub use store::{load_one, write_record, LoadOutcome, StoreError};

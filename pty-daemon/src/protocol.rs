@@ -370,6 +370,8 @@ pub enum DaemonEvent {
         /// even if an aborted old forwarder races past a newer baseline.
         #[serde(default)]
         output_generation_echo: bool,
+        #[serde(default)]
+        child_environment: bool,
     },
     TerminalBell {
         id: SessionId,
@@ -490,10 +492,11 @@ mod damage_tests {
             protocol_version: DAEMON_PROTOCOL_VERSION,
             build_version: "0.1.0".into(),
             output_generation_echo: true,
+            child_environment: true,
         };
         assert_eq!(
             serde_json::to_string(&event).unwrap(),
-            r#"{"ev":"daemon_info","protocol_version":2,"build_version":"0.1.0","output_generation_echo":true}"#
+            r#"{"ev":"daemon_info","protocol_version":2,"build_version":"0.1.0","output_generation_echo":true,"child_environment":true}"#
         );
     }
 

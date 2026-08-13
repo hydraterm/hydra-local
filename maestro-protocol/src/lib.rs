@@ -33,4 +33,4 @@ pub use channel::{ChannelEvent, ChannelEventKind};
 pub use endpoint::daemon_socket_filename;
 pub use event::{GridInfo, SessionListInfo, ShellEvent};
 pub use ids::{ChannelId, SessionId};
-pub use request::{ClientRequest, DAEMON_PROTOCOL_VERSION, MAX_LINE_BYTES};
+pub use request::{ChildEnvironment, ClientRequest, DAEMON_PROTOCOL_VERSION, MAX_LINE_BYTES};

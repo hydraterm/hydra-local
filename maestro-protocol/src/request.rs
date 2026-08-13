@@ -19,10 +19,22 @@ pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 /// App/daemon control-protocol generation. A client probes this before reusing a
 /// retained daemon so it never silently pairs a new renderer with an obsolete
 /// PTY owner. Additive terminal grid revisions have their own schema versions.
-/// Version 2 adds explicit exited-session restart authority and live-only session listings. A v2
+/// Version 2 adds explicit exited-session restart authority and live-only session listings. The
+/// additive headless child-environment field is separately capability-gated by DaemonInfo so the
+/// retained desktop v2 compatibility contract does not change.
+/// A v2
 /// GUI may still attach to a retained v1 daemon, but must not send mutating StartSession requests to
 /// it because v1 could reap unrelated exited snapshots as a side effect.
 pub const DAEMON_PROTOCOL_VERSION: u32 = 2;
+
+/// Fixed child environment authority for a headless StartSession. This deliberately is not a
+/// general environment map: browser/caller input can never inject PATH, loader, or other process
+/// variables through the daemon protocol. Absence retains the desktop/legacy daemon environment.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct ChildEnvironment {
+    pub home: String,
+    pub shell: String,
+}
 
 /// serde default for `Attach.want_raw_output`: absence identifies a compatibility client, which
 /// must keep receiving raw output.
@@ -48,6 +60,10 @@ pub enum ClientRequest {
         cwd: String,
         command: String,
         args: Vec<String>,
+        /// Explicit all-or-none child HOME/SHELL. Absent preserves the daemon's inherited
+        /// environment and the exact legacy/desktop wire bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        child_environment: Option<ChildEnvironment>,
         cols: u16,
         rows: u16,
         /// Explicit authority to replace an exited, retained same-id session with a new process.
@@ -149,6 +165,7 @@ mod tests {
             cwd: "/tmp/work".into(),
             command: "bash".into(),
             args: vec!["-l".into()],
+            child_environment: None,
             cols: 80,
             rows: 24,
             restart_exited: false,
@@ -161,12 +178,59 @@ mod tests {
     }
 
     #[test]
+    fn child_environment_is_an_additive_typed_pair() {
+        let legacy = r#"{"op":"start_session","id":"s1","cwd":"/tmp/work","command":"bash","args":[],"cols":80,"rows":24}"#;
+        let decoded: ClientRequest = serde_json::from_str(legacy).unwrap();
+        assert!(matches!(
+            &decoded,
+            ClientRequest::StartSession {
+                child_environment: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            serde_json::to_string(&decoded).unwrap(),
+            legacy,
+            "an older desktop StartSession must retain its exact wire bytes"
+        );
+
+        let request = ClientRequest::StartSession {
+            id: sid("s1"),
+            cwd: "/srv/work".into(),
+            command: "/bin/sh".into(),
+            args: vec!["-l".into()],
+            child_environment: Some(ChildEnvironment {
+                home: "/home/user".into(),
+                shell: "/bin/sh".into(),
+            }),
+            cols: 80,
+            rows: 24,
+            restart_exited: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&request).unwrap(),
+            r#"{"op":"start_session","id":"s1","cwd":"/srv/work","command":"/bin/sh","args":["-l"],"child_environment":{"home":"/home/user","shell":"/bin/sh"},"cols":80,"rows":24}"#
+        );
+
+        for partial in [
+            r#"{"op":"start_session","id":"s1","cwd":"/tmp","command":"/bin/sh","args":[],"child_environment":{"home":"/home/user"},"cols":80,"rows":24}"#,
+            r#"{"op":"start_session","id":"s1","cwd":"/tmp","command":"/bin/sh","args":[],"child_environment":{"shell":"/bin/sh"},"cols":80,"rows":24}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ClientRequest>(partial).is_err(),
+                "a partial HOME/SHELL authority must fail closed"
+            );
+        }
+    }
+
+    #[test]
     fn explicit_exited_restart_serializes_authority_and_absent_defaults_safe() {
         let request = ClientRequest::StartSession {
             id: sid("s1"),
             cwd: "/tmp/work".into(),
             command: "bash".into(),
             args: vec![],
+            child_environment: None,
             cols: 80,
             rows: 24,
             restart_exited: true,
@@ -262,6 +326,7 @@ mod tests {
                 cwd: ".".into(),
                 command: "sh".into(),
                 args: vec![],
+                child_environment: None,
                 cols: 100,
                 rows: 40,
                 restart_exited: false,

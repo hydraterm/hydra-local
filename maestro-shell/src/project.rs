@@ -4,8 +4,9 @@
 //! records under app-support through the shared store (atomic envelope writes, corrupt-record
 //! quarantine, future-version read-only semantics). Mirrors [`AgentTaskService`] and
 //! [`WindowLayoutService`]: STORE/LOCAL-STATE ONLY — no daemon, socket, PTY, git, or renderer. A
-//! project is product metadata (name, root, default policy, branding); it never spawns or checks
-//! a session, workspace, or task.
+//! project is product metadata (name, root, default policy, branding). Deletion reads the complete
+//! workspace/session/task/window/tab ownership graph and returns a prepared plan, but this service
+//! never opens a daemon socket or mutates a PTY; the app owns that lifecycle boundary.
 //!
 //! What is strict:
 //! - [`create`](ProjectService::create) never overwrites an existing project
@@ -22,12 +23,333 @@
 //! a caller-supplied order by re-stamping `last_active_at_ms` into a strictly-descending run, so a
 //! later load reproduces that exact order without adding a schema field.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crate::paths::{AppPaths, RecordKind};
 use crate::records::Project;
 use crate::store::{self, load_one, write_record, LoadOutcome, StoreError};
 use crate::WorkspacePolicy;
+use rusqlite::OptionalExtension;
+
+/// Immutable ownership snapshot for one project deletion.
+///
+/// The app obtains this before deletion. [`ProjectService::commit_delete`] then recomputes the same
+/// snapshot inside an `IMMEDIATE` SQLite transaction and invokes the caller's session-release
+/// callback while the writer lock is held. Any workspace/session/task/window/tab ownership change
+/// therefore aborts before a PTY is touched, and a conforming concurrent start cannot write its
+/// session record between release and cascade.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectDeletionPlan {
+    pub project_id: String,
+    pub project_exists: bool,
+    /// Every window the project owns, including a legacy NULL-FK window named by its
+    /// `window_order`. These rows are removed by the same commit as the project.
+    pub window_ids: Vec<String>,
+    /// Complete session ownership discovered through workspace session rows, project agent-task
+    /// current/history references, and tabs in the project's windows.
+    pub affected_session_ids: Vec<String>,
+    /// Tabs in surviving windows that incorrectly point at a session durably owned only by this
+    /// project. They are removed atomically with the project; a misplaced pane is presentation,
+    /// not authority to detach a session from its workspace owner.
+    pub remove_tab_keys: Vec<(String, String)>,
+    /// Affected ids with no surviving durable project/task owner or valid pane owner. A caller must
+    /// confirm these ids absent from the daemon before committing the plan.
+    pub kill_session_ids: Vec<String>,
+    /// Affected ids with a genuine surviving durable owner, or a surviving pane for a session that
+    /// was only pane-owned by this project. They are deliberately kept alive.
+    pub retained_shared_session_ids: Vec<String>,
+}
+
+/// Result of committing a previously prepared [`ProjectDeletionPlan`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectDeletionResult {
+    pub removed: bool,
+    pub project_id: String,
+    pub window_ids: Vec<String>,
+    pub affected_session_ids: Vec<String>,
+    pub removed_tab_keys: Vec<(String, String)>,
+    pub retained_shared_session_ids: Vec<String>,
+}
+
+fn deletion_store_error(error: impl std::fmt::Display) -> ProjectServiceError {
+    ProjectServiceError::Store(StoreError::Db(error.to_string()))
+}
+
+fn deletion_map_error(error: impl std::fmt::Display) -> ProjectServiceError {
+    ProjectServiceError::Store(StoreError::Map(error.to_string()))
+}
+
+fn checked_deletion_id(id: &str, what: &str) -> Result<String, ProjectServiceError> {
+    crate::ids::validate_id(id)
+        .map(|_| id.to_string())
+        .map_err(|error| deletion_map_error(format!("invalid {what} id {id:?}: {error}")))
+}
+
+fn parse_id_list(json: &str, what: &str) -> Result<Vec<String>, ProjectServiceError> {
+    let ids: Vec<String> = serde_json::from_str(json)
+        .map_err(|error| deletion_map_error(format!("invalid {what}: {error}")))?;
+    let mut seen = BTreeSet::new();
+    for id in &ids {
+        checked_deletion_id(id, what)?;
+        if !seen.insert(id.clone()) {
+            return Err(deletion_map_error(format!(
+                "invalid {what}: duplicate id {id:?}"
+            )));
+        }
+    }
+    Ok(ids)
+}
+
+/// Build one complete project-deletion ownership graph from a single SQLite snapshot.
+fn project_deletion_plan(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+) -> Result<ProjectDeletionPlan, ProjectServiceError> {
+    checked_deletion_id(project_id, "project")?;
+    let project_row: Option<(bool, String)> = conn
+        .query_row(
+            "SELECT system, window_order_json FROM projects WHERE project_id = ?1",
+            [project_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(deletion_store_error)?;
+    let Some((system, project_window_order_json)) = project_row else {
+        return Ok(ProjectDeletionPlan {
+            project_id: project_id.to_string(),
+            project_exists: false,
+            window_ids: Vec::new(),
+            affected_session_ids: Vec::new(),
+            remove_tab_keys: Vec::new(),
+            kill_session_ids: Vec::new(),
+            retained_shared_session_ids: Vec::new(),
+        });
+    };
+    if system {
+        return Err(ProjectServiceError::SystemProjectCannotBeDeleted {
+            project_id: project_id.to_string(),
+        });
+    }
+    let ordered_windows = parse_id_list(
+        &project_window_order_json,
+        &format!("window_order for project {project_id:?}"),
+    )?;
+
+    // Parse every other project's window order before trusting a legacy NULL-FK row. If two
+    // projects name it, there is no safe automatic owner choice.
+    let mut other_ordered_windows = BTreeSet::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT project_id, window_order_json FROM projects WHERE project_id <> ?1")
+            .map_err(deletion_store_error)?;
+        let rows = stmt
+            .query_map([project_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(deletion_store_error)?;
+        for row in rows {
+            let (other_project, json) = row.map_err(deletion_store_error)?;
+            for window_id in parse_id_list(
+                &json,
+                &format!("window_order for project {other_project:?}"),
+            )? {
+                other_ordered_windows.insert(window_id);
+            }
+        }
+    }
+
+    let mut window_ids = BTreeSet::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT window_id FROM windows WHERE project_id = ?1 ORDER BY window_id")
+            .map_err(deletion_store_error)?;
+        let rows = stmt
+            .query_map([project_id], |row| row.get::<_, String>(0))
+            .map_err(deletion_store_error)?;
+        for row in rows {
+            let window_id = row.map_err(deletion_store_error)?;
+            window_ids.insert(checked_deletion_id(&window_id, "window")?);
+        }
+    }
+    for window_id in ordered_windows {
+        let owner: Option<Option<String>> = conn
+            .query_row(
+                "SELECT project_id FROM windows WHERE window_id = ?1",
+                [&window_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(deletion_store_error)?;
+        match owner {
+            None => {} // stale order entry; there is no row to delete
+            Some(Some(owner)) if owner == project_id => {
+                window_ids.insert(window_id);
+            }
+            Some(Some(owner)) => {
+                return Err(ProjectServiceError::WindowOwnershipConflict {
+                    project_id: project_id.to_string(),
+                    window_id,
+                    detail: format!("the window FK belongs to project {owner:?}"),
+                })
+            }
+            Some(None) if other_ordered_windows.contains(&window_id) => {
+                return Err(ProjectServiceError::WindowOwnershipConflict {
+                    project_id: project_id.to_string(),
+                    window_id,
+                    detail: "the NULL-owner window is also named by another project".into(),
+                })
+            }
+            Some(None) => {
+                window_ids.insert(window_id);
+            }
+        }
+    }
+
+    let mut session_rows: Vec<(String, String)> = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.session_id, w.project_id FROM sessions s \
+                 JOIN workspaces w ON w.workspace_id = s.workspace_id",
+            )
+            .map_err(deletion_store_error)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(deletion_store_error)?;
+        for row in rows {
+            let (session_id, owner) = row.map_err(deletion_store_error)?;
+            session_rows.push((checked_deletion_id(&session_id, "session")?, owner));
+        }
+    }
+
+    let mut task_refs: Vec<(String, Vec<String>)> = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT project_id, current_session_id, session_history_json FROM agent_tasks")
+            .map_err(deletion_store_error)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(deletion_store_error)?;
+        for row in rows {
+            let (owner, current, history_json) = row.map_err(deletion_store_error)?;
+            let mut refs = parse_id_list(&history_json, "agent task session_history")?;
+            if let Some(current) = current {
+                refs.push(checked_deletion_id(&current, "agent task current session")?);
+            }
+            refs.sort();
+            refs.dedup();
+            task_refs.push((owner, refs));
+        }
+    }
+
+    let mut tab_refs: Vec<(String, String, String)> = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT window_id, tab_id, session_id FROM tabs WHERE session_id IS NOT NULL")
+            .map_err(deletion_store_error)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(deletion_store_error)?;
+        for row in rows {
+            let (window_id, tab_id, session_id) = row.map_err(deletion_store_error)?;
+            tab_refs.push((
+                checked_deletion_id(&window_id, "tab window")?,
+                checked_deletion_id(&tab_id, "tab")?,
+                checked_deletion_id(&session_id, "tab session")?,
+            ));
+        }
+    }
+
+    let mut affected = BTreeSet::new();
+    for (session_id, owner) in &session_rows {
+        if owner == project_id {
+            affected.insert(session_id.clone());
+        }
+    }
+    for (owner, refs) in &task_refs {
+        if owner == project_id {
+            affected.extend(refs.iter().cloned());
+        }
+    }
+    for (window_id, _, session_id) in &tab_refs {
+        if window_ids.contains(window_id) {
+            affected.insert(session_id.clone());
+        }
+    }
+
+    let mut target_owned = BTreeSet::new();
+    target_owned.extend(
+        session_rows
+            .iter()
+            .filter(|(_, owner)| owner == project_id)
+            .map(|(session_id, _)| session_id.clone()),
+    );
+    for (owner, refs) in &task_refs {
+        if owner == project_id {
+            target_owned.extend(refs.iter().cloned());
+        }
+    }
+
+    let mut durable_external = BTreeSet::new();
+    for (session_id, owner) in &session_rows {
+        if owner != project_id && affected.contains(session_id) {
+            durable_external.insert(session_id.clone());
+        }
+    }
+    for (owner, refs) in &task_refs {
+        if owner != project_id {
+            durable_external.extend(
+                refs.iter()
+                    .filter(|session_id| affected.contains(*session_id))
+                    .cloned(),
+            );
+        }
+    }
+    let mut externally_referenced = durable_external.clone();
+    let mut remove_tab_keys = BTreeSet::new();
+    for (window_id, tab_id, session_id) in &tab_refs {
+        if !window_ids.contains(window_id) && affected.contains(session_id) {
+            if target_owned.contains(session_id) && !durable_external.contains(session_id) {
+                remove_tab_keys.insert((window_id.clone(), tab_id.clone()));
+            } else {
+                externally_referenced.insert(session_id.clone());
+            }
+        }
+    }
+
+    let kill_session_ids = affected
+        .difference(&externally_referenced)
+        .cloned()
+        .collect();
+    let retained_shared_session_ids = affected
+        .intersection(&externally_referenced)
+        .cloned()
+        .collect();
+    Ok(ProjectDeletionPlan {
+        project_id: project_id.to_string(),
+        project_exists: true,
+        window_ids: window_ids.into_iter().collect(),
+        affected_session_ids: affected.into_iter().collect(),
+        remove_tab_keys: remove_tab_keys.into_iter().collect(),
+        kill_session_ids,
+        retained_shared_session_ids,
+    })
+}
 
 /// Why a project operation failed.
 #[derive(Debug)]
@@ -45,6 +367,19 @@ pub enum ProjectServiceError {
     /// `delete` was called on a SYSTEM project (the built-in "Terminal"). System projects can be renamed + hidden
     /// but never deleted. Nothing was removed.
     SystemProjectCannotBeDeleted { project_id: String },
+    /// The database ownership graph changed after the daemon cleanup plan was prepared. Nothing
+    /// was deleted; the caller must prepare and execute a fresh plan.
+    DeletionPlanChanged { project_id: String },
+    /// The caller-supplied session-release boundary failed while the deletion transaction held the
+    /// ownership graph stable. The transaction was rolled back and every database row remains.
+    SessionReleaseFailed { detail: String },
+    /// A legacy NULL-FK window is named by more than one project, or a project names a window whose
+    /// explicit FK owner is another project. Deletion refuses to guess which owner is authoritative.
+    WindowOwnershipConflict {
+        project_id: String,
+        window_id: String,
+        detail: String,
+    },
     /// The project record was written by a NEWER Maestro. Left exactly as on disk so no field is
     /// dropped; it cannot be mutated or replaced from this build.
     FutureVersion { path: PathBuf, ours: u32, got: u32 },
@@ -79,6 +414,22 @@ impl std::fmt::Display for ProjectServiceError {
             ProjectServiceError::SystemProjectCannotBeDeleted { project_id } => write!(
                 f,
                 "project {project_id:?} is a system project and cannot be deleted (it can be hidden or renamed)"
+            ),
+            ProjectServiceError::DeletionPlanChanged { project_id } => write!(
+                f,
+                "project {project_id:?} changed before its sessions could be released; nothing was deleted"
+            ),
+            ProjectServiceError::SessionReleaseFailed { detail } => write!(
+                f,
+                "project session release failed; project records were preserved: {detail}"
+            ),
+            ProjectServiceError::WindowOwnershipConflict {
+                project_id,
+                window_id,
+                detail,
+            } => write!(
+                f,
+                "project {project_id:?} cannot delete window {window_id:?}: {detail}"
             ),
             ProjectServiceError::FutureVersion { path, ours, got } => write!(
                 f,
@@ -403,24 +754,142 @@ impl<'a> ProjectService<'a> {
         self.mutate(project_id, now_ms, |p| p.last_active_at_ms = now_ms)
     }
 
-    /// Permanently DELETE a project record. Returns `Ok(true)` when a record was removed,
-    /// `Ok(false)` when none existed (idempotent). The database foreign keys cascade the deletion
-    /// through the project's workspaces, sessions, tasks, windows, tabs, and scoped presets. The id
-    /// is validated before any query is built.
-    pub fn delete(&self, project_id: &str) -> Result<bool, ProjectServiceError> {
-        // A SYSTEM project (the built-in "Terminal") is renameable + hideable but NEVER deletable — refuse before
-        // touching disk. A non-existent / non-system project falls through to the idempotent remove below.
-        if let Some(project) = self.load(project_id)? {
-            if project.system {
-                return Err(ProjectServiceError::SystemProjectCannotBeDeleted {
-                    project_id: project_id.to_string(),
-                });
-            }
+    /// Prepare a complete, read-only project deletion plan.
+    ///
+    /// Session ownership is the union of:
+    /// - durable `sessions → workspaces → project` rows;
+    /// - every project `agent_tasks.current_session_id` and `session_history_json` id;
+    /// - every tab in a project-owned window (including a legacy NULL-FK window named by the
+    ///   project's durable `window_order`).
+    ///
+    /// The plan also classifies ids referenced by a surviving project/task/tab/session owner as
+    /// shared, so callers preserve those live PTYs. Any malformed history/ownership evidence aborts
+    /// the plan; an empty set is never inferred from a failed read.
+    pub fn plan_delete(
+        &self,
+        project_id: &str,
+    ) -> Result<ProjectDeletionPlan, ProjectServiceError> {
+        let _ = self
+            .paths
+            .record_path(RecordKind::Project, project_id)
+            .map_err(|error| ProjectServiceError::Store(StoreError::Id(error)))?;
+        let arc = crate::db::conn_for(self.paths.base())
+            .map_err(|error| ProjectServiceError::Store(StoreError::Db(error.to_string())))?;
+        let conn = arc.lock().unwrap();
+        project_deletion_plan(&conn, project_id)
+    }
+
+    /// Atomically commit a previously prepared deletion plan.
+    ///
+    /// This method intentionally does NOT accept a bare project id. The caller must first obtain
+    /// the complete ownership plan. An `IMMEDIATE` transaction recomputes the plan and requires
+    /// byte-for-byte equality before invoking `release_sessions`; that callback must confirm every
+    /// supplied id absent from the daemon. Keeping the database writer lock through the callback
+    /// closes the ordinary record-write/start race: a conforming process cannot publish a new
+    /// session owner between release and cascade. A callback error rolls back with all records
+    /// intact. Foreign-key cascades remove ordinary children; exact legacy NULL-FK windows proven
+    /// solely owned by this project are explicitly removed in the same transaction.
+    pub fn commit_delete(
+        &self,
+        plan: &ProjectDeletionPlan,
+        release_sessions: impl FnOnce(&[String]) -> Result<(), String>,
+    ) -> Result<ProjectDeletionResult, ProjectServiceError> {
+        let _ = self
+            .paths
+            .record_path(RecordKind::Project, &plan.project_id)
+            .map_err(|error| ProjectServiceError::Store(StoreError::Id(error)))?;
+        let arc = crate::db::conn_for(self.paths.base())
+            .map_err(|error| ProjectServiceError::Store(StoreError::Db(error.to_string())))?;
+        let mut conn = arc.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| ProjectServiceError::Store(StoreError::Db(error.to_string())))?;
+        let current = project_deletion_plan(&tx, &plan.project_id)?;
+        if &current != plan {
+            return Err(ProjectServiceError::DeletionPlanChanged {
+                project_id: plan.project_id.clone(),
+            });
         }
-        // FK ON DELETE CASCADE removes the project's workspaces → sessions, agent_tasks, windows → tabs, and
-        // project-scoped presets — closed projects leave NO orphans. Idempotent (missing id → Ok(false)).
-        crate::store::delete_record(self.paths, RecordKind::Project, project_id)
-            .map_err(ProjectServiceError::Store)
+
+        if !plan.project_exists {
+            tx.commit()
+                .map_err(|error| ProjectServiceError::Store(StoreError::Db(error.to_string())))?;
+            return Ok(ProjectDeletionResult {
+                removed: false,
+                project_id: plan.project_id.clone(),
+                window_ids: Vec::new(),
+                affected_session_ids: Vec::new(),
+                removed_tab_keys: Vec::new(),
+                retained_shared_session_ids: Vec::new(),
+            });
+        }
+
+        // Remove stale cross-project panes inside the transaction before touching the daemon.
+        // Other readers cannot observe these uncommitted deletes; a daemon failure rolls them all
+        // back, while a successful release cannot leave a pane pointing at a cascaded session row.
+        for (window_id, tab_id) in &plan.remove_tab_keys {
+            tx.execute(
+                "DELETE FROM tabs WHERE window_id = ?1 AND tab_id = ?2",
+                rusqlite::params![window_id, tab_id],
+            )
+            .map_err(|error| ProjectServiceError::Store(StoreError::Db(error.to_string())))?;
+        }
+
+        release_sessions(&plan.kill_session_ids)
+            .map_err(|detail| ProjectServiceError::SessionReleaseFailed { detail })?;
+
+        // Delete every exact planned window first. This is redundant for ordinary FK-owned rows,
+        // but is what safely closes the documented legacy NULL-owner corruption class.
+        for window_id in &plan.window_ids {
+            tx.execute(
+                "DELETE FROM windows WHERE window_id = ?1 AND (project_id = ?2 OR project_id IS NULL)",
+                rusqlite::params![window_id, plan.project_id],
+            )
+            .map_err(|error| ProjectServiceError::Store(StoreError::Db(error.to_string())))?;
+        }
+        let removed = tx
+            .execute(
+                "DELETE FROM projects WHERE project_id = ?1",
+                [&plan.project_id],
+            )
+            .map_err(|error| ProjectServiceError::Store(StoreError::Db(error.to_string())))?
+            > 0;
+        tx.commit()
+            .map_err(|error| ProjectServiceError::Store(StoreError::Db(error.to_string())))?;
+
+        if removed {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or(0);
+            for window_id in &plan.window_ids {
+                crate::write_trace::trace_delete(self.paths.base(), "WindowLayout", window_id, ts);
+            }
+            let surviving_windows: BTreeSet<&str> = plan
+                .remove_tab_keys
+                .iter()
+                .map(|(window_id, _)| window_id.as_str())
+                .collect();
+            for window_id in surviving_windows {
+                crate::write_trace::trace_write(
+                    self.paths.base(),
+                    "WindowLayout",
+                    window_id,
+                    &["tabs".into()],
+                    ts,
+                );
+            }
+            crate::write_trace::trace_delete(self.paths.base(), "Project", &plan.project_id, ts);
+        }
+
+        Ok(ProjectDeletionResult {
+            removed,
+            project_id: plan.project_id.clone(),
+            window_ids: plan.window_ids.clone(),
+            affected_session_ids: plan.affected_session_ids.clone(),
+            removed_tab_keys: plan.remove_tab_keys.clone(),
+            retained_shared_session_ids: plan.retained_shared_session_ids.clone(),
+        })
     }
 
     /// Realize a caller-supplied project order. `ordered_project_ids` MUST be an exact permutation
@@ -538,6 +1007,12 @@ mod tests {
 
     fn svc(paths: &AppPaths) -> ProjectService<'_> {
         ProjectService::new(paths)
+    }
+
+    fn commit_delete(paths: &AppPaths, project_id: &str) -> ProjectDeletionResult {
+        let service = svc(paths);
+        let plan = service.plan_delete(project_id).unwrap();
+        service.commit_delete(&plan, |_| Ok(())).unwrap()
     }
 
     fn ids(ps: &[Project]) -> Vec<&str> {
@@ -860,9 +1335,9 @@ mod tests {
         svc(&paths)
             .create("b", "B", "/b", NewProject::default(), 1)
             .unwrap();
-        assert!(svc(&paths).delete("a").unwrap(), "a removed");
+        assert!(commit_delete(&paths, "a").removed, "a removed");
         assert!(
-            !svc(&paths).delete("a").unwrap(),
+            !commit_delete(&paths, "a").removed,
             "second delete is a no-op"
         );
         assert_eq!(ids(&svc(&paths).list().unwrap()), vec!["b"]);
@@ -889,7 +1364,7 @@ mod tests {
             .create("u1", "User", "/u", NewProject::default(), 1)
             .unwrap();
 
-        let err = svc(&paths).delete("system-terminal").unwrap_err();
+        let err = svc(&paths).plan_delete("system-terminal").unwrap_err();
         assert!(
             matches!(
                 err,
@@ -900,13 +1375,13 @@ mod tests {
         // the record is still there
         assert!(svc(&paths).load("system-terminal").unwrap().is_some());
         // ordinary delete still works
-        assert!(svc(&paths).delete("u1").unwrap());
+        assert!(commit_delete(&paths, "u1").removed);
         assert!(svc(&paths).load("u1").unwrap().is_none());
     }
 
     #[test]
     fn delete_cascades_to_all_children() {
-        // The payoff: deleting a project removes its workspaces → sessions, agent_tasks, and windows → tabs. No orphans.
+        // The payoff: the plan exposes PTY ownership before deleting the project graph.
         use crate::paths::RecordKind;
         use crate::records::{
             AttentionState, LaunchSpec, SessionKind, SessionRecord, SessionStatus, TabRecord,
@@ -968,7 +1443,15 @@ mod tests {
         }
 
         // Delete the project → everything under it cascades away.
-        assert!(svc(&paths).delete("p1").unwrap());
+        let plan = svc(&paths).plan_delete("p1").unwrap();
+        assert_eq!(plan.affected_session_ids, vec!["s1"]);
+        assert_eq!(plan.kill_session_ids, vec!["s1"]);
+        assert!(
+            svc(&paths)
+                .commit_delete(&plan, |_| Ok(()))
+                .unwrap()
+                .removed
+        );
         let arc = crate::db::conn_for(paths.base()).unwrap();
         let conn = arc.lock().unwrap();
         for table in ["projects", "workspaces", "sessions", "windows", "tabs"] {
@@ -980,6 +1463,364 @@ mod tests {
                 "{table} must be empty after the project cascade-delete"
             );
         }
+    }
+
+    #[test]
+    fn delete_plan_finds_tabless_workspace_task_history_and_tab_only_sessions() {
+        use crate::paths::RecordKind;
+        use crate::records::{
+            AgentTask, AgentTaskState, AttentionState, LaunchSpec, SessionKind, SessionRecord,
+            SessionStatus, Workspace, WorkspaceConsent,
+        };
+
+        let (_t, paths) = temp_paths();
+        for project_id in ["target", "other"] {
+            svc(&paths)
+                .create(project_id, project_id, "/r", NewProject::default(), 1)
+                .unwrap();
+        }
+        let workspace = Workspace {
+            workspace_id: "ws-target".into(),
+            project_id: "target".into(),
+            root: "/r".into(),
+            policy: WorkspacePolicy::ScratchCwd,
+            consent: WorkspaceConsent::default(),
+        };
+        crate::store::write_record(&paths, RecordKind::Workspace, "ws-target", 1, &workspace)
+            .unwrap();
+        let tabless = SessionRecord {
+            session_id: "tabless-workspace".into(),
+            workspace_id: "ws-target".into(),
+            kind: SessionKind::Agent,
+            launch: LaunchSpec::OptOut,
+            cwd_resolved: "/r".into(),
+            agent_task_id: None,
+            created_at_ms: 1,
+            last_attached_at_ms: 1,
+            last_known_generation: None,
+            status: SessionStatus::Live,
+        };
+        crate::store::write_record(
+            &paths,
+            RecordKind::Session,
+            "tabless-workspace",
+            1,
+            &tabless,
+        )
+        .unwrap();
+        let target_task = AgentTask {
+            agent_task_id: "task-target".into(),
+            project_id: "target".into(),
+            goal: "test".into(),
+            state: AgentTaskState::Running,
+            current_session_id: Some("task-current".into()),
+            session_history: vec!["task-history".into(), "shared-history".into()],
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            result_summary: None,
+        };
+        crate::store::write_record(
+            &paths,
+            RecordKind::AgentTask,
+            "task-target",
+            1,
+            &target_task,
+        )
+        .unwrap();
+        let other_task = AgentTask {
+            agent_task_id: "task-other".into(),
+            project_id: "other".into(),
+            goal: "test".into(),
+            state: AgentTaskState::Running,
+            current_session_id: Some("shared-history".into()),
+            session_history: vec![],
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            result_summary: None,
+        };
+        crate::store::write_record(&paths, RecordKind::AgentTask, "task-other", 1, &other_task)
+            .unwrap();
+
+        let windows = crate::WindowLayoutService::new(&paths);
+        windows.create_empty("target-window", 1).unwrap();
+        windows
+            .open_tab(
+                "target-window",
+                "tab-only",
+                "tab-only-session",
+                "Recovered",
+                false,
+                AttentionState::default(),
+                1,
+            )
+            .unwrap();
+        crate::store::set_window_project(&paths, "target-window", "target").unwrap();
+
+        let plan = svc(&paths).plan_delete("target").unwrap();
+        assert_eq!(
+            plan.affected_session_ids,
+            vec![
+                "shared-history",
+                "tab-only-session",
+                "tabless-workspace",
+                "task-current",
+                "task-history",
+            ]
+        );
+        assert_eq!(
+            plan.kill_session_ids,
+            vec![
+                "tab-only-session",
+                "tabless-workspace",
+                "task-current",
+                "task-history",
+            ]
+        );
+        assert_eq!(plan.retained_shared_session_ids, vec!["shared-history"]);
+    }
+
+    #[test]
+    fn delete_commit_refuses_a_stale_session_ownership_plan() {
+        use crate::paths::RecordKind;
+        use crate::records::{AgentTask, AgentTaskState};
+
+        let (_t, paths) = temp_paths();
+        svc(&paths)
+            .create("target", "Target", "/r", NewProject::default(), 1)
+            .unwrap();
+        let stale = svc(&paths).plan_delete("target").unwrap();
+        let task = AgentTask {
+            agent_task_id: "late-task".into(),
+            project_id: "target".into(),
+            goal: "late".into(),
+            state: AgentTaskState::Running,
+            current_session_id: Some("late-session".into()),
+            session_history: vec![],
+            created_at_ms: 2,
+            updated_at_ms: 2,
+            result_summary: None,
+        };
+        crate::store::write_record(&paths, RecordKind::AgentTask, "late-task", 2, &task).unwrap();
+
+        let release_called = std::cell::Cell::new(false);
+        assert!(matches!(
+            svc(&paths)
+                .commit_delete(&stale, |_| {
+                    release_called.set(true);
+                    Ok(())
+                })
+                .unwrap_err(),
+            ProjectServiceError::DeletionPlanChanged { .. }
+        ));
+        assert!(
+            !release_called.get(),
+            "a stale plan must abort before touching the daemon boundary"
+        );
+        assert!(svc(&paths).load("target").unwrap().is_some());
+    }
+
+    #[test]
+    fn delete_release_failure_rolls_back_without_losing_ownership_evidence() {
+        use crate::records::{LaunchSpec, SessionKind, SessionRecord, SessionStatus};
+
+        let (_t, paths) = temp_paths();
+        svc(&paths)
+            .create("target", "Target", "/r", NewProject::default(), 1)
+            .unwrap();
+        let workspace = crate::records::Workspace {
+            workspace_id: "target-workspace".into(),
+            project_id: "target".into(),
+            root: "/r".into(),
+            policy: WorkspacePolicy::ScratchCwd,
+            consent: crate::records::WorkspaceConsent::default(),
+        };
+        crate::store::write_record(
+            &paths,
+            RecordKind::Workspace,
+            "target-workspace",
+            1,
+            &workspace,
+        )
+        .unwrap();
+        let session = SessionRecord {
+            session_id: "must-release".into(),
+            workspace_id: "target-workspace".into(),
+            kind: SessionKind::Agent,
+            launch: LaunchSpec::OptOut,
+            cwd_resolved: "/r".into(),
+            agent_task_id: None,
+            created_at_ms: 1,
+            last_attached_at_ms: 1,
+            last_known_generation: None,
+            status: SessionStatus::Live,
+        };
+        crate::store::write_record(&paths, RecordKind::Session, "must-release", 1, &session)
+            .unwrap();
+        let plan = svc(&paths).plan_delete("target").unwrap();
+
+        assert!(matches!(
+            svc(&paths)
+                .commit_delete(&plan, |ids| {
+                    assert_eq!(ids, ["must-release"]);
+                    Err("daemon unavailable".into())
+                })
+                .unwrap_err(),
+            ProjectServiceError::SessionReleaseFailed { .. }
+        ));
+        assert!(svc(&paths).load("target").unwrap().is_some());
+        assert!(crate::store::load_one::<SessionRecord>(
+            &paths,
+            RecordKind::Session,
+            "must-release"
+        )
+        .unwrap()
+        .is_some());
+    }
+
+    #[test]
+    fn delete_removes_a_misplaced_surviving_pane_and_releases_its_owned_session() {
+        use crate::records::{
+            AttentionState, LaunchSpec, SessionKind, SessionRecord, SessionStatus,
+        };
+
+        let (_t, paths) = temp_paths();
+        for project_id in ["target", "survivor"] {
+            svc(&paths)
+                .create(project_id, project_id, "/r", NewProject::default(), 1)
+                .unwrap();
+        }
+        let workspace = crate::records::Workspace {
+            workspace_id: "target-workspace".into(),
+            project_id: "target".into(),
+            root: "/r".into(),
+            policy: WorkspacePolicy::ScratchCwd,
+            consent: crate::records::WorkspaceConsent::default(),
+        };
+        crate::store::write_record(
+            &paths,
+            RecordKind::Workspace,
+            "target-workspace",
+            1,
+            &workspace,
+        )
+        .unwrap();
+        let session = SessionRecord {
+            session_id: "shared-pane-session".into(),
+            workspace_id: "target-workspace".into(),
+            kind: SessionKind::Shell,
+            launch: LaunchSpec::OptOut,
+            cwd_resolved: "/r".into(),
+            agent_task_id: None,
+            created_at_ms: 1,
+            last_attached_at_ms: 1,
+            last_known_generation: None,
+            status: SessionStatus::Live,
+        };
+        crate::store::write_record(
+            &paths,
+            RecordKind::Session,
+            "shared-pane-session",
+            1,
+            &session,
+        )
+        .unwrap();
+        let windows = crate::WindowLayoutService::new(&paths);
+        windows.create_empty("surviving-window", 1).unwrap();
+        windows
+            .open_tab(
+                "surviving-window",
+                "surviving-pane",
+                "shared-pane-session",
+                "Shared",
+                false,
+                AttentionState::default(),
+                1,
+            )
+            .unwrap();
+        crate::store::set_window_project(&paths, "surviving-window", "survivor").unwrap();
+
+        let plan = svc(&paths).plan_delete("target").unwrap();
+        assert_eq!(plan.affected_session_ids, vec!["shared-pane-session"]);
+        assert_eq!(plan.kill_session_ids, vec!["shared-pane-session"]);
+        assert_eq!(
+            plan.remove_tab_keys,
+            vec![("surviving-window".into(), "surviving-pane".into())]
+        );
+        assert!(plan.retained_shared_session_ids.is_empty());
+
+        let mut released = Vec::new();
+        let result = svc(&paths)
+            .commit_delete(&plan, |ids| {
+                released.extend_from_slice(ids);
+                Ok(())
+            })
+            .unwrap();
+        assert!(result.removed);
+        assert_eq!(released, ["shared-pane-session"]);
+        assert_eq!(result.removed_tab_keys, plan.remove_tab_keys);
+        let surviving = windows.load("surviving-window").unwrap().unwrap();
+        assert!(surviving.tabs.is_empty());
+    }
+
+    #[test]
+    fn delete_plan_never_treats_an_unreadable_ownership_list_as_empty() {
+        let (_t, paths) = temp_paths();
+        for project_id in ["target", "other"] {
+            svc(&paths)
+                .create(project_id, project_id, "/r", NewProject::default(), 1)
+                .unwrap();
+        }
+        let arc = crate::db::conn_for(paths.base()).unwrap();
+        arc.lock()
+            .unwrap()
+            .execute(
+                "UPDATE projects SET window_order_json = '{not-json' WHERE project_id = 'other'",
+                [],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            svc(&paths).plan_delete("target").unwrap_err(),
+            ProjectServiceError::Store(StoreError::Map(_))
+        ));
+        assert!(svc(&paths).load("target").unwrap().is_some());
+    }
+
+    #[test]
+    fn delete_plan_owns_and_removes_a_legacy_null_fk_window_from_window_order() {
+        use crate::records::AttentionState;
+
+        let (_t, paths) = temp_paths();
+        svc(&paths)
+            .create("target", "Target", "/r", NewProject::default(), 1)
+            .unwrap();
+        let windows = crate::WindowLayoutService::new(&paths);
+        windows.create_empty("legacy-window", 1).unwrap();
+        windows
+            .open_tab(
+                "legacy-window",
+                "legacy-tab",
+                "legacy-session",
+                "Legacy",
+                false,
+                AttentionState::default(),
+                1,
+            )
+            .unwrap();
+        svc(&paths)
+            .reorder_windows("target", &["legacy-window".into()], 2)
+            .unwrap();
+
+        let plan = svc(&paths).plan_delete("target").unwrap();
+        assert_eq!(plan.window_ids, vec!["legacy-window"]);
+        assert_eq!(plan.kill_session_ids, vec!["legacy-session"]);
+        assert!(
+            svc(&paths)
+                .commit_delete(&plan, |_| Ok(()))
+                .unwrap()
+                .removed
+        );
+        assert!(windows.load("legacy-window").unwrap().is_none());
     }
 
     #[test]

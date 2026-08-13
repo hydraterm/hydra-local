@@ -1099,6 +1099,10 @@ export function Sidebar({
                   const isFocused = w.window_id === focusedWindowId
                   const winOpen = expandedWindows[winKey] ?? (isFocused || isSel)
                   const menuKey = windowMenuKey(p.project_id, w.window_id)
+                  const paneMenuOpenInWindow = w.tabs.some(
+                    (tab) =>
+                      openPaneMenuKey === paneMenuKey(p.project_id, tab.window_id, tab.tab_id),
+                  )
                   const isWindowStashed =
                     Boolean(w.stashed) || (w.tabs.length > 0 && w.tabs.every((tab) => tab.stashed))
                   const firstStashedPane = w.tabs.find((tab) => tab.stashed)
@@ -1120,7 +1124,7 @@ export function Sidebar({
                         dragWindow?.windowId === w.window_id ? 'is-dragging' : ''
                       } ${windowDropBefore ? 'is-drop-before' : ''} ${
                         windowDropAfter ? 'is-drop-after' : ''
-                      }`}
+                      } ${openWindowMenuKey === menuKey || paneMenuOpenInWindow ? 'is-menu-open' : ''}`}
                       role="group"
                       onDragOver={(e) => {
                         if (
@@ -1171,7 +1175,7 @@ export function Sidebar({
                       }}
                     >
                       <div
-                        className={`tree-row tree-row--window ${isFocused ? 'is-focused' : ''} ${isWindowStashed ? 'is-stashed' : ''} ${allVisiblePanesExited ? 'is-restartable' : ''}`}
+                        className={`tree-row tree-row--window ${isFocused ? 'is-focused' : ''} ${isWindowStashed ? 'is-stashed' : ''} ${allVisiblePanesExited ? 'is-restartable' : ''} ${openWindowMenuKey === menuKey ? 'is-menu-open' : ''}`}
                         draggable
                         onDragStart={(e) => {
                           e.stopPropagation()
@@ -1266,7 +1270,9 @@ export function Sidebar({
                               : w.tabs.filter((t) => !t.stashed).length}
                           </span>
                         </button>
-                        <div className="tree-menu-wrap">
+                        <div
+                          className={`tree-menu-wrap ${openWindowMenuKey === menuKey ? 'is-open' : ''}`}
+                        >
                           <button
                             type="button"
                             className="tree-more"
@@ -1347,7 +1353,7 @@ export function Sidebar({
                                 isFocused ? 'is-active-window-pane' : 'is-inactive-window-pane'
                               } ${t.stashed ? 'is-stashed' : ''} ${
                                 stashedDragKey === pMenuKey ? 'is-picked' : ''
-                              } ${!t.stashed && t.session_status === 'exited' ? 'is-restartable' : ''}`}
+                              } ${!t.stashed && t.session_status === 'exited' ? 'is-restartable' : ''} ${openPaneMenuKey === pMenuKey ? 'is-menu-open' : ''}`}
                               draggable={t.stashed}
                               onDragStart={(e) => {
                                 if (!t.stashed) return
@@ -1507,7 +1513,9 @@ export function Sidebar({
                                 </button>
                                 </>
                               )}
-                              <div className="tree-menu-wrap">
+                              <div
+                                className={`tree-menu-wrap ${openPaneMenuKey === pMenuKey ? 'is-open' : ''}`}
+                              >
                                 <button
                                   type="button"
                                   className="tree-more"

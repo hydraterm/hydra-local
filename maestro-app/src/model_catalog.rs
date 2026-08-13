@@ -47,7 +47,7 @@ pub fn spawn_refresh(cache_path: PathBuf) {
 fn compiled_catalog_url() -> Option<&'static str> {
     #[cfg(feature = "official-distribution")]
     {
-        return Some(PRODUCTION_CATALOG_URL);
+        Some(PRODUCTION_CATALOG_URL)
     }
     #[cfg(not(feature = "official-distribution"))]
     {

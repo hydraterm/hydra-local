@@ -27,16 +27,14 @@
 //!
 //! ## Project association (documented choice)
 //!
-//! `WindowLayout` has no `project_id`, so a window's owning project is derived from its tabs first.
-//! A tab associates to a project if its `session_id` is the `current_session_id` of an `AgentTask`
-//! (use that task's `project_id`), or — failing that — if its session's `SessionRecord.workspace_id`
-//! maps to a `Workspace` whose `project_id` is known. A window is placed under the project of its
-//! FIRST associable tab (tabs scanned in `index` order). If no tab associates, the snapshot falls
-//! back to the loaded projects' `window_order`; this keeps newly-created or currently-empty windows
-//! under their owning project in the local/browser dashboard tree. Only windows with neither a
-//! tab-derived project nor a `window_order` owner go to `unassigned_windows`.
+//! `WindowLayout` has no `project_id` field, but SQLite's `windows.project_id` FK is the durable
+//! ownership authority. The snapshot uses that exact owner whenever it names a loaded project; a
+//! pane restored from another project can therefore never move the whole window in the dashboard.
+//! Only a missing/dangling FK uses the repair derivation: a tab's owning task project, then its
+//! session workspace project, then a project's `window_order`. Tabs are scanned in `index` order.
+//! Windows with no authoritative or derivable owner go to `unassigned_windows`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::agent_task_reconcile::{
@@ -132,7 +130,11 @@ pub struct DashboardSnapshot {
     pub projects: Vec<ProjectSnapshot>,
     /// Windows that could not be associated to any project, sorted by `window_id`. Never dropped.
     pub unassigned_windows: Vec<DashboardWindow>,
-    /// Recovered/orphan daemon sessions from a supplied [`ReconcileReport`], sorted by `session_id`.
+    /// Freshly-proven live daemon sessions with no pane reference, from a supplied
+    /// [`ReconcileReport`], sorted by `session_id`. This includes both daemon-only sessions and
+    /// current-version record-backed sessions whose pane was lost. Any active or stashed pane
+    /// removes the id from this native lifecycle-candidate list; daemon-only sessions never gain
+    /// invented launch metadata, while record-backed sessions retain their ownership/history.
     pub recovered_sessions: Vec<RecoveredSession>,
     /// Future-version record paths per kind, left byte-identical in place, sorted lexically.
     pub skipped_future_projects: Vec<PathBuf>,
@@ -161,7 +163,8 @@ impl<'a> DashboardSnapshotService<'a> {
     /// - `None` — purely local: tab `session_status` falls back to whatever the task report and
     ///   on-disk `SessionRecord.status` say, and `recovered_sessions` is empty.
     /// - `Some(report)` — prefer the report's per-session status when projecting tabs, and include
-    ///   its `recovered_sessions`. The override is in-memory only; nothing is written back.
+    ///   every freshly-live session with no pane in `recovered_sessions`. The override is in-memory
+    ///   only; nothing is written back.
     ///
     /// The only error is the store's own directory IO; per-file problems (future-version, corrupt)
     /// land in the snapshot report instead of aborting the scan.
@@ -197,6 +200,19 @@ impl<'a> DashboardSnapshotService<'a> {
             &mut snap.skipped_future_windows,
             &mut snap.quarantined,
         )?;
+        let stored_window_projects: HashMap<String, Option<String>> =
+            store::window_project_owners(self.paths)?
+                .into_iter()
+                .collect();
+        let known_project_ids: HashSet<&str> = projects
+            .iter()
+            .map(|project| project.project_id.as_str())
+            .collect();
+        let pane_session_ids: HashSet<&str> = windows
+            .iter()
+            .flat_map(|window| window.tabs.iter())
+            .map(|tab| tab.session_id.as_str())
+            .collect();
 
         // Task reconciliation is reused for per-task attention/session linkage. This scan
         // also quarantines corrupt task/session records — but we already loaded (and quarantined)
@@ -254,7 +270,12 @@ impl<'a> DashboardSnapshotService<'a> {
                     &reconciled_status,
                 ),
             };
-            match self.window_project(
+            let stored_project_id = stored_window_projects
+                .get(&layout.window_id)
+                .and_then(|project_id| project_id.as_deref())
+                .filter(|project_id| known_project_ids.contains(*project_id));
+            match Self::window_project(
+                stored_project_id,
                 &layout.tabs,
                 &task_session_project,
                 &session_by_id,
@@ -348,9 +369,32 @@ impl<'a> DashboardSnapshotService<'a> {
             windows_by_project.into_values().flatten().collect();
         snap.unassigned_windows.append(&mut orphaned);
 
-        // --- recovered sessions from the supplied report (reported, never invented) ---
+        // --- live sessions without panes from the supplied report (reported, never invented) ---
+        // The report is the fresh daemon authority for BOTH classes that need an owner decision:
+        // daemon-only live ids and loaded current-version records still live without a pane. A
+        // restored pane removes either class from this list. Never use a stale on-disk `Live`
+        // status by itself, and never reinterpret a future/corrupt record.
         if let Some(report) = session_report {
-            snap.recovered_sessions = report.recovered_sessions.clone();
+            let mut unrepresented_ids: HashSet<String> = report
+                .recovered_sessions
+                .iter()
+                .filter(|session| !pane_session_ids.contains(session.session_id.as_str()))
+                .map(|session| session.session_id.clone())
+                .collect();
+            unrepresented_ids.extend(
+                sessions
+                    .iter()
+                    .filter(|session| !pane_session_ids.contains(session.session_id.as_str()))
+                    .filter(|session| {
+                        reconciled_status.get(session.session_id.as_str())
+                            == Some(&SessionStatus::Live)
+                    })
+                    .map(|session| session.session_id.clone()),
+            );
+            snap.recovered_sessions = unrepresented_ids
+                .into_iter()
+                .map(|session_id| RecoveredSession { session_id })
+                .collect();
         }
 
         self.sort_snapshot(&mut snap);
@@ -426,9 +470,8 @@ impl<'a> DashboardSnapshotService<'a> {
                     agent_task_id: linked.map(|t| t.agent_task_id.clone()),
                     agent_task_state: linked.map(|t| t.state),
                     session_status,
-                    session_record_missing: linked
-                        .map(|t| t.session_record_missing)
-                        .unwrap_or(false),
+                    session_record_missing: !session_by_id.contains_key(tab.session_id.as_str())
+                        || linked.map(|t| t.session_record_missing).unwrap_or(false),
                     needs_attention,
                     stashed: tab.stashed,
                     cwd: session_by_id
@@ -442,12 +485,10 @@ impl<'a> DashboardSnapshotService<'a> {
         rows
     }
 
-    /// Decide a window's owning project from its tabs (scanned in `index` order): a tab's session
-    /// owned by a task gives that task's project; else the session's workspace gives its project.
-    /// First tab match wins. If no tab associates, fall back to the owning project's `window_order`
-    /// entry so empty local windows still stay under their project.
+    /// Use the durable FK owner when it names a loaded project. Only a missing/dangling FK falls
+    /// back to repair derivation from tabs (scanned in `index` order), then `window_order`.
     fn window_project(
-        &self,
+        stored_project_id: Option<&str>,
         tabs: &[TabRecord],
         task_session_project: &HashMap<&str, &str>,
         session_by_id: &HashMap<&str, &SessionRecord>,
@@ -455,6 +496,9 @@ impl<'a> DashboardSnapshotService<'a> {
         window_project_by_order: &HashMap<&str, &str>,
         window_id: &str,
     ) -> Option<String> {
+        if let Some(project_id) = stored_project_id {
+            return Some(project_id.to_string());
+        }
         let mut ordered: Vec<&TabRecord> = tabs.iter().collect();
         ordered.sort_by_key(|t| t.index);
         for tab in ordered {
@@ -849,6 +893,46 @@ mod tests {
     }
 
     #[test]
+    fn stored_window_owner_wins_over_a_cross_project_first_pane() {
+        let (_tmp, paths) = temp_paths();
+        let mut p1 = project("p1", "One", 100);
+        p1.window_order = vec!["w1".into()];
+        write_project(&paths, &p1);
+        write_project(&paths, &project("p2", "Two", 90));
+        write_workspace(&paths, &workspace("ws-2", "p2"));
+        write_session(&paths, &session("s2", "ws-2", SessionStatus::Live));
+        write_window(
+            &paths,
+            &window(
+                "w1",
+                vec![tab(
+                    "restored-cross-project",
+                    "s2",
+                    0,
+                    attn(Attention::None, false),
+                )],
+            ),
+        );
+        store::set_window_project(&paths, "w1", "p1").unwrap();
+
+        let snap = snapshot(&paths, None);
+        let p1 = snap
+            .projects
+            .iter()
+            .find(|project| project.project_id == "p1")
+            .unwrap();
+        let p2 = snap
+            .projects
+            .iter()
+            .find(|project| project.project_id == "p2")
+            .unwrap();
+        assert_eq!(p1.windows.len(), 1);
+        assert_eq!(p1.windows[0].window_id, "w1");
+        assert!(p2.windows.is_empty());
+        assert!(snap.unassigned_windows.is_empty());
+    }
+
+    #[test]
     fn stashed_flag_projects_into_dashboard_tab() {
         let (_tmp, paths) = temp_paths();
         write_project(&paths, &project("p1", "One", 100));
@@ -1029,6 +1113,92 @@ mod tests {
             .map(|r| r.session_id.as_str())
             .collect();
         assert_eq!(ids, vec!["s-a", "s-z"]);
+    }
+
+    #[test]
+    fn fresh_live_record_without_a_pane_is_actionable_but_stale_or_paned_records_are_not() {
+        let (_tmp, paths) = temp_paths();
+        write_project(&paths, &project("p1", "One", 100));
+        write_workspace(&paths, &workspace("ws-1", "p1"));
+        write_session(&paths, &session("live-hidden", "ws-1", SessionStatus::Live));
+        write_session(
+            &paths,
+            &session("stale-hidden", "ws-1", SessionStatus::Live),
+        );
+        write_session(&paths, &session("live-paned", "ws-1", SessionStatus::Live));
+        write_window(
+            &paths,
+            &window(
+                "w1",
+                vec![tab(
+                    "visible-tab",
+                    "live-paned",
+                    0,
+                    attn(Attention::None, false),
+                )],
+            ),
+        );
+        let report = ReconcileReport {
+            sessions: vec![
+                ReconciledSession {
+                    session_id: "live-hidden".into(),
+                    status: SessionStatus::Live,
+                    rewritten: false,
+                },
+                ReconciledSession {
+                    session_id: "stale-hidden".into(),
+                    status: SessionStatus::Exited,
+                    rewritten: true,
+                },
+                ReconciledSession {
+                    session_id: "live-paned".into(),
+                    status: SessionStatus::Live,
+                    rewritten: false,
+                },
+            ],
+            recovered_sessions: vec![RecoveredSession {
+                session_id: "daemon-only".into(),
+            }],
+            skipped_future_version: vec![],
+        };
+
+        let snap = snapshot(&paths, Some(&report));
+        let ids: Vec<&str> = snap
+            .recovered_sessions
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["daemon-only", "live-hidden"]);
+    }
+
+    #[test]
+    fn explicit_pane_reference_removes_recovered_action_without_inventing_a_session_record() {
+        let (_tmp, paths) = temp_paths();
+        write_window(
+            &paths,
+            &window(
+                "w1",
+                vec![tab(
+                    "restored-tab",
+                    "live-only",
+                    0,
+                    attn(Attention::None, false),
+                )],
+            ),
+        );
+        let report = ReconcileReport {
+            sessions: vec![],
+            recovered_sessions: vec![RecoveredSession {
+                session_id: "live-only".into(),
+            }],
+            skipped_future_version: vec![],
+        };
+
+        let snap = snapshot(&paths, Some(&report));
+        assert!(snap.recovered_sessions.is_empty());
+        assert_eq!(snap.unassigned_windows.len(), 1);
+        assert!(snap.unassigned_windows[0].tabs[0].session_record_missing);
+        assert_eq!(snap.unassigned_windows[0].tabs[0].session_id, "live-only");
     }
 
     #[test]

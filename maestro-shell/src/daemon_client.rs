@@ -221,6 +221,11 @@ fn connected_server_uid(stream: &UnixStream) -> std::io::Result<u32> {
 /// Linux exposes the connected server identity through `SO_PEERCRED`.
 #[cfg(target_os = "linux")]
 fn connected_server_uid(stream: &UnixStream) -> std::io::Result<u32> {
+    Ok(connected_server_credentials(stream)?.uid)
+}
+
+#[cfg(target_os = "linux")]
+fn connected_server_credentials(stream: &UnixStream) -> std::io::Result<libc::ucred> {
     let mut credentials = libc::ucred {
         pid: 0,
         uid: 0,
@@ -241,7 +246,13 @@ fn connected_server_uid(stream: &UnixStream) -> std::io::Result<u32> {
     if status != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(credentials.uid)
+    if length as usize != std::mem::size_of::<libc::ucred>() || credentials.pid <= 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "kernel returned an invalid Unix peer identity",
+        ));
+    }
+    Ok(credentials)
 }
 
 fn effective_uid() -> u32 {
@@ -388,6 +399,8 @@ impl Write for BoundedJsonWriter {
 pub struct DaemonClient {
     writer: UnixStream,
     reader: BufReader<UnixStream>,
+    /// Kernel-authenticated server PID on Linux. Other supported Unix platforms expose only UID.
+    server_pid: Option<u32>,
 }
 
 impl DaemonClient {
@@ -413,6 +426,19 @@ impl DaemonClient {
                 source,
             })?;
         verify_connected_server_identity(path, effective_uid(), connected_server_uid(&stream))?;
+        #[cfg(target_os = "linux")]
+        let server_pid = Some(
+            connected_server_credentials(&stream)
+                .map_err(|error| DaemonClientError::UntrustedDaemon {
+                    path: path.display().to_string(),
+                    expected_uid: effective_uid(),
+                    observed_uid: Some(effective_uid()),
+                    detail: format!("kernel peer PID was unavailable: {error}"),
+                })?
+                .pid as u32,
+        );
+        #[cfg(not(target_os = "linux"))]
+        let server_pid = None;
         // A silent daemon must not hang us: bound every read and write by the deadline.
         stream
             .set_read_timeout(Some(timeout))
@@ -426,7 +452,14 @@ impl DaemonClient {
         Ok(DaemonClient {
             writer: stream,
             reader: BufReader::new(reader_stream),
+            server_pid,
         })
+    }
+
+    /// Return the kernel-authenticated PID at the connected server end when the platform exposes it.
+    /// This lets a service owner bind protocol readiness to the exact PID its manager reports.
+    pub fn server_pid(&self) -> Option<u32> {
+        self.server_pid
     }
 
     /// Serialize a request and write it as one newline-delimited JSON line. A request never exceeds
@@ -502,6 +535,12 @@ impl DaemonClient {
 
     /// Non-mutating identity probe used before reusing a retained daemon.
     pub fn daemon_info(&mut self) -> Result<(u32, String), DaemonClientError> {
+        let (protocol_version, build_version, _, _) = self.daemon_capabilities()?;
+        Ok((protocol_version, build_version))
+    }
+
+    /// Full additive daemon capabilities. Retained daemons decode omitted booleans as false.
+    pub fn daemon_capabilities(&mut self) -> Result<(u32, String, bool, bool), DaemonClientError> {
         self.send(&ClientRequest::DaemonInfo)?;
         let mut budget = ReplyBudget::new("reading daemon_info reply");
         loop {
@@ -509,8 +548,16 @@ impl DaemonClient {
                 Some(ShellEvent::DaemonInfo {
                     protocol_version,
                     build_version,
-                    ..
-                }) => return Ok((protocol_version, build_version)),
+                    output_generation_echo,
+                    child_environment,
+                }) => {
+                    return Ok((
+                        protocol_version,
+                        build_version,
+                        output_generation_echo,
+                        child_environment,
+                    ))
+                }
                 Some(ShellEvent::Error { message }) => {
                     return Err(DaemonClientError::DaemonError { message })
                 }
@@ -644,6 +691,7 @@ impl DaemonClient {
             cwd: cwd.to_string(),
             command: command.to_string(),
             args: args.to_vec(),
+            child_environment: None,
             cols,
             rows,
             restart_exited,
@@ -818,6 +866,15 @@ mod tests {
 
         assert_eq!(connected_server_uid(&client).unwrap(), effective_uid());
         assert_eq!(connected_server_uid(&server).unwrap(), effective_uid());
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(connected_server_credentials(&client).unwrap().pid, unsafe {
+                libc::getpid()
+            });
+            assert_eq!(connected_server_credentials(&server).unwrap().pid, unsafe {
+                libc::getpid()
+            });
+        }
     }
 
     /// A loopback stub daemon: a real Unix socket on a temp path, served by one accept thread that

@@ -136,6 +136,16 @@ describe('native sidebar geometry and focus', () => {
     ).toHaveLength(0)
   })
 
+  it('does not ask the owner to classify daemon reconciliation candidates', async () => {
+    const intents: Array<Record<string, unknown>> = []
+    installWindow('?chrome=sidebar', intents)
+    await mount()
+
+    expect(renderer!.root.findAllByProps({ className: 'recovered-sessions' })).toHaveLength(0)
+    expect(JSON.stringify(renderer!.toJSON())).not.toContain('s-orphan-7a3f')
+    expect(intents).toHaveLength(0)
+  })
+
   it('shows an exact available version above New project and emits only the typed native action', async () => {
     const intents: Array<Record<string, unknown>> = []
     const initialModel: DashboardModel = {
@@ -1140,6 +1150,25 @@ describe('native sidebar geometry and focus', () => {
     expect(stopRowPropagation).toHaveBeenCalledOnce()
     expect(reviveIntents()).toHaveLength(2)
     expect(reviveIntents()[1]).toEqual(reviveIntents()[0])
+  })
+
+  it('raises a stashed pane action menu above sibling panes without dimming the menu layer', async () => {
+    installWindow('?chrome=sidebar', [])
+    await mount()
+
+    const label = renderer!.root.findByProps({ title: 'Click to revive; use the grip to drag' })
+    const preventDefault = vi.fn()
+    act(() => label.parent!.props.onContextMenu({ preventDefault }))
+
+    expect(preventDefault).toHaveBeenCalledOnce()
+    const reopenedLabel = renderer!.root.findByProps({ title: 'Click to revive; use the grip to drag' })
+    const row = reopenedLabel.parent!
+    expect(row.props.className).toContain('is-stashed')
+    expect(row.props.className).toContain('is-menu-open')
+    const menuWrap = row.findByProps({ className: 'tree-menu-wrap is-open' })
+    expect(menuWrap.findByProps({ role: 'menu' })).toBeDefined()
+    expect(row.parent?.props.className).toContain('tree-window')
+    expect(row.parent?.props.className).toContain('is-menu-open')
   })
 
   it('treats a click on an exited visible pane as explicit reopen authority', async () => {

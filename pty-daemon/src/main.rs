@@ -335,6 +335,7 @@ async fn handle_request(
                     protocol_version: protocol::DAEMON_PROTOCOL_VERSION,
                     build_version: env!("CARGO_PKG_VERSION").to_string(),
                     output_generation_echo: true,
+                    child_environment: true,
                 })
                 .await;
         }
@@ -343,6 +344,7 @@ async fn handle_request(
             cwd,
             command,
             args,
+            child_environment,
             cols,
             rows,
             restart_exited,
@@ -350,7 +352,30 @@ async fn handle_request(
             let result = {
                 let mut d = shared.lock().await;
                 if restart_exited {
-                    d.start_session_with_restart(id, &cwd, &command, &args, cols, rows, true)
+                    if let Some(environment) = child_environment.as_ref() {
+                        d.start_session_with_restart_and_environment(
+                            id,
+                            &cwd,
+                            &command,
+                            &args,
+                            Some(environment),
+                            cols,
+                            rows,
+                            true,
+                        )
+                    } else {
+                        d.start_session_with_restart(id, &cwd, &command, &args, cols, rows, true)
+                    }
+                } else if let Some(environment) = child_environment.as_ref() {
+                    d.start_session_with_environment(
+                        id,
+                        &cwd,
+                        &command,
+                        &args,
+                        Some(environment),
+                        cols,
+                        rows,
+                    )
                 } else {
                     d.start_session(id, &cwd, &command, &args, cols, rows)
                 }

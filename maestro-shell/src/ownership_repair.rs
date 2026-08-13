@@ -268,14 +268,14 @@ mod tests {
     #[test]
     fn adopts_fk_owned_stray_and_restores_the_oracle() {
         let (_tmp, paths) = temp_paths();
-        // FK stamped but the window derives to nothing and is missing from window_order → the
-        // snapshot floats it as unassigned even though ownership intent is on record.
+        // FK stamped but missing from window_order: the authoritative owner keeps it under p1,
+        // while the invariant oracle requires repair to restore the ordering index.
         seed_project(&paths, "p1", vec![]);
         seed_window(&paths, "w1", "ghost-session");
         store::set_window_project(&paths, "w1", "p1").unwrap();
         let pre = crate::invariants::check_store_invariants(&paths).unwrap();
         assert!(
-            pre.iter().any(|v| v.invariant == "owned-but-unassigned"),
+            pre.iter().any(|v| v.invariant == "window-in-order"),
             "oracle must flag the stray: {pre:?}"
         );
 

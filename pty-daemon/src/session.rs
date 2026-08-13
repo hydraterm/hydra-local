@@ -268,12 +268,27 @@ where
 /// advertises xterm-256color support.
 const TERMINAL_ENV_REMOVALS: &[&str] = &["NO_COLOR"];
 
+/// A typed headless request pins account authority to passwd HOME/SHELL. Remove the standard
+/// alternate-home and noninteractive-shell startup redirects inherited from a long-lived user
+/// manager so they cannot split provider/config discovery from that account snapshot. Desktop
+/// requests omit the typed pair and retain their established environment byte for byte.
+const HEADLESS_ACCOUNT_ENV_REMOVALS: &[&str] = &[
+    "ZDOTDIR",
+    "BASH_ENV",
+    "ENV",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+];
+
 impl Session {
     pub fn spawn(
         id: SessionId,
         cwd: &str,
         command: &str,
         args: &[String],
+        child_environment: Option<&maestro_protocol::ChildEnvironment>,
         cols: u16,
         rows: u16,
     ) -> Result<Self> {
@@ -295,6 +310,13 @@ impl Session {
         let mut cmd = CommandBuilder::new(command);
         cmd.args(args);
         cmd.cwd(cwd);
+        if let Some(environment) = child_environment {
+            cmd.env("HOME", &environment.home);
+            cmd.env("SHELL", &environment.shell);
+            for key in HEADLESS_ACCOUNT_ENV_REMOVALS {
+                cmd.env_remove(key);
+            }
+        }
         // Give the child a sane terminal environment even when the daemon itself
         // was launched from a thin env (launchd, `env -i`, a stripped shell). The
         // base env is inherited from the daemon process; we only fill in the few
