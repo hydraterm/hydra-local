@@ -2046,7 +2046,7 @@ export function Sidebar({
             </button>
           </div>
         )}
-        {remoteAvailable && !enrollPending && (model.enroll_error || enrollUiError) && (
+        {!enrollPending && (model.enroll_error || enrollUiError) && (
           <div className="sidebar__add-remote-error" role="alert">
             {model.enroll_error ?? enrollUiError}
           </div>

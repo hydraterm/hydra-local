@@ -8533,8 +8533,9 @@ fn run_launch(launch: LaunchArgs) -> Result<LaunchSuccess, LaunchFailure> {
         .unwrap_or_else(|| default_base_dir(|k| std::env::var(k).ok(), &runtime_base));
     let paths = AppPaths::with_base(&base);
 
-    // Background model-catalog refresh (same posture as the update check): keeps the agent
-    // model dropdowns current without an app release. The dashboard model reads the cache.
+    // Background metadata-only model-catalog refresh for official builds keeps agent model dropdowns
+    // current without an app release. It is independent of the unsigned desktop update feed, which is
+    // disabled in every build. The dashboard model reads the bounded catalog cache.
     maestro_app::model_catalog::spawn_refresh(
         paths
             .base()

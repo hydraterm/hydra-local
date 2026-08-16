@@ -11,7 +11,8 @@
 
 use rusqlite::{Connection, OpenFlags};
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
+use std::ffi::OsStr;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -27,6 +28,11 @@ pub const DB_SCHEMA_VERSION: i64 = 1;
 /// lock exclusively. This prevents an older schema-aware writer from continuing through a cached
 /// connection while a newer binary changes the schema underneath it.
 const SCHEMA_LEASE_FILENAME: &str = ".maestro-schema.lock";
+
+/// SQLite may leave these siblings while a connection is active or after an interrupted start.
+/// They carry database pages and therefore receive the same owner/type/link/mode checks as the
+/// main database before SQLite is allowed to inspect them.
+const DB_SIDECAR_FILENAMES: [&str; 3] = ["maestro.db-wal", "maestro.db-shm", "maestro.db-journal"];
 
 /// Process-wide cache of one connection per base dir. `Arc<Mutex<Connection>>` so concurrent callers in THIS process
 /// serialize on the same handle (rusqlite Connection is not Sync); cross-PROCESS safety is WAL + busy_timeout.
@@ -198,25 +204,40 @@ fn authority_ready(base: &Path) -> bool {
 /// Open a connection to `<base>/maestro.db`, set the safety PRAGMAs, ensure the schema exists, and enforce the
 /// future-version guard. This is the ONE opener both binaries (app + agent) go through.
 fn open_conn(base: &Path) -> Result<(Connection, File), DbError> {
-    std::fs::create_dir_all(base).map_err(DbError::Io)?;
+    let (secured_base, database_exists) = secure_database_boundary(base)?;
     let path = db_path(base);
-    let lease_path = base.join(SCHEMA_LEASE_FILENAME);
-    let lease = open_schema_lease(&lease_path)?;
+
+    // Preserve the future-schema no-write contract. Existing DB bytes are inspected before a
+    // schema lease is created. The only permitted change before this verdict is tightening the
+    // owner-controlled base/DB/sidecar metadata to the security invariant; no DB byte, lock, or
+    // schema state is created or mutated for a future-version database.
+    if database_exists {
+        inspect_database_for_write(&path)?;
+    }
+
+    let lease = open_schema_lease(&secured_base)?;
     lock_schema_shared(&lease)?;
+
+    // Pre-create through the verified base descriptor so SQLite can never follow a link at its
+    // authority path. The `0700` base makes the later pathname open safe from other UIDs; same-UID
+    // replacement is the product's explicit local trust boundary. Scope this descriptor so it is
+    // closed before the following read-only SQLite inspection can acquire process-owned locks.
+    {
+        let database_file = secured_base
+            .open_owner_file(OsStr::new(DB_FILENAME), false)
+            .map_err(|error| DbError::Io(io_context("pre-create SQLite database", error)))?;
+        drop(database_file);
+    }
+
+    // Do not raw-open the database or any SQLite sidecar after this point. POSIX record locks are
+    // process-owned: closing an unrelated descriptor for an inode releases every SQLite lock this
+    // process holds on that inode, bypassing SQLite's deferred-close protection.
 
     // Existing databases are inspected through a read-only connection first. A future-version or
     // malformed database therefore returns before a read-write connection, persistent PRAGMA, or
     // schema DDL is attempted. A hot journal that would require recovery also fails read-only rather
     // than being replayed by this older binary.
-    let mut needs_write = if path.exists() {
-        let readonly = Connection::open_with_flags(
-            &path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        crate::schema::schema_requires_write(&readonly)?
-    } else {
-        true
-    };
+    let mut needs_write = inspect_database_for_write(&path)?;
 
     let mut have_exclusive = false;
     if needs_write {
@@ -228,13 +249,7 @@ fn open_conn(base: &Path) -> Result<(Connection, File), DbError> {
                 // re-inspect: success means it completed our exact schema; an older process still
                 // holding the previous generation leaves `needs_write=true` and we fail closed.
                 lock_schema_shared(&lease)?;
-                if path.exists() {
-                    let readonly = Connection::open_with_flags(
-                        &path,
-                        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-                    )?;
-                    needs_write = crate::schema::schema_requires_write(&readonly)?;
-                }
+                needs_write = inspect_database_for_write(&path)?;
                 if needs_write {
                     return Err(DbError::SchemaLeaseBusy);
                 }
@@ -262,20 +277,71 @@ fn open_conn(base: &Path) -> Result<(Connection, File), DbError> {
         // process-lifetime shared lease.
         lock_schema_shared(&lease)?;
     }
-    // Best-effort restrictive perms on the db file (matches the old 0600 record files).
-    set_owner_only(&path);
     Ok((conn, lease))
 }
 
-fn open_schema_lease(path: &Path) -> Result<File, DbError> {
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+fn open_schema_lease(
+    secured_base: &crate::local_store_security::SecureAppSupport,
+) -> Result<File, DbError> {
+    secured_base
+        .open_owner_file(OsStr::new(SCHEMA_LEASE_FILENAME), false)
+        .map_err(|error| DbError::Io(io_context("open schema lease", error)))
+}
+
+fn inspect_database_for_write(path: &Path) -> Result<bool, DbError> {
+    let readonly = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    crate::schema::schema_requires_write(&readonly).map_err(DbError::from)
+}
+
+fn secure_database_boundary(
+    base: &Path,
+) -> Result<(crate::local_store_security::SecureAppSupport, bool), DbError> {
+    let secured_base = crate::local_store_security::SecureAppSupport::open(base)
+        .map_err(|error| DbError::Io(io_context("secure app-support base", error)))?;
+    let database_exists = secured_base
+        .secure_existing_file(OsStr::new(DB_FILENAME))
+        .map_err(|error| DbError::Io(io_context("secure SQLite database", error)))?;
+    secure_database_sidecars(&secured_base)?;
+    Ok((secured_base, database_exists))
+}
+
+fn secure_database_sidecars(
+    secured_base: &crate::local_store_security::SecureAppSupport,
+) -> Result<(), DbError> {
+    for name in DB_SIDECAR_FILENAMES {
+        secured_base
+            .secure_existing_file(OsStr::new(name))
+            .map_err(|error| DbError::Io(io_context("secure SQLite sidecar", error)))?;
     }
-    options.open(path).map_err(DbError::Io)
+    Ok(())
+}
+
+fn io_context(context: &str, error: std::io::Error) -> std::io::Error {
+    std::io::Error::new(error.kind(), format!("{context}: {error}"))
+}
+
+/// Permission/type/version preflight used by the legacy migrator before it creates its lock.
+/// A future-version database therefore receives safe metadata tightening only and no auxiliary
+/// file creation. Ordinary open repeats the verdict while holding the schema lease.
+pub(crate) fn preflight_existing_database(base: &Path) -> Result<(), DbError> {
+    // A failed legacy import can leave its connection cached while authority remains blocked, and
+    // the next attempt enters this preflight again. Never raw-open/close SQLite inodes in that
+    // state: on Unix, doing so would release every POSIX lock this process's cached connection owns.
+    // Hold the same map mutex used by `conn_for_migration` across the uncached preflight so a new
+    // cached connection cannot appear between this check and the descriptor-based boundary walk.
+    let connections = CONNS.get_or_init(|| Mutex::new(HashMap::new()));
+    let cached = connections.lock().unwrap();
+    if cached.contains_key(base) {
+        return Ok(());
+    }
+    let (_secured_base, database_exists) = secure_database_boundary(base)?;
+    if database_exists {
+        inspect_database_for_write(&db_path(base))?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -381,15 +447,6 @@ pub fn data_version_for(base: &Path) -> Option<i64> {
     data_version(&guard).ok()
 }
 
-#[cfg(unix)]
-fn set_owner_only(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-}
-
-#[cfg(not(unix))]
-fn set_owner_only(_path: &Path) {}
-
 /// TEST-ONLY: drop the cached connection for a base so a temp DB can be reopened fresh (tests reuse temp dirs).
 #[cfg(test)]
 pub fn forget_cached(base: &Path) {
@@ -410,6 +467,118 @@ mod data_version_tests {
     use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
 
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    const SQLITE_DMS_LOCK_OFFSET: libc::off_t = 128;
+
+    #[cfg(unix)]
+    fn sqlite_dms_lock(lock_type: libc::c_short) -> libc::flock {
+        // SQLite's Unix VFS reserves bytes 120..127 for WAL locks and byte 128 for the dead-man
+        // switch (UNIX_SHM_BASE + SQLITE_SHM_NLOCK). A live WAL mapping retains a shared lock here;
+        // a newcomer may take it exclusively and truncate the SHM file only when no holder exists.
+        // SAFETY: every field used by F_GETLK/F_SETLK is initialized immediately below.
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = lock_type;
+        lock.l_whence = libc::SEEK_SET as libc::c_short;
+        lock.l_start = SQLITE_DMS_LOCK_OFFSET;
+        lock.l_len = 1;
+        lock
+    }
+
+    #[cfg(unix)]
+    fn conflicting_dms_lock(file: &File) -> std::io::Result<libc::c_short> {
+        use std::os::fd::AsRawFd;
+
+        let mut lock = sqlite_dms_lock(libc::F_WRLCK as libc::c_short);
+        loop {
+            // SAFETY: `lock` is a valid writable flock and `file` remains open for this call.
+            if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock) } == 0 {
+                return Ok(lock.l_type);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn set_dms_lock(file: &File, lock_type: libc::c_short) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+
+        let lock = sqlite_dms_lock(lock_type);
+        loop {
+            // SAFETY: `lock` is a valid flock and `file` remains open for this call.
+            if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) } == 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_dms_exclusive_truncate_is_blocked(base: &Path) {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("db::data_version_tests::sqlite_dms_exclusive_truncate_probe")
+            .arg("--nocapture")
+            .env("HYDRA_SQLITE_DMS_PROBE_BASE", base)
+            .status()
+            .unwrap();
+        assert!(status.success(), "SQLite DMS contender was not blocked");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_dms_exclusive_truncate_probe() {
+        let Some(base) = std::env::var_os("HYDRA_SQLITE_DMS_PROBE_BASE") else {
+            return;
+        };
+        let shm = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(Path::new(&base).join("maestro.db-shm"))
+            .unwrap();
+        let length_before = shm.metadata().unwrap().len();
+        assert!(
+            length_before >= 32 * 1024,
+            "live SQLite SHM must contain its first complete 32 KiB region"
+        );
+
+        assert_eq!(
+            conflicting_dms_lock(&shm).unwrap(),
+            libc::F_RDLCK as libc::c_short,
+            "a live SQLite WAL mapping must retain a shared DMS lock"
+        );
+
+        match set_dms_lock(&shm, libc::F_WRLCK as libc::c_short) {
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EACCES) | Some(libc::EAGAIN)
+                ) => {}
+            Err(error) => panic!("unexpected SQLite DMS lock error: {error}"),
+            Ok(()) => {
+                shm.set_len(0).unwrap();
+                set_dms_lock(&shm, libc::F_UNLCK as libc::c_short).unwrap();
+                panic!("exclusive SQLite DMS lock allowed SHM truncation beside a live mapping");
+            }
+        }
+        assert_eq!(
+            shm.metadata().unwrap().len(),
+            length_before,
+            "blocked DMS contender must not truncate SQLite SHM"
+        );
+    }
+
     #[test]
     fn future_version_is_rejected_without_changing_database_bytes() {
         let dir = TempDir::new().unwrap();
@@ -426,6 +595,12 @@ mod data_version_tests {
             )
             .unwrap();
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
         let before = std::fs::read(&path).unwrap();
 
         assert!(matches!(
@@ -438,6 +613,21 @@ mod data_version_tests {
 
         let after = std::fs::read(&path).unwrap();
         assert_eq!(after, before, "future-version DB bytes must be untouched");
+        assert!(
+            !dir.path().join(SCHEMA_LEASE_FILENAME).exists(),
+            "future-version rejection must not create a schema lease"
+        );
+        for name in DB_SIDECAR_FILENAMES {
+            assert!(
+                !dir.path().join(name).exists(),
+                "future-version rejection must not create {name}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            assert_eq!(mode(dir.path()), 0o700);
+            assert_eq!(mode(&path), 0o600);
+        }
         let raw = Connection::open(&path).unwrap();
         let tables: i64 = raw
             .query_row(
@@ -447,6 +637,48 @@ mod data_version_tests {
             )
             .unwrap();
         assert_eq!(tables, 0, "no v1 DDL may run before the future guard");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn future_version_authority_gate_creates_no_migration_or_schema_lock() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("Maestro");
+        std::fs::create_dir(&base).unwrap();
+        let path = db_path(&base);
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(
+                "CREATE TABLE schema_meta (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL);",
+            )
+            .unwrap();
+            raw.execute(
+                "INSERT INTO schema_meta (id, version) VALUES (1, ?1)",
+                [DB_SCHEMA_VERSION + 1],
+            )
+            .unwrap();
+        }
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        assert!(conn_for(&base).is_err());
+
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!base.join(SCHEMA_LEASE_FILENAME).exists());
+        assert!(!base
+            .join(crate::migrate::MIGRATION_LOCK_FOR_SECURITY_TESTS)
+            .exists());
+        for name in DB_SIDECAR_FILENAMES {
+            assert!(
+                !base.join(name).exists(),
+                "future-version authority gate must not create {name}"
+            );
+        }
+        assert_eq!(mode(&base), 0o700);
+        assert_eq!(mode(&path), 0o600);
     }
 
     #[test]
@@ -492,7 +724,8 @@ mod data_version_tests {
         let dir = TempDir::new().unwrap();
         let base = dir.path();
         let cached = conn_for_migration(base).unwrap();
-        let contender = open_schema_lease(&base.join(SCHEMA_LEASE_FILENAME)).unwrap();
+        let secured = crate::local_store_security::SecureAppSupport::open(base).unwrap();
+        let contender = open_schema_lease(&secured).unwrap();
         let error = acquire_schema_exclusive_after_upgrade(&contender).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
 
@@ -561,6 +794,49 @@ mod data_version_tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn blocked_authority_retry_preserves_cached_sqlite_dms_lock() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("Maestro");
+        let cached = conn_for(&base).unwrap();
+        {
+            let conn = cached.lock().unwrap();
+            conn.execute(
+                "INSERT INTO projects (project_id, name, root, default_workspace_policy, created_at_ms, last_active_at_ms) \
+                 VALUES ('p-retry','Retry','/tmp','scratch_cwd',1,1)",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch("BEGIN DEFERRED").unwrap();
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM projects", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
+
+        assert_dms_exclusive_truncate_is_blocked(&base);
+
+        // This is the exact in-process state left when migration fails after opening SQLite:
+        // authority is blocked, but `CONNS` still owns the live WAL connection. A public retry
+        // repeats preflight before it reuses that cached connection.
+        mark_authority_blocked(&base);
+        preflight_existing_database(&base).unwrap();
+        preflight_existing_database(&base).unwrap();
+        let report =
+            crate::migrate::migrate_json_to_sqlite(&crate::paths::AppPaths::with_base(&base))
+                .unwrap();
+        assert!(report.already_done);
+
+        assert_dms_exclusive_truncate_is_blocked(&base);
+
+        cached.lock().unwrap().execute_batch("ROLLBACK").unwrap();
+        forget_cached(&base);
+        drop(cached);
+    }
+
     /// data_version on a stable connection: unchanged with no other-connection writes, STRICTLY increases after a
     /// commit by a SEPARATE connection to the same DB file. This pins the connection-local semantics the agent poll
     /// relies on (a write by the desktop app's connection is observed by the agent's cached connection).
@@ -602,5 +878,222 @@ mod data_version_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_repairs_permissive_database_and_lock_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("Maestro");
+        let (conn, lease) = open_conn(&base).unwrap();
+        conn.execute(
+            "INSERT INTO projects (project_id, name, root, default_workspace_policy, created_at_ms, last_active_at_ms) \
+             VALUES ('p-restart','Restart','/tmp','scratch_cwd',1,1)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        drop(lease);
+
+        let db = db_path(&base);
+        let schema_lock = base.join(SCHEMA_LEASE_FILENAME);
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&schema_lock, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let (reopened, _lease) = open_conn(&base).unwrap();
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT COUNT(*) FROM projects WHERE project_id='p-restart'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(mode(&base), 0o700);
+        assert_eq!(mode(&db), 0o600);
+        assert_eq!(mode(&schema_lock), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_permissive_sqlite_sidecars_are_repaired() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("Maestro");
+        let _secured = crate::local_store_security::SecureAppSupport::open(&base).unwrap();
+        for name in [
+            DB_FILENAME,
+            "maestro.db-wal",
+            "maestro.db-shm",
+            "maestro.db-journal",
+        ] {
+            let path = base.join(name);
+            std::fs::write(&path, b"").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        }
+
+        let (_secured, database_exists) = secure_database_boundary(&base).unwrap();
+        assert!(database_exists);
+
+        for name in [
+            DB_FILENAME,
+            "maestro.db-wal",
+            "maestro.db-shm",
+            "maestro.db-journal",
+        ] {
+            assert_eq!(mode(&base.join(name)), 0o600, "wrong mode for {name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schema_lease_refuses_symlink_and_hardlink_without_touching_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("Maestro");
+        let (conn, lease) = open_conn(&base).unwrap();
+        drop(conn);
+        drop(lease);
+        let schema_lock = base.join(SCHEMA_LEASE_FILENAME);
+        std::fs::remove_file(&schema_lock).unwrap();
+        let victim = base.join("victim");
+        std::fs::write(&victim, b"preserve").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        symlink(&victim, &schema_lock).unwrap();
+        assert!(matches!(open_conn(&base), Err(DbError::Io(_))));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"preserve");
+        assert_eq!(mode(&victim), 0o644);
+
+        std::fs::remove_file(&schema_lock).unwrap();
+        std::fs::hard_link(&victim, &schema_lock).unwrap();
+        assert!(matches!(open_conn(&base), Err(DbError::Io(_))));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"preserve");
+        assert_eq!(mode(&victim), 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permissive_umask_two_process_wal_probe() {
+        let Some(base) = std::env::var_os("HYDRA_STORE_SECURITY_PROBE_BASE") else {
+            return;
+        };
+        let control =
+            PathBuf::from(std::env::var_os("HYDRA_STORE_SECURITY_PROBE_CONTROL").unwrap());
+        let id = std::env::var("HYDRA_STORE_SECURITY_PROBE_ID").unwrap();
+        // SAFETY: umask is process-global, but this probe runs as its own exact-test subprocess.
+        unsafe { libc::umask(0) };
+        let arc = conn_for(Path::new(&base)).unwrap();
+        let conn = arc.lock().unwrap();
+        conn.execute(
+            "INSERT INTO projects (project_id, name, root, default_workspace_policy, created_at_ms, last_active_at_ms) \
+             VALUES (?1,?1,'/tmp','scratch_cwd',1,1)",
+            [&id],
+        )
+        .unwrap();
+        conn.execute_batch("BEGIN DEFERRED").unwrap();
+        let _: i64 = conn
+            .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
+            .unwrap();
+        std::fs::write(control.join(format!("ready-{id}")), b"ready").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !control.join(format!("release-{id}")).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "parent never released probe"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            conn.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        conn.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permissive_umask_and_two_process_wal_remain_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("Maestro");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let control = tmp.path().join("control");
+        std::fs::create_dir(&control).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let spawn_probe = |id: &str| {
+            std::process::Command::new(&executable)
+                .arg("--exact")
+                .arg("db::data_version_tests::permissive_umask_two_process_wal_probe")
+                .arg("--nocapture")
+                .env("HYDRA_STORE_SECURITY_PROBE_BASE", &base)
+                .env("HYDRA_STORE_SECURITY_PROBE_CONTROL", &control)
+                .env("HYDRA_STORE_SECURITY_PROBE_ID", id)
+                .spawn()
+                .unwrap()
+        };
+        let wait_until_ready = |id: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while !control.join(format!("ready-{id}")).exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "child probe {id} did not become ready"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+
+        // Start the second process only after the first has created and mapped the WAL sidecars.
+        // This pins the existing-SHM path that used to lose its DMS lock when `open_conn` performed
+        // a late descriptor-based sidecar recheck.
+        let mut first = spawn_probe("p-one");
+        wait_until_ready("p-one");
+        let mut second = spawn_probe("p-two");
+        wait_until_ready("p-two");
+
+        assert_eq!(mode(&base), 0o700);
+        for name in [
+            DB_FILENAME,
+            "maestro.db-wal",
+            "maestro.db-shm",
+            SCHEMA_LEASE_FILENAME,
+            crate::migrate::MIGRATION_LOCK_FOR_SECURITY_TESTS,
+        ] {
+            let path = base.join(name);
+            assert!(
+                path.exists(),
+                "active two-process store did not create {name}"
+            );
+            assert_eq!(mode(&path), 0o600, "wrong active mode for {name}");
+        }
+
+        // Once the first holder exits, the second holder alone must retain the shared DMS lock. A
+        // third opener must not acquire the exclusive lock that authorizes SHM truncation.
+        std::fs::write(control.join("release-p-one"), b"release").unwrap();
+        assert!(first.wait().unwrap().success());
+        assert_dms_exclusive_truncate_is_blocked(&base);
+
+        std::fs::write(control.join("release-p-two"), b"release").unwrap();
+        assert!(second.wait().unwrap().success());
+        let raw = Connection::open(db_path(&base)).unwrap();
+        assert_eq!(
+            raw.query_row(
+                "SELECT COUNT(*) FROM projects WHERE project_id IN ('p-one','p-two')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
     }
 }

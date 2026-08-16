@@ -1,6 +1,6 @@
 {
   "schema": "hydra.third-party-license-policy.v2",
-  "cargo_lock_sha256": "08b7b5a4d1704710329af2ec0c8b50e879da5926ad35c7d9b82915ee2a93cbb4",
+  "cargo_lock_sha256": "5dc38d6f0875deea16c6911860ed69c2c6e8390e6946d68e52872ea45c596c86",
   "npm_lock_sha256": "f797f86b630338688c0357e0aa9980300d403bb92b768e92dc6457d73a087073",
   "targets": {
     "aarch64-apple-darwin": {

@@ -6,11 +6,13 @@
 //! model (e.g. a vendor release that morning) appears in Split/New Window/Project dropdowns on
 //! next launch, while offline/first-run users still get the built-ins.
 //!
-//! Same transport + trust posture as `update_check`: the automatic plain, content-blind GET exists
-//! only when the binary is compiled with the default-off `official-distribution` feature. Production
-//! uses that fixed public feed; staging and community/source builds make no catalog request. The URL
-//! has no runtime override, requests apply hard timeouts and fail silently, and may still be disabled
-//! with `HYDRA_NO_UPDATE_CHECK=1`. Catalog display metadata is not remote authority.
+//! This metadata-only catalog has its own deliberately narrow trust boundary. The automatic plain,
+//! content-blind GET exists only when the binary is compiled with the default-off
+//! `official-distribution` feature. Production uses that fixed public feed; staging and
+//! community/source builds make no catalog request. The URL has no runtime override, requests apply
+//! hard timeouts and fail silently, and may still be disabled with `HYDRA_NO_UPDATE_CHECK=1`.
+//! Catalog display metadata is not remote authority. Unlike this catalog, the unsigned desktop
+//! update feed is disabled in every build.
 //!
 //! The catalog can only affect dropdown labels; the daemon keeps the executable, flags, and
 //! security policy in the signed application. V1 `{ "agents": ... }` catalogs remain readable.
@@ -132,7 +134,7 @@ fn refresh(cache_path: &Path, catalog_url: &str) {
 /// Construct the bounded catalog fetch without consulting `PATH`. Official desktop builds launch
 /// this request automatically, so a project-local or inherited `curl` shim must never become code
 /// execution during ordinary app startup. The shipping macOS and Linux packages both provide the
-/// fixed system executable used by the update checker.
+/// fixed system executable reserved for bounded native HTTPS metadata fetches.
 fn refresh_command(url: &str, max_bytes: &str) -> Option<Command> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {

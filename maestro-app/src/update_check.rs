@@ -1,22 +1,19 @@
-//! Non-blocking update check against the published `downloads/version.json`.
+//! Disabled-by-default desktop update-feed boundary.
 //!
-//! The stable desktop feed is a complete `hydra.desktop-update-manifest.v1`, not merely a version
-//! string. The checker validates that exact shape, the release identity, every immutable artifact
-//! path and digest, then publishes a small presentation model for the React dashboard. JavaScript
-//! never supplies a URL: the typed update action can only open the validated immutable artifact for
-//! this compiled platform in the system browser.
+//! The published `downloads/version.json` carries hashes but no application-pinned signature. A
+//! compromised publication/HTTPS authority could therefore replace both the manifest and the bytes
+//! named by it. Official and community builds intentionally keep automatic feed consumption and the
+//! native download-opening action disabled until a signed-manifest format, pinned verification key,
+//! rotation policy, and byte-verifying installer are qualified together.
 //!
 //! This module deliberately does not replace the running application, invoke a package manager,
 //! request elevation, or touch the PTY daemon. A real one-click installer needs a separately
-//! reviewed signed-updater architecture. The current action is an explicit, user-visible download
-//! step that leaves retained sessions alone.
+//! reviewed signed-updater architecture. The dormant typed download action remains incapable of
+//! replacing the app or touching retained sessions, but no shipping build can populate it.
 //!
-//! The request is a plain, content-blind GET with no device/account identifiers. It only exists as
-//! automatic behavior when the binary is compiled with the default-off `official-distribution`
-//! feature. Community/source builds therefore make no update request. Official builds use one
-//! fixed HTTPS origin with no runtime override, retain hard time and size bounds, and may still be
-//! disabled by `HYDRA_NO_UPDATE_CHECK=1`. A one-shot completion signal makes the foreground
-//! listener publish the terminal result without waiting for an incidental UI event.
+//! The parser and bounded fetch/opener builders remain as non-shipping test seams for the future
+//! signed design. `compiled_manifest_url` is the compile-time choke point and returns `None` for
+//! every feature set, so launch performs no update network request and exposes no download action.
 
 use serde::Serialize;
 use std::process::Command;
@@ -25,7 +22,8 @@ use std::sync::{
     mpsc, Mutex, OnceLock,
 };
 
-#[cfg_attr(not(feature = "official-distribution"), allow(dead_code))]
+#[cfg(test)]
+#[allow(dead_code)]
 const STABLE_MANIFEST_PATH: &str = "/downloads/version.json";
 const RELEASE_ORIGIN: &str = "https://app.hydraterms.com";
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
@@ -251,7 +249,7 @@ pub fn dashboard_model() -> UpdateDashboardModel {
     current_snapshot().dashboard
 }
 
-/// Spawn the production stable-feed check once for this foreground launch and return immediately.
+/// Publish the compile-time update state once for this foreground launch and return immediately.
 ///
 /// The caller owns the completion signal and must connect it to the dashboard listener. There is no
 /// production URL override: development tests exercise the parser directly.
@@ -319,17 +317,13 @@ fn check_and_publish(manifest_url: &str, completion: mpsc::Sender<()>) {
 }
 
 fn compiled_manifest_url() -> Option<String> {
-    #[cfg(feature = "official-distribution")]
-    {
-        manifest_url_for(RELEASE_ORIGIN, STABLE_MANIFEST_PATH)
-    }
-    #[cfg(not(feature = "official-distribution"))]
-    {
-        None
-    }
+    // A digest inside an unsigned document authenticates neither that document nor its artifact.
+    // Keep this exact choke point closed until the binary can verify a pinned signed manifest.
+    None
 }
 
-#[cfg_attr(not(feature = "official-distribution"), allow(dead_code))]
+#[cfg(test)]
+#[allow(dead_code)]
 fn manifest_url_for(app_origin: &str, manifest_path: &str) -> Option<String> {
     (manifest_path == STABLE_MANIFEST_PATH && trusted_https_origin(app_origin))
         .then(|| format!("{app_origin}{manifest_path}"))
@@ -865,13 +859,10 @@ mod tests {
 
     #[cfg(feature = "official-distribution")]
     #[test]
-    fn official_distribution_fetcher_is_fixed_bounded_and_has_no_runtime_override() {
+    fn official_distribution_refuses_the_unsigned_feed_at_compile_time() {
         let manifest_url = manifest_url_for(RELEASE_ORIGIN, STABLE_MANIFEST_PATH)
-            .expect("the official desktop has an active stable feed");
-        assert_eq!(
-            compiled_manifest_url().as_deref(),
-            Some(manifest_url.as_str())
-        );
+            .expect("the future signed design retains one canonical candidate URL");
+        assert_eq!(compiled_manifest_url(), None);
         assert_eq!(
             manifest_url,
             "https://app.hydraterms.com/downloads/version.json"
@@ -904,6 +895,16 @@ mod tests {
         ] {
             assert_eq!(manifest_url_for(origin, path), None);
         }
+
+        let mut completion = spawn_update_check();
+        assert!(
+            completion.try_take(),
+            "disabled check must complete immediately"
+        );
+        let dashboard = dashboard_model();
+        assert_eq!(dashboard.status, UpdateStatus::Disabled);
+        assert!(!dashboard.action_available);
+        assert_eq!(current_snapshot().download_url, None);
     }
 
     #[cfg(not(feature = "official-distribution"))]

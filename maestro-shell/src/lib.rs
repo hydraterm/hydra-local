@@ -34,6 +34,7 @@ pub mod focus_request_signal;
 pub mod ids;
 pub mod invariants;
 pub mod layout_preset;
+mod local_store_security;
 pub mod migrate;
 pub mod names;
 pub mod ownership_repair;

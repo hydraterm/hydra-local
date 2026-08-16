@@ -1,6 +1,6 @@
 [package]
 name = "maestro-app"
-version = "0.2.9"
+version = "0.2.12"
 publish = false
 edition.workspace = true
 license.workspace = true
@@ -15,8 +15,9 @@ name = "maestro_app"
 path = "src/lib.rs"
 
 [features]
-# Community/source builds are network-silent by default. Hydra's signed distribution enables this
-# explicitly to check the two fixed public metadata feeds; there is no runtime origin override.
+# This feature still selects other official-distribution behavior, but it no longer enables the
+# unsigned desktop update feed. Every feature set remains update-network-silent until the binary
+# can verify an application-pinned signed manifest and the downloaded artifact bytes.
 default = []
 official-distribution = []
 

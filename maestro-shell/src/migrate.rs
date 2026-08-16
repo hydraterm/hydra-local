@@ -21,6 +21,8 @@ use crate::envelope::Envelope;
 use crate::paths::{AppPaths, RecordKind};
 
 const MIGRATION_LOCK: &str = ".legacy-json-import.lock";
+#[cfg(test)]
+pub(crate) const MIGRATION_LOCK_FOR_SECURITY_TESTS: &str = MIGRATION_LOCK;
 // Version 1 markers were introduced after the best-effort importer had already shipped. That
 // implementation could move records it skipped into `legacy-json*`, while the v1 marker path only
 // looked for active JSON. Consequently a v1 marker is evidence that SQLite was checked, but is not
@@ -151,42 +153,28 @@ struct ArchivedIndependentFile {
 
 /// Process-shared serialization for every supported local-store writer. Hydra's desktop targets are
 /// Unix (macOS and Linux), where `flock` releases automatically on process death.
+#[derive(Debug)]
 struct MigrationLock {
     file: File,
+    _base: crate::local_store_security::SecureAppSupport,
 }
 
 impl MigrationLock {
     fn acquire(base: &Path) -> Result<Self, String> {
-        match path_is_directory_no_follow(base) {
-            Ok(true) => {}
-            Ok(false) => {
-                fs::create_dir_all(base)
-                    .map_err(|e| format!("create migration base {}: {e}", base.display()))?;
-                if !path_is_directory_no_follow(base)
-                    .map_err(|e| format!("verify created migration base {}: {e}", base.display()))?
-                {
-                    return Err(format!(
-                        "created migration base disappeared: {}",
-                        base.display()
-                    ));
-                }
-            }
-            Err(error) => {
-                return Err(format!(
-                    "migration base must be a real directory {}: {error}",
+        let secured_base =
+            crate::local_store_security::SecureAppSupport::open(base).map_err(|error| {
+                format!(
+                    "migration base must be a real current-user directory {}: {error}",
                     base.display()
-                ))
-            }
-        }
+                )
+            })?;
         let path = base.join(MIGRATION_LOCK);
-        let file = open_owner_only(&path, false)
+        let file = secured_base
+            .open_owner_file(std::ffi::OsStr::new(MIGRATION_LOCK), false)
             .map_err(|e| format!("open migration lock {}: {e}", path.display()))?;
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o600))
-                .map_err(|e| format!("secure migration lock {}: {e}", path.display()))?;
             // SAFETY: `file` remains owned by this guard until Drop, and LOCK_EX blocks rather than
             // allowing the app and agent to race first-run import.
             loop {
@@ -203,7 +191,10 @@ impl MigrationLock {
         {
             return Err("legacy migration locking is unsupported on this platform".to_string());
         }
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            _base: secured_base,
+        })
     }
 }
 
@@ -225,6 +216,12 @@ pub fn migrate_json_to_sqlite(paths: &AppPaths) -> Result<MigrationReport, Strin
     // promotion. Otherwise a successful importer can release the filesystem lock, a second
     // importer can fail, and the first importer can then incorrectly publish READY over that
     // newer failure.
+    crate::db::preflight_existing_database(paths.base()).map_err(|error| {
+        format!(
+            "migration base must be a real directory and SQLite authority must be a regular file with current-user ownership under {}: {error}",
+            paths.base().display()
+        )
+    })?;
     run_migration_test_hook("before-migration-lock", paths.base());
     let _lock = MigrationLock::acquire(paths.base())?;
     migrate_json_to_sqlite_locked(paths)
@@ -2128,29 +2125,17 @@ fn write_named_marker(base: &Path, name: &str, body: &[u8], label: &str) -> Resu
 }
 
 fn open_owner_only(path: &Path, create_new: bool) -> std::io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true).write(true);
-    if create_new {
-        options.create_new(true);
-    } else {
-        options.create(true);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // O_NONBLOCK prevents a hostile/stale FIFO at the lock path from hanging startup before
-        // the descriptor can be classified. It has no behavioral effect on ordinary files.
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        options.mode(0o600);
-    }
-    let file = options.open(path)?;
-    if !file.metadata()?.file_type().is_file() {
-        return Err(std::io::Error::new(
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "store path has no parent")
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "path is not a regular file",
-        ));
-    }
-    Ok(file)
+            "store path has no filename",
+        )
+    })?;
+    let secured = crate::local_store_security::SecureAppSupport::open(parent)?;
+    secured.open_owner_file(name, create_new)
 }
 
 fn sync_parent(path: &Path) -> Result<(), String> {
@@ -2336,30 +2321,17 @@ fn verify_archived_independent_files(files: &[ArchivedIndependentFile]) -> Resul
 }
 
 fn ensure_owner_only_notice(path: &Path) -> Result<(), String> {
-    let mut options = OpenOptions::new();
-    options.read(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = options
-        .open(path)
+    let parent = path
+        .parent()
+        .ok_or_else(|| "independent reconciliation notice has no parent".to_string())?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| "independent reconciliation notice has no filename".to_string())?;
+    let secured = crate::local_store_security::SecureAppSupport::open(parent)
+        .map_err(|error| format!("secure independent reconciliation notice parent: {error}"))?;
+    let file = secured
+        .open_existing_owner_file(name)
         .map_err(|error| format!("open independent reconciliation notice: {error}"))?;
-    if !file
-        .metadata()
-        .map_err(|error| format!("inspect independent reconciliation notice: {error}"))?
-        .file_type()
-        .is_file()
-    {
-        return Err("independent reconciliation notice is not a regular file".to_string());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|error| format!("secure independent reconciliation notice: {error}"))?;
-    }
     file.sync_all()
         .map_err(|error| format!("sync independent reconciliation notice: {error}"))?;
     sync_parent(path)
@@ -3049,6 +3021,39 @@ mod tests {
 
         assert!(error.contains("open migration lock"));
         assert!(!crate::db::db_path(paths.base()).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_lock_repairs_mode_and_refuses_hardlinks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let paths = base_paths(&tmp);
+        fs::create_dir_all(paths.base()).unwrap();
+        let lock = paths.base().join(MIGRATION_LOCK);
+        fs::write(&lock, b"").unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o666)).unwrap();
+        let guard = MigrationLock::acquire(paths.base()).unwrap();
+        assert_eq!(
+            fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(guard);
+
+        fs::remove_file(&lock).unwrap();
+        let victim = paths.base().join("lock-victim");
+        fs::write(&victim, b"preserve").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::hard_link(&victim, &lock).unwrap();
+
+        let error = MigrationLock::acquire(paths.base()).unwrap_err();
+        assert!(error.contains("hard-link"), "unexpected error: {error}");
+        assert_eq!(fs::read(&victim).unwrap(), b"preserve");
+        assert_eq!(
+            fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
     }
 
     #[cfg(unix)]

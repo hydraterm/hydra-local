@@ -290,6 +290,28 @@ impl WorkerState {
         projection.remote_owned_sessions = sessions;
         projection
     }
+
+    fn projection_after_exchange_error(
+        &mut self,
+        error: ExtensionTransportError,
+        now: Instant,
+    ) -> RemoteExtensionProjection {
+        if error.is_validated_refusal() {
+            // A negotiated, request-correlated Error frame proves that the installed extension and
+            // lifecycle capability are still present. Preserve the last authoritative lifecycle
+            // projection while expiring only its separately leased viewport snapshot. Treating this
+            // typed refusal like a transport loss briefly published `available=false`, which hid the
+            // enrollment result and cleared the one-time code before the next Status restored it.
+            let mut projection = self.last_projection.clone();
+            projection.available = true;
+            projection.remote_owned_sessions = self.viewport.sessions(now);
+            projection
+        } else {
+            // Spawn, framing, compatibility, I/O, child-exit, and timeout failures provide no proof
+            // that the private capability remains available. Keep their existing fail-closed path.
+            self.projection_with_live_cache(now)
+        }
+    }
 }
 
 /// A single background owner for optional-extension calls. A slow or malicious child can consume
@@ -654,16 +676,7 @@ fn run_operation(
     });
     let (outcome, supports_external_viewport, supports_filesystem_mode_migration) = match result {
         Ok(result) => result,
-        Err(error) => {
-            let projection = state.projection_with_live_cache(Instant::now());
-            state.last_projection = projection.clone();
-            return ExtensionUpdate {
-                operation,
-                projection,
-                error_message: (operation != ExtensionOperation::Refresh)
-                    .then_some(error.user_message()),
-            };
-        }
+        Err(error) => return failed_operation_update(operation, state, error, Instant::now()),
     };
 
     if let OperationOutcome::Notice { notice, status } = outcome {
@@ -738,6 +751,22 @@ fn run_operation(
         operation,
         projection,
         error_message: None,
+    }
+}
+
+fn failed_operation_update(
+    operation: ExtensionOperation,
+    state: &mut WorkerState,
+    error: ExtensionTransportError,
+    now: Instant,
+) -> ExtensionUpdate {
+    let projection = state.projection_after_exchange_error(error, now);
+    state.last_projection = projection.clone();
+    ExtensionUpdate {
+        operation,
+        projection,
+        error_message: (operation != ExtensionOperation::Refresh)
+            .then_some(error.user_message(operation)),
     }
 }
 
@@ -940,7 +969,10 @@ fn outcome_from_response(
             RemoteDesktopExtensionResponse::FilesystemModeMigration { notice, status, .. },
         ) => Ok(OperationOutcome::Notice { notice, status }),
         (_, RemoteDesktopExtensionResponse::Error { error, .. }) => {
-            Err(ExtensionTransportError::Refused(error.code()))
+            Err(ExtensionTransportError::Refused {
+                code: error.code(),
+                retryable: error.retryable(),
+            })
         }
         _ => Err(ExtensionTransportError::UnexpectedResponse),
     }
@@ -960,26 +992,83 @@ enum ExtensionTransportError {
     UnexpectedResponse,
     ExtraOutput,
     ChildFailed,
-    Refused(RemoteDesktopErrorCode),
+    Refused {
+        code: RemoteDesktopErrorCode,
+        retryable: bool,
+    },
 }
 
 impl ExtensionTransportError {
-    fn user_message(self) -> &'static str {
+    fn is_validated_refusal(self) -> bool {
+        matches!(self, Self::Refused { .. })
+    }
+
+    fn user_message(self, operation: ExtensionOperation) -> &'static str {
         match self {
-            Self::Refused(RemoteDesktopErrorCode::NotEnrolled) => {
-                "This desktop is not enrolled. Add Remote first."
+            Self::Refused {
+                code: RemoteDesktopErrorCode::NotEnrolled,
+                ..
+            } => "This desktop is not enrolled. Add Remote first.",
+            Self::Refused {
+                code: RemoteDesktopErrorCode::AlreadyEnrolled,
+                ..
+            } => "This desktop is already enrolled.",
+            Self::Refused {
+                code: RemoteDesktopErrorCode::EnrollmentRejected,
+                ..
+            } => "Enrollment was rejected. Generate a fresh code and try again.",
+            Self::Refused {
+                code: RemoteDesktopErrorCode::RemoteUnavailable,
+                retryable: true,
+            } if operation == ExtensionOperation::Enroll => {
+                "The code was accepted, but Remote could not start. Generate a fresh code and try again."
             }
-            Self::Refused(RemoteDesktopErrorCode::AlreadyEnrolled) => {
-                "This desktop is already enrolled."
-            }
-            Self::Refused(RemoteDesktopErrorCode::EnrollmentRejected) => {
-                "Enrollment was refused. Generate a fresh code and try again."
-            }
-            Self::Refused(RemoteDesktopErrorCode::Busy) => {
-                "Remote is busy. Wait a moment and try again."
-            }
+            Self::Refused {
+                code: RemoteDesktopErrorCode::RemoteUnavailable,
+                retryable: true,
+            } => "Remote service is temporarily unavailable. Wait a moment and try again.",
+            Self::Refused {
+                code: RemoteDesktopErrorCode::RemoteUnavailable,
+                retryable: false,
+            } => "Remote was closed for safety. Add this desktop again.",
+            Self::Refused {
+                code: RemoteDesktopErrorCode::Busy,
+                ..
+            } => "Remote is busy. Wait a moment and try again.",
+            Self::Refused {
+                code: RemoteDesktopErrorCode::Internal,
+                retryable: true,
+            } => "Remote hit an internal lifecycle error. Wait a moment and try again.",
+            Self::Refused {
+                code: RemoteDesktopErrorCode::Internal,
+                retryable: false,
+            } => "Remote lifecycle could not be verified. Restart Hydra before trying again.",
+            Self::Refused {
+                code: RemoteDesktopErrorCode::InvalidRequest,
+                ..
+            } => "Hydra Remote could not process this request. Update Hydra and try again.",
+            Self::Refused {
+                code: RemoteDesktopErrorCode::ViewportUnavailable,
+                ..
+            } => "The remote viewport changed. Try again.",
             Self::Timeout => "Remote extension timed out. Try again.",
-            _ => "Remote extension is unavailable or incompatible.",
+            Self::Incompatible | Self::MissingCapability => {
+                "Hydra Remote components are incompatible. Update Hydra and try again."
+            }
+            Self::OversizedFrame
+            | Self::MalformedFrame
+            | Self::MismatchedRequestId
+            | Self::MismatchedNoticeId
+            | Self::UnexpectedResponse
+            | Self::ExtraOutput => {
+                "Hydra Remote returned an invalid protocol response. Update Hydra and try again."
+            }
+            Self::Spawn => {
+                "Hydra Remote could not start. Reinstall or update Hydra, then try again."
+            }
+            Self::Io | Self::ChildFailed => {
+                "Hydra Remote stopped unexpectedly. Restart Hydra and try again."
+            }
         }
     }
 }
@@ -987,7 +1076,11 @@ impl ExtensionTransportError {
 impl fmt::Debug for ExtensionTransportError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Refused(code) => formatter.debug_tuple("Refused").field(code).finish(),
+            Self::Refused { code, retryable } => formatter
+                .debug_struct("Refused")
+                .field("code", code)
+                .field("retryable", retryable)
+                .finish(),
             Self::Spawn => formatter.write_str("Spawn"),
             Self::Io => formatter.write_str("Io"),
             Self::Timeout => formatter.write_str("Timeout"),
@@ -1418,7 +1511,9 @@ printf '%s\n' '{{"type":"error","request_id":7,"error":{{"code":"enrollment_reje
             .response;
         let error = outcome_from_response(&request, response).unwrap_err();
         assert!(!format!("{error:?}").contains(secret));
-        assert!(!error.user_message().contains(secret));
+        assert!(!error
+            .user_message(ExtensionOperation::Enroll)
+            .contains(secret));
         let capture = fs::read_to_string(capture).unwrap();
         assert!(!capture.contains(secret));
         for name in RETIRED_EXTENSION_ENVIRONMENT {
@@ -1569,6 +1664,264 @@ done"#
                 filesystem_mode_migration: None,
             }
         );
+    }
+
+    #[test]
+    fn validated_enrollment_refusals_do_not_publish_true_false_true_capability_flicker() {
+        let status = RemoteDesktopStatus::new(None, None, false, 0, None).unwrap();
+        let authoritative = projection_from_status(&status);
+        assert!(authoritative.available);
+
+        for (code, retryable, message) in [
+            (
+                RemoteDesktopErrorCode::Internal,
+                false,
+                "Remote lifecycle could not be verified. Restart Hydra before trying again.",
+            ),
+            (
+                RemoteDesktopErrorCode::Busy,
+                true,
+                "Remote is busy. Wait a moment and try again.",
+            ),
+        ] {
+            let request = RemoteDesktopHostRequest::Enroll {
+                request_id: request_id(),
+                code: EnrollmentCode::new("TEST-CODE").unwrap(),
+            };
+            let response = RemoteDesktopExtensionResponse::Error {
+                request_id: request_id(),
+                error: maestro_extension_api::RemoteDesktopResponseError::new(
+                    code,
+                    "bounded enrollment failure",
+                    retryable,
+                )
+                .unwrap(),
+            };
+            let validated_error = outcome_from_response(&request, response).unwrap_err();
+            assert_eq!(
+                validated_error,
+                ExtensionTransportError::Refused { code, retryable }
+            );
+            let mut state = WorkerState {
+                last_projection: authoritative.clone(),
+                ..Default::default()
+            };
+            let rejected = failed_operation_update(
+                ExtensionOperation::Enroll,
+                &mut state,
+                validated_error,
+                Instant::now(),
+            );
+            let recovered = projection_from_status(&status);
+
+            assert_eq!(
+                [
+                    authoritative.available,
+                    rejected.projection.available,
+                    recovered.available,
+                ],
+                [true, true, true],
+                "a validated refusal must not masquerade as capability loss"
+            );
+            assert_eq!(rejected.error_message, Some(message));
+            assert!(!rejected.projection.enrolled);
+            assert!(!rejected.projection.remote_open);
+        }
+    }
+
+    #[test]
+    fn lifecycle_errors_have_bounded_actionable_host_owned_messages() {
+        use ExtensionOperation::{Enroll, SetRemoteOpen};
+        use ExtensionTransportError as Error;
+        use RemoteDesktopErrorCode as Code;
+
+        let cases = [
+            (
+                Error::Refused {
+                    code: Code::NotEnrolled,
+                    retryable: false,
+                },
+                SetRemoteOpen,
+                "This desktop is not enrolled. Add Remote first.",
+            ),
+            (
+                Error::Refused {
+                    code: Code::AlreadyEnrolled,
+                    retryable: false,
+                },
+                Enroll,
+                "This desktop is already enrolled.",
+            ),
+            (
+                Error::Refused {
+                    code: Code::EnrollmentRejected,
+                    retryable: false,
+                },
+                Enroll,
+                "Enrollment was rejected. Generate a fresh code and try again.",
+            ),
+            (
+                Error::Refused {
+                    code: Code::RemoteUnavailable,
+                    retryable: true,
+                },
+                Enroll,
+                "The code was accepted, but Remote could not start. Generate a fresh code and try again.",
+            ),
+            (
+                Error::Refused {
+                    code: Code::RemoteUnavailable,
+                    retryable: true,
+                },
+                SetRemoteOpen,
+                "Remote service is temporarily unavailable. Wait a moment and try again.",
+            ),
+            (
+                Error::Refused {
+                    code: Code::RemoteUnavailable,
+                    retryable: false,
+                },
+                SetRemoteOpen,
+                "Remote was closed for safety. Add this desktop again.",
+            ),
+            (
+                Error::Refused {
+                    code: Code::ViewportUnavailable,
+                    retryable: false,
+                },
+                SetRemoteOpen,
+                "The remote viewport changed. Try again.",
+            ),
+            (
+                Error::Refused {
+                    code: Code::Busy,
+                    retryable: true,
+                },
+                Enroll,
+                "Remote is busy. Wait a moment and try again.",
+            ),
+            (
+                Error::Refused {
+                    code: Code::Internal,
+                    retryable: true,
+                },
+                Enroll,
+                "Remote hit an internal lifecycle error. Wait a moment and try again.",
+            ),
+            (
+                Error::Refused {
+                    code: Code::Internal,
+                    retryable: false,
+                },
+                Enroll,
+                "Remote lifecycle could not be verified. Restart Hydra before trying again.",
+            ),
+            (
+                Error::Refused {
+                    code: Code::InvalidRequest,
+                    retryable: false,
+                },
+                Enroll,
+                "Hydra Remote could not process this request. Update Hydra and try again.",
+            ),
+            (
+                Error::Incompatible,
+                Enroll,
+                "Hydra Remote components are incompatible. Update Hydra and try again.",
+            ),
+            (
+                Error::MissingCapability,
+                Enroll,
+                "Hydra Remote components are incompatible. Update Hydra and try again.",
+            ),
+            (
+                Error::OversizedFrame,
+                Enroll,
+                "Hydra Remote returned an invalid protocol response. Update Hydra and try again.",
+            ),
+            (
+                Error::MalformedFrame,
+                Enroll,
+                "Hydra Remote returned an invalid protocol response. Update Hydra and try again.",
+            ),
+            (
+                Error::MismatchedRequestId,
+                Enroll,
+                "Hydra Remote returned an invalid protocol response. Update Hydra and try again.",
+            ),
+            (
+                Error::MismatchedNoticeId,
+                Enroll,
+                "Hydra Remote returned an invalid protocol response. Update Hydra and try again.",
+            ),
+            (
+                Error::UnexpectedResponse,
+                Enroll,
+                "Hydra Remote returned an invalid protocol response. Update Hydra and try again.",
+            ),
+            (
+                Error::ExtraOutput,
+                Enroll,
+                "Hydra Remote returned an invalid protocol response. Update Hydra and try again.",
+            ),
+            (
+                Error::Spawn,
+                Enroll,
+                "Hydra Remote could not start. Reinstall or update Hydra, then try again.",
+            ),
+            (
+                Error::Io,
+                Enroll,
+                "Hydra Remote stopped unexpectedly. Restart Hydra and try again.",
+            ),
+            (
+                Error::ChildFailed,
+                Enroll,
+                "Hydra Remote stopped unexpectedly. Restart Hydra and try again.",
+            ),
+            (
+                Error::Timeout,
+                Enroll,
+                "Remote extension timed out. Try again.",
+            ),
+        ];
+
+        for (error, operation, expected) in cases {
+            let message = error.user_message(operation);
+            assert_eq!(message, expected);
+            assert!(!message.contains("unavailable or incompatible"));
+        }
+    }
+
+    #[test]
+    fn validated_busy_refresh_preserves_capability_but_transport_loss_remains_fail_closed() {
+        let mut state = WorkerState {
+            last_projection: projection_from_status(
+                &RemoteDesktopStatus::new(None, None, false, 0, None).unwrap(),
+            ),
+            ..Default::default()
+        };
+
+        let busy = failed_operation_update(
+            ExtensionOperation::Refresh,
+            &mut state,
+            ExtensionTransportError::Refused {
+                code: RemoteDesktopErrorCode::Busy,
+                retryable: true,
+            },
+            Instant::now(),
+        );
+        assert!(busy.projection.available);
+        assert_eq!(busy.error_message, None);
+
+        let timeout = failed_operation_update(
+            ExtensionOperation::Refresh,
+            &mut state,
+            ExtensionTransportError::Timeout,
+            Instant::now(),
+        );
+        assert!(!timeout.projection.available);
+        assert_eq!(timeout.error_message, None);
     }
 
     #[test]

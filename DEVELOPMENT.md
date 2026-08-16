@@ -197,8 +197,10 @@ packaging inputs.
 
 Community and source builds are network-silent by default: they do not fetch HydraTerms update or
 model-catalog metadata automatically. The fixed-origin `maestro-app/official-distribution` Cargo
-feature enables those two public metadata feeds for HydraTerms' separately controlled official
-package build. It exposes no runtime URL override and does not add the private remote agent.
+feature enables the public model-catalog feed for HydraTerms' separately controlled official
+package build, but the unsigned desktop update feed remains disabled for every feature set until
+the binary can verify an application-pinned signed manifest and downloaded artifact bytes. The
+feature exposes no runtime URL override and does not add the private remote agent.
 
 ## Design boundaries
 

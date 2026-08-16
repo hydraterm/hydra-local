@@ -584,7 +584,7 @@ describe('native sidebar geometry and focus', () => {
     )
   })
 
-  it('hides every Remote control unless the private extension capability is negotiated', async () => {
+  it('hides every Remote control but still surfaces the bounded enrollment result when capability is unavailable', async () => {
     const intents: Array<Record<string, unknown>> = []
     const unavailableModel: DashboardModel = {
       ...structuredClone(mockDashboardModel),
@@ -592,7 +592,7 @@ describe('native sidebar geometry and focus', () => {
       enrolled: true,
       account_id: 'acct_must_not_render',
       remote_open: true,
-      enroll_error: 'must not render',
+      enroll_error: 'Enrollment could not be completed.',
       desktop_access: {
         status: 'required',
         onboarding_acknowledged: false,
@@ -608,7 +608,9 @@ describe('native sidebar geometry and focus', () => {
     )
     expect(renderer!.root.findAllByProps({ 'aria-label': 'Close remote access' })).toHaveLength(0)
     expect(renderer!.root.findAllByProps({ className: 'sidebar__enrolled' })).toHaveLength(0)
-    expect(renderer!.root.findAllByProps({ role: 'alert' })).toHaveLength(0)
+    expect(renderer!.root.findByProps({ role: 'alert' }).children).toEqual([
+      'Enrollment could not be completed.',
+    ])
     expect(intents).toEqual([])
 
     await act(async () => {
@@ -621,12 +623,16 @@ describe('native sidebar geometry and focus', () => {
       await Promise.resolve()
     })
     expect(renderer!.root.findByProps({ 'aria-label': 'Close remote access' })).toBeTruthy()
+    expect(renderer!.root.findAllByProps({ role: 'alert' })).toHaveLength(0)
 
     await act(async () => {
       browserWindow.__TEST_PUSH_DASHBOARD_MODEL__?.(unavailableModel)
       await Promise.resolve()
     })
     expect(renderer!.root.findAllByProps({ 'aria-label': 'Close remote access' })).toHaveLength(0)
+    expect(renderer!.root.findByProps({ role: 'alert' }).children).toEqual([
+      'Enrollment could not be completed.',
+    ])
     expect(intents).toEqual([])
   })
 

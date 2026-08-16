@@ -1816,7 +1816,7 @@ dependencies = [
 
 [[package]]
 name = "hydra-launcher"
-version = "0.2.9"
+version = "0.2.12"
 dependencies = [
  "libc",
  "maestro-protocol",
@@ -2198,7 +2198,7 @@ checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
 
 [[package]]
 name = "maestro-app"
-version = "0.2.9"
+version = "0.2.12"
 dependencies = [
  "libc",
  "maestro-extension-api",

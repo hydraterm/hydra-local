@@ -1,6 +1,6 @@
 [package]
 name = "hydra-launcher"
-version = "0.2.9"
+version = "0.2.12"
 publish = false
 edition.workspace = true
 license.workspace = true
