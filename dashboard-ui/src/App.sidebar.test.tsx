@@ -1044,7 +1044,28 @@ describe('native sidebar geometry and focus', () => {
       separator.props.onPointerMove(pointerEvent(pointer.target, { screenX: 520 })),
     )
     expect(intents.filter((intent) => intent.type === 'setSidebarWidth')).toHaveLength(0)
-    expect(intents.filter((intent) => intent.type === 'openProjectDialog')).toHaveLength(1)
+    expect(intents.filter((intent) => intent.type === 'openProjectDialog')).toEqual([
+      { type: 'openProjectDialog' },
+    ])
+    expect(intents.some((intent) => intent.type === 'createProject')).toBe(false)
+    expect(renderer!.root.findAllByProps({ className: 'sidebar-create' })).toHaveLength(0)
+  })
+
+  it('routes New window directly to the native dialog without creating a sidebar draft', async () => {
+    const intents: Array<Record<string, unknown>> = []
+    installWindow('?chrome=sidebar', intents)
+    await mount()
+
+    const addWindow = renderer!.root.findAllByProps({ className: 'tree-add' })[0]
+    expect(addWindow).toBeTruthy()
+
+    act(() => addWindow.props.onClick())
+
+    expect(intents.filter((intent) => intent.type === 'openWindowDialog')).toEqual([
+      { type: 'openWindowDialog', project_id: 'sample_workspace' },
+    ])
+    expect(intents.some((intent) => intent.type === 'createWindow')).toBe(false)
+    expect(renderer!.root.findAllByProps({ className: 'new-window-dialog' })).toHaveLength(0)
   })
 
   it('ignores foreign pointers and self-cancels when the owner loses its primary button', async () => {
