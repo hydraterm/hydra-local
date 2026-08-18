@@ -31,6 +31,7 @@ import {
   supportsProviderHistory,
   type OverlayAgentKind,
 } from './model/agent-provider'
+import { launchPreflightFailureMessage } from './model/launch-preflight'
 
 type OverlayModal =
   | {
@@ -56,7 +57,6 @@ const SIDEBAR_HOST_MAX = 720
 const SIDEBAR_DEFAULT = 460
 const SIDEBAR_COLLAPSED = 24
 const OVERLAY_AGENT_OPTIONS = SELECTABLE_AGENT_OPTIONS
-const OVERLAY_PREFLIGHT_ERROR_MAX = 320
 const DIALOG_FOCUSABLE_SELECTOR = [
   'a[href]',
   'button:not([disabled])',
@@ -254,13 +254,6 @@ function relTime(ms: number): string {
   const hours = Math.floor(minutes / 60)
   if (hours < 24) return `${hours}h ago`
   return `${Math.floor(hours / 24)}d ago`
-}
-
-function boundedLaunchPreflightError(message: string | null): string {
-  const fallback = 'That launch command is unavailable. Install the selected agent or choose another command.'
-  const trimmed = message?.trim() || fallback
-  if (trimmed.length <= OVERLAY_PREFLIGHT_ERROR_MAX) return trimmed
-  return `${trimmed.slice(0, OVERLAY_PREFLIGHT_ERROR_MAX - 1)}…`
 }
 
 function isOverlayAgent(value: string | null | undefined): value is OverlayAgent {
@@ -1188,7 +1181,7 @@ function OverlayChrome({
       // response must never create a window from a dialog that is gone.
       if (launchPreflightAttemptRef.current !== attempt) return
       if (!result.ok) {
-        setLaunchPreflightError(boundedLaunchPreflightError(result.message))
+        setLaunchPreflightError(launchPreflightFailureMessage(result, selectedAgent))
         return
       }
       if (launchPreflightDraftRef.current !== checkedDraft) {
@@ -1200,7 +1193,14 @@ function OverlayChrome({
     } catch {
       if (launchPreflightAttemptRef.current !== attempt) return
       setLaunchPreflightError(
-        boundedLaunchPreflightError('Hydra could not verify that launch command. Try again.'),
+        launchPreflightFailureMessage(
+          {
+            ok: false,
+            code: null,
+            message: 'Hydra could not verify that launch command. Try again.',
+          },
+          selectedAgent,
+        ),
       )
     } finally {
       if (launchPreflightAttemptRef.current === attempt) {
