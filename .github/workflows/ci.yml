@@ -173,7 +173,7 @@ jobs:
         # These three exact advisories affect APIs absent from Hydra's locked source closure.
         # RUSTSEC-2024-0429 is limited to glib::VariantStrIter methods. RUSTSEC-2026-0002 is
         # limited to lru::LruCache::iter_mut. RUSTSEC-2026-0253 is limited to LruCache::pop();
-        # locked glyphon 0.6 calls pop_lru(), not pop(), and its GlyphonCacheKey is Copy. This is
+        # locked glyphon 0.7 calls pop_lru(), not pop(), and its GlyphonCacheKey is Copy. This is
         # Hydra's locked-source reachability assessment, not an upstream guarantee. Remove an lru
         # exception when the locked graph uses a RustSec-declared fixed lru, or when glyphon moves
         # off the affected lru; either change requires renderer requalification. Keep every other

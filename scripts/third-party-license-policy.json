@@ -1,27 +1,27 @@
 {
   "schema": "hydra.third-party-license-policy.v2",
-  "cargo_lock_sha256": "5dc38d6f0875deea16c6911860ed69c2c6e8390e6946d68e52872ea45c596c86",
+  "cargo_lock_sha256": "5c1a6a5750386110a42e7957f36cc4c094205c705780e3ca54c1f17c6aa65ed5",
   "npm_lock_sha256": "f797f86b630338688c0357e0aa9980300d403bb92b768e92dc6457d73a087073",
   "targets": {
     "aarch64-apple-darwin": {
       "family": "macos",
       "cargo_packages": 252,
-      "cargo_closure_sha256": "ab4af8e60bdc5da0ffd029918025b69b1835e45e2e2149e5170d44d095944f89"
+      "cargo_closure_sha256": "14bbb1b02118726e1ec7d7cd307672ebc03fe612068f0f6312ed4b188e214043"
     },
     "x86_64-apple-darwin": {
       "family": "macos",
       "cargo_packages": 252,
-      "cargo_closure_sha256": "ab4af8e60bdc5da0ffd029918025b69b1835e45e2e2149e5170d44d095944f89"
+      "cargo_closure_sha256": "14bbb1b02118726e1ec7d7cd307672ebc03fe612068f0f6312ed4b188e214043"
     },
     "aarch64-unknown-linux-gnu": {
       "family": "linux",
       "cargo_packages": 296,
-      "cargo_closure_sha256": "43ace126583e2accb1e3564b64d110edfd0160602914a6eb2dfbae002806eafe"
+      "cargo_closure_sha256": "bb491cd6fd56b41b4c8cfd4afca321340389095486988c5a7a8a507e4897d599"
     },
     "x86_64-unknown-linux-gnu": {
       "family": "linux",
       "cargo_packages": 296,
-      "cargo_closure_sha256": "43ace126583e2accb1e3564b64d110edfd0160602914a6eb2dfbae002806eafe"
+      "cargo_closure_sha256": "bb491cd6fd56b41b4c8cfd4afca321340389095486988c5a7a8a507e4897d599"
     }
   },
   "npm_runtime": {
@@ -96,7 +96,7 @@
     "gpu-descriptor-types@0.2.0": { "license": "MIT OR Apache-2.0", "text": "Apache-2.0" },
     "hexf-parse@0.2.1": { "license": "CC0-1.0", "text": "CC0-1.0" },
     "malloc_buf@0.0.6": { "license": "MIT", "text": "MIT" },
-    "naga@22.1.0": { "license": "MIT OR Apache-2.0", "text": "Apache-2.0" },
+    "naga@23.1.0": { "license": "MIT OR Apache-2.0", "text": "Apache-2.0" },
     "objc-sys@0.3.5": { "license": "MIT", "text": "MIT" },
     "objc2@0.5.2": { "license": "MIT", "text": "MIT" },
     "objc2@0.6.4": { "license": "MIT", "text": "MIT" },

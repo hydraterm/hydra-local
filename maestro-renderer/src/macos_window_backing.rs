@@ -1,10 +1,10 @@
 //! Opaque AppKit backing beneath macOS's full-window WGPU surface.
 //!
-//! WGPU replaces winit's content-view layer with a `CAMetalLayer`. During a live width resize,
-//! AppKit can expose newly allocated content pixels before the next Metal drawable is presented.
-//! `NSWindow` otherwise supplies its dynamic system background there, which is light in the default
-//! appearance. The backing is not a terminal geometry or presentation owner; it is only the final
-//! opaque fill under the WGPU layer and child WKWebViews.
+//! WGPU 23 keeps winit's content-view layer and presents through a Metal sublayer. During a live
+//! width resize, AppKit can still expose newly allocated content pixels before the next Metal
+//! drawable is presented. `NSWindow` otherwise supplies its dynamic system background there, which
+//! is light in the default appearance. The backing is not a terminal geometry or presentation
+//! owner; it is only the final opaque fill under the WGPU sublayer and child WKWebViews.
 
 use crate::theme::{self, RendererTheme};
 use objc2_app_kit::{NSColor, NSView};

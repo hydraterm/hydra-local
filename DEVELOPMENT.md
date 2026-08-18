@@ -163,7 +163,7 @@ rename them without a reviewed migration.
 CI fails on new Rust soundness advisories. Three exact advisories are reviewed exceptions in the
 locked Linux graphics stack. RUSTSEC-2024-0429 affects `glib::VariantStrIter` methods that Hydra
 does not call. RUSTSEC-2026-0002 affects `lru::LruCache::iter_mut`, which neither Hydra nor locked
-glyphon 0.6 calls. RUSTSEC-2026-0253 affects `lru::LruCache::pop()`; locked glyphon 0.6 calls
+glyphon 0.7 calls. RUSTSEC-2026-0253 affects `lru::LruCache::pop()`; locked glyphon 0.7 calls
 `pop_lru()` rather than `pop()`, and its `GlyphonCacheKey` is `Copy`. That reachability conclusion is
 Hydra's reading of the locked source, not an upstream guarantee.
 
