@@ -52,9 +52,9 @@ mod host_event;
 // Platform-neutral window-service boundary (redraw/size/scale/cursor/title/attention/IME). App routes its
 // outbound window-service calls through the `HostServices` trait so no toolkit type reaches those call sites.
 mod host_services;
-// The full-window macOS CAMetalLayer can trail AppKit's content allocation by one compositor frame
-// during a live resize. Keep the native backing beneath it opaque and theme-dark so that interval
-// cannot expose NSWindow's default light background.
+// The full-window macOS Metal sublayer can trail AppKit's content allocation by one compositor
+// frame during a live resize. Keep the native backing beneath it opaque and theme-dark so that
+// interval cannot expose NSWindow's default light background.
 #[cfg(target_os = "macos")]
 mod macos_window_backing;
 // The macOS winit → HostEvent adapter (preserves the current winit event order/meaning).

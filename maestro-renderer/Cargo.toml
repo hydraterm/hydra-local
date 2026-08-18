@@ -13,8 +13,14 @@ rust-version.workspace = true
 maestro-shell = { path = "../maestro-shell" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-wgpu = "22"
-glyphon = "0.6"
+# WGPU 23 stopped replacing winit's macOS NSView root layer with CAMetalLayer and instead renders
+# into a sublayer. The old layer-hosting path disabled AppKit's draw/update callbacks and could
+# leave event-driven terminal frames cached until a later mouse/scroll window event caused another
+# redraw. Keep this at 23+ unless the macOS redraw qualification is repeated against a successor.
+wgpu = "23"
+# Glyphon 0.7 is the matching text stack for WGPU 23; keeping these on one WGPU generation avoids
+# duplicate device/type graphs and ensures text is rendered into the corrected macOS surface.
+glyphon = "0.7"
 pollster = "0.3"
 bytemuck = { version = "1", features = ["derive"] }
 [target.'cfg(target_os = "macos")'.dependencies]
