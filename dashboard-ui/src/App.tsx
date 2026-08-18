@@ -16,6 +16,7 @@ import { Topbar } from './components/Topbar'
 import { TerminalHost } from './components/TerminalHost'
 import { EmptyState, ErrorState, LoadingState } from './components/States'
 import { AgentBadge } from './components/AgentBadge'
+import { ModelSelector } from './components/ModelSelector'
 import {
   AGENT_PROVIDERS,
   SELECTABLE_AGENT_OPTIONS,
@@ -733,28 +734,6 @@ export function App(): JSX.Element {
       </div>
     </div>
   )
-}
-
-/** Per-agent model options, with the stable model-catalog channel merged OVER the
- * built-in list: 'default' first, then built-ins, then any catalog entries not already present.
- * A missing/empty catalog yields exactly the built-in list, so offline/first-run is unchanged. */
-function agentModelOptions(
-  agent: OverlayAgent,
-  catalog: DashboardModel['model_catalog'],
-): { value: string; label: string }[] {
-  const builtin = OVERLAY_AGENTS[agent].models.map((value) => ({ value, label: value }))
-  const extra = catalog?.agents?.[agent] ?? []
-  if (extra.length === 0) return builtin
-  const seen = new Set(builtin.map((m) => m.value))
-  const merged = [...builtin]
-  for (const value of extra) {
-    const v = value === 'default' ? 'default' : value
-    if (!seen.has(v)) {
-      seen.add(v)
-      merged.push({ value: v, label: v })
-    }
-  }
-  return merged
 }
 
 function OverlayChrome({
@@ -1959,19 +1938,13 @@ function OverlayChrome({
             </div>
             {agent !== 'terminal' && (<>
             <div className="overlay-sublabel overlay-sublabel--spaced">Model</div>
-            <select
-              className="overlay-select"
-              aria-label="Split model"
+            <ModelSelector
+              ariaLabel="Split model"
+              agent={agent}
+              catalog={model.model_catalog}
               value={splitModel}
-              onInput={(e) => selectSplitModel(e.currentTarget.value)}
-              onChange={(e) => selectSplitModel(e.currentTarget.value)}
-            >
-              {agentModelOptions(agent, model.model_catalog).map((model) => (
-                <option key={model.value} value={model.value}>
-                  {model.label}
-                </option>
-              ))}
-            </select>
+              onValue={selectSplitModel}
+            />
             <label className="overlay-check">
               <input
                 type="checkbox"
@@ -2223,19 +2196,13 @@ function OverlayChrome({
               {projectDraft.default_agent !== 'terminal' && (
               <div className="overlay-launch-grid__col overlay-launch-grid__model">
                 <div className="overlay-sublabel">Model</div>
-                <select
-                  className="overlay-select"
-                  aria-label="Default model"
+                <ModelSelector
+                  ariaLabel="Default model"
+                  agent={projectDraft.default_agent}
+                  catalog={model.model_catalog}
                   value={projectDraft.default_model}
-                  onInput={(e) => selectProjectDefaultModel(e.currentTarget.value)}
-                  onChange={(e) => selectProjectDefaultModel(e.currentTarget.value)}
-                >
-                  {agentModelOptions(projectDraft.default_agent, model.model_catalog).map((model) => (
-                    <option key={model.value} value={model.value}>
-                      {model.label}
-                    </option>
-                  ))}
-                </select>
+                  onValue={selectProjectDefaultModel}
+                />
               </div>
               )}
             </div>
@@ -2675,19 +2642,13 @@ function OverlayChrome({
             </div>
           {windowDraft.agent !== 'terminal' && (<>
           <div className="overlay-sublabel overlay-sublabel--spaced">Model</div>
-          <select
-            className="overlay-select"
-            aria-label="Window model"
+          <ModelSelector
+            ariaLabel="Window model"
+            agent={windowDraft.agent}
+            catalog={model.model_catalog}
             value={windowDraft.model}
-            onInput={(e) => selectWindowModel(e.currentTarget.value)}
-            onChange={(e) => selectWindowModel(e.currentTarget.value)}
-          >
-            {agentModelOptions(windowDraft.agent, model.model_catalog).map((m) => (
-              <option key={m.value} value={m.value}>
-                {m.label}
-              </option>
-            ))}
-          </select>
+            onValue={selectWindowModel}
+          />
           <label className="overlay-check">
             <input
               type="checkbox"

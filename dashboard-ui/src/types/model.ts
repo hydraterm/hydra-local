@@ -200,6 +200,17 @@ export interface FilesystemModeMigrationChange {
   rollback_command: string
 }
 
+export interface ModelDeprecation {
+  since_revision: number
+  message: string
+  replacement?: string
+}
+
+export interface ModelCatalog {
+  agents?: Record<string, string[]>
+  deprecations?: Record<string, Record<string, ModelDeprecation>>
+}
+
 interface FilesystemModeMigrationNoticeBase {
   /** Exact capability-bound native notice id. Dashboard actions echo only this id. */
   notice_id: string
@@ -252,7 +263,7 @@ export interface DashboardModel {
   /** Stable model catalog cache: per-agent model lists merged over the
    * built-in dropdown entries, so new vendor models appear without an app release. Null/absent →
    * built-ins only. */
-  model_catalog?: { agents?: Record<string, string[]> } | null
+  model_catalog?: ModelCatalog | null
 }
 
 export type LoadState =
