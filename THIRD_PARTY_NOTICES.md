@@ -4,9 +4,9 @@ Hydra Local is Apache-2.0 licensed. It depends on third-party software under the
 listed below. This inventory is generated from the exact locked Rust and dashboard
 dependency graphs; it does not change or replace any upstream licence.
 
-- `Cargo.lock` SHA-256: `08b7b5a4d1704710329af2ec0c8b50e879da5926ad35c7d9b82915ee2a93cbb4`
-- `dashboard-ui/package-lock.json` SHA-256: `fcd145c1adb7ee07d0a75fed9a5431d917331d196adab83e227ec3419af5a6bf`
-- Rust dependency versions: 547
+- `Cargo.lock` SHA-256: `5c1a6a5750386110a42e7957f36cc4c094205c705780e3ca54c1f17c6aa65ed5`
+- `dashboard-ui/package-lock.json` SHA-256: `f797f86b630338688c0357e0aa9980300d403bb92b768e92dc6457d73a087073`
+- Rust dependency versions: 543
 - npm dependency versions: 197
 
 The source repository does not vendor these dependencies. Package managers retrieve each
@@ -66,9 +66,7 @@ obligation that applies to the exact dependency set they ship.
 | `atomic-waker` | `1.1.2` | `Apache-2.0 OR MIT` | [source](https://github.com/smol-rs/atomic-waker) |
 | `autocfg` | `1.5.1` | `Apache-2.0 OR MIT` | [source](https://github.com/cuviper/autocfg) |
 | `base64` | `0.22.1` | `MIT OR Apache-2.0` | [source](https://github.com/marshallpierce/rust-base64) |
-| `bit-set` | `0.6.0` | `MIT/Apache-2.0` | [source](https://github.com/contain-rs/bit-set) |
 | `bit-set` | `0.8.0` | `Apache-2.0 OR MIT` | [source](https://github.com/contain-rs/bit-set) |
-| `bit-vec` | `0.7.0` | `MIT/Apache-2.0` | [source](https://github.com/contain-rs/bit-vec) |
 | `bit-vec` | `0.8.0` | `Apache-2.0 OR MIT` | [source](https://github.com/contain-rs/bit-vec) |
 | `bitflags` | `1.3.2` | `MIT/Apache-2.0` | [source](https://github.com/bitflags/bitflags) |
 | `bitflags` | `2.13.0` | `MIT OR Apache-2.0` | [source](https://github.com/bitflags/bitflags) |
@@ -93,9 +91,6 @@ obligation that applies to the exact dependency set they ship.
 | `cfg_aliases` | `0.2.1` | `MIT` | [source](https://github.com/katharostech/cfg_aliases) |
 | `clipboard-win` | `5.4.1` | `BSL-1.0` | [source](https://github.com/DoumanAsh/clipboard-win) |
 | `codespan-reporting` | `0.11.1` | `Apache-2.0` | [source](https://github.com/brendanzab/codespan) |
-| `com` | `0.6.0` | `MIT` | [source](https://github.com/microsoft/com-rs) |
-| `com_macros` | `0.6.0` | `MIT` | [source](https://github.com/microsoft/com-rs) |
-| `com_macros_support` | `0.6.0` | `MIT` | [source](https://github.com/microsoft/com-rs) |
 | `combine` | `4.6.7` | `MIT` | [source](https://github.com/Marwes/combine) |
 | `compact_str` | `0.8.2` | `MIT` | [source](https://github.com/ParkMyCar/compact_str) |
 | `concurrent-queue` | `2.5.0` | `Apache-2.0 OR MIT` | [source](https://github.com/smol-rs/concurrent-queue) |
@@ -117,7 +112,6 @@ obligation that applies to the exact dependency set they ship.
 | `cssparser` | `0.36.0` | `MPL-2.0` | [source](https://github.com/servo/rust-cssparser) |
 | `cssparser-macros` | `0.6.1` | `MPL-2.0` | [source](https://github.com/servo/rust-cssparser) |
 | `cursor-icon` | `1.2.0` | `MIT OR Apache-2.0 OR Zlib` | [source](https://github.com/rust-windowing/cursor-icon) |
-| `d3d12` | `22.0.0` | `MIT OR Apache-2.0` | [source](https://github.com/gfx-rs/wgpu/tree/trunk/d3d12) |
 | `deranged` | `0.5.8` | `MIT OR Apache-2.0` | [source](https://github.com/jhpratt/deranged) |
 | `derive_more` | `2.1.1` | `MIT` | [source](https://github.com/JelteF/derive_more) |
 | `derive_more-impl` | `2.1.1` | `MIT` | [source](https://github.com/JelteF/derive_more) |
@@ -189,13 +183,13 @@ obligation that applies to the exact dependency set they ship.
 | `glib` | `0.18.5` | `MIT` | [source](https://github.com/gtk-rs/gtk-rs-core) |
 | `glib-macros` | `0.18.5` | `MIT` | [source](https://github.com/gtk-rs/gtk-rs-core) |
 | `glib-sys` | `0.18.1` | `MIT` | [source](https://github.com/gtk-rs/gtk-rs-core) |
-| `glow` | `0.13.1` | `MIT OR Apache-2.0 OR Zlib` | [source](https://github.com/grovesNL/glow) |
+| `glow` | `0.14.2` | `MIT OR Apache-2.0 OR Zlib` | [source](https://github.com/grovesNL/glow) |
 | `glutin_wgl_sys` | `0.6.1` | `Apache-2.0` | [source](https://github.com/rust-windowing/glutin) |
-| `glyphon` | `0.6.0` | `MIT OR Apache-2.0 OR Zlib` | [source](https://github.com/grovesNL/glyphon) |
+| `glyphon` | `0.7.0` | `MIT OR Apache-2.0 OR Zlib` | [source](https://github.com/grovesNL/glyphon) |
 | `gobject-sys` | `0.18.0` | `MIT` | [source](https://github.com/gtk-rs/gtk-rs-core) |
 | `gpu-alloc` | `0.6.0` | `MIT OR Apache-2.0` | [source](https://github.com/zakarumych/gpu-alloc) |
 | `gpu-alloc-types` | `0.3.0` | `MIT OR Apache-2.0` | [source](https://github.com/zakarumych/gpu-alloc) |
-| `gpu-allocator` | `0.26.0` | `MIT OR Apache-2.0` | [source](https://github.com/Traverse-Research/gpu-allocator) |
+| `gpu-allocator` | `0.27.0` | `MIT OR Apache-2.0` | [source](https://github.com/Traverse-Research/gpu-allocator) |
 | `gpu-descriptor` | `0.3.2` | `MIT OR Apache-2.0` | [source](https://github.com/zakarumych/gpu-descriptor) |
 | `gpu-descriptor-types` | `0.2.0` | `MIT OR Apache-2.0` | [source](https://github.com/zakarumych/gpu-descriptor) |
 | `gtk` | `0.18.2` | `MIT` | [source](https://github.com/gtk-rs/gtk3-rs) |
@@ -205,7 +199,6 @@ obligation that applies to the exact dependency set they ship.
 | `hashbrown` | `0.15.5` | `MIT OR Apache-2.0` | [source](https://github.com/rust-lang/hashbrown) |
 | `hashbrown` | `0.17.1` | `MIT OR Apache-2.0` | [source](https://github.com/rust-lang/hashbrown) |
 | `hashlink` | `0.9.1` | `MIT OR Apache-2.0` | [source](https://github.com/kyren/hashlink) |
-| `hassle-rs` | `0.11.0` | `MIT` | [source](https://github.com/Traverse-Research/hassle-rs) |
 | `heck` | `0.4.1` | `MIT OR Apache-2.0` | [source](https://github.com/withoutboats/heck) |
 | `heck` | `0.5.0` | `MIT OR Apache-2.0` | [source](https://github.com/withoutboats/heck) |
 | `hermit-abi` | `0.5.2` | `MIT OR Apache-2.0` | [source](https://github.com/hermit-os/hermit-rs) |
@@ -263,7 +256,7 @@ obligation that applies to the exact dependency set they ship.
 | `metal` | `0.29.0` | `MIT OR Apache-2.0` | [source](https://github.com/gfx-rs/metal-rs) |
 | `mio` | `1.2.1` | `MIT` | [source](https://github.com/tokio-rs/mio) |
 | `miow` | `0.6.1` | `MIT OR Apache-2.0` | [source](https://github.com/yoshuawuyts/miow) |
-| `naga` | `22.1.0` | `MIT OR Apache-2.0` | [source](https://github.com/gfx-rs/wgpu/tree/trunk/naga) |
+| `naga` | `23.1.0` | `MIT OR Apache-2.0` | [source](https://github.com/gfx-rs/wgpu/tree/trunk/naga) |
 | `ndk` | `0.9.0` | `MIT OR Apache-2.0` | [source](https://github.com/rust-mobile/ndk) |
 | `ndk-context` | `0.1.1` | `MIT OR Apache-2.0` | [source](https://github.com/rust-windowing/android-ndk-rs) |
 | `ndk-sys` | `0.5.0+25.2.9519653` | `MIT OR Apache-2.0` | [source](https://github.com/rust-mobile/ndk) |
@@ -501,27 +494,30 @@ obligation that applies to the exact dependency set they ship.
 | `webview2-com` | `0.38.2` | `MIT` | [source](https://github.com/wravery/webview2-rs) |
 | `webview2-com-macros` | `0.8.1` | `MIT` | [source](https://github.com/wravery/webview2-rs) |
 | `webview2-com-sys` | `0.38.2` | `MIT` | [source](https://github.com/wravery/webview2-rs) |
-| `wgpu` | `22.1.0` | `MIT OR Apache-2.0` | [source](https://github.com/gfx-rs/wgpu) |
-| `wgpu-core` | `22.1.0` | `MIT OR Apache-2.0` | [source](https://github.com/gfx-rs/wgpu) |
-| `wgpu-hal` | `22.0.0` | `MIT OR Apache-2.0` | [source](https://github.com/gfx-rs/wgpu) |
-| `wgpu-types` | `22.0.0` | `MIT OR Apache-2.0` | [source](https://github.com/gfx-rs/wgpu) |
-| `widestring` | `1.2.1` | `MIT OR Apache-2.0` | [source](https://github.com/VoidStarKat/widestring-rs) |
+| `wgpu` | `23.0.1` | `MIT OR Apache-2.0` | [source](https://github.com/gfx-rs/wgpu) |
+| `wgpu-core` | `23.0.1` | `MIT OR Apache-2.0` | [source](https://github.com/gfx-rs/wgpu) |
+| `wgpu-hal` | `23.0.1` | `MIT OR Apache-2.0` | [source](https://github.com/gfx-rs/wgpu) |
+| `wgpu-types` | `23.0.0` | `MIT OR Apache-2.0` | [source](https://github.com/gfx-rs/wgpu) |
 | `winapi` | `0.3.9` | `MIT/Apache-2.0` | [source](https://github.com/retep998/winapi-rs) |
 | `winapi-i686-pc-windows-gnu` | `0.4.0` | `MIT/Apache-2.0` | [source](https://github.com/retep998/winapi-rs) |
 | `winapi-util` | `0.1.11` | `Unlicense OR MIT` | [source](https://github.com/BurntSushi/winapi-util) |
 | `winapi-x86_64-pc-windows-gnu` | `0.4.0` | `MIT/Apache-2.0` | [source](https://github.com/retep998/winapi-rs) |
-| `windows` | `0.52.0` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
+| `windows` | `0.58.0` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
 | `windows` | `0.61.3` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
 | `windows-collections` | `0.2.0` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
-| `windows-core` | `0.52.0` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
+| `windows-core` | `0.58.0` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
 | `windows-core` | `0.61.2` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
 | `windows-future` | `0.2.1` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
+| `windows-implement` | `0.58.0` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
 | `windows-implement` | `0.60.2` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
+| `windows-interface` | `0.58.0` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
 | `windows-interface` | `0.59.3` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
 | `windows-link` | `0.1.3` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
 | `windows-link` | `0.2.1` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
 | `windows-numerics` | `0.2.0` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
+| `windows-result` | `0.2.0` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
 | `windows-result` | `0.3.4` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
+| `windows-strings` | `0.1.0` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
 | `windows-strings` | `0.4.2` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
 | `windows-sys` | `0.45.0` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
 | `windows-sys` | `0.52.0` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
