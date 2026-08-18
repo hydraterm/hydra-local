@@ -8,6 +8,16 @@ recorded.*
 Hydra is a local-first terminal desktop for working with terminal sessions and coding agents.
 Projects, windows, panes, terminal history and retained PTY sessions live on your machine.
 
+## Start here
+
+- [Frequently asked questions](FAQ.md) — tmux, Electron, retention, Remote, security and Herdr.
+- [Architecture](docs/architecture.md) — PTY ownership, native rendering, dashboard composition and
+  the macOS/Linux host split.
+- [Troubleshooting](TROUBLESHOOTING.md) — local-data migration, agent discovery and Linux display
+  backends.
+- [Development](DEVELOPMENT.md) and [contributing](CONTRIBUTING.md) — build, test and contribution
+  contracts.
+
 ## Install
 
 Official macOS package:

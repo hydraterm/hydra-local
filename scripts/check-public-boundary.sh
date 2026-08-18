@@ -59,8 +59,9 @@ reviewed_binary_files = {
 allowed_root_entries = {
     ".editorconfig", ".git", ".github", ".gitignore", ".nvmrc", ".python-version",
     "CODE_OF_CONDUCT.md", "CONTRIBUTING.md", "Cargo.lock", "Cargo.toml",
-    "DCO.md", "DEVELOPMENT.md", "LICENSE", "README.md", "SECURITY.md", "THIRD_PARTY_NOTICES.md",
-    "TRADEMARKS.md", "dashboard-ui", "docs", "hydra-launcher", "maestro-app",
+    "DCO.md", "DEVELOPMENT.md", "FAQ.md", "LICENSE", "README.md", "SECURITY.md",
+    "THIRD_PARTY_NOTICES.md", "TRADEMARKS.md", "TROUBLESHOOTING.md", "dashboard-ui", "docs",
+    "hydra-launcher", "maestro-app",
     "maestro-extension-api", "maestro-local-services", "maestro-protocol",
     "maestro-renderer", "maestro-shell", "packaging", "pty-daemon", "rust-toolchain.toml",
     "scripts",
@@ -70,6 +71,7 @@ if unexpected_root:
     raise SystemExit(f"public-boundary: ERROR: unexpected top-level entries: {unexpected_root}")
 
 allowed_docs = {
+    "architecture.md",
     "assets/hydra-local-demo.gif",
     "public-private-boundary.md",
     "third-party-licensing.md",
