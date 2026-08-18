@@ -103,8 +103,8 @@ use client::{
     command_palette_escape_dismisses, command_palette_nav, compute_dims_with_chrome_rows,
     encode_focus, encode_key, encode_mouse, extract_selection, next_view_offset,
     pixel_to_cell_with_top_offset, plan_attach_switch, reset_session_state, scroll_key_action_for,
-    CellPos, CommandPaletteNavKey, MouseButton as MouseBtn, MouseEvent as MouseEv, ResizeCoalescer,
-    ScrollAction, ScrollKey, Shared, TermModes, WheelAccumulator,
+    wheel_route, CellPos, CommandPaletteNavKey, MouseButton as MouseBtn, MouseEvent as MouseEv,
+    ResizeCoalescer, ScrollAction, ScrollKey, Shared, TermModes, WheelAccumulator, WheelRoute,
 };
 #[cfg(not(target_os = "linux"))]
 use client::{paste_payload, Clipboard, SystemClipboard};
@@ -14238,6 +14238,13 @@ impl App {
                 }
             }
             HostEvent::MouseWheel { delta } => {
+                // A wheel gesture targets the pane under the pointer. Reset fractional carry when
+                // focus changes so a sub-line gesture accumulated over one pane cannot trigger a
+                // line in another pane.
+                let focus_changed = self.focus_pane_under_cursor();
+                if focus_changed {
+                    self.wheel = WheelAccumulator::default();
+                }
                 // Positive y = scroll UP into history (winit: positive y reveals content
                 // above). Accumulate sub-line deltas so a slow trackpad scroll (a stream of
                 // <16px PixelDelta events) eventually crosses a line boundary instead of
@@ -14247,26 +14254,41 @@ impl App {
                     HostScrollDelta::Pixels { y, .. } => self.wheel.add_pixels(y),
                 };
                 if lines == 0 {
-                    return HostControl::Continue;
-                }
-                let focus_changed = self.focus_pane_under_cursor();
-                // TUI mouse reporting: forward wheel as button-64/65 reports (one per line
-                // step) so pagers/editors scroll, instead of moving the renderer scrollback.
-                if self.mouse_reporting_active() {
-                    let ev = if lines > 0 {
-                        MouseEv::WheelUp
-                    } else {
-                        MouseEv::WheelDown
-                    };
-                    for _ in 0..lines.unsigned_abs().min(16) {
-                        self.report_mouse(ev);
-                    }
                     if focus_changed {
                         self.request_redraw();
                     }
                     return HostControl::Continue;
                 }
-                self.apply_scroll(ScrollAction::Lines(lines));
+
+                let alt_screen = self.live_view_geometry().is_some_and(|(alt, _)| alt);
+                match wheel_route(lines, alt_screen, self.mouse_reporting_active()) {
+                    WheelRoute::NoOp => {}
+                    // TUI mouse reporting: forward button-64/65 reports when the application
+                    // explicitly negotiated them. This remains higher priority than fallback.
+                    WheelRoute::MouseReport { event, steps } => {
+                        for _ in 0..steps {
+                            self.report_mouse(event);
+                        }
+                    }
+                    // Xterm-compatible alternate-scroll fallback: a full-screen application that
+                    // did not enable mouse reporting receives bounded cursor keys. Encode once under
+                    // the pane's live DECCKM mode and send one atomic Write to avoid a wheel burst
+                    // producing many queue entries on the UI thread.
+                    WheelRoute::AlternateScroll { key, steps } => {
+                        if let Some(seq) = encode_key(
+                            &HostKey::Named(key),
+                            None,
+                            None,
+                            &HostModifiers::default(),
+                            self.current_modes(),
+                        ) {
+                            self.write_to_pty(seq.repeat(usize::from(steps)));
+                        }
+                    }
+                    WheelRoute::RendererScroll(action) => {
+                        self.apply_scroll(action);
+                    }
+                }
                 if focus_changed {
                     self.request_redraw();
                 }
