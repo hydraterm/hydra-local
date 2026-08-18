@@ -4731,18 +4731,25 @@ fn respond_react_launch_preflight(
     result: Result<(), launch_preflight::LaunchPreflightError>,
 ) {
     let request_json = serde_json::to_string(request_id).expect("request id serializes");
-    let (ok, message) = match result {
-        Ok(()) => (true, None),
-        Err(error) => (false, Some(error.user_message())),
-    };
+    let (ok, code, message) = react_launch_preflight_response_fields(result);
+    let code_json = serde_json::to_string(&code).expect("preflight code serializes");
     let message_json = serde_json::to_string(&message).expect("preflight message serializes");
     let script = format!(
-        "if (window.__HYDRA_DASHBOARD_RESOLVE_LAUNCH_PREFLIGHT__) {{ window.__HYDRA_DASHBOARD_RESOLVE_LAUNCH_PREFLIGHT__({request_json}, {ok}, {message_json}); }}"
+        "if (window.__HYDRA_DASHBOARD_RESOLVE_LAUNCH_PREFLIGHT__) {{ window.__HYDRA_DASHBOARD_RESOLVE_LAUNCH_PREFLIGHT__({request_json}, {ok}, {message_json}, {code_json}); }}"
     );
     if let Err(error) = tab_runtime.evaluate_react_chrome_script(script) {
         eprintln!(
             "attach-tab: React launch preflight response failed request={request_id:?} (non-fatal): {error}"
         );
+    }
+}
+
+fn react_launch_preflight_response_fields(
+    result: Result<(), launch_preflight::LaunchPreflightError>,
+) -> (bool, Option<&'static str>, Option<String>) {
+    match result {
+        Ok(()) => (true, None, None),
+        Err(error) => (false, Some(error.code()), Some(error.user_message())),
     }
 }
 
@@ -16717,9 +16724,26 @@ mod terminal_agent_resolves_to_shell {
 
 #[cfg(test)]
 mod react_create_daemon_preflight_tests {
-    use super::{launch_preflight::LaunchPreflightError, validate_react_daemon_mutation_protocol};
+    use super::{
+        launch_preflight::{LaunchPreflightError, SupportedAgentExecutable},
+        react_launch_preflight_response_fields, validate_react_daemon_mutation_protocol,
+    };
     use std::io::{BufRead, Read, Write};
     use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn react_preflight_response_preserves_the_stable_error_code() {
+        let (ok, code, message) = react_launch_preflight_response_fields(Err(
+            LaunchPreflightError::Missing(SupportedAgentExecutable::Claude),
+        ));
+        assert!(!ok);
+        assert_eq!(code, Some("agent_executable_missing"));
+        assert!(message.is_some_and(|value| value.contains("Claude")));
+        assert_eq!(
+            react_launch_preflight_response_fields(Ok(())),
+            (true, None, None)
+        );
+    }
 
     #[test]
     fn retained_v1_is_rejected_after_only_a_non_mutating_identity_request() {

@@ -223,13 +223,14 @@ declare global {
       requestId: string,
       ok: boolean,
       message: string | null,
+      code?: unknown,
     ) => void
     __HYDRA_DASHBOARD_APPLY_SIDEBAR_STATE__?: (state: NativeSidebarState) => void
     __HYDRA_PENDING_SIDEBAR_STATE__?: NativeSidebarState
   }
 }
 
-export type LaunchPreflightResult = { ok: boolean; message: string | null }
+export type LaunchPreflightResult = { ok: boolean; message: string | null; code: string | null }
 export type NativeSidebarState = {
   width_logical_px: number
   last_expanded_width_logical_px: number
@@ -276,6 +277,7 @@ const launchPreflightRequests = new Map<
 
 const LAUNCH_PREFLIGHT_TIMEOUT_MS = 8_000
 const LAUNCH_PREFLIGHT_MESSAGE_MAX = 320
+const LAUNCH_PREFLIGHT_CODE_MAX = 64
 const SIDEBAR_NATIVE_MIN = 24
 const SIDEBAR_NATIVE_MAX = 720
 let latestNativeSidebarState: NativeSidebarState | null = null
@@ -361,12 +363,21 @@ function installFolderSessionResolvers(): void {
 
 function installLaunchPreflightResolver(): void {
   if (typeof window === 'undefined') return
-  window.__HYDRA_DASHBOARD_RESOLVE_LAUNCH_PREFLIGHT__ = (requestId, ok, message) => {
+  window.__HYDRA_DASHBOARD_RESOLVE_LAUNCH_PREFLIGHT__ = (requestId, ok, message, code) => {
     const pending = launchPreflightRequests.get(requestId)
     if (!pending) return
     launchPreflightRequests.delete(requestId)
     window.clearTimeout(pending.timeoutId)
-    pending.resolve({ ok: Boolean(ok), message: boundedPreflightMessage(message) })
+    pending.resolve({
+      ok: Boolean(ok),
+      message: boundedPreflightMessage(message),
+      code:
+        typeof code === 'string' &&
+        code.length <= LAUNCH_PREFLIGHT_CODE_MAX &&
+        /^[a-z0-9_]+$/.test(code)
+          ? code
+          : null,
+    })
   }
 }
 
@@ -559,7 +570,7 @@ export const bridge = {
     // Project creation without an initial session has no launch to validate.
     // Terminal launches still go native so the working directory is checked.
     if (!resolved_launch_command && !selectedAgent) {
-      return { ok: true, message: null }
+      return { ok: true, message: null, code: null }
     }
 
     const canPostNative = Boolean(
@@ -573,7 +584,7 @@ export const bridge = {
         resolved_launch_command,
         cwd: input.cwd?.trim() || undefined,
       })
-      return { ok: true, message: null }
+      return { ok: true, message: null, code: null }
     }
 
     // Tests and dynamically-installed development hosts can replace `window`
@@ -588,6 +599,7 @@ export const bridge = {
         resolve({
           ok: false,
           message: 'Hydra could not verify that launch command. Check the desktop app and try again.',
+          code: null,
         })
       }, LAUNCH_PREFLIGHT_TIMEOUT_MS)
       launchPreflightRequests.set(request_id, { resolve, timeoutId })

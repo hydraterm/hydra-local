@@ -23,6 +23,7 @@ type OverlayTestWindow = Window & {
     requestId: string,
     ok: boolean,
     message: string | null,
+    code?: string | null,
   ) => void
 }
 
@@ -1225,6 +1226,7 @@ describe('lazy native overlay model delivery', () => {
               String(intent.request_id),
               false,
               `Executable claude was not found. ${'x'.repeat(500)}`,
+              'agent_executable_missing',
             )
           }
         },
@@ -1264,9 +1266,12 @@ describe('lazy native overlay model delivery', () => {
     expect(renderer!.root.findByProps({ 'aria-label': 'New project' })).toBeTruthy()
     const alert = renderer!.root.findByProps({ role: 'alert' })
     const message = alert.children.join('')
-    expect(message).toContain('Executable claude was not found.')
+    expect(message).toContain('Claude')
+    expect(message).toContain('`claude`')
+    expect(message).toContain('`command -v claude`')
+    expect(message).toContain('choose Terminal')
+    expect(message).not.toContain('Executable claude was not found.')
     expect(message.length).toBeLessThanOrEqual(320)
-    expect(message.endsWith('…')).toBe(true)
     const readyButton = renderer!.root
       .findAllByType('button')
       .find((node) => node.children.join('') === 'Create')!
