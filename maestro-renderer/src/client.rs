@@ -185,6 +185,22 @@ impl ScrollbackState {
     }
 }
 
+/// A primary/alternate screen transition invalidates any renderer-owned historical viewport.
+/// Initial publication has no previous screen to invalidate; ordinary damage on the same screen
+/// must preserve the user's current normal-screen history position.
+fn reset_scrollback_for_screen_transition(
+    previous_alt_screen: Option<bool>,
+    next_alt_screen: bool,
+    scrollback: &mut ScrollbackState,
+) -> bool {
+    if previous_alt_screen.is_some_and(|previous| previous != next_alt_screen) {
+        scrollback.reset_to_live();
+        true
+    } else {
+        false
+    }
+}
+
 /// Clamp a desired view offset against the KNOWN history length, if any.
 /// - `Some(n)`: clamp into `[0, n]` (the authoritative bound the daemon also enforces).
 /// - `None` (length not yet known): clamp into `[0, provisional_cap]`. This lets the
@@ -327,6 +343,64 @@ impl WheelAccumulator {
         self.residue -= whole;
         whole as i64
     }
+}
+
+/// Maximum number of terminal or renderer line steps one host wheel event may produce.
+/// Precision trackpads can occasionally deliver a large momentum delta; bounding it keeps
+/// alternate-screen key fallback and normal scrollback work proportional per event while the
+/// remaining gesture events continue to arrive normally.
+pub const MAX_WHEEL_STEPS_PER_EVENT: i64 = 16;
+
+/// One resolved wheel action after fractional deltas have accumulated into whole lines.
+///
+/// This is the single policy boundary for wheel routing:
+///
+/// - negotiated terminal mouse reporting wins;
+/// - an alternate-screen application without mouse reporting receives conventional Up/Down
+///   cursor-key input;
+/// - a normal-screen pane moves the renderer-owned scrollback viewport;
+/// - a sub-line gesture that has not accumulated to one line is a no-op.
+///
+/// The route carries an already bounded step count so no platform adapter or caller can drift on
+/// direction or caps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WheelRoute {
+    NoOp,
+    MouseReport { event: MouseEvent, steps: u8 },
+    AlternateScroll { key: HostNamedKey, steps: u8 },
+    RendererScroll(ScrollAction),
+}
+
+/// Resolve whole wheel lines into exactly one bounded route. Positive lines mean scrolling up;
+/// negative lines mean scrolling down. Mouse reporting takes precedence even on the alternate
+/// screen, matching xterm-compatible applications that explicitly opted into wheel reports.
+pub fn wheel_route(lines: i64, alt_screen: bool, mouse_reporting: bool) -> WheelRoute {
+    let lines = lines.clamp(-MAX_WHEEL_STEPS_PER_EVENT, MAX_WHEEL_STEPS_PER_EVENT);
+    if lines == 0 {
+        return WheelRoute::NoOp;
+    }
+    let steps = lines.unsigned_abs() as u8;
+    if mouse_reporting {
+        return WheelRoute::MouseReport {
+            event: if lines > 0 {
+                MouseEvent::WheelUp
+            } else {
+                MouseEvent::WheelDown
+            },
+            steps,
+        };
+    }
+    if alt_screen {
+        return WheelRoute::AlternateScroll {
+            key: if lines > 0 {
+                HostNamedKey::ArrowUp
+            } else {
+                HostNamedKey::ArrowDown
+            },
+            steps,
+        };
+    }
+    WheelRoute::RendererScroll(ScrollAction::Lines(lines))
 }
 
 /// The four navigation keys that may drive renderer scrollback. The caller maps a
@@ -714,6 +788,25 @@ impl Shared {
         self.active.lock().unwrap().clone()
     }
 
+    /// Publish one accepted active-session grid and clear a historical viewport when the terminal
+    /// switches between the primary and alternate screens. Grid and scrollback remain separately
+    /// locked and are never held across each other; the draw path independently refuses history
+    /// over an alternate grid, so the short publication/reset interval cannot paint stale history.
+    pub fn publish_primary_grid(&self, grid: Arc<GridSnapshot>) {
+        let next_alt_screen = grid.alt_screen;
+        let previous_alt_screen = {
+            let mut held = self.grid.lock().unwrap();
+            let previous_alt_screen = held.as_ref().map(|previous| previous.alt_screen);
+            *held = Some(grid);
+            previous_alt_screen
+        };
+        reset_scrollback_for_screen_transition(
+            previous_alt_screen,
+            next_alt_screen,
+            &mut self.scrollback.lock().unwrap(),
+        );
+    }
+
     /// Initialize the active session to `id` at epoch 0 — the attach the reader does
     /// at spawn. Called ONCE before the reader thread starts so the first
     /// `sync_active_session` is a no-op (the reader's local epoch already matches).
@@ -838,6 +931,11 @@ impl Shared {
         let mut stores = self.stores.lock().unwrap();
         match stores.get_mut(for_id) {
             Some(entry) if entry.kind == PaneKind::Sibling && entry.epoch == for_epoch => {
+                reset_scrollback_for_screen_transition(
+                    entry.grid.as_ref().map(|previous| previous.alt_screen),
+                    grid.alt_screen,
+                    &mut entry.scrollback,
+                );
                 entry.grid = Some(grid);
                 true
             }
@@ -1081,6 +1179,11 @@ impl Shared {
         let mut stores = self.stores.lock().unwrap();
         match stores.get_mut(id) {
             Some(entry) if entry.kind == PaneKind::Pane && entry.epoch == for_epoch => {
+                reset_scrollback_for_screen_transition(
+                    entry.grid.as_ref().map(|previous| previous.alt_screen),
+                    grid.alt_screen,
+                    &mut entry.scrollback,
+                );
                 entry.grid = Some(grid);
                 true
             }
@@ -1869,7 +1972,7 @@ fn handle_event(
                     if outcome.repaint {
                         let rev = grid.revision;
                         *shared.last_revision.lock().unwrap() = Some((rev, Instant::now()));
-                        *shared.grid.lock().unwrap() = Some(Arc::new(grid));
+                        shared.publish_primary_grid(Arc::new(grid));
                         wake(proxy);
                     }
                     if outcome.request_snapshot {
@@ -1943,7 +2046,7 @@ fn handle_event(
                 DamageOutcome::Applied(grid) => {
                     let rev = grid.revision;
                     *shared.last_revision.lock().unwrap() = Some((rev, Instant::now()));
-                    *shared.grid.lock().unwrap() = Some(Arc::from(grid));
+                    shared.publish_primary_grid(Arc::from(grid));
                     wake(proxy);
                 }
                 DamageOutcome::Ignore => {
@@ -5338,6 +5441,83 @@ mod scrollback_view_tests {
         let down = w2.add_pixels(-32.0);
         assert!(down < 0, "negative delta is down toward live");
     }
+
+    #[test]
+    fn wheel_route_mouse_reporting_precedes_alternate_fallback() {
+        assert_eq!(
+            wheel_route(3, true, true),
+            WheelRoute::MouseReport {
+                event: MouseEvent::WheelUp,
+                steps: 3,
+            }
+        );
+        assert_eq!(
+            wheel_route(-2, true, true),
+            WheelRoute::MouseReport {
+                event: MouseEvent::WheelDown,
+                steps: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn wheel_route_alt_screen_without_mouse_uses_cursor_keys() {
+        assert_eq!(
+            wheel_route(4, true, false),
+            WheelRoute::AlternateScroll {
+                key: HostNamedKey::ArrowUp,
+                steps: 4,
+            }
+        );
+        assert_eq!(
+            wheel_route(-5, true, false),
+            WheelRoute::AlternateScroll {
+                key: HostNamedKey::ArrowDown,
+                steps: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn wheel_route_normal_screen_uses_bounded_renderer_scrollback() {
+        assert_eq!(
+            wheel_route(3, false, false),
+            WheelRoute::RendererScroll(ScrollAction::Lines(3))
+        );
+        assert_eq!(
+            wheel_route(i64::MAX, false, false),
+            WheelRoute::RendererScroll(ScrollAction::Lines(MAX_WHEEL_STEPS_PER_EVENT))
+        );
+        assert_eq!(
+            wheel_route(i64::MIN, false, false),
+            WheelRoute::RendererScroll(ScrollAction::Lines(-MAX_WHEEL_STEPS_PER_EVENT))
+        );
+        assert_eq!(wheel_route(0, true, true), WheelRoute::NoOp);
+    }
+
+    #[test]
+    fn alternate_scroll_keys_honor_application_cursor_mode() {
+        let plain = encode_key(
+            &HostKey::Named(HostNamedKey::ArrowUp),
+            None,
+            None,
+            &HostModifiers::default(),
+            TermModes::default(),
+        );
+        assert_eq!(plain.as_deref(), Some("\x1b[A"));
+
+        let application = encode_key(
+            &HostKey::Named(HostNamedKey::ArrowUp),
+            None,
+            None,
+            &HostModifiers::default(),
+            TermModes {
+                app_cursor: true,
+                ..TermModes::default()
+            },
+        );
+        assert_eq!(application.as_deref(), Some("\x1bOA"));
+    }
 }
 
 #[cfg(test)]
@@ -6069,6 +6249,78 @@ mod rebind_tests {
         assert!(shared.sibling_snapshot().grid.is_some());
         let after = shared.grid.lock().unwrap().clone();
         assert!(Arc::ptr_eq(&active_before.unwrap(), &after.unwrap()));
+    }
+
+    #[test]
+    fn primary_screen_transition_resets_only_stale_scrollback_view() {
+        let shared = Arc::new(Shared::default());
+        shared.publish_primary_grid(Arc::new(grid("gen-active", 1)));
+        shared.scrollback.lock().unwrap().view_offset = 7;
+
+        // Ordinary primary-screen damage preserves the user's historical position.
+        shared.publish_primary_grid(Arc::new(grid("gen-active", 2)));
+        assert_eq!(shared.scrollback.lock().unwrap().view_offset, 7);
+
+        // Entering alternate screen invalidates that renderer-owned historical viewport.
+        let mut alt = grid("gen-active", 3);
+        alt.alt_screen = true;
+        shared.publish_primary_grid(Arc::new(alt));
+        assert_eq!(shared.scrollback.lock().unwrap().view_offset, 0);
+
+        // Defensive symmetry: a stale offset cannot survive the transition back either.
+        shared.scrollback.lock().unwrap().view_offset = 5;
+        shared.publish_primary_grid(Arc::new(grid("gen-active", 4)));
+        assert_eq!(shared.scrollback.lock().unwrap().view_offset, 0);
+    }
+
+    #[test]
+    fn sibling_screen_transition_resets_its_own_scrollback_only() {
+        let shared = Arc::new(Shared::default());
+        let epoch = shared.set_sibling_session("s-sib");
+        assert!(shared.apply_sibling_grid("s-sib", epoch, Arc::new(grid("gen-sib", 1))));
+        shared.with_pane_scrollback("s-sib", "s-active", |sb| sb.view_offset = 9);
+        shared.scrollback.lock().unwrap().view_offset = 4;
+
+        let mut alt = grid("gen-sib", 2);
+        alt.alt_screen = true;
+        assert!(shared.apply_sibling_grid("s-sib", epoch, Arc::new(alt)));
+
+        assert_eq!(
+            shared.with_pane_scrollback("s-sib", "s-active", |sb| sb.view_offset),
+            0,
+            "sibling transition clears the sibling viewport"
+        );
+        assert_eq!(
+            shared.scrollback.lock().unwrap().view_offset,
+            4,
+            "sibling transition never clears the primary viewport"
+        );
+    }
+
+    #[test]
+    fn extra_pane_screen_transition_resets_that_pane_only() {
+        let shared = Arc::new(Shared::default());
+        shared.set_pane_sessions(&["pane-b", "pane-c"]);
+        let epoch_b = shared.pane_epoch("pane-b").unwrap();
+        let epoch_c = shared.pane_epoch("pane-c").unwrap();
+        assert!(shared.apply_pane_grid("pane-b", epoch_b, Arc::new(grid("gen-b", 1))));
+        assert!(shared.apply_pane_grid("pane-c", epoch_c, Arc::new(grid("gen-c", 1))));
+        shared.with_pane_scrollback("pane-b", "primary", |sb| sb.view_offset = 6);
+        shared.with_pane_scrollback("pane-c", "primary", |sb| sb.view_offset = 8);
+
+        let mut alt = grid("gen-b", 2);
+        alt.alt_screen = true;
+        assert!(shared.apply_pane_grid("pane-b", epoch_b, Arc::new(alt)));
+
+        assert_eq!(
+            shared.with_pane_scrollback("pane-b", "primary", |sb| sb.view_offset),
+            0
+        );
+        assert_eq!(
+            shared.with_pane_scrollback("pane-c", "primary", |sb| sb.view_offset),
+            8,
+            "another pane's transition cannot leak into this pane"
+        );
     }
 
     #[test]
