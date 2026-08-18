@@ -2131,6 +2131,12 @@ body.is-overlay-chrome #root {
   color: var(--text-faint);
   font-size: 11px;
 }
+.overlay-model-deprecation {
+  margin: 6px 0 0;
+  color: #f0b35b;
+  font-size: 11px;
+  line-height: 1.4;
+}
 .overlay-select {
   width: 100%;
 }
