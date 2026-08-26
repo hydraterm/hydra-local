@@ -4,7 +4,7 @@ Hydra Local is Apache-2.0 licensed. It depends on third-party software under the
 listed below. This inventory is generated from the exact locked Rust and dashboard
 dependency graphs; it does not change or replace any upstream licence.
 
-- `Cargo.lock` SHA-256: `97e8050f33ee0054d97f269f80fbd26b6206ec81f2143a2e7ccd5bb038550968`
+- `Cargo.lock` SHA-256: `c93e103136f24c8987191887f79f2ba54be7ed6dbfdec874754105f2a70abeed`
 - `dashboard-ui/package-lock.json` SHA-256: `f797f86b630338688c0357e0aa9980300d403bb92b768e92dc6457d73a087073`
 - Rust dependency versions: 543
 - npm dependency versions: 197

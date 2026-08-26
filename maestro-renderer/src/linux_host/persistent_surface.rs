@@ -23,7 +23,7 @@ use super::recovery::{
 use super::wake::{webkit_recovery_sender, LinuxLoopEvent};
 pub(super) use crate::dashboard_protocol::DashboardAssetServing as ChromeServing;
 use crate::dashboard_protocol::DASHBOARD_PROTOCOL_SCHEME;
-use crate::{RendererEvent, UserEvent};
+use crate::{RendererEvent, UserEvent, ViewportEventSink};
 
 /// Installed at document-start, before the bundled dashboard runs. WebKit accessibility can retain
 /// a remote action for a DOM control after its native GTK WebView becomes insensitive. While the
@@ -142,7 +142,7 @@ impl PersistentChromeSurface {
         initialization_script: String,
         web_context: &Rc<RefCell<wry::WebContext>>,
         mount: PersistentMount<'_>,
-        events: Option<std::sync::mpsc::Sender<RendererEvent>>,
+        events: Option<ViewportEventSink>,
         wake_proxy: EventLoopProxy<LinuxLoopEvent>,
         input_gate: Rc<PersistentInputGate>,
     ) -> Self {
@@ -295,7 +295,7 @@ fn mount_webview(
     initialization_script: String,
     web_context: &Rc<RefCell<wry::WebContext>>,
     mount: PersistentMount<'_>,
-    events: Option<std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<ViewportEventSink>,
     wake_proxy: EventLoopProxy<LinuxLoopEvent>,
     tracker: Rc<RefCell<RecoverySignalTracker>>,
     input_gate: Rc<PersistentInputGate>,

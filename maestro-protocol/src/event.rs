@@ -1,9 +1,10 @@
 //! A LIGHTWEIGHT shell-side decoder for the few daemon events the app-shell client needs,
 //! deliberately decoupled from the daemon's full `DaemonEvent`/`GridSnapshot`/`Cell` types.
 //!
-//! The app shell first proves mutation compatibility with `DaemonInfo`, then drives one
-//! `StartSession -> Attach{want_raw_output:false} -> Grid` flow plus `ListSessions`, and watches
-//! for end-of-session. To do that it only needs five events:
+//! The app shell first proves mutation compatibility with `DaemonInfo`, reserves a content-blind
+//! operation tuple, then drives one `StartSession -> Attach{want_raw_output:false} -> Grid` flow
+//! plus `ListSessions`, and watches for end-of-session. Its lightweight mirror also carries the
+//! typed operation-ledger acknowledgements needed for exact recovery and retirement.
 //! - `DaemonInfo` — the read-only protocol/build identity used to keep retained older daemons
 //!   attach-compatible while making session creation fail closed.
 //! - `Grid`     — the attach/snapshot baseline. The shell flips `status=Live` and captures the
@@ -21,7 +22,8 @@
 //! to the shell's needs.
 
 use crate::ids::SessionId;
-use serde::Deserialize;
+use crate::request::{AttachmentHandoffToken, DaemonInstanceId, SessionStartOperationToken};
+use serde::{Deserialize, Serialize};
 
 /// Lightweight live-session identity from the daemon's additive `sessions` metadata. Older
 /// retained daemons omit the vector entirely; newer daemons include a generation so reconciliation
@@ -33,7 +35,99 @@ pub struct SessionListInfo {
     pub generation: Option<String>,
 }
 
-/// The subset of daemon events a shell client acts on. Tagged by the same `ev` field the
+/// Why a generation-conditional `StartSession` made no daemon-map mutation.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConditionalSessionStartRefusal {
+    AttachmentInUse,
+    PreconditionFailed,
+    SpawnFailed,
+}
+
+/// Why a content-blind start-operation reservation was refused without adding a ledger entry.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStartOperationReserveRefusal {
+    InvalidSessionId,
+    LedgerFull,
+    TokenInUse,
+    AlreadyTerminal,
+}
+
+/// Typed acknowledgement for `ReserveStartOperation`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SessionStartOperationReserveOutcome {
+    Reserved,
+    AlreadyReserved,
+    Refused {
+        reason: SessionStartOperationReserveRefusal,
+    },
+}
+
+/// Typed result of one conditional start operation. `AlreadyApplied` is returned only for the
+/// same exact tuple retained as Applied in the process-lifetime ledger; it makes an ACK retry
+/// idempotent without granting a second spawn, even after Session removal or replacement.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ConditionalSessionStartOutcome {
+    Applied {
+        generation: String,
+    },
+    AlreadyApplied {
+        generation: String,
+    },
+    Refused {
+        reason: ConditionalSessionStartRefusal,
+    },
+}
+
+/// Read-only status for an ambiguous conditional-start operation. It never causes a spawn.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SessionStartOperationStatus {
+    Unknown,
+    Reserved,
+    Refused,
+    Applied {
+        generation: String,
+        lifecycle: SessionStartOperationLifecycle,
+    },
+}
+
+/// Current lifecycle observation for the exact generation recorded by an Applied ledger entry.
+/// The ledger keeps the generation after map removal/replacement; lifecycle is derived under the
+/// same daemon mutex used for map mutations.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStartOperationLifecycle {
+    Live,
+    Exited,
+    Removed,
+}
+
+/// Typed result of the compare-and-set `RetireStartOperation` barrier.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SessionStartOperationRetireOutcome {
+    Retired,
+    AlreadyRetired,
+    Conflict {
+        current: SessionStartOperationStatus,
+    },
+}
+
+/// Typed refusal for a generation-conditional Attach. Both cases are decided before acquiring an
+/// attachment guard or exposing a Grid, so the caller may safely distinguish absence from an ABA
+/// same-id lifetime.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionAttachRefusal {
+    Missing,
+    GenerationMismatch,
+}
+
+/// The subset of daemon events a Phase 1 shell client acts on. Tagged by the same `ev` field the
 /// daemon emits (snake_case); any unmodeled event lands in [`ShellEvent::Other`] so a read loop
 /// tolerates the full event stream. `serde(other)` requires a unit/variant with no data, so the
 /// heavy events are not decoded — exactly the point.
@@ -43,6 +137,10 @@ pub enum ShellEvent {
     DaemonInfo {
         protocol_version: u32,
         build_version: String,
+        /// Opaque per-daemon-process identity. Retained peers omit it; exact cross-connection
+        /// mutation/handoff authority requires it.
+        #[serde(default)]
+        daemon_instance_id: Option<DaemonInstanceId>,
         /// Whether Attach restore grids echo and live forwarders tag the optional output generation.
         #[serde(default)]
         output_generation_echo: bool,
@@ -50,10 +148,74 @@ pub enum ShellEvent {
         /// retained daemons means false; headless mutation must remain closed.
         #[serde(default)]
         child_environment: bool,
+        /// Whether Write/Resize/Kill require and atomically enforce an exact PTY generation.
+        #[serde(default)]
+        generation_conditional_mutations: bool,
+        /// Whether conditional Kill also refuses an exact session lifetime while it has an active
+        /// attachment guard or an unclaimed handoff token. Absent on retained daemons means false.
+        #[serde(default)]
+        attachment_aware_conditional_kill: bool,
+        /// Whether StartSession accepts an atomic daemon-map precondition and returns an exact,
+        /// token-correlated acknowledgement before Attach is admitted.
+        #[serde(default)]
+        generation_conditional_start: bool,
+        /// Whether this daemon requires Reserve -> conditional Start and retains operation status
+        /// without TTL/LRU eviction until an exact retirement barrier removes it.
+        #[serde(default)]
+        start_operation_ledger: bool,
+        /// Whether Attach atomically enforces `expected_session_generation` before guard/Grid.
+        #[serde(default)]
+        generation_conditional_attach: bool,
+    },
+    SessionAttachRefused {
+        id: SessionId,
+        expected_generation: String,
+        daemon_instance_id: DaemonInstanceId,
+        reason: SessionAttachRefusal,
+    },
+    /// Exact acknowledgement for a conditional StartSession mutation.
+    ConditionalSessionStart {
+        id: SessionId,
+        operation_token: SessionStartOperationToken,
+        daemon_instance_id: DaemonInstanceId,
+        outcome: ConditionalSessionStartOutcome,
+    },
+    /// Exact acknowledgement for `ReserveStartOperation`.
+    StartOperationReserved {
+        id: SessionId,
+        operation_token: SessionStartOperationToken,
+        daemon_instance_id: DaemonInstanceId,
+        outcome: SessionStartOperationReserveOutcome,
+    },
+    /// Exact read-only answer to `LookupStartOperation`.
+    StartOperationStatus {
+        id: SessionId,
+        operation_token: SessionStartOperationToken,
+        daemon_instance_id: DaemonInstanceId,
+        status: SessionStartOperationStatus,
+    },
+    /// Exact acknowledgement for the compare-and-set retirement barrier.
+    StartOperationRetired {
+        id: SessionId,
+        operation_token: SessionStartOperationToken,
+        daemon_instance_id: DaemonInstanceId,
+        outcome: SessionStartOperationRetireOutcome,
+    },
+    /// Ordered acknowledgement that one exact cancellation request was processed by the daemon
+    /// instance named in the request. Unknown/already-retired tokens are idempotent success.
+    AttachmentHandoffCancelled {
+        id: SessionId,
+        token: AttachmentHandoffToken,
+        daemon_instance_id: DaemonInstanceId,
     },
     /// Authoritative grid baseline (attach restore / `Snapshot` reply). Only the lightweight
     /// [`GridInfo`] is decoded — never the cell payload.
-    Grid { id: SessionId, grid: GridInfo },
+    Grid {
+        id: SessionId,
+        #[serde(default)]
+        output_generation: Option<u64>,
+        grid: GridInfo,
+    },
     /// Reply to `ListSessions`: legacy live ids plus additive per-session identity metadata.
     Sessions {
         ids: Vec<SessionId>,
@@ -106,10 +268,127 @@ mod tests {
             ShellEvent::DaemonInfo {
                 protocol_version: 1,
                 build_version: "0.1.0".into(),
+                daemon_instance_id: None,
                 output_generation_echo: false,
                 child_environment: false,
+                generation_conditional_mutations: false,
+                attachment_aware_conditional_kill: false,
+                generation_conditional_start: false,
+                start_operation_ledger: false,
+                generation_conditional_attach: false,
             }
         );
+    }
+
+    #[test]
+    fn decodes_exact_conditional_start_lookup_and_cancel_acknowledgements() {
+        let start = ShellEvent::from_line(
+            r#"{"ev":"conditional_session_start","id":"s1","operation_token":"11111111111141118111111111111111","daemon_instance_id":"22222222222242228222222222222222","outcome":{"status":"applied","generation":"generation-b"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            start,
+            ShellEvent::ConditionalSessionStart {
+                id: SessionId(ref id),
+                outcome: ConditionalSessionStartOutcome::Applied { ref generation },
+                ..
+            } if id == "s1" && generation == "generation-b"
+        ));
+
+        let reserved = ShellEvent::from_line(
+            r#"{"ev":"start_operation_reserved","id":"s1","operation_token":"11111111111141118111111111111111","daemon_instance_id":"22222222222242228222222222222222","outcome":{"status":"already_reserved"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            reserved,
+            ShellEvent::StartOperationReserved {
+                outcome: SessionStartOperationReserveOutcome::AlreadyReserved,
+                ..
+            }
+        ));
+
+        let applied_lookup = ShellEvent::from_line(
+            r#"{"ev":"start_operation_status","id":"s1","operation_token":"11111111111141118111111111111111","daemon_instance_id":"22222222222242228222222222222222","status":{"status":"applied","generation":"generation-b","lifecycle":"exited"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            applied_lookup,
+            ShellEvent::StartOperationStatus {
+                status: SessionStartOperationStatus::Applied {
+                    ref generation,
+                    lifecycle: SessionStartOperationLifecycle::Exited,
+                },
+                ..
+            } if generation == "generation-b"
+        ));
+
+        let retired = ShellEvent::from_line(
+            r#"{"ev":"start_operation_retired","id":"s1","operation_token":"11111111111141118111111111111111","daemon_instance_id":"22222222222242228222222222222222","outcome":{"status":"conflict","current":{"status":"reserved"}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            retired,
+            ShellEvent::StartOperationRetired {
+                outcome: SessionStartOperationRetireOutcome::Conflict {
+                    current: SessionStartOperationStatus::Reserved,
+                },
+                ..
+            }
+        ));
+
+        let lookup = ShellEvent::from_line(
+            r#"{"ev":"start_operation_status","id":"s1","operation_token":"11111111111141118111111111111111","daemon_instance_id":"22222222222242228222222222222222","status":{"status":"unknown"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            lookup,
+            ShellEvent::StartOperationStatus {
+                status: SessionStartOperationStatus::Unknown,
+                ..
+            }
+        ));
+
+        let cancelled = ShellEvent::from_line(
+            r#"{"ev":"attachment_handoff_cancelled","id":"s1","token":"0123456789abcdef0123456789abcdef","daemon_instance_id":"22222222222242228222222222222222"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            cancelled,
+            ShellEvent::AttachmentHandoffCancelled { id: SessionId(ref id), .. } if id == "s1"
+        ));
+    }
+
+    #[test]
+    fn decodes_generation_conditional_mutation_capability() {
+        let line = r#"{"ev":"daemon_info","protocol_version":3,"build_version":"0.1.0","generation_conditional_mutations":true,"attachment_aware_conditional_kill":true}"#;
+        assert!(matches!(
+            ShellEvent::from_line(line).unwrap(),
+            ShellEvent::DaemonInfo {
+                protocol_version: 3,
+                generation_conditional_mutations: true,
+                attachment_aware_conditional_kill: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn decodes_exact_generation_conditional_attach_refusal() {
+        let event = ShellEvent::from_line(
+            r#"{"ev":"session_attach_refused","id":"s1","expected_generation":"generation-a","daemon_instance_id":"22222222222242228222222222222222","reason":"generation_mismatch"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            event,
+            ShellEvent::SessionAttachRefused {
+                id: SessionId(ref id),
+                ref expected_generation,
+                ref daemon_instance_id,
+                reason: SessionAttachRefusal::GenerationMismatch,
+            } if id == "s1"
+                && expected_generation == "generation-a"
+                && daemon_instance_id.as_str() == "22222222222242228222222222222222"
+        ));
     }
 
     /// The EXACT canonical `Grid` event the daemon emits (copied verbatim from the daemon's
@@ -124,7 +403,7 @@ mod tests {
     fn decodes_grid_generation_from_full_daemon_snapshot() {
         let ev = ShellEvent::from_line(DAEMON_GRID_LINE).unwrap();
         match ev {
-            ShellEvent::Grid { id, grid } => {
+            ShellEvent::Grid { id, grid, .. } => {
                 assert_eq!(id, SessionId("s1".into()));
                 assert_eq!(grid.generation, "11111111-1111-1111-1111-111111111111");
                 assert_eq!(grid.revision, Some(5));

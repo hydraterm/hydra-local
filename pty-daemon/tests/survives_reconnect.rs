@@ -113,6 +113,14 @@ fn grid_text(grid_line: &str) -> String {
     out
 }
 
+fn grid_generation(grid_line: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(grid_line.trim()).expect("grid event is JSON")["grid"]
+        ["generation"]
+        .as_str()
+        .expect("grid generation")
+        .to_string()
+}
+
 /// Decode an Output event's base64 `data` to a lossy String, for marker search.
 fn output_text(line: &str) -> String {
     let v: serde_json::Value = serde_json::from_str(line.trim()).expect("output event is JSON");
@@ -180,19 +188,26 @@ fn session_survives_client_reconnect() {
                 r#"{{"op":"start_session","id":"{session_id}","cwd":".","command":"cat","args":[],"cols":80,"rows":24}}"#
             ),
         );
-        // Give the PTY a moment to spawn before writing to it.
-        std::thread::sleep(Duration::from_millis(200));
-        send(
-            &mut stream,
-            &format!(r#"{{"op":"write","id":"{session_id}","data":"{marker}\n"}}"#),
-        );
-
-        // Attach so we observe the echoed marker on this connection too,
-        // confirming the session is live before we drop the client.
+        // Attach first to obtain exact lifetime authority for the write.
         send(
             &mut stream,
             &format!(r#"{{"op":"attach","id":"{session_id}"}}"#),
         );
+        let baseline = read_until(&mut reader, "\"ev\":\"grid\"", Duration::from_secs(5));
+        let generation = grid_generation(&baseline);
+
+        send(
+            &mut stream,
+            &serde_json::json!({
+                "op": "write",
+                "id": session_id,
+                "data": format!("{marker}\n"),
+                "expected_generation": generation
+            })
+            .to_string(),
+        );
+        // Observe the echoed marker, confirming the session is live before we
+        // drop this client.
         assert_grid_has_marker(&mut reader, marker, Duration::from_secs(5));
 
         // Drop the stream/reader: client fully disconnects. The daemon (and the

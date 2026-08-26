@@ -1103,6 +1103,8 @@ mod tests {
                     session_id: "s-a".into(),
                 },
             ],
+            recovered_session_targets: vec![],
+            live_session_release_targets: vec![],
             skipped_future_version: vec![],
         };
 
@@ -1159,6 +1161,8 @@ mod tests {
             recovered_sessions: vec![RecoveredSession {
                 session_id: "daemon-only".into(),
             }],
+            recovered_session_targets: vec![],
+            live_session_release_targets: vec![],
             skipped_future_version: vec![],
         };
 
@@ -1191,6 +1195,8 @@ mod tests {
             recovered_sessions: vec![RecoveredSession {
                 session_id: "live-only".into(),
             }],
+            recovered_session_targets: vec![],
+            live_session_release_targets: vec![],
             skipped_future_version: vec![],
         };
 
@@ -1225,6 +1231,8 @@ mod tests {
                 rewritten: false,
             }],
             recovered_sessions: vec![],
+            recovered_session_targets: vec![],
+            live_session_release_targets: vec![],
             skipped_future_version: vec![],
         };
 

@@ -14,15 +14,20 @@ mod revision;
 mod session;
 mod socket;
 
-use crate::daemon::{Daemon, SharedDaemon};
+use crate::daemon::{ConditionalSessionTake, Daemon, SessionAttachmentAcquireError, SharedDaemon};
 use crate::ids::SessionId;
-use crate::protocol::{ClientRequest, DaemonEvent, MAX_LINE_BYTES};
+use crate::protocol::{
+    AttachmentHandoff, AttachmentHandoffToken, ClientRequest, DaemonEvent, SessionAttachRefusal,
+    SessionStartOperationToken, MAX_LINE_BYTES,
+};
+use crate::session::AttachmentGuard;
 use anyhow::Result;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::task::AbortHandle;
@@ -201,21 +206,152 @@ fn log_shutdown_report(report: &crate::daemon::ShutdownReport) {
     }
 }
 
-/// Per-connection state. The key invariant is that a client has at most
-/// ONE live forwarder per session, so a repeat Attach (UI reconnect, double
-/// attach) can't double every byte.
-#[derive(Default)]
+static NEXT_ATTACHMENT_OWNER_NONCE: AtomicU64 = AtomicU64::new(0);
+
+fn allocate_attachment_owner_nonce(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .ok()?
+        .checked_add(1)
+}
+
+/// One connection-local attachment. The non-cloneable guard owns the exact Session lifetime; the
+/// optional abort handle owns its live forwarder. Every connection-exit path drops this value, so
+/// EOF, framing/read error, outbound failure, and request cancellation all release by RAII.
+struct ClientAttachment {
+    guard: Option<AttachmentGuard>,
+    forwarder: Option<AbortHandle>,
+    offered_token: Option<AttachmentHandoffToken>,
+}
+
+impl ClientAttachment {
+    fn new(
+        guard: AttachmentGuard,
+        forwarder: Option<AbortHandle>,
+        offered_token: Option<AttachmentHandoffToken>,
+    ) -> Self {
+        Self {
+            guard: Some(guard),
+            forwarder,
+            offered_token,
+        }
+    }
+
+    fn detach(mut self) {
+        if let Some(handle) = self.forwarder.take() {
+            handle.abort();
+        }
+        if let Some(guard) = self.guard.take() {
+            guard.detach();
+        }
+    }
+
+    /// Relinquish only this connection's exact Session guard before its own conditional Kill. The
+    /// forwarder remains subscribed long enough to deliver `SessionExited` after the child is
+    /// signalled. Any guard owned by another client remains in the Session fence and still makes
+    /// the daemon's generation-CAS take fail closed.
+    fn release_guard_for_own_kill(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            guard.detach();
+        }
+        self.offered_token = None;
+    }
+}
+
+impl Drop for ClientAttachment {
+    fn drop(&mut self) {
+        if let Some(handle) = self.forwarder.take() {
+            handle.abort();
+        }
+        // The guard's raw Drop stays non-retiring solely for `ClientState::install`'s same-client
+        // acquire-before-release replacement. Connection EOF goes through `ClientState::drop`,
+        // which explicitly detaches and retires every pending Offer.
+    }
+}
+
+/// Per-connection state. A client has at most one live forwarder/guard per Session. A replacement
+/// Attach acquires its new guard before this map swaps and drops the old one, so a repeat request
+/// never creates an ownerless instant.
 struct ClientState {
-    attachments: HashMap<SessionId, AbortHandle>,
+    owner_nonce: u64,
+    attachments: HashMap<SessionId, ClientAttachment>,
+    /// A refused conditional Start invalidates any already-queued Attach on this connection. The
+    /// typed refusal remains readable, but a client cannot ignore it and bind the old/foreign grid.
+    conditional_start_refused: Option<(SessionId, SessionStartOperationToken)>,
+    /// A handoff-bearing generation-conditional Attach refusal is delivered before the connection
+    /// is retired. This latch prevents any already-buffered request from overtaking that refusal.
+    conditional_attach_refused: bool,
 }
 
 impl ClientState {
-    /// Stop and forget this client's forwarder for `id`, if any.
-    fn detach(&mut self, id: &SessionId) {
-        if let Some(handle) = self.attachments.remove(id) {
-            handle.abort();
+    fn new() -> Option<Self> {
+        let owner_nonce = allocate_attachment_owner_nonce(&NEXT_ATTACHMENT_OWNER_NONCE)?;
+        Some(Self {
+            owner_nonce,
+            attachments: HashMap::new(),
+            conditional_start_refused: None,
+            conditional_attach_refused: false,
+        })
+    }
+
+    fn install(&mut self, id: SessionId, attachment: ClientAttachment) {
+        // `attachment` already owns its guard. Only now may the old guard/forwarder drop.
+        let preserves_same_offer = attachment.offered_token.is_some()
+            && self
+                .attachments
+                .get(&id)
+                .is_some_and(|old| old.offered_token == attachment.offered_token);
+        if let Some(old) = self.attachments.insert(id, attachment) {
+            if preserves_same_offer {
+                // A repeated same-client Offer keeps the one shared Pending token. Unexpected
+                // guard release deliberately leaves it for the replacement guard.
+                drop(old);
+            } else {
+                // Switching to ordinary/Claim/a different Offer is an explicit replacement; retire
+                // any pending token owned by the old attachment after the new guard is installed.
+                old.detach();
+            }
         }
     }
+
+    /// Stop and explicitly retire this client's forwarder/guard for `id`, if any.
+    fn detach(&mut self, id: &SessionId) {
+        if let Some(attachment) = self.attachments.remove(id) {
+            attachment.detach();
+        }
+    }
+
+    fn release_guard_for_own_kill(&mut self, id: &SessionId) {
+        if let Some(attachment) = self.attachments.get_mut(id) {
+            attachment.release_guard_for_own_kill();
+        }
+    }
+
+    fn set_forwarder(&mut self, id: &SessionId, forwarder: AbortHandle) {
+        self.attachments
+            .get_mut(id)
+            .expect("provisional attachment is installed before its forwarder")
+            .forwarder = Some(forwarder);
+    }
+}
+
+impl Drop for ClientState {
+    fn drop(&mut self) {
+        for (_, attachment) in self.attachments.drain() {
+            // Connection EOF/error/task cancellation is now an explicit retirement boundary for
+            // every supported Offer owner. Same-client replacement remains non-retiring in
+            // `ClientState::install`, where the replacement guard is already held first.
+            attachment.detach();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestDisposition {
+    Continue,
+    CloseClient,
 }
 
 /// Serve one client over any newline-JSON byte transport. The connection is provided as already-split
@@ -233,6 +369,8 @@ where
     // before we even attempt to parse. A line over the cap drops the connection.
     let mut reader = BufReader::new(read_half);
     let mut line_buf: Vec<u8> = Vec::new();
+    let mut state = ClientState::new()
+        .ok_or_else(|| anyhow::anyhow!("attachment owner nonce space exhausted"))?;
 
     // Outbound queue: every DaemonEvent destined for this client funnels here,
     // so PTY pump tasks and request replies share one writer. Each event is serialized exactly once
@@ -248,8 +386,6 @@ where
             }
         }
     });
-
-    let mut state = ClientState::default();
 
     loop {
         line_buf.clear();
@@ -268,46 +404,39 @@ where
         let terminated = line_buf.last() == Some(&b'\n');
         if !terminated && line_buf.len() > MAX_LINE_BYTES {
             // Oversized, unterminated line: framing violation. Drop the connection
-            // rather than buffer more.
-            let _ = out_tx.try_send(DaemonEvent::Error {
-                message: format!("request line exceeds {MAX_LINE_BYTES} bytes; closing"),
-            });
+            // rather than buffer more or emit an unscoped Error that a mutation client could
+            // mistake for an acknowledgement.
             break;
         }
         let line = match std::str::from_utf8(&line_buf) {
             Ok(s) => s.trim(),
-            Err(_) => {
-                let _ = out_tx.try_send(DaemonEvent::Error {
-                    message: "request line is not valid UTF-8".into(),
-                });
-                continue;
-            }
+            Err(_) => break,
         };
         if line.is_empty() {
             continue;
         }
         let req: ClientRequest = match serde_json::from_str(line) {
             Ok(r) => r,
-            Err(e) => {
-                let _ = out_tx.try_send(DaemonEvent::Error {
-                    message: format!("bad request: {e}"),
-                });
-                continue;
-            }
+            // Protocol v3 treats an unparseable request as a connection framing failure. This is
+            // both simpler and safer than attempting to prove malformed JSON was non-mutating;
+            // especially, an id-only/malformed generation mutation receives EOF and no unscoped
+            // Error that could be mistaken for an acknowledgement.
+            Err(_) => break,
         };
-        tokio::select! {
+        let disposition = tokio::select! {
             biased;
             _ = outbound_failed.changed() => break,
-            _ = handle_request(req, &shared, &out_tx, &mut state) => {}
+            disposition = handle_request(req, &shared, &out_tx, &mut state) => disposition,
+        };
+        if disposition == RequestDisposition::CloseClient {
+            break;
         }
     }
 
-    // Client disconnected: stop all of its forwarders. spawned tasks outlive a
-    // dropped JoinHandle, so we must abort explicitly or they leak (and keep
-    // pushing into a dead out_tx).
-    for (_, handle) in state.attachments.drain() {
-        handle.abort();
-    }
+    // Dropping state aborts every forwarder, explicitly releases every exact Session guard, and
+    // retires each still-unclaimed Offer owned by this connection. Supported transfer paths keep
+    // this original socket alive until Claim/cancel; a raw token never outlives its owner socket.
+    drop(state);
     // Once the request owner exits, no queued response has a live request stream to belong to. An
     // attachment abort is asynchronous and could still publish a fatal after any one-time flag
     // sample, so never attempt to drain into a half-closed or non-reading peer here. Aborting the
@@ -327,17 +456,76 @@ async fn handle_request(
     shared: &SharedDaemon,
     out_tx: &outbound::OutboundSender,
     state: &mut ClientState,
-) {
+) -> RequestDisposition {
+    let exact_refused_start_replay = !state.conditional_attach_refused
+        && matches!(
+            (&state.conditional_start_refused, &req),
+            (
+                Some((refused_id, refused_token)),
+                ClientRequest::StartSession {
+                    id,
+                    conditional_start: Some(conditional),
+                    ..
+                }
+            ) if id == refused_id && &conditional.operation_token == refused_token
+        );
+    if (state.conditional_attach_refused || state.conditional_start_refused.is_some())
+        && !matches!(
+            &req,
+            ClientRequest::DaemonInfo
+                | ClientRequest::LookupStartOperation { .. }
+                | ClientRequest::RetireStartOperation { .. }
+        )
+        && !exact_refused_start_replay
+    {
+        // Keep the writer alive until the already-queued exact refusal reaches the peer. Every
+        // pipelined terminal/session mutation is discarded, so Snapshot/Attach cannot overtake or
+        // expose a Grid. Content-blind Lookup and Retire remain available for exact cleanup.
+        return RequestDisposition::Continue;
+    }
     match req {
         ClientRequest::DaemonInfo => {
+            let daemon_instance_id = {
+                let daemon = shared.lock().await;
+                daemon.instance_id().clone()
+            };
             let _ = out_tx
                 .send(DaemonEvent::DaemonInfo {
                     protocol_version: protocol::DAEMON_PROTOCOL_VERSION,
                     build_version: env!("CARGO_PKG_VERSION").to_string(),
+                    daemon_instance_id: Some(daemon_instance_id),
                     output_generation_echo: true,
                     child_environment: true,
+                    generation_conditional_mutations: true,
+                    attachment_aware_conditional_kill: true,
+                    generation_conditional_start: true,
+                    start_operation_ledger: true,
+                    generation_conditional_attach: true,
                 })
                 .await;
+        }
+        ClientRequest::ReserveStartOperation {
+            id,
+            operation_token,
+        } => {
+            let (daemon_instance_id, outcome) = {
+                let mut daemon = shared.lock().await;
+                let daemon_instance_id = daemon.instance_id().clone();
+                let outcome = daemon.reserve_start_operation(id.clone(), operation_token.clone());
+                (daemon_instance_id, outcome)
+            };
+            if out_tx
+                .send(DaemonEvent::StartOperationReserved {
+                    id,
+                    operation_token,
+                    daemon_instance_id,
+                    outcome,
+                })
+                .await
+                .is_err()
+            {
+                return RequestDisposition::CloseClient;
+            }
         }
         ClientRequest::StartSession {
             id,
@@ -348,7 +536,44 @@ async fn handle_request(
             cols,
             rows,
             restart_exited,
+            conditional_start,
         } => {
+            if let Some(conditional_start) = conditional_start {
+                let (daemon_instance_id, outcome) = {
+                    let mut daemon = shared.lock().await;
+                    let daemon_instance_id = daemon.instance_id().clone();
+                    let outcome = daemon.start_session_conditionally(
+                        id.clone(),
+                        &cwd,
+                        &command,
+                        &args,
+                        child_environment.as_ref(),
+                        cols,
+                        rows,
+                        &conditional_start,
+                    );
+                    (daemon_instance_id, outcome)
+                };
+                let refused = matches!(
+                    outcome,
+                    maestro_protocol::ConditionalSessionStartOutcome::Refused { .. }
+                );
+                let refused_operation =
+                    refused.then(|| (id.clone(), conditional_start.operation_token.clone()));
+                let sent = out_tx
+                    .send(DaemonEvent::ConditionalSessionStart {
+                        id,
+                        operation_token: conditional_start.operation_token,
+                        daemon_instance_id,
+                        outcome,
+                    })
+                    .await;
+                state.conditional_start_refused = refused_operation;
+                if sent.is_err() {
+                    return RequestDisposition::CloseClient;
+                }
+                return RequestDisposition::Continue;
+            }
             let result = {
                 let mut d = shared.lock().await;
                 if restart_exited {
@@ -386,14 +611,71 @@ async fn handle_request(
                 });
             }
         }
+        ClientRequest::LookupStartOperation {
+            id,
+            operation_token,
+        } => {
+            let (daemon_instance_id, status) = {
+                let daemon = shared.lock().await;
+                (
+                    daemon.instance_id().clone(),
+                    daemon.lookup_start_operation(&id, &operation_token),
+                )
+            };
+            if out_tx
+                .send(DaemonEvent::StartOperationStatus {
+                    id,
+                    operation_token,
+                    daemon_instance_id,
+                    status,
+                })
+                .await
+                .is_err()
+            {
+                return RequestDisposition::CloseClient;
+            }
+        }
+        ClientRequest::RetireStartOperation {
+            id,
+            operation_token,
+            expected,
+        } => {
+            let (daemon_instance_id, outcome) = {
+                let mut daemon = shared.lock().await;
+                let daemon_instance_id = daemon.instance_id().clone();
+                let outcome = daemon.retire_start_operation(&id, &operation_token, &expected);
+                (daemon_instance_id, outcome)
+            };
+            if out_tx
+                .send(DaemonEvent::StartOperationRetired {
+                    id,
+                    operation_token,
+                    daemon_instance_id,
+                    outcome,
+                })
+                .await
+                .is_err()
+            {
+                return RequestDisposition::CloseClient;
+            }
+        }
         // `want_raw_output` selects this attacher's live-update channel: the
         // forwarder below branches on it (raw Output bytes when true/omitted, vs
         // structured Damage only when false — see the send guard in the pump).
         ClientRequest::Attach {
             id,
             want_raw_output,
+            expected_session_generation,
             output_generation,
+            handoff,
         } => {
+            if state.conditional_start_refused.is_some() {
+                return RequestDisposition::CloseClient;
+            }
+            let offered_token = match handoff.as_ref() {
+                Some(AttachmentHandoff::Offer { token }) => Some(token.clone()),
+                Some(AttachmentHandoff::Claim { .. }) | None => None,
+            };
             // Restore from the authoritative grid (a clean screen), then stream
             // live output. The snapshot and the live subscription are taken
             // atomically (Session::attach_state) at one revision boundary:
@@ -408,46 +690,104 @@ async fn handle_request(
             //     `frame.revision <= snapshot.revision`; the forwarder drops
             //     those, so a chunk is delivered exactly once (no harmless-double
             //     reliance — that timing gap was the flaky reconnect test).
-            // Attach deduplication: if this client already has a forwarder for the session,
-            // stop it before starting a new one, or a repeat Attach would double.
-            state.detach(&id);
-
-            let (mut rx, mut exit_rx, snapshot, generation, already_exited, grid) = {
+            // Acquire the exact Session guard before releasing the daemon mutex. Conditional Kill
+            // and exited-session restart use that same mutex, so either they remove A first and
+            // this Attach fails, or this guard exists before either mutation can inspect A.
+            let (daemon_instance_id, acquired) = {
                 let d = shared.lock().await;
-                match d.session(&id) {
-                    Ok(s) => {
-                        let attach = s.attach_state();
-                        let grid = s.grid_handle();
-                        // Generation is fixed for this grid's lifetime (a respawn
-                        // builds a new Session with a new broadcast channel), so
-                        // capture it once and stamp every Output frame with it.
-                        let generation = attach.snapshot.generation;
-                        // Hand the snapshot OUT of the lock scope: the restore Grid
-                        // is delivered with guaranteed-delivery
-                        // `.send().await`, which cannot be awaited while holding the
-                        // daemon Mutex. Atomicity is preserved: output_rx subscribed
-                        // under the lock at this snapshot's revision, and the
-                        // forwarder drops every frame <= that revision regardless of
-                        // when the snapshot bytes physically land.
-                        (
-                            attach.output_rx,
-                            attach.exit_rx,
-                            attach.snapshot,
-                            generation,
-                            attach.already_exited,
-                            grid,
+                let daemon_instance_id = d.instance_id().clone();
+                let guard = match expected_session_generation.as_deref() {
+                    Some(expected_generation)
+                        if !expected_generation.is_empty() && expected_generation.len() <= 128 =>
+                    {
+                        d.acquire_session_attachment_if_generation(
+                            &id,
+                            expected_generation,
+                            handoff.as_ref(),
+                            state.owner_nonce,
                         )
                     }
-                    Err(e) => {
-                        // Error replies are best-effort; a dropped one is not a
-                        // correctness hazard the way a missing baseline is.
-                        let _ = out_tx.try_send(DaemonEvent::Error {
-                            message: e.to_string(),
-                        });
-                        return;
+                    Some(_) => Err(SessionAttachmentAcquireError::Refused(
+                        SessionAttachRefusal::GenerationMismatch,
+                    )),
+                    None => d
+                        .acquire_session_attachment(&id, handoff.as_ref(), state.owner_nonce)
+                        .map_err(SessionAttachmentAcquireError::Invalid),
+                };
+                let acquired = match guard {
+                    Ok(guard) => {
+                        match d.session(&id) {
+                            Ok(s) => {
+                                let attach = s.attach_state();
+                                let grid = s.grid_handle();
+                                // Generation is fixed for this grid's lifetime (a respawn builds a
+                                // fresh Session, including a fresh ownership fence).
+                                let generation = attach.snapshot.generation;
+                                Ok((
+                                    guard,
+                                    attach.output_rx,
+                                    attach.exit_rx,
+                                    attach.snapshot,
+                                    generation,
+                                    attach.already_exited,
+                                    grid,
+                                ))
+                            }
+                            Err(error) => Err(Err(error.to_string())),
+                        }
                     }
-                }
+                    Err(SessionAttachmentAcquireError::Refused(reason)) => Err(Ok(reason)),
+                    Err(SessionAttachmentAcquireError::Invalid(error)) => {
+                        Err(Err(error.to_string()))
+                    }
+                };
+                (daemon_instance_id, acquired)
             };
+            let (guard, mut rx, mut exit_rx, snapshot, generation, already_exited, grid) =
+                match acquired {
+                    Ok(acquired) => acquired,
+                    Err(Ok(reason)) => {
+                        let expected_generation = expected_session_generation
+                            .expect("typed conditional Attach refusal has an expected generation");
+                        if out_tx
+                            .send(DaemonEvent::SessionAttachRefused {
+                                id,
+                                expected_generation,
+                                daemon_instance_id,
+                                reason,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return RequestDisposition::CloseClient;
+                        }
+                        if handoff.is_some() {
+                            state.conditional_attach_refused = true;
+                        }
+                        return RequestDisposition::Continue;
+                    }
+                    Err(Err(message)) => {
+                        // A handoff-bearing Attach is an ownership mutation boundary. On a wrong,
+                        // retired, duplicate, or over-cap token, close without any unscoped Error
+                        // and without parsing a queued Snapshot: otherwise a renderer could bind a
+                        // Grid despite never acquiring the exact Session guard.
+                        if handoff.is_some() {
+                            return RequestDisposition::CloseClient;
+                        }
+                        // Ordinary Attach retains its compatibility behavior: report no-session or
+                        // other read-only lookup errors and keep the connection usable.
+                        let _ = out_tx.try_send(DaemonEvent::Error { message });
+                        return RequestDisposition::Continue;
+                    }
+                };
+
+            // Install the exact guard before the first awaited outbound baseline. If that send is
+            // blocked, fails, or this request task is cancelled, ClientState still owns an explicit
+            // retirement path for the Offer; no token lives outside the connection's EOF boundary.
+            state.install(
+                id.clone(),
+                ClientAttachment::new(guard, None, offered_token.clone()),
+            );
 
             let snapshot_revision = snapshot.revision;
             // Damage baseline: the diff source for live damage frames. It
@@ -470,7 +810,8 @@ async fn handle_request(
                 .await
                 .is_err()
             {
-                return;
+                state.detach(&id);
+                return RequestDisposition::Continue;
             }
 
             // If the session had already exited before this attach, the latch is
@@ -478,7 +819,7 @@ async fn handle_request(
             // restore Grid) and skip the live forwarder entirely — there is no
             // more output coming.
             if let Some(code) = already_exited {
-                let _ = out_tx
+                if out_tx
                     .send_for_attachment(
                         DaemonEvent::SessionExited {
                             id: id.clone(),
@@ -486,8 +827,12 @@ async fn handle_request(
                         },
                         output_generation,
                     )
-                    .await;
-                return;
+                    .await
+                    .is_err()
+                {
+                    state.detach(&id);
+                }
+                return RequestDisposition::Continue;
             }
             let out_tx = out_tx.clone();
             let id2 = id.clone();
@@ -717,13 +1062,42 @@ async fn handle_request(
                     }
                 }
             });
-            state.attachments.insert(id, handle.abort_handle());
+            state.set_forwarder(&id, handle.abort_handle());
         }
         ClientRequest::Detach { id } => {
             state.detach(&id);
         }
-        ClientRequest::Write { id, data } => {
-            // A PTY write can BLOCK on a full kernel buffer
+        ClientRequest::CancelAttachmentHandoff {
+            id,
+            token,
+            expected_daemon_instance,
+        } => {
+            let daemon_instance_id = {
+                let daemon = shared.lock().await;
+                if daemon.instance_id() != &expected_daemon_instance {
+                    return RequestDisposition::CloseClient;
+                }
+                daemon.cancel_session_attachment_handoff(&id, &token);
+                daemon.instance_id().clone()
+            };
+            if out_tx
+                .send(DaemonEvent::AttachmentHandoffCancelled {
+                    id,
+                    token,
+                    daemon_instance_id,
+                })
+                .await
+                .is_err()
+            {
+                return RequestDisposition::CloseClient;
+            }
+        }
+        ClientRequest::Write {
+            id,
+            expected_generation,
+            data,
+        } => {
+            // P4 lock isolation: a PTY write can BLOCK on a full kernel buffer
             // (child not draining). Doing it under the daemon lock would stall
             // every unrelated request. So resolve the session to its cheap
             // `PtyHandle` under the lock, RELEASE the lock, then do the blocking
@@ -732,13 +1106,12 @@ async fn handle_request(
             let handle = {
                 let d = shared.lock().await;
                 match d.session(&id) {
-                    Ok(s) => s.pty_handle(),
-                    Err(e) => {
-                        let _ = out_tx.try_send(DaemonEvent::Error {
-                            message: e.to_string(),
-                        });
-                        return;
+                    Ok(s)
+                        if s.live_generation().as_deref() == Some(expected_generation.as_str()) =>
+                    {
+                        s.pty_handle()
                     }
+                    Ok(_) | Err(_) => return RequestDisposition::CloseClient,
                 }
             };
             // The blocking write must not run on the async worker thread,
@@ -756,14 +1129,23 @@ async fn handle_request(
                 let _ = out_tx.try_send(DaemonEvent::Error { message });
             }
         }
-        ClientRequest::Resize { id, cols, rows } => {
-            // The resize ioctl can block, so resolve the
+        ClientRequest::Resize {
+            id,
+            expected_generation,
+            cols,
+            rows,
+        } => {
+            // P4 lock isolation: the resize ioctl can block, so resolve the
             // handle under the daemon lock, release it, then resize off-lock.
             let handle = {
                 let d = shared.lock().await;
                 match d.session(&id) {
-                    Ok(s) => s.pty_handle(),
-                    Err(_) => return,
+                    Ok(s)
+                        if s.live_generation().as_deref() == Some(expected_generation.as_str()) =>
+                    {
+                        s.pty_handle()
+                    }
+                    Ok(_) | Err(_) => return RequestDisposition::CloseClient,
                 }
             };
             // Like Write, run the blocking resize ioctl on the blocking
@@ -783,7 +1165,7 @@ async fn handle_request(
                         let _ = out_tx.try_send(DaemonEvent::Error {
                             message: e.to_string(),
                         });
-                        return;
+                        return RequestDisposition::Continue;
                     }
                 }
             };
@@ -812,7 +1194,7 @@ async fn handle_request(
                         let _ = out_tx.try_send(DaemonEvent::Error {
                             message: e.to_string(),
                         });
-                        return;
+                        return RequestDisposition::Continue;
                     }
                 }
             };
@@ -827,9 +1209,33 @@ async fn handle_request(
                 })
                 .await;
         }
-        ClientRequest::Kill { id } => {
-            let mut d = shared.lock().await;
-            d.kill_session(&id);
+        ClientRequest::Kill {
+            id,
+            expected_generation,
+        } => {
+            // An attached client may explicitly kill the exact generation it is currently
+            // observing. Release only this connection's guard while retaining its forwarder for
+            // the terminal event. A different client's guard is untouched and still blocks take.
+            state.release_guard_for_own_kill(&id);
+            let taken = {
+                let mut d = shared.lock().await;
+                d.take_session_if_generation(&id, &expected_generation)
+            };
+            match taken {
+                ConditionalSessionTake::Absent => {}
+                ConditionalSessionTake::GenerationMismatch
+                | ConditionalSessionTake::AttachmentInUse => {
+                    // Close without a best-effort Error. In particular, an attached exited A is
+                    // omitted from live Sessions; allowing this release connection to continue to
+                    // ListSessions could misclassify A as confirmed absent after Kill was refused.
+                    return RequestDisposition::CloseClient;
+                }
+                ConditionalSessionTake::Taken(session) => {
+                    // The exact A Session was removed while the map lock was held. Kill only that
+                    // detached handle after unlock; a concurrently inserted B cannot be touched.
+                    session.kill_child();
+                }
+            }
         }
         ClientRequest::ListSessions => {
             let sessions = {
@@ -879,6 +1285,7 @@ async fn handle_request(
             }
         }
     }
+    RequestDisposition::Continue
 }
 
 #[cfg(test)]
@@ -889,6 +1296,889 @@ mod tests {
 
     fn sid(s: &str) -> SessionId {
         SessionId(s.to_string())
+    }
+
+    fn handoff_token(value: &str) -> AttachmentHandoffToken {
+        value.parse().expect("test token is fixed lowercase hex")
+    }
+
+    #[test]
+    fn attachment_owner_nonce_exhaustion_is_fail_closed_without_wrap_or_reuse() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(allocate_attachment_owner_nonce(&counter), Some(u64::MAX));
+        assert_eq!(allocate_attachment_owner_nonce(&counter), None);
+        assert_eq!(allocate_attachment_owner_nonce(&counter), None);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn conditional_offer_refusal_is_exact_and_pipelined_snapshot_is_discarded() {
+        let shared = Daemon::shared();
+        let id = sid("conditional-attach-refusal");
+        let daemon_instance_id = {
+            let mut daemon = shared.lock().await;
+            daemon
+                .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+                .unwrap();
+            daemon.instance_id().clone()
+        };
+        let mut state = ClientState::new().unwrap();
+        let (tx, mut rx, _failed) = outbound::channel(OUT_QUEUE_CAP, OUT_QUEUE_BYTES);
+        let expected_generation = "not-the-live-generation".to_string();
+        let token = handoff_token("01000000000000000000000000000001");
+
+        assert_eq!(
+            handle_request(
+                ClientRequest::Attach {
+                    id: id.clone(),
+                    want_raw_output: false,
+                    expected_session_generation: Some(expected_generation.clone()),
+                    output_generation: Some(41),
+                    handoff: Some(AttachmentHandoff::Offer { token }),
+                },
+                &shared,
+                &tx,
+                &mut state,
+            )
+            .await,
+            RequestDisposition::Continue
+        );
+        assert!(state.conditional_attach_refused);
+        assert!(matches!(
+            rx.recv_event().await,
+            Some(DaemonEvent::SessionAttachRefused {
+                id: ref got_id,
+                expected_generation: ref got_generation,
+                daemon_instance_id: ref got_instance,
+                reason: SessionAttachRefusal::GenerationMismatch,
+            }) if got_id == &id
+                && got_generation == &expected_generation
+                && got_instance == &daemon_instance_id
+        ));
+        assert_eq!(
+            shared
+                .lock()
+                .await
+                .session(&id)
+                .unwrap()
+                .attachment_fence_counts(),
+            (0, 0),
+            "refusal occurs before guard acquisition"
+        );
+
+        assert_eq!(
+            handle_request(
+                ClientRequest::Snapshot { id: id.clone() },
+                &shared,
+                &tx,
+                &mut state,
+            )
+            .await,
+            RequestDisposition::Continue
+        );
+        assert!(
+            rx.try_recv_event().is_err(),
+            "a queued Snapshot cannot overtake the terminal refusal or expose Grid bytes"
+        );
+        shared.lock().await.kill_session(&id);
+    }
+
+    #[test]
+    fn same_client_repeat_has_no_zero_owner_and_replacement_retires_old_offer() {
+        let mut daemon = Daemon::default();
+        let id = sid("same-client-repeat");
+        daemon
+            .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+            .unwrap();
+        let mut state = ClientState::new().unwrap();
+        let first_token = handoff_token("10000000000000000000000000000001");
+        let second_token = handoff_token("10000000000000000000000000000002");
+
+        let first_offer = AttachmentHandoff::Offer {
+            token: first_token.clone(),
+        };
+        let first = daemon
+            .acquire_session_attachment(&id, Some(&first_offer), state.owner_nonce)
+            .unwrap();
+        state.install(
+            id.clone(),
+            ClientAttachment::new(first, None, Some(first_token.clone())),
+        );
+
+        let repeated = daemon
+            .acquire_session_attachment(&id, Some(&first_offer), state.owner_nonce)
+            .unwrap();
+        assert_eq!(
+            daemon.session(&id).unwrap().attachment_fence_counts(),
+            (2, 1),
+            "new repeat guard exists before the old guard can drop"
+        );
+        state.install(
+            id.clone(),
+            ClientAttachment::new(repeated, None, Some(first_token)),
+        );
+        assert_eq!(
+            daemon.session(&id).unwrap().attachment_fence_counts(),
+            (1, 1),
+            "same-token repeat preserves exactly one pending handoff"
+        );
+
+        let second_offer = AttachmentHandoff::Offer {
+            token: second_token.clone(),
+        };
+        let second = daemon
+            .acquire_session_attachment(&id, Some(&second_offer), state.owner_nonce)
+            .unwrap();
+        state.install(
+            id.clone(),
+            ClientAttachment::new(second, None, Some(second_token)),
+        );
+        assert_eq!(
+            daemon.session(&id).unwrap().attachment_fence_counts(),
+            (1, 1),
+            "T1 is explicitly retired while T2 remains pending"
+        );
+
+        let ordinary = daemon
+            .acquire_session_attachment(&id, None, state.owner_nonce)
+            .unwrap();
+        state.install(id.clone(), ClientAttachment::new(ordinary, None, None));
+        assert_eq!(
+            daemon.session(&id).unwrap().attachment_fence_counts(),
+            (1, 0),
+            "switching to ordinary Attach retires the old pending offer"
+        );
+        state.detach(&id);
+        assert_eq!(
+            daemon.session(&id).unwrap().attachment_fence_counts(),
+            (0, 0)
+        );
+        daemon.kill_session(&id);
+    }
+
+    #[test]
+    fn client_state_eof_retires_its_pending_offer_before_late_claim() {
+        let mut daemon = Daemon::default();
+        let id = sid("ordinary-does-not-consume-handoff");
+        daemon
+            .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+            .unwrap();
+        let value = handoff_token("20000000000000000000000000000001");
+        let offer = AttachmentHandoff::Offer {
+            token: value.clone(),
+        };
+
+        let mut starter = ClientState::new().unwrap();
+        let starter_guard = daemon
+            .acquire_session_attachment(&id, Some(&offer), starter.owner_nonce)
+            .unwrap();
+        starter.install(
+            id.clone(),
+            ClientAttachment::new(starter_guard, None, Some(value.clone())),
+        );
+        drop(starter);
+        assert_eq!(
+            daemon.session(&id).unwrap().attachment_fence_counts(),
+            (0, 0),
+            "connection EOF explicitly retires the Offer it owned"
+        );
+
+        let late_claim = AttachmentHandoff::Claim {
+            token: value.clone(),
+        };
+        assert!(daemon
+            .acquire_session_attachment(&id, Some(&late_claim), 999)
+            .is_err());
+
+        let mut unrelated = ClientState::new().unwrap();
+        let ordinary_guard = daemon
+            .acquire_session_attachment(&id, None, unrelated.owner_nonce)
+            .unwrap();
+        unrelated.install(
+            id.clone(),
+            ClientAttachment::new(ordinary_guard, None, None),
+        );
+        drop(unrelated);
+        assert_eq!(
+            daemon.session(&id).unwrap().attachment_fence_counts(),
+            (0, 0)
+        );
+        daemon.kill_session(&id);
+    }
+
+    #[tokio::test]
+    async fn attach_and_conditional_kill_linearize_in_both_mutex_winner_orders() {
+        // Attach wins: its guard is installed before the map mutex unlocks, so exact Kill refuses
+        // and closes only the release client while A remains mapped.
+        let shared = Daemon::shared();
+        let id = sid("attach-wins-linearization");
+        let generation = {
+            let mut daemon = shared.lock().await;
+            daemon
+                .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+                .unwrap();
+            daemon.session(&id).unwrap().generation()
+        };
+        let (attach_tx, mut attach_rx, _failed) = outbound::channel(OUT_QUEUE_CAP, OUT_QUEUE_BYTES);
+        let mut attach_state = ClientState::new().unwrap();
+        assert_eq!(
+            handle_request(
+                ClientRequest::Attach {
+                    id: id.clone(),
+                    want_raw_output: false,
+                    expected_session_generation: None,
+                    output_generation: None,
+                    handoff: None,
+                },
+                &shared,
+                &attach_tx,
+                &mut attach_state,
+            )
+            .await,
+            RequestDisposition::Continue
+        );
+        assert!(matches!(
+            attach_rx.recv_event().await,
+            Some(DaemonEvent::Grid { .. })
+        ));
+        let (kill_tx, _kill_rx, _failed) = outbound::channel(OUT_QUEUE_CAP, OUT_QUEUE_BYTES);
+        let mut kill_state = ClientState::new().unwrap();
+        assert_eq!(
+            handle_request(
+                ClientRequest::Kill {
+                    id: id.clone(),
+                    expected_generation: generation,
+                },
+                &shared,
+                &kill_tx,
+                &mut kill_state,
+            )
+            .await,
+            RequestDisposition::CloseClient
+        );
+        assert!(shared.lock().await.session(&id).is_ok());
+        drop(attach_state);
+        shared.lock().await.kill_session(&id);
+
+        // Kill wins: it removes exact A under the map mutex. The later Attach cannot install a
+        // guard or emit Grid; it receives only a no-session Error and leaves the map absent.
+        let killed_id = sid("kill-wins-linearization");
+        let killed_generation = {
+            let mut daemon = shared.lock().await;
+            daemon
+                .start_session(killed_id.clone(), ".", "sleep", &["30".into()], 80, 24)
+                .unwrap();
+            daemon.session(&killed_id).unwrap().generation()
+        };
+        let (first_kill_tx, _rx, _failed) = outbound::channel(OUT_QUEUE_CAP, OUT_QUEUE_BYTES);
+        let mut first_kill_state = ClientState::new().unwrap();
+        assert_eq!(
+            handle_request(
+                ClientRequest::Kill {
+                    id: killed_id.clone(),
+                    expected_generation: killed_generation,
+                },
+                &shared,
+                &first_kill_tx,
+                &mut first_kill_state,
+            )
+            .await,
+            RequestDisposition::Continue
+        );
+        assert!(shared.lock().await.session(&killed_id).is_err());
+
+        let (late_attach_tx, mut late_attach_rx, _failed) =
+            outbound::channel(OUT_QUEUE_CAP, OUT_QUEUE_BYTES);
+        let mut late_attach_state = ClientState::new().unwrap();
+        assert_eq!(
+            handle_request(
+                ClientRequest::Attach {
+                    id: killed_id,
+                    want_raw_output: false,
+                    expected_session_generation: None,
+                    output_generation: None,
+                    handoff: None,
+                },
+                &shared,
+                &late_attach_tx,
+                &mut late_attach_state,
+            )
+            .await,
+            RequestDisposition::Continue
+        );
+        assert!(matches!(
+            late_attach_rx.recv_event().await,
+            Some(DaemonEvent::Error { .. })
+        ));
+        assert!(
+            late_attach_rx.try_recv_event().is_err(),
+            "Kill-first Attach emitted Grid"
+        );
+    }
+
+    async fn replace_test_session(shared: &SharedDaemon, id: &str) -> (String, String) {
+        let id = sid(id);
+        let mut daemon = shared.lock().await;
+        daemon
+            .start_session(id.clone(), ".", "cat", &[], 80, 24)
+            .expect("spawn generation A");
+        let generation_a = daemon.session(&id).unwrap().generation();
+        daemon.kill_session(&id);
+        daemon
+            .start_session(id.clone(), ".", "cat", &[], 80, 24)
+            .expect("spawn generation B");
+        let generation_b = daemon.session(&id).unwrap().generation();
+        assert_ne!(
+            generation_a, generation_b,
+            "replacement must be a new PTY lifetime"
+        );
+        (generation_a, generation_b)
+    }
+
+    async fn send_raw_request(
+        writer: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        request: serde_json::Value,
+    ) {
+        writer
+            .write_all(serde_json::to_string(&request).unwrap().as_bytes())
+            .await
+            .unwrap();
+        writer.write_all(b"\n").await.unwrap();
+        writer.flush().await.unwrap();
+    }
+
+    async fn read_event_line(
+        reader: &mut BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+    ) -> serde_json::Value {
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line))
+            .await
+            .expect("timed out waiting for daemon event")
+            .expect("failed to read daemon event");
+        serde_json::from_str(&line).expect("daemon event is JSON")
+    }
+
+    async fn stale_mutation_closes_only_its_client_and_lists_replacement(
+        id: &str,
+        request_for_generation: impl FnOnce(String) -> serde_json::Value,
+    ) -> (SharedDaemon, String) {
+        let shared = Daemon::shared();
+        let (generation_a, generation_b) = replace_test_session(&shared, id).await;
+
+        let (server_a, client_a) = tokio::io::duplex(4096);
+        let (server_a_read, server_a_write) = tokio::io::split(server_a);
+        let (client_a_read, mut client_a_write) = tokio::io::split(client_a);
+        let handler_a_shared = shared.clone();
+        let handler_a = tokio::spawn(async move {
+            handle_client(server_a_read, server_a_write, handler_a_shared).await
+        });
+
+        let (server_b, client_b) = tokio::io::duplex(4096);
+        let (server_b_read, server_b_write) = tokio::io::split(server_b);
+        let (client_b_read, mut client_b_write) = tokio::io::split(client_b);
+        let handler_b_shared = shared.clone();
+        let handler_b = tokio::spawn(async move {
+            handle_client(server_b_read, server_b_write, handler_b_shared).await
+        });
+
+        send_raw_request(&mut client_a_write, request_for_generation(generation_a)).await;
+        let mut client_a_read = BufReader::new(client_a_read);
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), client_a_read.read(&mut byte))
+                .await
+                .expect("stale mutation client was not closed")
+                .expect("stale mutation client read failed"),
+            0,
+            "generation mismatch must be connection EOF, never an unscoped ack/error"
+        );
+
+        send_raw_request(
+            &mut client_b_write,
+            serde_json::json!({"op": "list_sessions"}),
+        )
+        .await;
+        let mut client_b_read = BufReader::new(client_b_read);
+        let sessions = read_event_line(&mut client_b_read).await;
+        assert_eq!(sessions["ev"], "sessions");
+        let listed_generation = sessions["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == id)
+            .and_then(|entry| entry["generation"].as_str());
+        assert_eq!(listed_generation, Some(generation_b.as_str()));
+
+        drop(client_a_write);
+        drop(client_b_write);
+        drop(client_b_read);
+        tokio::time::timeout(Duration::from_secs(1), handler_a)
+            .await
+            .expect("stale client handler did not retire")
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), handler_b)
+            .await
+            .expect("unrelated client handler did not retire")
+            .unwrap()
+            .unwrap();
+        (shared, generation_b)
+    }
+
+    #[tokio::test]
+    async fn stale_generation_kill_closes_only_that_client_and_preserves_replacement() {
+        let (shared, _) = stale_mutation_closes_only_its_client_and_lists_replacement(
+            "generation-kill",
+            |generation_a| {
+                serde_json::json!({
+                    "op": "kill",
+                    "id": "generation-kill",
+                    "expected_generation": generation_a,
+                })
+            },
+        )
+        .await;
+        shared.lock().await.kill_session(&sid("generation-kill"));
+    }
+
+    #[tokio::test]
+    async fn attached_exited_session_refuses_kill_with_eof_and_remains_retained() {
+        let shared = Daemon::shared();
+        let id = sid("attached-exited-kill");
+        {
+            let mut daemon = shared.lock().await;
+            daemon
+                .start_session(id.clone(), ".", "true", &[], 80, 24)
+                .unwrap();
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if shared
+                .lock()
+                .await
+                .session(&id)
+                .unwrap()
+                .exit_state()
+                .is_some()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "short-lived test session did not exit"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let generation = shared.lock().await.session(&id).unwrap().generation();
+
+        let (attach_server, attach_client) = tokio::io::duplex(1024 * 1024);
+        let (attach_server_read, attach_server_write) = tokio::io::split(attach_server);
+        let (attach_client_read, mut attach_client_write) = tokio::io::split(attach_client);
+        let attach_shared = shared.clone();
+        let attach_handler = tokio::spawn(async move {
+            handle_client(attach_server_read, attach_server_write, attach_shared).await
+        });
+        send_raw_request(
+            &mut attach_client_write,
+            serde_json::json!({
+                "op": "attach",
+                "id": id.0.clone(),
+                "want_raw_output": false,
+            }),
+        )
+        .await;
+        let mut attach_client_read = BufReader::new(attach_client_read);
+        assert_eq!(read_event_line(&mut attach_client_read).await["ev"], "grid");
+        assert_eq!(
+            read_event_line(&mut attach_client_read).await["ev"],
+            "session_exited"
+        );
+        assert_eq!(
+            shared
+                .lock()
+                .await
+                .session(&id)
+                .unwrap()
+                .attachment_fence_counts(),
+            (1, 0),
+            "late exited Attach must retain its guard after replaying SessionExited"
+        );
+
+        let (kill_server, kill_client) = tokio::io::duplex(4096);
+        let (kill_server_read, kill_server_write) = tokio::io::split(kill_server);
+        let (mut kill_client_read, mut kill_client_write) = tokio::io::split(kill_client);
+        let kill_shared = shared.clone();
+        let kill_handler = tokio::spawn(async move {
+            handle_client(kill_server_read, kill_server_write, kill_shared).await
+        });
+        send_raw_request(
+            &mut kill_client_write,
+            serde_json::json!({
+                "op": "kill",
+                "id": id.0.clone(),
+                "expected_generation": generation.clone(),
+            }),
+        )
+        .await;
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), kill_client_read.read(&mut byte))
+                .await
+                .expect("in-use Kill did not close its release connection")
+                .expect("in-use Kill read failed"),
+            0,
+            "in-use Kill must return EOF with no unscoped Error or subsequent Sessions reply"
+        );
+        assert!(
+            shared.lock().await.session(&id).is_ok(),
+            "attached exited A remains retained after refused Kill"
+        );
+        assert!(
+            shared
+                .lock()
+                .await
+                .session_infos()
+                .iter()
+                .all(|info| info.id != id),
+            "the proof exercises the dangerous exited-but-omitted-from-Sessions case"
+        );
+
+        drop(kill_client_write);
+        tokio::time::timeout(Duration::from_secs(1), kill_handler)
+            .await
+            .expect("Kill handler did not retire")
+            .unwrap()
+            .unwrap();
+        drop(attach_client_write);
+        drop(attach_client_read);
+        tokio::time::timeout(Duration::from_secs(1), attach_handler)
+            .await
+            .expect("Attach handler did not retire")
+            .unwrap()
+            .unwrap();
+
+        let removed = shared
+            .lock()
+            .await
+            .take_session_if_generation(&id, &generation);
+        let ConditionalSessionTake::Taken(session) = removed else {
+            panic!("EOF must release the last attachment guard");
+        };
+        session.kill_child();
+    }
+
+    #[tokio::test]
+    async fn failed_handoff_claim_with_queued_snapshot_closes_without_any_event() {
+        let shared = Daemon::shared();
+        let id = sid("failed-handoff-claim-snapshot");
+        let exact_pending = handoff_token("30000000000000000000000000000001");
+        let wrong = handoff_token("30000000000000000000000000000002");
+        let retired = handoff_token("30000000000000000000000000000003");
+        {
+            let mut daemon = shared.lock().await;
+            daemon
+                .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+                .unwrap();
+            let pending_offer = AttachmentHandoff::Offer {
+                token: exact_pending.clone(),
+            };
+            drop(
+                daemon
+                    .acquire_session_attachment(&id, Some(&pending_offer), 30_001)
+                    .unwrap(),
+            );
+            let retired_offer = AttachmentHandoff::Offer {
+                token: retired.clone(),
+            };
+            daemon
+                .acquire_session_attachment(&id, Some(&retired_offer), 30_002)
+                .unwrap()
+                .detach();
+            assert_eq!(
+                daemon.session(&id).unwrap().attachment_fence_counts(),
+                (0, 1)
+            );
+        }
+
+        for (label, token) in [("wrong", wrong), ("retired", retired)] {
+            let (server, client) = tokio::io::duplex(4096);
+            let (server_read, server_write) = tokio::io::split(server);
+            let (mut client_read, mut client_write) = tokio::io::split(client);
+            let handler_shared = shared.clone();
+            let handler = tokio::spawn(async move {
+                handle_client(server_read, server_write, handler_shared).await
+            });
+
+            let mut queued = serde_json::to_vec(&ClientRequest::Attach {
+                id: id.clone(),
+                want_raw_output: false,
+                expected_session_generation: None,
+                output_generation: None,
+                handoff: Some(AttachmentHandoff::Claim { token }),
+            })
+            .unwrap();
+            queued.push(b'\n');
+            queued.extend(serde_json::to_vec(&ClientRequest::Snapshot { id: id.clone() }).unwrap());
+            queued.push(b'\n');
+            client_write.write_all(&queued).await.unwrap();
+            client_write.flush().await.unwrap();
+
+            let mut byte = [0_u8; 1];
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), client_read.read(&mut byte))
+                    .await
+                    .unwrap_or_else(|_| panic!("{label} Claim did not close"))
+                    .unwrap(),
+                0,
+                "{label} Claim must yield EOF with no Error/Grid from queued Snapshot"
+            );
+            drop(client_write);
+            tokio::time::timeout(Duration::from_secs(1), handler)
+                .await
+                .unwrap_or_else(|_| panic!("{label} Claim handler did not retire"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                shared
+                    .lock()
+                    .await
+                    .session(&id)
+                    .unwrap()
+                    .attachment_fence_counts(),
+                (0, 1),
+                "{label} Claim must not consume the unrelated exact Pending token"
+            );
+        }
+
+        let mut daemon = shared.lock().await;
+        daemon.cancel_session_attachment_handoff(&id, &exact_pending);
+        daemon.kill_session(&id);
+    }
+
+    #[tokio::test]
+    async fn stale_generation_resize_cannot_touch_replacement_geometry() {
+        let (shared, generation_b) = stale_mutation_closes_only_its_client_and_lists_replacement(
+            "generation-resize",
+            |generation_a| {
+                serde_json::json!({
+                    "op": "resize",
+                    "id": "generation-resize",
+                    "expected_generation": generation_a,
+                    "cols": 121,
+                    "rows": 37,
+                })
+            },
+        )
+        .await;
+        let snapshot = shared
+            .lock()
+            .await
+            .session(&sid("generation-resize"))
+            .unwrap()
+            .grid_snapshot();
+        assert_eq!(snapshot.generation.to_string(), generation_b);
+        assert_eq!((snapshot.cols, snapshot.rows), (80, 24));
+        shared.lock().await.kill_session(&sid("generation-resize"));
+    }
+
+    #[tokio::test]
+    async fn stale_generation_write_cannot_reach_replacement_pty() {
+        let (shared, generation_b) = stale_mutation_closes_only_its_client_and_lists_replacement(
+            "generation-write",
+            |generation_a| {
+                serde_json::json!({
+                    "op": "write",
+                    "id": "generation-write",
+                    "expected_generation": generation_a,
+                    "data": "STALE_GENERATION_MARKER\n",
+                })
+            },
+        )
+        .await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let snapshot = shared
+                .lock()
+                .await
+                .session(&sid("generation-write"))
+                .unwrap()
+                .grid_snapshot();
+            assert_eq!(snapshot.generation.to_string(), generation_b);
+            let text = snapshot
+                .rows_cells
+                .iter()
+                .flat_map(|row| row.iter())
+                .map(|cell| cell.text.as_str())
+                .collect::<String>();
+            assert!(
+                !text.contains("STALE_GENERATION_MARKER"),
+                "stale client input reached the replacement PTY"
+            );
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        shared.lock().await.kill_session(&sid("generation-write"));
+    }
+
+    #[tokio::test]
+    async fn matching_generation_write_resize_and_kill_touch_only_that_lifetime() {
+        let shared = Daemon::shared();
+        let generation = {
+            let mut daemon = shared.lock().await;
+            daemon
+                .start_session(sid("generation-match"), ".", "cat", &[], 80, 24)
+                .expect("spawn matching lifetime");
+            daemon
+                .session(&sid("generation-match"))
+                .unwrap()
+                .generation()
+        };
+        let (tx, _rx, _failed) = outbound::channel(OUT_QUEUE_CAP, OUT_QUEUE_BYTES);
+        let mut state = ClientState::new().unwrap();
+        assert_eq!(
+            handle_request(
+                ClientRequest::Resize {
+                    id: sid("generation-match"),
+                    expected_generation: generation.clone(),
+                    cols: 103,
+                    rows: 31,
+                },
+                &shared,
+                &tx,
+                &mut state,
+            )
+            .await,
+            RequestDisposition::Continue
+        );
+        assert_eq!(
+            {
+                let daemon = shared.lock().await;
+                let snapshot = daemon
+                    .session(&sid("generation-match"))
+                    .unwrap()
+                    .grid_snapshot();
+                (
+                    snapshot.cols,
+                    snapshot.rows,
+                    snapshot.generation.to_string(),
+                )
+            },
+            (103, 31, generation.clone())
+        );
+        assert_eq!(
+            handle_request(
+                ClientRequest::Write {
+                    id: sid("generation-match"),
+                    expected_generation: generation.clone(),
+                    data: "MATCHING_GENERATION_MARKER\n".into(),
+                },
+                &shared,
+                &tx,
+                &mut state,
+            )
+            .await,
+            RequestDisposition::Continue
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let text = {
+                let daemon = shared.lock().await;
+                daemon
+                    .session(&sid("generation-match"))
+                    .unwrap()
+                    .grid_snapshot()
+                    .rows_cells
+                    .iter()
+                    .flat_map(|row| row.iter())
+                    .map(|cell| cell.text.as_str())
+                    .collect::<String>()
+            };
+            if text.contains("MATCHING_GENERATION_MARKER") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "matching generation Write never reached its own PTY"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            handle_request(
+                ClientRequest::Kill {
+                    id: sid("generation-match"),
+                    expected_generation: generation,
+                },
+                &shared,
+                &tx,
+                &mut state,
+            )
+            .await,
+            RequestDisposition::Continue
+        );
+        assert!(shared
+            .lock()
+            .await
+            .session(&sid("generation-match"))
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn conditional_kill_is_idempotent_when_id_is_already_absent() {
+        let shared = Daemon::shared();
+        let (tx, _rx, _failed) = outbound::channel(OUT_QUEUE_CAP, OUT_QUEUE_BYTES);
+        let mut state = ClientState::new().unwrap();
+        assert_eq!(
+            handle_request(
+                ClientRequest::Kill {
+                    id: sid("already-absent"),
+                    expected_generation: "observed-before-exit".into(),
+                },
+                &shared,
+                &tx,
+                &mut state,
+            )
+            .await,
+            RequestDisposition::Continue
+        );
+    }
+
+    #[tokio::test]
+    async fn unparseable_request_framing_closes_without_error_reply() {
+        for (label, request) in [
+            (
+                "id-only mutation",
+                b"{\"op\":\"resize\",\"id\":\"s\",\"cols\":90,\"rows\":30}\n".as_slice(),
+            ),
+            ("malformed json", b"{\"op\":\"list_sessions\"\n".as_slice()),
+            ("invalid utf8", b"\xff\xfe\n".as_slice()),
+        ] {
+            let shared = Daemon::shared();
+            let (server, client) = tokio::io::duplex(4096);
+            let (server_read, server_write) = tokio::io::split(server);
+            let (mut client_read, mut client_write) = tokio::io::split(client);
+            let handler =
+                tokio::spawn(async move { handle_client(server_read, server_write, shared).await });
+            client_write.write_all(request).await.unwrap();
+            client_write.flush().await.unwrap();
+            let mut byte = [0_u8; 1];
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), client_read.read(&mut byte))
+                    .await
+                    .unwrap_or_else(|_| panic!("{label} did not close"))
+                    .unwrap(),
+                0,
+                "{label} must produce EOF with no Error frame"
+            );
+            drop(client_write);
+            tokio::time::timeout(Duration::from_secs(1), handler)
+                .await
+                .unwrap_or_else(|_| panic!("{label} handler did not retire"))
+                .unwrap()
+                .unwrap();
+        }
     }
 
     fn env_of<'a>(entries: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
@@ -938,7 +2228,7 @@ mod tests {
         }
 
         let (tx, mut rx, _failed) = outbound::channel(OUT_QUEUE_CAP, OUT_QUEUE_BYTES);
-        let mut state = ClientState::default();
+        let mut state = ClientState::new().unwrap();
         handle_request(ClientRequest::ListSessions, &shared, &tx, &mut state).await;
 
         let DaemonEvent::Sessions { ids, sessions } =
@@ -981,7 +2271,7 @@ mod tests {
         let request_shared = shared.clone();
         let request_tx = tx.clone();
         let request = tokio::spawn(async move {
-            let mut state = ClientState::default();
+            let mut state = ClientState::new().unwrap();
             handle_request(
                 ClientRequest::ListSessions,
                 &request_shared,
@@ -1040,7 +2330,9 @@ mod tests {
         let attach = serde_json::to_vec(&ClientRequest::Attach {
             id: sid("writer-failure"),
             want_raw_output: false,
+            expected_session_generation: None,
             output_generation: None,
+            handoff: None,
         })
         .unwrap();
         client_write.write_all(&attach).await.unwrap();
@@ -1148,11 +2440,12 @@ mod tests {
             .build()
             .unwrap();
 
-        let handle = rt.block_on(async {
+        let (handle, generation) = rt.block_on(async {
             let mut d = shared.lock().await;
             d.start_session(sid("w"), ".", "sleep", &["30".to_string()], 80, 24)
                 .expect("spawn session");
-            d.session(&sid("w")).unwrap().pty_handle()
+            let session = d.session(&sid("w")).unwrap();
+            (session.pty_handle(), session.generation())
         });
 
         // Stall every PTY write: hold the session's writer lock for ~1s. This
@@ -1177,12 +2470,13 @@ mod tests {
                 // Fire the Write through the real handler as a task; its blocking
                 // write hits the held writer lock.
                 let (tx, _rx, _failed) = outbound::channel(OUT_QUEUE_CAP, OUT_QUEUE_BYTES);
-                let mut wstate = ClientState::default();
+                let mut wstate = ClientState::new().unwrap();
                 let wshared = rt_shared.clone();
                 let write_task = tokio::spawn(async move {
                     handle_request(
                         ClientRequest::Write {
                             id: sid("w"),
+                            expected_generation: generation,
                             data: "ls\n".to_string(),
                         },
                         &wshared,
@@ -1197,7 +2491,7 @@ mod tests {
                 tokio::task::yield_now().await;
 
                 let (ltx, mut lrx, _failed) = outbound::channel(OUT_QUEUE_CAP, OUT_QUEUE_BYTES);
-                let mut lstate = ClientState::default();
+                let mut lstate = ClientState::new().unwrap();
                 handle_request(ClientRequest::ListSessions, &rt_shared, &ltx, &mut lstate).await;
 
                 if let Ok(DaemonEvent::Sessions { ids, .. }) = lrx.try_recv_event() {

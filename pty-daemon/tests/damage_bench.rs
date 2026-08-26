@@ -79,7 +79,12 @@ fn bench_sustained_output_damage_vs_snapshot() {
         &format!(r#"{{"op":"attach","id":"{id}","want_raw_output":false}}"#),
     );
     // Drain the baseline restore Grid.
-    let _ = read_until(&mut reader, "\"ev\":\"grid\"", WITHIN);
+    let baseline: Value =
+        serde_json::from_str(read_until(&mut reader, "\"ev\":\"grid\"", WITHIN).trim())
+            .expect("baseline Grid JSON");
+    let generation = baseline["grid"]["generation"]
+        .as_str()
+        .expect("baseline generation");
 
     const WRITES: usize = 200;
     let start = Instant::now();
@@ -88,7 +93,9 @@ fn bench_sustained_output_damage_vs_snapshot() {
         // producing one committed mutation -> one Damage frame.
         send(
             &mut stream,
-            &format!(r#"{{"op":"write","id":"{id}","data":"line-{i:04}\n"}}"#),
+            &format!(
+                r#"{{"op":"write","id":"{id}","data":"line-{i:04}\n","expected_generation":"{generation}"}}"#
+            ),
         );
     }
 
@@ -162,7 +169,12 @@ fn bench_resize_burst_bounded_no_storm() {
         &mut stream,
         &format!(r#"{{"op":"attach","id":"{id}","want_raw_output":false}}"#),
     );
-    let _ = read_until(&mut reader, "\"ev\":\"grid\"", WITHIN);
+    let baseline: Value =
+        serde_json::from_str(read_until(&mut reader, "\"ev\":\"grid\"", WITHIN).trim())
+            .expect("baseline Grid JSON");
+    let generation = baseline["grid"]["generation"]
+        .as_str()
+        .expect("baseline generation");
 
     // Distinct geometries so each resize is a real change.
     let dims: [(u16, u16); 6] = [
@@ -176,7 +188,9 @@ fn bench_resize_burst_bounded_no_storm() {
     for (i, (cols, rows)) in dims.iter().enumerate() {
         send(
             &mut stream,
-            &format!(r#"{{"op":"resize","id":"{id}","cols":{cols},"rows":{rows}}}"#),
+            &format!(
+                r#"{{"op":"resize","id":"{id}","cols":{cols},"rows":{rows},"expected_generation":"{generation}"}}"#
+            ),
         );
         // The forwarder only diffs the grid when PTY output advances it; a resize alone
         // produces no output. A tiny write after each resize drives one committed
@@ -186,7 +200,9 @@ fn bench_resize_burst_bounded_no_storm() {
         std::thread::sleep(Duration::from_millis(60));
         send(
             &mut stream,
-            &format!(r#"{{"op":"write","id":"{id}","data":"r{i}\n"}}"#),
+            &format!(
+                r#"{{"op":"write","id":"{id}","data":"r{i}\n","expected_generation":"{generation}"}}"#
+            ),
         );
     }
 
@@ -263,7 +279,12 @@ fn bench_large_screen_rewrite_single_frame() {
         &mut stream,
         &format!(r#"{{"op":"attach","id":"{id}","want_raw_output":false}}"#),
     );
-    let _ = read_until(&mut reader, "\"ev\":\"grid\"", WITHIN);
+    let baseline: Value =
+        serde_json::from_str(read_until(&mut reader, "\"ev\":\"grid\"", WITHIN).trim())
+            .expect("baseline Grid JSON");
+    let generation = baseline["grid"]["generation"]
+        .as_str()
+        .expect("baseline generation");
 
     // Fill most of the screen in one write: rows-1 lines of cols-1 chars each. cat echoes
     // it as one burst -> the grid rewrites in (typically) one committed mutation.
@@ -275,7 +296,9 @@ fn bench_large_screen_rewrite_single_frame() {
     }
     send(
         &mut stream,
-        &format!(r#"{{"op":"write","id":"{id}","data":"{payload}"}}"#),
+        &format!(
+            r#"{{"op":"write","id":"{id}","data":"{payload}","expected_generation":"{generation}"}}"#
+        ),
     );
 
     let mut frames = 0usize;

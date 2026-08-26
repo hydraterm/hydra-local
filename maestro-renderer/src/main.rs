@@ -56,6 +56,17 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let attachment_handoff_raw = std::env::var_os(maestro_renderer::ATTACHMENT_HANDOFF_ENV);
+    // A raw token cannot reconstruct the parent-owned original-connection cancellation authority
+    // or carry an exact Claim/Grid acknowledgement back to that parent. Remove and reject the
+    // retired carrier before any renderer threads or platform hosts can launch descendants.
+    std::env::remove_var(maestro_renderer::ATTACHMENT_HANDOFF_ENV);
+    if attachment_handoff_raw.is_some() {
+        eprintln!(
+            "maestro-renderer: detached attachment handoff requires a parent acknowledgement pipe"
+        );
+        std::process::exit(2);
+    }
 
     // The CLI keeps the historical title (None -> `maestro-renderer`); app-owned titles come from
     // library callers like `maestro-app`, not the bare renderer binary. `font_size_px` / `theme`
@@ -65,6 +76,8 @@ fn main() {
     finish(run_renderer(RendererLaunch {
         socket_path: cli.socket_path,
         session_id: cli.session_id,
+        attachment_handoff: None,
+        exact_viewport: None,
         window_title: None,
         status_label: None,
         tab_strip: None,

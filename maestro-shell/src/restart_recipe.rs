@@ -22,9 +22,11 @@ pub fn canonical_launch_for_restart(launch: &LaunchSpec) -> LaunchSpec {
             launch_spec_id: launch_spec_id.clone(),
             params: canonical_agent_params(launch_spec_id, params),
         },
-        LaunchSpec::AdHocRedacted { argv, .. } => {
-            canonical_adhoc_agent_launch(argv).unwrap_or_else(|| launch.clone())
-        }
+        LaunchSpec::AdHocRedacted {
+            argv,
+            redacted: false,
+            ..
+        } => canonical_adhoc_agent_launch(argv).unwrap_or_else(|| launch.clone()),
         _ => launch.clone(),
     }
 }
@@ -38,47 +40,364 @@ pub fn canonical_launch_for_restart(launch: &LaunchSpec) -> LaunchSpec {
 /// satisfy this boundary. Provider-specific value validation mirrors the canonicalizer below so a
 /// malformed identity cannot gain restart authority merely by following a familiar flag.
 pub fn known_safe_provider_has_exact_resume(launch: &LaunchSpec) -> bool {
+    strict_known_safe_provider_mode(launch) == Some(PreparedProviderLaunchMode::ExactResume)
+}
+
+pub(crate) fn strict_known_safe_provider_mode(
+    launch: &LaunchSpec,
+) -> Option<PreparedProviderLaunchMode> {
     let LaunchSpec::KnownSafe {
         launch_spec_id,
         params,
     } = launch
     else {
-        return false;
+        return None;
     };
 
-    let pair = |flag: &str| {
-        params
-            .windows(2)
-            .find(|values| values[0] == flag)
-            .map(|values| values[1].as_str())
-    };
-    match launch_spec_id.as_str() {
-        "claude" => pair("--resume").and_then(non_flag).is_some(),
-        "codex" => pair("resume").and_then(non_flag).is_some(),
-        "gemini" => {
-            pair("--session-file").and_then(non_empty).is_some()
-                || pair("--resume")
-                    .and_then(non_flag)
-                    .is_some_and(|value| value != "latest")
-        }
-        "opencode" => pair("--session").and_then(non_flag).is_some(),
-        "copilot" => params.iter().any(|value| valid_copilot_resume(value)),
-        "agy" => pair("--conversation").and_then(bounded_resume_id).is_some(),
-        "kimi" => pair("--session").and_then(bounded_resume_id).is_some(),
-        "kiro-cli" => pair("--resume-id")
-            .and_then(canonical_copilot_uuid)
-            .is_some(),
-        "agent" => pair("--resume").and_then(canonical_copilot_uuid).is_some(),
-        "amp" => params.windows(3).any(|values| {
-            values[0] == "threads"
-                && values[1] == "continue"
-                && bounded_amp_thread_target(&values[2]).is_some()
-        }),
-        "devin" | "droid" => pair("--resume")
-            .and_then(bounded_opaque_resume_id)
-            .is_some(),
-        _ => false,
+    if !is_agent(launch_spec_id) || canonical_agent_params(launch_spec_id, params) != *params {
+        return None;
     }
+    strict_prepared_provider_params(launch_spec_id, params)
+}
+
+/// Closed launch language accepted by transaction-prepared provider sessions.
+///
+/// `canonical_launch_for_restart` is deliberately a sanitizer for old durable records: it drops
+/// unknown bytes and invents a workspace-latest fallback. It is therefore not an authorization
+/// check for a brand-new launch. This parser rejects every byte outside the reviewed provider
+/// grammar before either daemon argv or durable launch metadata is minted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PreparedProviderLaunchMode {
+    ExactResume,
+    /// A bare provider launch with no provider conversation identity. It may run once, but Hydra
+    /// cannot publish a durable restart recipe without guessing from mutable history.
+    FreshUnassigned,
+    /// The user explicitly selected a non-exact provider operation such as latest, a picker search,
+    /// an ordinal index, or a session import. It remains explicit-user-only restart authority.
+    ExplicitNonExact,
+    /// The provider's first launch is assigned a UUID up front; publication converts that create
+    /// identity to the corresponding exact resume recipe.
+    FreshWithAssignedIdentity,
+}
+
+pub(crate) fn strict_prepared_provider_launch(
+    selected_provider: &str,
+    source_argv: &[String],
+) -> Option<(PreparedProviderLaunchMode, LaunchSpec)> {
+    if source_argv.first().map(String::as_str) != Some(selected_provider)
+        || !is_agent(selected_provider)
+    {
+        return None;
+    }
+    let params = &source_argv[1..];
+    let mode = strict_prepared_provider_params(selected_provider, params)?;
+    let canonical = canonical_launch_for_restart(&LaunchSpec::KnownSafe {
+        launch_spec_id: selected_provider.to_string(),
+        params: params.to_vec(),
+    });
+    let LaunchSpec::KnownSafe {
+        launch_spec_id,
+        params: _,
+    } = &canonical
+    else {
+        return None;
+    };
+    if launch_spec_id != selected_provider {
+        return None;
+    }
+    let exact = known_safe_provider_has_exact_resume(&canonical);
+    match mode {
+        PreparedProviderLaunchMode::ExactResume if exact => Some((mode, canonical)),
+        PreparedProviderLaunchMode::FreshWithAssignedIdentity if exact => Some((mode, canonical)),
+        PreparedProviderLaunchMode::FreshUnassigned
+        | PreparedProviderLaunchMode::ExplicitNonExact
+            if !exact =>
+        {
+            Some((mode, canonical))
+        }
+        _ => None,
+    }
+}
+
+fn strict_prepared_provider_params(
+    provider: &str,
+    params: &[String],
+) -> Option<PreparedProviderLaunchMode> {
+    let mut idx = 0;
+    let mut resume = None;
+    let mut model_seen = false;
+    let mut dangerous_seen = false;
+    let mut kiro_chat_seen = false;
+
+    let set_resume = |slot: &mut Option<PreparedProviderLaunchMode>, mode| {
+        if slot.is_some() {
+            None
+        } else {
+            *slot = Some(mode);
+            Some(())
+        }
+    };
+    while idx < params.len() {
+        let token = params[idx].as_str();
+        match (provider, token) {
+            ("claude", "--session-id") => {
+                params
+                    .get(idx + 1)
+                    .and_then(|value| canonical_provider_uuid(value))?;
+                set_resume(
+                    &mut resume,
+                    PreparedProviderLaunchMode::FreshWithAssignedIdentity,
+                )?;
+                idx += 2;
+            }
+            ("claude", "--resume") => {
+                let value = params.get(idx + 1).filter(|value| strict_opaque(value))?;
+                let mode = if canonical_provider_uuid(value).is_some() {
+                    PreparedProviderLaunchMode::ExactResume
+                } else {
+                    PreparedProviderLaunchMode::ExplicitNonExact
+                };
+                set_resume(&mut resume, mode)?;
+                idx += 2;
+            }
+            ("claude", "--continue") => {
+                set_resume(&mut resume, PreparedProviderLaunchMode::ExplicitNonExact)?;
+                idx += 1;
+            }
+            ("codex", "resume") => {
+                let value = params.get(idx + 1)?;
+                let mode = if value == "--last" || strict_opaque(value) {
+                    if canonical_provider_uuid(value).is_some() {
+                        PreparedProviderLaunchMode::ExactResume
+                    } else {
+                        PreparedProviderLaunchMode::ExplicitNonExact
+                    }
+                } else {
+                    return None;
+                };
+                set_resume(&mut resume, mode)?;
+                idx += 2;
+            }
+            ("gemini", "--session-file") => {
+                let value = params
+                    .get(idx + 1)
+                    .filter(|value| strict_path_value(value))?;
+                // Importing a session file creates a new Gemini identity on every invocation; the
+                // path is stable input, not exact resume authority.
+                set_resume(&mut resume, PreparedProviderLaunchMode::ExplicitNonExact)?;
+                let _ = value;
+                idx += 2;
+            }
+            ("gemini", "--session-id") => {
+                params
+                    .get(idx + 1)
+                    .and_then(|value| canonical_provider_uuid(value))?;
+                set_resume(
+                    &mut resume,
+                    PreparedProviderLaunchMode::FreshWithAssignedIdentity,
+                )?;
+                idx += 2;
+            }
+            ("gemini", "--resume") => {
+                let value = params.get(idx + 1)?;
+                let mode = if value == "latest" || canonical_gemini_resume_index(value) {
+                    PreparedProviderLaunchMode::ExplicitNonExact
+                } else if canonical_provider_uuid(value).is_some() {
+                    PreparedProviderLaunchMode::ExactResume
+                } else {
+                    return None;
+                };
+                set_resume(&mut resume, mode)?;
+                idx += 2;
+            }
+            ("opencode", "--session") => {
+                let value = params.get(idx + 1).filter(|value| strict_opaque(value))?;
+                set_resume(&mut resume, PreparedProviderLaunchMode::ExactResume)?;
+                let _ = value;
+                idx += 2;
+            }
+            ("opencode", "--continue") => {
+                set_resume(&mut resume, PreparedProviderLaunchMode::ExplicitNonExact)?;
+                idx += 1;
+            }
+            ("copilot", value) if value.starts_with("--resume=") => {
+                value
+                    .strip_prefix("--resume=")
+                    .and_then(canonical_provider_uuid)?;
+                set_resume(&mut resume, PreparedProviderLaunchMode::ExactResume)?;
+                idx += 1;
+            }
+            ("copilot", value) if value.starts_with("--session-id=") => {
+                value
+                    .strip_prefix("--session-id=")
+                    .and_then(canonical_provider_uuid)?;
+                set_resume(
+                    &mut resume,
+                    PreparedProviderLaunchMode::FreshWithAssignedIdentity,
+                )?;
+                idx += 1;
+            }
+            ("copilot", "--continue") => {
+                set_resume(&mut resume, PreparedProviderLaunchMode::ExplicitNonExact)?;
+                idx += 1;
+            }
+            ("agy", "--conversation") | ("kimi", "--session") => {
+                let value = params.get(idx + 1).filter(|value| {
+                    bounded_resume_id(value).is_some_and(|bounded| bounded == value.as_str())
+                })?;
+                let exact = if provider == "agy" {
+                    canonical_provider_uuid(value).is_some()
+                } else {
+                    canonical_kimi_session_id(value)
+                };
+                set_resume(
+                    &mut resume,
+                    if exact {
+                        PreparedProviderLaunchMode::ExactResume
+                    } else {
+                        PreparedProviderLaunchMode::ExplicitNonExact
+                    },
+                )?;
+                idx += 2;
+            }
+            ("agy" | "kimi", "--continue") => {
+                set_resume(&mut resume, PreparedProviderLaunchMode::ExplicitNonExact)?;
+                idx += 1;
+            }
+            ("kiro-cli", "chat") => {
+                if kiro_chat_seen || idx != 0 {
+                    return None;
+                }
+                kiro_chat_seen = true;
+                idx += 1;
+            }
+            ("kiro-cli", "--resume-id") => {
+                params
+                    .get(idx + 1)
+                    .and_then(|value| canonical_provider_uuid(value))?;
+                set_resume(&mut resume, PreparedProviderLaunchMode::ExactResume)?;
+                idx += 2;
+            }
+            ("kiro-cli", "--resume") => {
+                set_resume(&mut resume, PreparedProviderLaunchMode::ExplicitNonExact)?;
+                idx += 1;
+            }
+            ("agent", "--resume") => {
+                params
+                    .get(idx + 1)
+                    .and_then(|value| canonical_provider_uuid(value))?;
+                set_resume(&mut resume, PreparedProviderLaunchMode::ExactResume)?;
+                idx += 2;
+            }
+            ("agent", "--continue") => {
+                set_resume(&mut resume, PreparedProviderLaunchMode::ExplicitNonExact)?;
+                idx += 1;
+            }
+            ("amp", "last") => {
+                set_resume(&mut resume, PreparedProviderLaunchMode::ExplicitNonExact)?;
+                idx += 1;
+            }
+            ("amp", "threads") => {
+                if params.get(idx + 1).map(String::as_str) != Some("continue") {
+                    return None;
+                }
+                let value = params.get(idx + 2).filter(|value| {
+                    bounded_amp_thread_target(value)
+                        .is_some_and(|bounded| bounded == value.as_str())
+                })?;
+                set_resume(&mut resume, PreparedProviderLaunchMode::ExactResume)?;
+                let _ = value;
+                idx += 3;
+            }
+            ("devin", "--resume") => {
+                let value = params.get(idx + 1).filter(|value| {
+                    bounded_opaque_resume_id(value).is_some_and(|bounded| bounded == value.as_str())
+                })?;
+                set_resume(&mut resume, PreparedProviderLaunchMode::ExactResume)?;
+                let _ = value;
+                idx += 2;
+            }
+            ("devin", "--continue") => {
+                set_resume(&mut resume, PreparedProviderLaunchMode::ExplicitNonExact)?;
+                idx += 1;
+            }
+            ("droid", "--resume") => {
+                if let Some(value) = params.get(idx + 1).filter(|value| strict_opaque(value)) {
+                    set_resume(&mut resume, PreparedProviderLaunchMode::ExactResume)?;
+                    let _ = value;
+                    idx += 2;
+                } else {
+                    set_resume(&mut resume, PreparedProviderLaunchMode::ExplicitNonExact)?;
+                    idx += 1;
+                }
+            }
+            (_, "--model") if !matches!(provider, "amp" | "droid") => {
+                let value = params
+                    .get(idx + 1)
+                    .filter(|value| strict_model_name(value))?;
+                if model_seen {
+                    return None;
+                }
+                model_seen = true;
+                let _ = value;
+                idx += 2;
+            }
+            ("claude", "--dangerously-skip-permissions")
+            | ("codex", "--dangerously-bypass-approvals-and-sandbox")
+            | ("gemini", "--yolo")
+            | ("opencode", "--auto")
+            | ("copilot", "--yolo")
+            | ("agy", "--dangerously-skip-permissions")
+            | ("kimi", "--yolo")
+            | ("kiro-cli", "--trust-all-tools")
+            | ("agent", "--yolo")
+            | ("amp", "--dangerously-allow-all")
+            | ("devin", "--permission-mode=dangerous")
+            | ("droid", "--auto=high") => {
+                if dangerous_seen {
+                    return None;
+                }
+                dangerous_seen = true;
+                idx += 1;
+            }
+            _ => return None,
+        }
+    }
+    if (provider == "kiro-cli" && !kiro_chat_seen) || (provider == "copilot" && resume.is_none()) {
+        return None;
+    }
+    Some(resume.unwrap_or(PreparedProviderLaunchMode::FreshUnassigned))
+}
+
+fn strict_opaque(value: &str) -> bool {
+    bounded_opaque_resume_id(value).is_some_and(|bounded| bounded == value)
+}
+
+fn canonical_gemini_resume_index(value: &str) -> bool {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|index| *index > 0)
+        .is_some_and(|index| index.to_string() == value)
+}
+
+fn canonical_kimi_session_id(value: &str) -> bool {
+    value
+        .strip_prefix("session_")
+        .and_then(canonical_provider_uuid)
+        .is_some()
+}
+
+fn strict_path_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.trim() == value
+        && !value.starts_with('-')
+        && value.chars().count() <= 1024
+        && !value.chars().any(char::is_control)
+}
+
+fn strict_model_name(value: &str) -> bool {
+    !value.starts_with('-') && bounded_model_name(value).is_some_and(|bounded| bounded == value)
 }
 
 pub fn canonicalize_session_restart_recipe(
@@ -125,33 +444,87 @@ pub fn canonicalize_all_session_restart_recipes(
 }
 
 fn canonical_adhoc_agent_launch(argv: &[String]) -> Option<LaunchSpec> {
-    let (agent_idx, agent) = first_agent(argv)?;
-    let params = canonical_agent_params(agent, &argv[agent_idx + 1..]);
-    if params.is_empty() && !contains_explicit_resume(agent, argv) {
+    let command = argv.first()?;
+    let command_path = std::path::Path::new(command);
+    if command.contains('/') && !command_path.is_absolute() {
         return None;
     }
-    Some(LaunchSpec::KnownSafe {
-        launch_spec_id: agent.to_string(),
-        params,
-    })
-}
-
-fn first_agent(argv: &[String]) -> Option<(usize, &str)> {
-    for (idx, token) in argv.iter().enumerate() {
-        let leaf = token.rsplit('/').next().unwrap_or(token);
-        if let Some(agent) = INFERABLE_AGENTS
-            .iter()
-            .copied()
-            .find(|agent| *agent == leaf)
-        {
-            return Some((idx, agent));
-        }
+    let provider = command_path.file_name()?.to_str()?;
+    if !INFERABLE_AGENTS.contains(&provider) {
+        return None;
     }
-    None
+    let mut normalized = argv.to_vec();
+    normalized[0] = provider.to_string();
+    strict_prepared_provider_launch(provider, &normalized).map(|(_, canonical)| canonical)
 }
 
 fn is_agent(value: &str) -> bool {
     KNOWN_SAFE_AGENTS.contains(&value)
+}
+
+pub fn is_known_provider_id(value: &str) -> bool {
+    is_agent(value)
+}
+
+pub fn is_strict_prepared_provider_launch(provider: &str, source_argv: &[String]) -> bool {
+    strict_prepared_provider_launch(provider, source_argv).is_some()
+}
+
+pub fn is_valid_prepared_provider_custom_adhoc(provider: &str, source_argv: &[String]) -> bool {
+    source_argv.first().map(String::as_str) == Some(provider)
+        && is_known_provider_id(provider)
+        && !prepared_provider_source_has_selector_shape(provider, &source_argv[1..])
+}
+
+pub(crate) fn prepared_provider_source_has_selector_shape(
+    provider: &str,
+    params: &[String],
+) -> bool {
+    match provider {
+        "claude" => params.iter().any(|value| {
+            value.starts_with("--resume")
+                || value.starts_with("--continue")
+                || value.starts_with("--session-id")
+        }),
+        "codex" => params
+            .iter()
+            .any(|value| value.starts_with("resume") || value.starts_with("--continue")),
+        "gemini" => params.iter().any(|value| {
+            value.starts_with("--resume")
+                || value.starts_with("--session-id")
+                || value.starts_with("--session-file")
+        }),
+        "opencode" => params
+            .iter()
+            .any(|value| value.starts_with("--session") || value.starts_with("--continue")),
+        "copilot" => params.iter().any(|value| {
+            value.starts_with("--resume")
+                || value.starts_with("--session-id")
+                || value.starts_with("--continue")
+                || value == "-r"
+                || value.starts_with("-r=")
+                || value.starts_with("--connect")
+        }),
+        "agy" => params
+            .iter()
+            .any(|value| value.starts_with("--conversation") || value.starts_with("--continue")),
+        "kimi" => params
+            .iter()
+            .any(|value| value.starts_with("--session") || value.starts_with("--continue")),
+        "kiro-cli" => params
+            .iter()
+            .any(|value| value.starts_with("--resume-id") || value.starts_with("--resume")),
+        "agent" | "devin" => params
+            .iter()
+            .any(|value| value.starts_with("--resume") || value.starts_with("--continue")),
+        "droid" => params.iter().any(|value| value.starts_with("--resume")),
+        "amp" => params.iter().any(|value| {
+            value.starts_with("last")
+                || value.starts_with("threads")
+                || value.starts_with("continue")
+        }),
+        _ => false,
+    }
 }
 
 fn canonical_agent_params(agent: &str, params: &[String]) -> Vec<String> {
@@ -187,6 +560,17 @@ fn canonical_agent_params(agent: &str, params: &[String]) -> Vec<String> {
                 }
                 idx += 2;
             }
+            "--session-id" if agent == "claude" => {
+                // Hydra uses this UUID only for the first Claude launch. Every durable restart must
+                // resume the exact conversation instead of replaying create or guessing latest.
+                if let Some(id) = params
+                    .get(idx + 1)
+                    .and_then(|value| canonical_provider_uuid(value))
+                {
+                    push_pair_once(&mut out, "--resume", id);
+                }
+                idx += 2;
+            }
             "resume" if agent == "codex" => {
                 if let Some(id) = params.get(idx + 1).and_then(|s| non_flag(s)) {
                     push_pair_once(&mut out, "resume", id);
@@ -199,10 +583,31 @@ fn canonical_agent_params(agent: &str, params: &[String]) -> Vec<String> {
                 }
                 idx += 2;
             }
+            "--session-id" if agent == "gemini" => {
+                // Gemini accepts a caller-chosen UUID for one new session. Persist only the exact
+                // resume selector so a reboot cannot make sibling panes converge on `latest`.
+                if let Some(id) = params
+                    .get(idx + 1)
+                    .and_then(|value| canonical_provider_uuid(value))
+                {
+                    push_pair_once(&mut out, "--resume", id);
+                }
+                idx += 2;
+            }
+            "--resume" if agent == "gemini" => {
+                if let Some(target) = params.get(idx + 1).and_then(|value| {
+                    (value == "latest")
+                        .then_some(value.as_str())
+                        .or_else(|| non_flag(value))
+                }) {
+                    push_pair_once(&mut out, "--resume", target);
+                }
+                idx += 2;
+            }
             token if agent == "copilot" && token.starts_with("--resume=") => {
                 if let Some(id) = token
                     .strip_prefix("--resume=")
-                    .and_then(canonical_copilot_uuid)
+                    .and_then(canonical_provider_uuid)
                 {
                     push_prefixed_value_once(&mut out, "--resume=", id);
                 }
@@ -213,7 +618,7 @@ fn canonical_agent_params(agent: &str, params: &[String]) -> Vec<String> {
                 // provider session, not replay the create-or-resume flag or fall back to a different latest one.
                 if let Some(id) = token
                     .strip_prefix("--session-id=")
-                    .and_then(canonical_copilot_uuid)
+                    .and_then(canonical_provider_uuid)
                 {
                     push_prefixed_value_once(&mut out, "--resume=", id);
                 }
@@ -238,7 +643,7 @@ fn canonical_agent_params(agent: &str, params: &[String]) -> Vec<String> {
             "--resume-id" if agent == "kiro-cli" => {
                 if let Some(id) = params
                     .get(idx + 1)
-                    .and_then(|value| canonical_copilot_uuid(value))
+                    .and_then(|value| canonical_provider_uuid(value))
                 {
                     push_pair_flag_once(&mut out, "--resume-id", id);
                 }
@@ -251,7 +656,7 @@ fn canonical_agent_params(agent: &str, params: &[String]) -> Vec<String> {
             "--resume" if agent == "agent" => {
                 if let Some(id) = params
                     .get(idx + 1)
-                    .and_then(|value| canonical_copilot_uuid(value))
+                    .and_then(|value| canonical_provider_uuid(value))
                 {
                     push_pair_flag_once(&mut out, "--resume", id);
                 }
@@ -503,35 +908,14 @@ fn has_resume_target(agent: &str, params: &[String]) -> bool {
     }
 }
 
-fn contains_explicit_resume(agent: &str, argv: &[String]) -> bool {
-    match agent {
-        "claude" => argv.iter().any(|s| s == "--resume"),
-        "codex" => argv.windows(2).any(|w| w[0] == "codex" && w[1] == "resume"),
-        "gemini" => argv.iter().any(|s| s == "--session-file"),
-        "opencode" => argv.iter().any(|s| s == "--session"),
-        "copilot" => argv.iter().any(|s| valid_copilot_resume(s)),
-        "agy" => argv.iter().any(|s| s == "--conversation"),
-        "kimi" => argv.iter().any(|s| s == "--session"),
-        "kiro-cli" => argv.iter().any(|s| s == "--resume-id"),
-        "agent" => argv.iter().any(|s| s == "--resume"),
-        "amp" => {
-            argv.iter().any(|s| s == "last")
-                || argv
-                    .windows(3)
-                    .any(|w| w[0] == "threads" && w[1] == "continue")
-        }
-        _ => false,
-    }
-}
-
 fn valid_copilot_resume(value: &str) -> bool {
     value
         .strip_prefix("--resume=")
-        .and_then(canonical_copilot_uuid)
+        .and_then(canonical_provider_uuid)
         .is_some()
 }
 
-fn canonical_copilot_uuid(value: &str) -> Option<&str> {
+fn canonical_provider_uuid(value: &str) -> Option<&str> {
     let value = non_flag(value)?;
     let parsed = uuid::Uuid::parse_str(value).ok()?;
     (parsed.hyphenated().to_string() == value).then_some(value)
@@ -609,22 +993,38 @@ mod tests {
     #[test]
     fn exact_provider_resume_boundary_accepts_only_one_named_conversation() {
         let exact = [
-            ("claude", vec!["--resume", "claude-session"]),
+            (
+                "claude",
+                vec!["--resume", "50000000-0000-4000-8000-000000000001"],
+            ),
             (
                 "codex",
                 vec!["resume", "60000000-0000-4000-8000-000000000001"],
             ),
-            ("gemini", vec!["--session-file", "/tmp/session.json"]),
+            (
+                "gemini",
+                vec!["--resume", "30000000-0000-4000-8000-000000000001"],
+            ),
             ("opencode", vec!["--session", "ses_123"]),
             (
                 "copilot",
                 vec!["--resume=123e4567-e89b-42d3-a456-426614174000"],
             ),
-            ("agy", vec!["--conversation", "conversation-123"]),
-            ("kimi", vec!["--session", "session-123"]),
+            (
+                "agy",
+                vec!["--conversation", "70000000-0000-4000-8000-000000000001"],
+            ),
+            (
+                "kimi",
+                vec!["--session", "session_80000000-0000-4000-8000-000000000001"],
+            ),
             (
                 "kiro-cli",
-                vec!["--resume-id", "20000000-0000-4000-8000-000000000001"],
+                vec![
+                    "chat",
+                    "--resume-id",
+                    "20000000-0000-4000-8000-000000000001",
+                ],
             ),
             (
                 "agent",
@@ -661,6 +1061,14 @@ mod tests {
                 params: vec!["--resume".into(), "latest".into()],
             },
             LaunchSpec::KnownSafe {
+                launch_spec_id: "gemini".into(),
+                params: vec!["--resume".into(), "5".into()],
+            },
+            LaunchSpec::KnownSafe {
+                launch_spec_id: "gemini".into(),
+                params: vec!["--session-file".into(), "/tmp/session.json".into()],
+            },
+            LaunchSpec::KnownSafe {
                 launch_spec_id: "kiro-cli".into(),
                 params: vec!["chat".into(), "--resume".into()],
             },
@@ -684,7 +1092,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_ad_hoc_resume_becomes_known_safe_and_drops_mini() {
+    fn opencode_ad_hoc_with_unreviewed_mini_remains_user_gated() {
         let launch = LaunchSpec::AdHocRedacted {
             argv: vec![
                 "opencode".into(),
@@ -696,13 +1104,7 @@ mod tests {
             redacted: false,
             restart_requires_user: true,
         };
-        assert_eq!(
-            canonical_launch_for_restart(&launch),
-            LaunchSpec::KnownSafe {
-                launch_spec_id: "opencode".into(),
-                params: vec!["--session".into(), "ses_123".into(), "--auto".into()],
-            }
-        );
+        assert_eq!(canonical_launch_for_restart(&launch), launch);
     }
 
     #[test]
@@ -747,6 +1149,35 @@ mod tests {
     }
 
     #[test]
+    fn claude_assigned_identity_canonicalizes_to_exact_resume_with_safe_flags() {
+        const UUID: &str = "01234567-89ab-4def-8123-456789abcdef";
+        let canonical = canonical_launch_for_restart(&LaunchSpec::KnownSafe {
+            launch_spec_id: "claude".into(),
+            params: vec![
+                "--model".into(),
+                "opus".into(),
+                "--session-id".into(),
+                UUID.into(),
+                "--dangerously-skip-permissions".into(),
+            ],
+        });
+        assert_eq!(
+            canonical,
+            LaunchSpec::KnownSafe {
+                launch_spec_id: "claude".into(),
+                params: vec![
+                    "--model".into(),
+                    "opus".into(),
+                    "--resume".into(),
+                    UUID.into(),
+                    "--dangerously-skip-permissions".into(),
+                ],
+            }
+        );
+        assert!(known_safe_provider_has_exact_resume(&canonical));
+    }
+
+    #[test]
     fn codex_without_specific_id_restarts_latest_with_safe_flags() {
         let launch = LaunchSpec::KnownSafe {
             launch_spec_id: "codex".into(),
@@ -766,7 +1197,7 @@ mod tests {
     }
 
     #[test]
-    fn copilot_preserves_single_token_resume_model_and_dangerous_flag() {
+    fn copilot_duplicate_model_remains_user_gated() {
         let launch = LaunchSpec::AdHocRedacted {
             argv: vec![
                 "/usr/local/bin/copilot".into(),
@@ -780,18 +1211,7 @@ mod tests {
             redacted: false,
             restart_requires_user: true,
         };
-        assert_eq!(
-            canonical_launch_for_restart(&launch),
-            LaunchSpec::KnownSafe {
-                launch_spec_id: "copilot".into(),
-                params: vec![
-                    "--resume=123e4567-e89b-12d3-a456-426614174000".into(),
-                    "--model".into(),
-                    "gpt-5:preview".into(),
-                    "--yolo".into(),
-                ],
-            }
-        );
+        assert_eq!(canonical_launch_for_restart(&launch), launch);
     }
 
     #[test]
@@ -1177,6 +1597,8 @@ mod tests {
                 "--model".into(),
                 "other".into(),
             ],
+            vec!["./claude".into(), "--continue".into()],
+            vec!["tools/claude".into(), "--continue".into()],
         ] {
             let launch = LaunchSpec::AdHocRedacted {
                 argv,
@@ -1329,12 +1751,7 @@ mod tests {
             workspace_id: "w".into(),
             kind: SessionKind::Agent,
             launch: LaunchSpec::AdHocRedacted {
-                argv: vec![
-                    "opencode".into(),
-                    "--mini".into(),
-                    "--session".into(),
-                    "ses".into(),
-                ],
+                argv: vec!["opencode".into(), "--session".into(), "ses".into()],
                 redacted: false,
                 restart_requires_user: true,
             },
@@ -1363,5 +1780,306 @@ mod tests {
                 params: vec!["--session".into(), "ses".into()],
             }
         );
+    }
+
+    fn provider_argv(provider: &str, params: &[&str]) -> Vec<String> {
+        std::iter::once(provider)
+            .chain(params.iter().copied())
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn prepared_provider_grammar_classifies_fresh_latest_and_exact_for_closed_set() {
+        const UUID: &str = "01234567-89ab-4def-8123-456789abcdef";
+        type ProviderGrammarCase = (
+            &'static str,
+            &'static [&'static str],
+            &'static [&'static str],
+            &'static [&'static str],
+        );
+        let rows: &[ProviderGrammarCase] = &[
+            ("claude", &[], &["--continue"], &["--resume", UUID]),
+            ("codex", &[], &["resume", "--last"], &["resume", UUID]),
+            ("gemini", &[], &["--resume", "latest"], &["--resume", UUID]),
+            ("opencode", &[], &["--continue"], &["--session", "thread"]),
+            (
+                "copilot",
+                &["--session-id=01234567-89ab-4def-8123-456789abcdef"],
+                &["--continue"],
+                &["--resume=01234567-89ab-4def-8123-456789abcdef"],
+            ),
+            ("agy", &[], &["--continue"], &["--conversation", UUID]),
+            (
+                "kimi",
+                &[],
+                &["--continue"],
+                &["--session", "session_01234567-89ab-4def-8123-456789abcdef"],
+            ),
+            (
+                "kiro-cli",
+                &["chat"],
+                &["chat", "--resume"],
+                &["chat", "--resume-id", UUID],
+            ),
+            ("agent", &[], &["--continue"], &["--resume", UUID]),
+            ("amp", &[], &["last"], &["threads", "continue", "thread"]),
+            ("devin", &[], &["--continue"], &["--resume", "thread"]),
+            ("droid", &[], &["--resume"], &["--resume", "thread"]),
+        ];
+        for (provider, fresh, latest, exact) in rows {
+            let (fresh_mode, fresh_publication) =
+                strict_prepared_provider_launch(provider, &provider_argv(provider, fresh))
+                    .unwrap_or_else(|| panic!("fresh provider grammar rejected {provider}"));
+            let expected_fresh = if *provider == "copilot" {
+                PreparedProviderLaunchMode::FreshWithAssignedIdentity
+            } else {
+                PreparedProviderLaunchMode::FreshUnassigned
+            };
+            assert_eq!(fresh_mode, expected_fresh, "fresh provider={provider}");
+            assert_eq!(
+                strict_prepared_provider_launch(provider, &provider_argv(provider, latest))
+                    .map(|(mode, _)| mode),
+                Some(PreparedProviderLaunchMode::ExplicitNonExact),
+                "latest provider={provider}"
+            );
+            assert_eq!(
+                strict_prepared_provider_launch(provider, &provider_argv(provider, exact))
+                    .map(|(mode, _)| mode),
+                Some(PreparedProviderLaunchMode::ExactResume),
+                "exact provider={provider}"
+            );
+
+            let mut conflicting = latest.to_vec();
+            conflicting.extend_from_slice(exact);
+            assert!(
+                strict_prepared_provider_launch(provider, &provider_argv(provider, &conflicting))
+                    .is_none(),
+                "duplicate/conflicting selector accepted for provider={provider}"
+            );
+
+            match *provider {
+                "copilot" => assert_eq!(
+                    fresh_publication,
+                    LaunchSpec::KnownSafe {
+                        launch_spec_id: "copilot".into(),
+                        params: vec![format!("--resume={UUID}")],
+                    }
+                ),
+                "kiro-cli" => assert_eq!(
+                    fresh_publication,
+                    LaunchSpec::KnownSafe {
+                        launch_spec_id: "kiro-cli".into(),
+                        params: vec!["chat".into(), "--resume".into()],
+                    }
+                ),
+                "droid" => assert_eq!(
+                    fresh_publication,
+                    LaunchSpec::KnownSafe {
+                        launch_spec_id: "droid".into(),
+                        params: vec!["--resume".into()],
+                    }
+                ),
+                _ => {}
+            }
+        }
+        let (claude_assigned_mode, claude_assigned_publication) = strict_prepared_provider_launch(
+            "claude",
+            &provider_argv(
+                "claude",
+                &[
+                    "--session-id",
+                    UUID,
+                    "--model",
+                    "opus",
+                    "--dangerously-skip-permissions",
+                ],
+            ),
+        )
+        .expect("Hydra-assigned Claude identity must be sealed");
+        assert_eq!(
+            claude_assigned_mode,
+            PreparedProviderLaunchMode::FreshWithAssignedIdentity
+        );
+        assert_eq!(
+            claude_assigned_publication,
+            LaunchSpec::KnownSafe {
+                launch_spec_id: "claude".into(),
+                params: vec![
+                    "--resume".into(),
+                    UUID.into(),
+                    "--model".into(),
+                    "opus".into(),
+                    "--dangerously-skip-permissions".into(),
+                ],
+            }
+        );
+        let (gemini_assigned_mode, gemini_assigned_publication) = strict_prepared_provider_launch(
+            "gemini",
+            &provider_argv(
+                "gemini",
+                &["--session-id", UUID, "--model", "pro", "--yolo"],
+            ),
+        )
+        .expect("Hydra-assigned Gemini identity must be sealed");
+        assert_eq!(
+            gemini_assigned_mode,
+            PreparedProviderLaunchMode::FreshWithAssignedIdentity
+        );
+        assert_eq!(
+            gemini_assigned_publication,
+            LaunchSpec::KnownSafe {
+                launch_spec_id: "gemini".into(),
+                params: vec![
+                    "--resume".into(),
+                    UUID.into(),
+                    "--model".into(),
+                    "pro".into(),
+                    "--yolo".into(),
+                ],
+            }
+        );
+        let (gemini_file_mode, gemini_file) = strict_prepared_provider_launch(
+            "gemini",
+            &provider_argv("gemini", &["--session-file", "/tmp/session.json"]),
+        )
+        .expect("Gemini session-file import must be sealed without exact authority");
+        assert_eq!(
+            gemini_file_mode,
+            PreparedProviderLaunchMode::ExplicitNonExact
+        );
+        assert_eq!(
+            gemini_file,
+            LaunchSpec::KnownSafe {
+                launch_spec_id: "gemini".into(),
+                params: vec!["--session-file".into(), "/tmp/session.json".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn prepared_provider_grammar_rejects_malformed_duplicate_and_unknown_bytes() {
+        const UUID: &str = "01234567-89ab-4def-8123-456789abcdef";
+        let malformed: &[(&str, &[&str])] = &[
+            ("claude", &["--resume=bad"]),
+            ("claude", &["--session-id"]),
+            ("claude", &["--session-id", "bad"]),
+            (
+                "claude",
+                &["--session-id=01234567-89ab-4def-8123-456789abcdef"],
+            ),
+            (
+                "claude",
+                &["--session-id", "01234567-89AB-4DEF-8123-456789ABCDEF"],
+            ),
+            ("codex", &["resume"]),
+            ("gemini", &["--session-file", "--yolo"]),
+            ("gemini", &["--session-id"]),
+            ("gemini", &["--session-id", "bad"]),
+            ("gemini", &["--resume", "thread"]),
+            (
+                "gemini",
+                &["--session-id=01234567-89ab-4def-8123-456789abcdef"],
+            ),
+            ("opencode", &["--mini"]),
+            ("copilot", &["--session-id=bad"]),
+            ("agy", &["--conversation", "--bad"]),
+            ("kimi", &["--session", "--bad"]),
+            ("kiro-cli", &["chat", "--resume-id", "bad"]),
+            ("agent", &["--resume", "bad"]),
+            ("amp", &["threads", "continue"]),
+            ("devin", &["--resume", "--bad"]),
+            ("droid", &["--model", "forbidden"]),
+        ];
+        for (provider, params) in malformed {
+            assert!(
+                strict_prepared_provider_launch(provider, &provider_argv(provider, params))
+                    .is_none(),
+                "malformed selector degraded to latest for provider={provider} params={params:?}"
+            );
+            let mut unknown = provider_argv(provider, &[]);
+            if *provider == "kiro-cli" {
+                unknown.push("chat".into());
+            }
+            unknown.extend(["--api-key".into(), UUID.into()]);
+            assert!(
+                strict_prepared_provider_launch(provider, &unknown).is_none(),
+                "unknown secret-bearing bytes were accepted for provider={provider}"
+            );
+        }
+        assert!(strict_prepared_provider_launch(
+            "claude",
+            &provider_argv("claude", &["--model", "opus", "--model", "sonnet"])
+        )
+        .is_none());
+        assert!(strict_prepared_provider_launch(
+            "claude",
+            &provider_argv(
+                "claude",
+                &[
+                    "--dangerously-skip-permissions",
+                    "--dangerously-skip-permissions"
+                ]
+            )
+        )
+        .is_none());
+        for conflicting in [
+            vec!["--session-id", UUID, "--session-id", UUID],
+            vec!["--session-id", UUID, "--continue"],
+            vec!["--continue", "--session-id", UUID],
+            vec!["--session-id", UUID, "--resume", "thread"],
+            vec!["--resume", "thread", "--session-id", UUID],
+        ] {
+            assert!(
+                strict_prepared_provider_launch("claude", &provider_argv("claude", &conflicting))
+                    .is_none(),
+                "conflicting Claude identity selectors were accepted: {conflicting:?}"
+            );
+        }
+        assert_eq!(
+            strict_prepared_provider_launch(
+                "claude",
+                &provider_argv("claude", &["--resume", "search term"])
+            )
+            .map(|(mode, _)| mode),
+            Some(PreparedProviderLaunchMode::ExplicitNonExact)
+        );
+        assert_eq!(
+            strict_prepared_provider_launch(
+                "codex",
+                &provider_argv("codex", &["resume", "named-session"])
+            )
+            .map(|(mode, _)| mode),
+            Some(PreparedProviderLaunchMode::ExplicitNonExact)
+        );
+        assert_eq!(
+            strict_prepared_provider_launch("gemini", &provider_argv("gemini", &["--resume", "5"]))
+                .map(|(mode, _)| mode),
+            Some(PreparedProviderLaunchMode::ExplicitNonExact)
+        );
+        for conflicting in [
+            vec!["--session-id", UUID, "--session-id", UUID],
+            vec!["--session-id", UUID, "--resume", "latest"],
+            vec!["--resume", "thread", "--session-id", UUID],
+            vec!["--session-file", "/tmp/session.json", "--session-id", UUID],
+        ] {
+            assert!(
+                strict_prepared_provider_launch("gemini", &provider_argv("gemini", &conflicting))
+                    .is_none(),
+                "conflicting Gemini identity selectors were accepted: {conflicting:?}"
+            );
+        }
+        for malformed_selector in [
+            provider_argv("claude", &["--session-id"]),
+            provider_argv("claude", &["--session-id=bad"]),
+            provider_argv("gemini", &["--session-id"]),
+            provider_argv("gemini", &["--session-id=bad"]),
+        ] {
+            let provider = malformed_selector[0].as_str();
+            assert!(!is_valid_prepared_provider_custom_adhoc(
+                provider,
+                &malformed_selector
+            ));
+        }
     }
 }

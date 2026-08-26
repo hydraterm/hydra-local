@@ -10,16 +10,554 @@
 
 use crate::host_event::{HostKey, HostModifiers, HostNamedKey};
 use crate::sync::{Action, DamageOutcome, SyncState};
+#[cfg(test)]
+use crate::wire::decode_event;
 use crate::wire::{
-    decode_event, Cell, ClientRequest, CursorShape, DaemonEvent, DecodeError, GridSnapshot,
-    Revision, SessionGeneration, MAX_LINE_BYTES,
+    decode_event_with_route, Cell, ClientRequest, CursorShape, DaemonEvent, DecodeError,
+    EventRouteKind, EventRouteMetadata, GridSnapshot, Revision, SessionGeneration, MAX_LINE_BYTES,
 };
 use crate::{UserEvent, UserEventSender};
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::Shutdown;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::TryLockError;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+const OUTBOUND_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+const REQUIRED_MUTATION_PROTOCOL_VERSION: u32 = 3;
+
+/// One indivisible Claim proof copied from an owned shell handoff authority. Keeping these fields
+/// together prevents a caller from accidentally checking daemon A while publishing daemon B's
+/// token. Debug is deliberately opaque.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct AttachmentHandoffClaim {
+    pub(crate) authority: maestro_shell::AttachmentHandoffAuthority,
+    pub(crate) session_id: String,
+    pub(crate) token: maestro_shell::AttachmentHandoffToken,
+    pub(crate) expected_daemon_instance: maestro_shell::DaemonInstanceId,
+    pub(crate) expected_server_pid: Option<u32>,
+    pub(crate) expected_generation: String,
+}
+
+impl std::fmt::Debug for AttachmentHandoffClaim {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AttachmentHandoffClaim(<redacted>)")
+    }
+}
+
+#[derive(Clone)]
+struct DaemonPeerProof {
+    daemon_instance_id: Option<maestro_shell::DaemonInstanceId>,
+    server_pid: Option<u32>,
+    mutation_capable: bool,
+    legacy_attach_compatible: bool,
+    attachment_handoff_capable: bool,
+}
+
+struct DaemonTransport {
+    stream: UnixStream,
+    mutation_capable: bool,
+    legacy_attach_compatible: bool,
+    peer: DaemonPeerProof,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct LinuxPeerCredentials {
+    pid: i32,
+    uid: u32,
+    gid: u32,
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn geteuid() -> u32;
+    fn getsockopt(
+        socket: i32,
+        level: i32,
+        option_name: i32,
+        option_value: *mut std::ffi::c_void,
+        option_len: *mut u32,
+    ) -> i32;
+}
+
+#[cfg(not(target_os = "linux"))]
+unsafe extern "C" {
+    fn geteuid() -> u32;
+    fn getpeereid(socket: i32, effective_uid: *mut u32, effective_gid: *mut u32) -> i32;
+    fn getsockopt(
+        socket: i32,
+        level: i32,
+        option_name: i32,
+        option_value: *mut std::ffi::c_void,
+        option_len: *mut u32,
+    ) -> i32;
+}
+
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+#[cfg(target_os = "linux")]
+type PollCount = usize;
+#[cfg(not(target_os = "linux"))]
+type PollCount = u32;
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct UnixSocketAddress {
+    family: u16,
+    path: [i8; 108],
+}
+
+#[cfg(not(target_os = "linux"))]
+#[repr(C)]
+struct UnixSocketAddress {
+    length: u8,
+    family: u8,
+    path: [i8; 104],
+}
+
+unsafe extern "C" {
+    fn socket(domain: i32, socket_type: i32, protocol: i32) -> i32;
+    fn connect(socket: i32, address: *const std::ffi::c_void, address_len: u32) -> i32;
+    fn poll(fds: *mut PollFd, count: PollCount, timeout_ms: i32) -> i32;
+    fn fcntl(fd: i32, command: i32, ...) -> i32;
+}
+
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { geteuid() }
+}
+
+/// Verify the kernel-authenticated server owner before any protocol bytes cross the socket and
+/// return the Linux peer PID used for exact handoff comparison.
+fn reviewed_server_pid(stream: &UnixStream) -> io::Result<Option<u32>> {
+    #[cfg(target_os = "linux")]
+    {
+        const SOL_SOCKET: i32 = 1;
+        const SO_PEERCRED: i32 = 17;
+        let mut credentials = LinuxPeerCredentials {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut length = std::mem::size_of::<LinuxPeerCredentials>() as u32;
+        // SAFETY: the stream owns a connected AF_UNIX fd and both output pointers reference
+        // correctly sized live storage for Linux SO_PEERCRED.
+        let status = unsafe {
+            getsockopt(
+                stream.as_raw_fd(),
+                SOL_SOCKET,
+                SO_PEERCRED,
+                (&mut credentials as *mut LinuxPeerCredentials).cast(),
+                &mut length,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if length as usize != std::mem::size_of::<LinuxPeerCredentials>()
+            || credentials.pid <= 0
+            || credentials.uid != effective_uid()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Unix daemon peer identity was unavailable or did not match the effective uid",
+            ));
+        }
+        return Ok(Some(credentials.pid as u32));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut uid = 0u32;
+        let mut gid = 0u32;
+        // SAFETY: the stream owns a connected AF_UNIX fd and both pointers reference writable ids.
+        if unsafe { getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if uid != effective_uid() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Unix daemon peer uid did not match the effective uid",
+            ));
+        }
+        Ok(None)
+    }
+}
+
+/// Terminal teardown must complete even if another thread panicked while holding authority/cache
+/// state. Recover the value and clear the poison bit so the neutral draw/owner paths that run after
+/// `ConnectionClosed` can inspect the now-cleared state without panicking again. Normal mutation
+/// paths deliberately keep ordinary poison semantics; this helper is teardown-only.
+fn teardown_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            mutex.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
+/// Write one already-framed request under a single wall-clock deadline. A socket-level timeout is
+/// normally restarted after every partial `write`, which lets a trickling peer hold the connection
+/// forever; recomputing the remaining budget gives the whole JSON line one bounded lifetime.
+fn write_frame_before_deadline(
+    stream: &mut UnixStream,
+    frame: &[u8],
+    timeout: Duration,
+) -> io::Result<()> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "outbound deadline overflow"))?;
+    write_frame_until(stream, frame, deadline)
+}
+
+fn write_frame_until(
+    stream: &mut UnixStream,
+    mut frame: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    while !frame.is_empty() {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "outbound frame deadline elapsed",
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        stream.set_write_timeout(Some(remaining))?;
+        match stream.write(frame) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "socket accepted no outbound bytes",
+                ));
+            }
+            Ok(written) => frame = &frame[written..],
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+fn connect_unix_until(socket_path: &str, deadline: Instant) -> io::Result<UnixStream> {
+    const AF_UNIX: i32 = 1;
+    const SOCK_STREAM: i32 = 1;
+    const F_GETFD: i32 = 1;
+    const F_SETFD: i32 = 2;
+    const FD_CLOEXEC: i32 = 1;
+    const POLLOUT: i16 = 0x0004;
+    #[cfg(target_os = "linux")]
+    const SOL_SOCKET: i32 = 1;
+    #[cfg(not(target_os = "linux"))]
+    const SOL_SOCKET: i32 = 0xffff;
+    #[cfg(target_os = "linux")]
+    const SO_ERROR: i32 = 4;
+    #[cfg(not(target_os = "linux"))]
+    const SO_ERROR: i32 = 0x1007;
+
+    let path = socket_path.as_bytes();
+    let max_path = unsafe { std::mem::zeroed::<UnixSocketAddress>() }
+        .path
+        .len();
+    if path.is_empty() || path.len() >= max_path || path.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Unix daemon socket path is empty or too long",
+        ));
+    }
+    // SAFETY: socket returns a new fd. Wrapping it immediately transfers cleanup to UnixStream on
+    // every subsequent return path.
+    let fd = unsafe { socket(AF_UNIX, SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    // SAFETY: fcntl reads/sets descriptor flags on this owned live fd.
+    let descriptor_flags = unsafe { fcntl(fd, F_GETFD) };
+    if descriptor_flags < 0 || unsafe { fcntl(fd, F_SETFD, descriptor_flags | FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    stream.set_nonblocking(true)?;
+
+    let mut address = unsafe { std::mem::zeroed::<UnixSocketAddress>() };
+    #[cfg(target_os = "linux")]
+    {
+        address.family = AF_UNIX as u16;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        address.family = AF_UNIX as u8;
+    }
+    for (destination, source) in address.path.iter_mut().zip(path.iter().copied()) {
+        *destination = source as i8;
+    }
+    let address_len = std::mem::offset_of!(UnixSocketAddress, path)
+        .checked_add(path.len() + 1)
+        .and_then(|length| u32::try_from(length).ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "socket path overflow"))?;
+    #[cfg(not(target_os = "linux"))]
+    {
+        address.length = u8::try_from(address_len)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket address overflow"))?;
+    }
+    // SAFETY: address points to a correctly initialized platform sockaddr_un prefix for address_len.
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "daemon connect deadline elapsed",
+        ));
+    }
+    let status = unsafe {
+        connect(
+            fd,
+            (&address as *const UnixSocketAddress).cast(),
+            address_len,
+        )
+    };
+    if status != 0 {
+        let error = io::Error::last_os_error();
+        #[cfg(target_os = "linux")]
+        let in_progress = error.raw_os_error() == Some(115);
+        #[cfg(not(target_os = "linux"))]
+        let in_progress = error.raw_os_error() == Some(36);
+        if !in_progress {
+            return Err(error);
+        }
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::TimedOut, "daemon connect deadline elapsed")
+                })?;
+            let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+            let mut descriptor = PollFd {
+                fd,
+                events: POLLOUT,
+                revents: 0,
+            };
+            // SAFETY: descriptor points to one live pollfd for the duration of this call.
+            let polled = unsafe { poll(&mut descriptor, 1 as PollCount, timeout_ms) };
+            if polled > 0 {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "daemon connect deadline elapsed",
+                    ));
+                }
+                break;
+            }
+            if polled == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "daemon connect deadline elapsed",
+                ));
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+        let mut socket_error = 0i32;
+        let mut socket_error_len = std::mem::size_of::<i32>() as u32;
+        // SAFETY: socket_error and length are correctly sized outputs for SO_ERROR.
+        if unsafe {
+            getsockopt(
+                fd,
+                SOL_SOCKET,
+                SO_ERROR,
+                (&mut socket_error as *mut i32).cast(),
+                &mut socket_error_len,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if socket_error != 0 {
+            return Err(io::Error::from_raw_os_error(socket_error));
+        }
+    }
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "daemon connect deadline elapsed",
+        ));
+    }
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
+fn read_frame_until(stream: &UnixStream, deadline: Instant) -> io::Result<Vec<u8>> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut line = Vec::new();
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::TimedOut, "daemon probe deadline elapsed")
+            })?;
+        reader.get_ref().set_read_timeout(Some(remaining))?;
+        let available = loop {
+            match reader.fill_buf() {
+                Ok(bytes) => break bytes,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        };
+        if available.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "daemon closed during capability probe",
+            ));
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if line.len().saturating_add(take) > MAX_LINE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "daemon capability reply exceeded the frame bound",
+            ));
+        }
+        line.extend_from_slice(&available[..take]);
+        let terminated = available[take - 1] == b'\n';
+        reader.consume(take);
+        if terminated {
+            return Ok(line);
+        }
+    }
+}
+
+/// Probe one candidate socket without mutating daemon state, then keep that exact connection for
+/// every admitted follow-up. A valid legacy DaemonInfo or typed legacy Error may downgrade this
+/// same socket to read-only; framing/EOF/invalid replies fail closed. Never reconnect between the
+/// capability decision and Attach: a path replacement must not receive an id-only legacy request.
+fn connect_daemon_transport(
+    socket_path: &str,
+    handoff: Option<&AttachmentHandoffClaim>,
+) -> io::Result<DaemonTransport> {
+    let deadline = Instant::now()
+        .checked_add(DAEMON_PROBE_TIMEOUT)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "daemon probe deadline overflow"))?;
+    let mut candidate = connect_unix_until(socket_path, deadline)?;
+    let server_pid = reviewed_server_pid(&candidate)?;
+
+    let probe = (|| -> io::Result<Option<DaemonPeerProof>> {
+        let mut frame = serde_json::to_vec(&ClientRequest::DaemonInfo)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        frame.push(b'\n');
+        write_frame_until(&mut candidate, &frame, deadline)?;
+
+        let line = read_frame_until(&candidate, deadline)?;
+        let event: DaemonEvent = serde_json::from_slice(&line)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        match event {
+            DaemonEvent::DaemonInfo {
+                protocol_version,
+                daemon_instance_id,
+                output_generation_echo,
+                generation_conditional_mutations,
+                attachment_aware_conditional_kill,
+                generation_conditional_attach,
+                ..
+            } => {
+                let mutation_capable = protocol_version == REQUIRED_MUTATION_PROTOCOL_VERSION
+                    && generation_conditional_mutations;
+                Ok(Some(DaemonPeerProof {
+                    daemon_instance_id,
+                    server_pid,
+                    mutation_capable,
+                    legacy_attach_compatible: protocol_version < REQUIRED_MUTATION_PROTOCOL_VERSION,
+                    attachment_handoff_capable: mutation_capable
+                        && output_generation_echo
+                        && attachment_aware_conditional_kill
+                        && generation_conditional_attach,
+                }))
+            }
+            DaemonEvent::Error { .. } => Ok(None),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "daemon capability probe returned an unrelated event",
+            )),
+        }
+    })()?;
+
+    if let Some(peer) = probe {
+        if peer.attachment_handoff_capable {
+            if let Some(expected) = handoff {
+                if peer.daemon_instance_id.as_ref() != Some(&expected.expected_daemon_instance)
+                    || peer.server_pid != expected.expected_server_pid
+                    || cfg!(target_os = "linux") && peer.server_pid.is_none()
+                {
+                    let _ = candidate.shutdown(Shutdown::Both);
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "daemon did not prove the exact attachment handoff peer",
+                    ));
+                }
+            }
+            candidate.set_read_timeout(None)?;
+            candidate.set_write_timeout(None)?;
+            return Ok(DaemonTransport {
+                stream: candidate,
+                mutation_capable: peer.mutation_capable,
+                legacy_attach_compatible: peer.legacy_attach_compatible,
+                peer,
+            });
+        }
+        if handoff.is_some() {
+            let _ = candidate.shutdown(Shutdown::Both);
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "daemon does not support exact attachment handoff",
+            ));
+        }
+        candidate.set_read_timeout(None)?;
+        candidate.set_write_timeout(None)?;
+        return Ok(DaemonTransport {
+            stream: candidate,
+            mutation_capable: peer.mutation_capable,
+            legacy_attach_compatible: peer.legacy_attach_compatible,
+            peer,
+        });
+    }
+
+    if handoff.is_some() {
+        let _ = candidate.shutdown(Shutdown::Both);
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "daemon does not support exact attachment handoff",
+        ));
+    }
+    candidate.set_read_timeout(None)?;
+    candidate.set_write_timeout(None)?;
+    Ok(DaemonTransport {
+        stream: candidate,
+        mutation_capable: false,
+        legacy_attach_compatible: true,
+        peer: DaemonPeerProof {
+            daemon_instance_id: None,
+            server_pid,
+            mutation_capable: false,
+            legacy_attach_compatible: true,
+            attachment_handoff_capable: false,
+        },
+    })
+}
 
 /// Hard cap on the outbound queue's buffered bytes. The daemon's socket can stall
 /// (a busy daemon, a slow consumer); rather than let the UI thread block on a raw
@@ -35,22 +573,19 @@ pub const OUTBOUND_CAP_BYTES: usize = 1024 * 1024;
 /// the exact order they were enqueued. A single writer thread owns the socket, so
 /// no two writers can interleave bytes at the kernel.
 ///
-/// OVERLOAD: when buffered bytes would exceed [`OUTBOUND_CAP_BYTES`] the producer
-/// BLOCKS (backpressure) until the writer drains enough room — we do NOT silently
-/// drop Write/Attach/Snapshot/Resize. NOTE that one producer is the winit UI
-/// thread (Write/Resize), so a wedged daemon can momentarily stall the UI thread
-/// here; the current overload policy deliberately blocks rather than dropping input —
-/// see [`Shared::send_request`]. The one safety valve: a single oversized item (larger
-/// than the whole cap, e.g. a giant paste) is still admitted once the queue is
-/// otherwise empty, so a legitimate large request can never deadlock. Resize
-/// floods don't reach here — the UI coalesces them upstream ([`ResizeCoalescer`])
-/// so only the settled geometry is ever enqueued.
+/// OVERLOAD: owner-loop and reader producers never wait on this queue. A request or
+/// ordered batch is admitted in full only when the queue mutex and byte capacity are
+/// immediately available; otherwise the typed refusal arms one level-triggered
+/// [`UserEvent::OutboundWritable`] wake when the writer next frees room. This keeps
+/// local ClearViewport/input handling live even when the daemon or socket is wedged.
 struct OutboundQueue {
     inner: Mutex<OutboundInner>,
-    /// Signalled when the writer drains an item (room freed) or `closed` flips.
-    space: Condvar,
     /// Signalled when an item is enqueued (work available) or `closed` flips.
     work: Condvar,
+    /// A producer observed contention/capacity refusal. The writer swaps this bit when dequeue
+    /// creates a writable transition and emits one owner-loop retry wake, coalescing any number of
+    /// refused requests while the queue remains unwritable.
+    retry_wake_armed: AtomicBool,
 }
 
 struct OutboundInner {
@@ -58,6 +593,139 @@ struct OutboundInner {
     bytes: usize,
     /// Set when the socket is gone; producers stop blocking and return.
     closed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TryEnqueueOutcome {
+    Admitted,
+    Contended { wake_now: bool },
+    Full,
+    TooLarge,
+    Closed,
+    Poisoned,
+}
+
+/// Why a nonblocking outbound admission did not occur. Low-cardinality by design: callers may
+/// surface this locally without including terminal text, session ids, or user data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutboundUnavailable {
+    Contended,
+    Full,
+    /// One read-only Scrollback query for this exact binding is already admitted. The owner retains
+    /// only its latest desired query; consuming any reply emits OutboundWritable to retry it.
+    ScrollbackInFlight,
+    TooLarge,
+    Closed,
+    NotConnected,
+    /// The retained daemon did not prove exact protocol-v3 generation-conditional mutation
+    /// support. Attach/Snapshot remain available, but terminal mutation never falls back to id.
+    MutationUnsupported,
+    Poisoned,
+    Serialize,
+}
+
+#[must_use = "outbound admission must be retained/retried or surfaced explicitly"]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestAdmission {
+    Admitted,
+    Unavailable {
+        reason: OutboundUnavailable,
+        /// The queue-lock contention raced a completed dequeue after wake registration. No future
+        /// capacity transition is guaranteed, so this producer must schedule one immediate retry.
+        wake_now: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActiveBindFailure {
+    Admission(RequestAdmission),
+    AuthorityExhausted,
+    /// The operational socket is not the exact UID/instance/PID peer bound into the authority.
+    HandoffPeerMismatch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryRequestResult {
+    Admitted,
+    Pending { wake_now: bool },
+    AlreadyAdmitted,
+    Stale,
+    Refused(RequestAdmission),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecoveryRetryResult {
+    pub wake_now: bool,
+    pub terminal: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PendingRecovery {
+    binding: ViewportBindingToken,
+    admitted: bool,
+}
+
+impl RequestAdmission {
+    pub fn is_admitted(self) -> bool {
+        matches!(self, Self::Admitted)
+    }
+
+    pub fn wake_now(self) -> bool {
+        matches!(self, Self::Unavailable { wake_now: true, .. })
+    }
+
+    pub fn is_retryable(self) -> bool {
+        matches!(
+            self,
+            Self::Unavailable {
+                reason: OutboundUnavailable::Contended
+                    | OutboundUnavailable::Full
+                    | OutboundUnavailable::ScrollbackInFlight,
+                ..
+            }
+        )
+    }
+
+    pub fn is_connection_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Unavailable {
+                reason: OutboundUnavailable::Closed
+                    | OutboundUnavailable::NotConnected
+                    | OutboundUnavailable::Poisoned
+                    | OutboundUnavailable::Serialize,
+                ..
+            }
+        )
+    }
+
+    pub fn is_mutation_unsupported(self) -> bool {
+        matches!(
+            self,
+            Self::Unavailable {
+                reason: OutboundUnavailable::MutationUnsupported,
+                ..
+            }
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DesiredPaneBinding {
+    pub session_id: String,
+    pub expected_generation: SessionGeneration,
+    pub dims: Option<(u16, u16)>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DesiredViewportBinding {
+    pub primary_session_id: String,
+    pub primary_expected_generation: SessionGeneration,
+    // Initial admission is Attach/Snapshot-only: generation-bound Resize follows the exact
+    // baseline. Retain the desired geometry with the aggregate request until that point.
+    #[allow(dead_code)]
+    pub primary_dims: Option<(u16, u16)>,
+    pub panes: Vec<DesiredPaneBinding>,
 }
 
 impl OutboundQueue {
@@ -68,55 +736,81 @@ impl OutboundQueue {
                 bytes: 0,
                 closed: false,
             }),
-            space: Condvar::new(),
             work: Condvar::new(),
+            retry_wake_armed: AtomicBool::new(false),
         }
     }
 
-    /// Enqueue one already-framed line (JSON + '\n'), blocking if the queue is at
-    /// capacity until room frees. Never drops. Returns `false` only if the queue
-    /// was closed (socket gone) before the item could be admitted.
-    fn enqueue(&self, line: Vec<u8>) -> bool {
-        let len = line.len();
-        let mut inner = self.inner.lock().unwrap();
-        // Block while admitting would overflow the cap — UNLESS the queue is empty,
-        // in which case we admit the item regardless of its size so an oversized
-        // request (bigger than the whole cap) can still make progress.
-        while !inner.closed && inner.bytes + len > OUTBOUND_CAP_BYTES && !inner.queue.is_empty() {
-            inner = self.space.wait(inner).unwrap();
+    /// Admit a frame only when it fits immediately. Reader-side recovery requests use this while
+    /// holding their binding authority, so ClearViewport can never be stranded behind outbound
+    /// backpressure and no stale request can cross the clear linearization point.
+    fn try_enqueue(&self, line: Vec<u8>) -> TryEnqueueOutcome {
+        self.try_enqueue_batch(vec![line])
+    }
+
+    /// All-or-none nonblocking admission for one protocol transaction. No prefix can become visible
+    /// to the writer: capacity is checked against the aggregate framed bytes before the first push.
+    fn try_enqueue_batch(&self, lines: Vec<Vec<u8>>) -> TryEnqueueOutcome {
+        let len = lines.iter().map(Vec::len).sum::<usize>();
+        if len > OUTBOUND_CAP_BYTES {
+            return TryEnqueueOutcome::TooLarge;
         }
+        let mut inner = match self.inner.try_lock() {
+            Ok(inner) => inner,
+            Err(TryLockError::WouldBlock) => {
+                // No registration handshake can order against an already-completed final dequeue
+                // while its guard is still held. Always make the producer schedule one immediate
+                // retry. Duplicates are harmless/level-triggered; zero wake is impossible.
+                return TryEnqueueOutcome::Contended { wake_now: true };
+            }
+            Err(TryLockError::Poisoned(_)) => return TryEnqueueOutcome::Poisoned,
+        };
         if inner.closed {
-            return false;
+            return TryEnqueueOutcome::Closed;
         }
-        inner.queue.push_back(line);
+        if inner.bytes.saturating_add(len) > OUTBOUND_CAP_BYTES {
+            self.retry_wake_armed.store(true, Ordering::Release);
+            return TryEnqueueOutcome::Full;
+        }
+        inner.queue.extend(lines);
         inner.bytes += len;
         self.work.notify_one();
-        true
+        TryEnqueueOutcome::Admitted
     }
 
-    /// Block until an item is available, then pop it (FIFO). Returns `None` when
-    /// the queue is closed AND drained — the writer thread then exits.
-    fn dequeue(&self) -> Option<Vec<u8>> {
-        let mut inner = self.inner.lock().unwrap();
+    /// Block until an item is available, then pop it (FIFO). Closing is an abort,
+    /// not a graceful drain: once the peer is untrusted/dead, queued terminal input
+    /// and topology frames must never be written afterward.
+    fn dequeue(&self) -> Option<(Vec<u8>, bool)> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
-            if let Some(item) = inner.queue.pop_front() {
-                inner.bytes -= item.len();
-                // Room freed — wake any producer blocked on the cap.
-                self.space.notify_all();
-                return Some(item);
-            }
             if inner.closed {
                 return None;
             }
-            inner = self.work.wait(inner).unwrap();
+            if let Some(item) = inner.queue.pop_front() {
+                inner.bytes -= item.len();
+                let wake_retry = self.retry_wake_armed.swap(false, Ordering::AcqRel);
+                return Some((item, wake_retry));
+            }
+            inner = self
+                .work
+                .wait(inner)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
 
-    /// Mark closed and wake everyone so producers/writer unblock and exit.
+    /// Abort the queue and wake the writer. Poison recovery is deliberately fail closed: teardown
+    /// itself must not panic and preserve queued secrets merely because a producer panicked while
+    /// holding the queue mutex.
     fn close(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = teardown_lock(&self.inner);
         inner.closed = true;
-        self.space.notify_all();
+        inner.queue.clear();
+        inner.bytes = 0;
+        self.retry_wake_armed.store(false, Ordering::Release);
         self.work.notify_all();
     }
 
@@ -139,6 +833,22 @@ impl OutboundQueue {
             .iter()
             .map(|l| serde_json::from_slice(l).expect("framed line parses as ClientRequest"))
             .collect()
+    }
+
+    #[cfg(test)]
+    fn saturate_raw(&self) {
+        assert_eq!(
+            self.try_enqueue(vec![0; OUTBOUND_CAP_BYTES]),
+            TryEnqueueOutcome::Admitted
+        );
+    }
+
+    #[cfg(test)]
+    fn discard_all(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.queue.clear();
+        inner.bytes = 0;
+        self.retry_wake_armed.store(false, Ordering::Release);
     }
 }
 
@@ -169,6 +879,16 @@ pub struct ScrollbackState {
     /// The live grid generation the `historical` rows belong to. A `ScrollbackRows`
     /// for a different (older/newer) generation than the live grid is stale and ignored.
     pub historical_generation: Option<SessionGeneration>,
+    /// Monotonic owner-local view intent. Replies are untagged by the daemon, so this epoch plus the
+    /// single exactly-correlated admitted query prevents an older clamped reply from overwriting a
+    /// newer scroll or return-to-live intent.
+    pub(crate) intent_epoch: u64,
+    pub(crate) intent_exhausted: bool,
+    pub(crate) admitted_request: Option<(u64, u32, SessionGeneration)>,
+    /// A live generation/screen transition occurred after the admitted untagged reply
+    /// was requested. The reply must still retire ordering, but none of its old history
+    /// metadata may be installed into the new screen context.
+    pub(crate) discard_admitted_reply_metadata: bool,
 }
 
 impl ScrollbackState {
@@ -179,25 +899,35 @@ impl ScrollbackState {
 
     /// Snap back to the live bottom and drop the cached historical window.
     pub fn reset_to_live(&mut self) {
+        let _ = self.advance_intent();
         self.view_offset = 0;
         self.historical = None;
         self.historical_generation = None;
     }
-}
 
-/// A primary/alternate screen transition invalidates any renderer-owned historical viewport.
-/// Initial publication has no previous screen to invalidate; ordinary damage on the same screen
-/// must preserve the user's current normal-screen history position.
-fn reset_scrollback_for_screen_transition(
-    previous_alt_screen: Option<bool>,
-    next_alt_screen: bool,
-    scrollback: &mut ScrollbackState,
-) -> bool {
-    if previous_alt_screen.is_some_and(|previous| previous != next_alt_screen) {
-        scrollback.reset_to_live();
-        true
-    } else {
-        false
+    pub(crate) fn advance_intent(&mut self) -> Option<u64> {
+        if self.intent_exhausted {
+            return None;
+        }
+        let Some(next) = self.intent_epoch.checked_add(1) else {
+            self.intent_exhausted = true;
+            return None;
+        };
+        self.intent_epoch = next;
+        Some(next)
+    }
+
+    /// A new PTY generation or primary/alternate-screen transition invalidates every
+    /// historical pixel, cached depth, and desired offset immediately. Preserve the one
+    /// admitted query until its ordered reply retires the correlation; the advanced intent
+    /// prevents that reply from reviving the stale view.
+    fn reset_for_live_context_change(&mut self) {
+        let _ = self.advance_intent();
+        self.discard_admitted_reply_metadata = self.admitted_request.is_some();
+        self.view_offset = 0;
+        self.history_len = None;
+        self.historical = None;
+        self.historical_generation = None;
     }
 }
 
@@ -252,6 +982,64 @@ pub enum ScrollAction {
     Home,
     /// Jump to the live bottom.
     End,
+}
+
+/// Exact scroll-query intent captured in the same authority/PTY-generation critical section that
+/// mutates the local viewport. A later queue retry must validate this tuple unchanged; it may never
+/// re-stamp an old gesture with a newer intent epoch or PTY generation after a Grid rollover.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScrollRequestIntent {
+    pub(crate) intent_epoch: u64,
+    pub(crate) requested_offset: u32,
+    pub(crate) expected_generation: SessionGeneration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PreparedScrollAction {
+    Unavailable,
+    AlternateScreen,
+    NoMove,
+    ToLive,
+    Moved {
+        binding: ViewportBindingToken,
+        request: ScrollRequestIntent,
+        count: u16,
+    },
+}
+
+fn prepare_bound_scroll_action(
+    binding: ViewportBindingToken,
+    grid: &GridSnapshot,
+    scrollback: &mut ScrollbackState,
+    action: ScrollAction,
+) -> PreparedScrollAction {
+    if grid.alt_screen {
+        scrollback.reset_to_live();
+        return PreparedScrollAction::AlternateScreen;
+    }
+    let page = grid.rows.min(u16::MAX as usize) as u32;
+    let next = next_view_offset(scrollback.view_offset, scrollback.history_len, page, action);
+    if next == scrollback.view_offset {
+        return PreparedScrollAction::NoMove;
+    }
+    if next == 0 {
+        scrollback.reset_to_live();
+        return PreparedScrollAction::ToLive;
+    }
+    let Some(intent_epoch) = scrollback.advance_intent() else {
+        scrollback.reset_to_live();
+        return PreparedScrollAction::ToLive;
+    };
+    scrollback.view_offset = next;
+    PreparedScrollAction::Moved {
+        binding,
+        request: ScrollRequestIntent {
+            intent_epoch,
+            requested_offset: next,
+            expected_generation: grid.generation.clone(),
+        },
+        count: page as u16,
+    }
 }
 
 /// Resolve a `ScrollAction` against the current offset into a new clamped offset.
@@ -323,6 +1111,13 @@ pub struct WheelAccumulator {
 }
 
 impl WheelAccumulator {
+    /// Drop any fractional motion owned by the previously focused pane. A partial
+    /// trackpad gesture must never cross the pane-focus boundary and become input
+    /// for a different terminal.
+    pub fn reset(&mut self) {
+        self.residue = 0.0;
+    }
+
     /// Feed a `LineDelta` y (already in line units). Returns the whole line steps to
     /// apply now (sign = direction), carrying any fraction forward.
     pub fn add_lines(&mut self, lines: f64) -> i64 {
@@ -345,62 +1140,69 @@ impl WheelAccumulator {
     }
 }
 
-/// Maximum number of terminal or renderer line steps one host wheel event may produce.
-/// Precision trackpads can occasionally deliver a large momentum delta; bounding it keeps
-/// alternate-screen key fallback and normal scrollback work proportional per event while the
-/// remaining gesture events continue to arrive normally.
-pub const MAX_WHEEL_STEPS_PER_EVENT: i64 = 16;
+/// Maximum whole-line steps one host wheel event may turn into. Precision-device
+/// residue is accumulated before this policy runs; this cap only bounds a single
+/// resulting PTY/report/view mutation burst.
+pub const MAX_WHEEL_STEPS_PER_EVENT: u8 = 16;
 
-/// One resolved wheel action after fractional deltas have accumulated into whole lines.
-///
-/// This is the single policy boundary for wheel routing:
-///
-/// - negotiated terminal mouse reporting wins;
-/// - an alternate-screen application without mouse reporting receives conventional Up/Down
-///   cursor-key input;
-/// - a normal-screen pane moves the renderer-owned scrollback viewport;
-/// - a sub-line gesture that has not accumulated to one line is a no-op.
-///
-/// The route carries an already bounded step count so no platform adapter or caller can drift on
-/// direction or caps.
+/// Direction shared by mouse-report and alternate-screen key fallbacks. The sign
+/// convention matches [`ScrollAction::Lines`]: positive host y is Up, negative is Down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WheelRoute {
-    NoOp,
-    MouseReport { event: MouseEvent, steps: u8 },
-    AlternateScroll { key: HostNamedKey, steps: u8 },
-    RendererScroll(ScrollAction),
+pub enum WheelDirection {
+    Up,
+    Down,
 }
 
-/// Resolve whole wheel lines into exactly one bounded route. Positive lines mean scrolling up;
-/// negative lines mean scrolling down. Mouse reporting takes precedence even on the alternate
-/// screen, matching xterm-compatible applications that explicitly opted into wheel reports.
-pub fn wheel_route(lines: i64, alt_screen: bool, mouse_reporting: bool) -> WheelRoute {
-    let lines = lines.clamp(-MAX_WHEEL_STEPS_PER_EVENT, MAX_WHEEL_STEPS_PER_EVENT);
-    if lines == 0 {
-        return WheelRoute::NoOp;
+/// One resolved wheel-input disposition. The event loop gathers focused-pane state;
+/// [`wheel_input_action_for`] is the sole policy that chooses which owner receives the gesture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WheelInputAction {
+    /// The focused TUI negotiated terminal mouse reporting; emit xterm wheel reports.
+    MouseReport {
+        direction: WheelDirection,
+        steps: u8,
+    },
+    /// A focused alternate-screen TUI did not negotiate mouse reporting; synthesize
+    /// conventional unmodified cursor Up/Down keys under its current cursor-key mode.
+    AlternateScrollKeys {
+        direction: WheelDirection,
+        steps: u8,
+    },
+    /// The normal-screen renderer owns the scrollback viewport.
+    RendererScrollback(ScrollAction),
+    /// A sub-line gesture has not crossed the accumulator threshold yet.
+    NoOp,
+}
+
+/// Select exactly one owner for an accumulated whole-line wheel gesture.
+///
+/// Precedence is intentional: negotiated mouse reporting wins even on the alternate
+/// screen; otherwise alternate-screen applications receive bounded Up/Down keys; the
+/// normal screen moves renderer history. Zero is a no-op. This function never inspects
+/// a process/provider and never changes scrollback content.
+pub fn wheel_input_action_for(
+    lines: i64,
+    mouse_reporting: bool,
+    alt_screen: bool,
+) -> WheelInputAction {
+    let cap = i64::from(MAX_WHEEL_STEPS_PER_EVENT);
+    let bounded = lines.clamp(-cap, cap);
+    if bounded == 0 {
+        return WheelInputAction::NoOp;
     }
-    let steps = lines.unsigned_abs() as u8;
+    let direction = if bounded > 0 {
+        WheelDirection::Up
+    } else {
+        WheelDirection::Down
+    };
+    let steps = bounded.unsigned_abs() as u8;
     if mouse_reporting {
-        return WheelRoute::MouseReport {
-            event: if lines > 0 {
-                MouseEvent::WheelUp
-            } else {
-                MouseEvent::WheelDown
-            },
-            steps,
-        };
+        WheelInputAction::MouseReport { direction, steps }
+    } else if alt_screen {
+        WheelInputAction::AlternateScrollKeys { direction, steps }
+    } else {
+        WheelInputAction::RendererScrollback(ScrollAction::Lines(bounded))
     }
-    if alt_screen {
-        return WheelRoute::AlternateScroll {
-            key: if lines > 0 {
-                HostNamedKey::ArrowUp
-            } else {
-                HostNamedKey::ArrowDown
-            },
-            steps,
-        };
-    }
-    WheelRoute::RendererScroll(ScrollAction::Lines(lines))
 }
 
 /// The four navigation keys that may drive renderer scrollback. The caller maps a
@@ -501,6 +1303,7 @@ fn scrollback_snapshot(
 ///   NOT resurrect a historical view; still repaint so the overlay's history is fresh.
 ///
 /// On accept we echo the daemon's actually-served offset (it may have clamped ours).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn apply_scrollback_rows(
     shared: &Arc<Shared>,
@@ -512,19 +1315,14 @@ fn apply_scrollback_rows(
     offset_from_top: u32,
     rows: Vec<Vec<Cell>>,
 ) -> bool {
-    if id != session_id {
+    let Some(token) = shared.active_token() else {
+        return false;
+    };
+    if token.session_id != session_id || id != session_id {
         return false;
     }
-    let live_generation = shared
-        .grid
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|g| g.generation.clone());
-    let mut sb = shared.scrollback.lock().unwrap();
-    apply_scrollback_payload(
-        live_generation,
-        &mut sb,
+    shared.commit_active_scrollback(
+        &token,
         generation,
         revision,
         history_len,
@@ -542,7 +1340,22 @@ fn apply_scrollback_payload(
     offset_from_top: u32,
     rows: Vec<Vec<Cell>>,
 ) -> bool {
-    if live_generation.as_ref() != Some(&generation) {
+    // ScrollbackRows are request replies on the ordered connection. Always retire the one admitted
+    // request before applying generation gates: an old-generation reply after a new Grid must release
+    // the slot so the owner can admit its coalesced current-generation intent.
+    let discard_metadata = std::mem::take(&mut sb.discard_admitted_reply_metadata);
+    let Some((reply_intent_epoch, requested_offset, expected_generation)) =
+        sb.admitted_request.take()
+    else {
+        return false;
+    };
+    if expected_generation != generation || live_generation.as_ref() != Some(&generation) {
+        return false;
+    }
+    if discard_metadata {
+        return false;
+    }
+    if !crate::wire::terminal_link_cells_within_cap(&rows) {
         return false;
     }
     let snap = Arc::new(scrollback_snapshot(generation.clone(), revision, rows));
@@ -551,12 +1364,23 @@ fn apply_scrollback_payload(
     // No history at all (the bootstrap request found an empty scrollback): snap back to
     // the live bottom so a provisional offset can't strand us in scrolled mode.
     if history_len == 0 {
-        sb.reset_to_live();
+        if reply_intent_epoch == sb.intent_epoch {
+            sb.reset_to_live();
+        }
         return true;
     }
-    if sb.is_scrolled() {
-        // Echo the daemon's actually-served offset, re-clamped to the now-known length.
-        sb.view_offset = clamp_view_offset(offset_from_top as i64, Some(history_len), history_len);
+    if reply_intent_epoch == sb.intent_epoch && sb.is_scrolled() {
+        let desired = clamp_view_offset(requested_offset as i64, Some(history_len), history_len);
+        let served = clamp_view_offset(offset_from_top as i64, Some(history_len), history_len);
+        // Replies are not request-id tagged. The latest local desired offset is therefore the only
+        // safe correlation: an older in-flight reply after another scroll (or return-to-live) must
+        // not overwrite the new viewport.
+        if served != desired
+            || clamp_view_offset(sb.view_offset as i64, Some(history_len), history_len) != desired
+        {
+            return false;
+        }
+        sb.view_offset = served;
         sb.historical = Some(snap);
         sb.historical_generation = Some(generation);
     }
@@ -571,16 +1395,158 @@ fn apply_scrollback_payload(
 /// honor"; the reader copies it into its `SyncState` and its own filter on each bump.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ActiveSession {
-    pub id: String,
+    pub id: Option<String>,
     pub epoch: u64,
+    /// Exact daemon-stream fence allocated from the one connection-global monotonic namespace.
+    /// This is protocol evidence, not a second local binding authority: every local commit still
+    /// requires `id + epoch`, while an absent generation can never authorize inbound bytes.
+    pub output_generation: Option<u64>,
+    /// Durable PTY lifetime authorized by the immutable exact viewport cohort.
+    pub expected_generation: Option<SessionGeneration>,
+}
+
+/// Exact authority for one incarnation of the primary renderer binding. Session ids may be
+/// reused after a viewport is cleared, so the id alone is never sufficient authorization to
+/// publish a frame or deliver a terminal side effect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveBindingToken {
+    pub session_id: String,
+    pub epoch: u64,
+    pub output_generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExactViewportRouteBinding {
+    token: ViewportBindingToken,
+    expected_generation: SessionGeneration,
+    primary: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExactViewportAdmissionStatus {
+    Pending,
+    Complete,
+    FailedBeforePrimaryProof,
+    FailedAfterPrimaryProof,
+}
+
+#[derive(Default)]
+struct ExactViewportAdmissionProgress {
+    proven_output_generations: std::collections::BTreeSet<u64>,
+    failed: bool,
+}
+
+struct ExactViewportAdmissionProof {
+    routes: Vec<ExactViewportRouteBinding>,
+    progress: Mutex<ExactViewportAdmissionProgress>,
+    primary_authority: Option<maestro_shell::AttachmentHandoffAuthority>,
+    primary_claim_proven: AtomicBool,
+}
+
+impl ExactViewportAdmissionProof {
+    fn note_grid(&self, token: &ViewportBindingToken, generation: &SessionGeneration) -> bool {
+        let Some(route) = self.routes.iter().find(|route| &route.token == token) else {
+            return false;
+        };
+        if &route.expected_generation != generation {
+            self.fail();
+            return false;
+        }
+        let mut progress = self.progress.lock().unwrap();
+        if progress.failed {
+            return false;
+        }
+        if route.primary && !self.primary_claim_proven.swap(true, Ordering::AcqRel) {
+            if let Some(authority) = self.primary_authority.as_ref() {
+                authority.mark_claimed();
+            }
+        }
+        progress
+            .proven_output_generations
+            .insert(token_output_generation(token));
+        true
+    }
+
+    fn fail(&self) {
+        self.progress.lock().unwrap().failed = true;
+    }
+
+    fn status(&self) -> ExactViewportAdmissionStatus {
+        let progress = self.progress.lock().unwrap();
+        if progress.failed {
+            if self.primary_claim_proven.load(Ordering::Acquire) {
+                ExactViewportAdmissionStatus::FailedAfterPrimaryProof
+            } else {
+                ExactViewportAdmissionStatus::FailedBeforePrimaryProof
+            }
+        } else if progress.proven_output_generations.len() == self.routes.len() {
+            ExactViewportAdmissionStatus::Complete
+        } else {
+            ExactViewportAdmissionStatus::Pending
+        }
+    }
+}
+
+fn token_output_generation(token: &ViewportBindingToken) -> u64 {
+    match token {
+        ViewportBindingToken::Active(token) => token.output_generation,
+        ViewportBindingToken::Pane {
+            output_generation, ..
+        } => *output_generation,
+    }
+}
+
+/// Immutable receipt for every route admitted by one all-or-none exact viewport batch. Re-querying
+/// Shared by session id is ABA-unsafe, so the owner retains these exact tokens until all baselines
+/// prove or the connection is neutralized.
+#[derive(Clone)]
+pub(crate) struct ViewportBindingSet {
+    primary: ActiveBindingToken,
+    proof: Arc<ExactViewportAdmissionProof>,
+}
+
+impl std::fmt::Debug for ViewportBindingSet {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ViewportBindingSet")
+            .field("primary", &self.primary)
+            .field("route_count", &self.proof.routes.len())
+            .finish()
+    }
+}
+
+impl ViewportBindingSet {
+    pub(crate) fn primary(&self) -> &ActiveBindingToken {
+        &self.primary
+    }
+
+    pub(crate) fn status(&self) -> ExactViewportAdmissionStatus {
+        self.proof.status()
+    }
+}
+
+/// Route-aware authority carried by queued bell/title/OSC52 notifications. A pane token also
+/// captures the active viewport epoch: clearing or switching the containing viewport invalidates
+/// every queued pane effect even if that pane's own store still happens to exist.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ViewportBindingToken {
+    Active(ActiveBindingToken),
+    Pane {
+        session_id: String,
+        pane_epoch: u64,
+        pane_kind: PaneKind,
+        viewport_epoch: u64,
+        output_generation: u64,
+    },
 }
 
 /// The renderer's cache of the ONE inactive split-pane sibling session, kept entirely
-/// separate from the active session ([`Shared::active`]/[`Shared::grid`]). The sibling is attached
-/// and cached without receiving input; this passive store is filled by
-/// [`Shared::sync_sibling_session`] and updated by its reader path.
+/// separate from the active session ([`Shared::active`]/[`Shared::grid`]). This turn
+/// only ATTACHES and CACHES the sibling — it is not rendered and receives no input —
+/// so this is a passive store the UI thread fills via [`Shared::sync_sibling_session`]
+/// and (later) a reader path will write grids into.
 ///
-/// Uniform per-session store. Every non-active session id — the rendered
+/// Phase A: the UNIFORM per-session store. Every non-active session id — the rendered
 /// split sibling AND every extra non-active pane of a three-or-more-pane layout — gets one
 /// `PaneStore` keyed by its session id in [`Shared::stores`]. This replaces the two formerly
 /// separate stores (`SiblingSession` and the `PaneCaches` map): both are now the SAME shape
@@ -590,7 +1556,8 @@ pub struct ActiveSession {
 ///
 /// `epoch` increments every time this id is (re)bound (sibling rebind / pane re-add) so a late
 /// grid/exit stamped with a stale epoch is dropped instead of overwriting the current binding.
-/// `scrollback` is carried for uniformity and owns the viewport state for this session.
+/// `scrollback` is carried for uniformity (every session WILL own a viewport in a later phase);
+/// it is unused by the sibling/pane ingest paths this phase.
 #[derive(Default)]
 pub struct PaneStore {
     /// Whether this entry is the rendered split sibling or one of the extra cached panes. Lets
@@ -599,6 +1566,12 @@ pub struct PaneStore {
     pub kind: PaneKind,
     /// Bumped whenever this id is (re)bound, so a frame stamped with a stale epoch is dropped.
     pub epoch: u64,
+    /// Connection-global Attach generation echoed/tagged by the canonical daemon. It is allocated
+    /// independently of role-local epochs so active↔pane and pane↔sibling transitions cannot
+    /// collide for the same session id.
+    pub output_generation: Option<u64>,
+    /// Durable PTY lifetime expected on every Grid accepted for this route.
+    pub expected_generation: Option<SessionGeneration>,
     /// The session's latest accepted grid, or `None` until its first frame (or after a rebind).
     pub grid: Option<Arc<GridSnapshot>>,
     /// `Some(code)` once this session's process exits; `None` while it is live.
@@ -606,6 +1579,11 @@ pub struct PaneStore {
     /// Renderer-owned scrollback view state, read by the uniform pane paint path.
     pub scrollback: ScrollbackState,
 }
+
+type PaneBindingsSnapshot = (
+    u64,
+    Vec<(String, u64, Option<u64>, Option<SessionGeneration>)>,
+);
 
 /// Which class of session a [`PaneStore`] entry represents in the unified [`Shared::stores`]
 /// map. The two binding surfaces (the single rendered sibling vs. the N-pane membership set)
@@ -629,6 +1607,7 @@ pub struct SiblingSession {
     pub id: Option<String>,
     /// The sibling entry's rebind epoch (0 when unbound).
     pub epoch: u64,
+    pub output_generation: Option<u64>,
     /// The sibling's latest accepted grid, or `None` until its first frame (or after a rebind).
     pub grid: Option<Arc<GridSnapshot>>,
     /// `Some(code)` once the sibling session process exits; `None` while it is live.
@@ -674,7 +1653,15 @@ impl PanePaint {
     /// has arrived), else the live grid. The same choice is applied uniformly per pane.
     pub fn paint_grid(&self) -> Option<Arc<GridSnapshot>> {
         if self.scrolled_offset > 0 {
-            self.historical.clone().or_else(|| self.live.clone())
+            self.historical
+                .as_ref()
+                .filter(|historical| {
+                    self.live
+                        .as_ref()
+                        .is_some_and(|live| historical.generation == live.generation)
+                })
+                .cloned()
+                .or_else(|| self.live.clone())
         } else {
             self.live.clone()
         }
@@ -694,8 +1681,33 @@ pub struct Shared {
     /// the UI thread on a tab switch ([`Shared::set_active_session`]), read by the
     /// reader thread before each event so it rebinds its `SyncState` to a new id and
     /// rejects late frames from the old one. `None`-equivalent is the empty default
-    /// (epoch 0, empty id) only for the demo/stress paths that never connect.
+    /// (`id == None`) for connection failures and any explicitly cleared viewport.
     pub active: Mutex<ActiveSession>,
+    /// Last allocated connection-local Attach generation. Zero means none allocated yet. Allocation
+    /// uses checked monotonic increments; reaching `u64::MAX` permanently fails closed instead of
+    /// wrapping and making an ancient forwarder authoritative again.
+    next_output_generation: AtomicU64,
+    /// Coalesces the fixed local outbound-stall diagnostic until any later admission succeeds.
+    outbound_unavailable_logged: AtomicBool,
+    /// Writer and reader can discover the same socket death. Exactly one wins fail-closed teardown
+    /// and owner notification; later observations are idempotent no-ops.
+    connection_closed: AtomicBool,
+    /// True only when DaemonInfo on this exact operational socket proved protocol v3 and the
+    /// explicit generation-conditional mutation capability. False keeps retained daemons
+    /// attach/read-only; no request path may infer mutation support from version alone.
+    generation_conditional_mutations: AtomicBool,
+    /// Identity/capability proof captured from DaemonInfo on this exact operational socket. A
+    /// runtime handoff Claim is refused before serialization unless all immutable facts match.
+    operational_daemon_instance: OnceLock<Option<maestro_shell::DaemonInstanceId>>,
+    operational_server_pid: OnceLock<Option<u32>>,
+    attachment_handoff_capable: AtomicBool,
+    /// Current all-route baseline receipt. The owner retains a clone across Shared teardown; the
+    /// reader marks primary Claim proof here before any later sibling refusal/EOF can clear caches.
+    exact_viewport_admission: Mutex<Option<Arc<ExactViewportAdmissionProof>>>,
+    /// Exact-token local recovery intents. `Pending` survives a transient full/contended queue until
+    /// OutboundWritable; `admitted` stays coalesced until an exact Grid clears it, preventing a burst
+    /// of gap/malformed frames from enqueueing duplicate Snapshots.
+    pending_recoveries: Mutex<Vec<PendingRecovery>>,
     /// The most recent grid snapshot (None until the first Grid event), stored
     /// behind an `Arc` so the UI thread can clone-and-release under a short lock
     /// and then shape/submit to the GPU without holding the mutex —
@@ -712,10 +1724,15 @@ pub struct Shared {
     /// The bounded outbound queue. ALL requests — the reader thread's
     /// Attach/Snapshot AND the UI thread's Write/Resize — are framed and pushed
     /// here; one dedicated writer thread (spawned in `spawn`) drains them to the
-    /// socket in strict order. `None` until the socket connects (and after it
-    /// closes); a request enqueued while `None` is a no-op (e.g. the demo scene).
-    outbound: Mutex<Option<Arc<OutboundQueue>>>,
-    /// Unified per-session store. One map holds a [`PaneStore`] for every non-active
+    /// socket in strict order. Installed exactly once after connect; the handle itself is immutable
+    /// so owner-loop admission never contends on an outer handle mutex. Socket teardown marks the
+    /// queue closed in place. An unset handle is a typed `NotConnected` refusal (e.g. demo mode).
+    outbound: OnceLock<Arc<OutboundQueue>>,
+    /// A shutdown-only clone of the connected socket. No reads or writes use this handle; it exists
+    /// solely so either owner, reader, or writer failure can interrupt a peer-stalled writer and
+    /// force the daemon to tear down every forwarder for this client.
+    shutdown_stream: OnceLock<UnixStream>,
+    /// Phase A UNIFIED per-session store. ONE map holding a [`PaneStore`] for every non-active
     /// session id: the single rendered split sibling (`kind == Sibling`) AND every extra
     /// non-active pane of a three-or-more-pane layout (`kind == Pane`). Replaces the two
     /// formerly separate stores (`sibling: Mutex<SiblingSession>` + `panes: Mutex<PaneCaches>`)
@@ -738,82 +1755,931 @@ pub struct Shared {
     /// change so the reader rebuilds its per-pane `SyncState` map. Independent of the sibling
     /// pointer (which has no generation — it is a single slot).
     pub pane_generation: Mutex<u64>,
+    /// Monotonic namespace for pane-role binding epochs. It is deliberately independent of the
+    /// membership generation: deriving entry epochs from membership/count can collide after a
+    /// remove/re-add (for example initial panes 1..4, clear generation 2, re-add pane epoch 3).
+    /// Exhaustion refuses the whole membership mutation rather than wrapping.
+    next_pane_epoch: AtomicU64,
 }
 
 impl Shared {
-    /// Frame `req` as one `json + '\n'` line and push it onto the outbound queue
-    /// for the writer thread.
-    ///
-    /// BLOCKING BEHAVIOR — read this before calling from the UI thread.
-    /// This is NOT fully nonblocking. Under normal load the enqueue returns
-    /// immediately, but if the queue has reached its byte cap
-    /// ([`OUTBOUND_CAP_BYTES`]) — i.e. the daemon's socket is wedged and the
-    /// writer thread cannot drain — [`OutboundQueue::enqueue`] BLOCKS the caller
-    /// until room frees. The winit UI thread calls this for Write/Resize, so a
-    /// wedged daemon CAN momentarily stall the UI thread here.
-    ///
-    /// The current overload policy deliberately blocks: backpressure is
-    /// preferable to silently dropping terminal input (a dropped keystroke or the
-    /// final Resize is a correctness bug; a brief stall is a responsiveness bug).
-    /// The cap is 1 MiB of control frames + a capped paste, so reaching it means
-    /// the daemon is badly wedged, not normal slowness. A future change should make
-    /// the UI-thread path nonblocking with an explicit "outbound saturated" state
-    /// surfaced to the UI (e.g. an overlay) rather than blocking; until then this
-    /// honestly blocks instead of dropping.
-    ///
-    /// Locking: takes only the short `outbound` lock to clone the queue handle,
-    /// then releases it before (possibly) blocking on the queue's own lock — so it
-    /// is a leaf w.r.t. `grid`/`exited`. Safe to call from any thread.
-    pub fn send_request(&self, req: &ClientRequest) {
-        let line = match serde_json::to_string(req) {
+    #[inline]
+    pub(crate) fn connection_is_closed(&self) -> bool {
+        self.connection_closed.load(Ordering::Acquire)
+    }
+
+    fn closed_admission() -> RequestAdmission {
+        RequestAdmission::Unavailable {
+            reason: OutboundUnavailable::Closed,
+            wake_now: false,
+        }
+    }
+
+    fn mutation_unsupported_admission() -> RequestAdmission {
+        RequestAdmission::Unavailable {
+            reason: OutboundUnavailable::MutationUnsupported,
+            wake_now: false,
+        }
+    }
+
+    fn request_is_terminal_mutation(request: &ClientRequest) -> bool {
+        matches!(
+            request,
+            ClientRequest::Write { .. } | ClientRequest::Resize { .. }
+        )
+    }
+
+    fn mutations_match_generation(
+        requests: &[ClientRequest],
+        expected_generation: &SessionGeneration,
+    ) -> bool {
+        requests.iter().all(|request| match request {
+            ClientRequest::Write {
+                expected_generation: request_generation,
+                ..
+            }
+            | ClientRequest::Resize {
+                expected_generation: request_generation,
+                ..
+            } => request_generation == expected_generation,
+            _ => true,
+        })
+    }
+
+    fn shutdown_transport_socket(&self) {
+        if let Some(stream) = self.shutdown_stream.get() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+
+    fn abort_outbound_queue(&self) {
+        if let Some(queue) = self.outbound.get() {
+            queue.close();
+        }
+    }
+
+    fn abort_transport(&self) {
+        self.shutdown_transport_socket();
+        self.abort_outbound_queue();
+    }
+
+    fn fail_closed_connection(&self, proxy: &dyn UserEventSender) {
+        if self.connection_closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.fail_exact_viewport_admission();
+        // Socket shutdown cannot wait on an authority or queue mutex. Publish the owner wake before
+        // queue abort/cache teardown, either of which may briefly wait on an in-flight guard. Every
+        // grant predicate is latch-gated, so the owner can clear projections and present a neutral
+        // frame immediately while teardown finishes erasing the physical leaves.
+        self.shutdown_transport_socket();
+        let _ = proxy.send(UserEvent::ConnectionClosed);
+        self.abort_outbound_queue();
+        self.clear_viewport();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_closed_connection_for_test(&self, proxy: &dyn UserEventSender) {
+        self.fail_closed_connection(proxy);
+    }
+
+    /// Owner-side terminal admission failure. The caller is already on the event loop and performs
+    /// its App projection clear synchronously, so no proxy wake is required here.
+    pub fn abort_connection(&self) {
+        self.connection_closed.store(true, Ordering::Release);
+        self.abort_transport();
+        self.clear_viewport();
+    }
+
+    /// Allocate one socket-global Attach generation. Zero is reserved as the initial counter value;
+    /// every successful allocation is therefore non-zero and unique for this connection. Once the
+    /// namespace is exhausted, `fetch_update` leaves it at `u64::MAX` and every future bind fails
+    /// closed instead of reusing an old forwarder's tag.
+    fn allocate_output_generation(&self) -> Option<u64> {
+        self.next_output_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |last| {
+                last.checked_add(1)
+            })
+            .ok()
+            .and_then(|last| last.checked_add(1))
+    }
+
+    fn allocate_pane_epoch(&self) -> Option<u64> {
+        self.next_pane_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |last| {
+                last.checked_add(1)
+            })
+            .ok()
+            .and_then(|last| last.checked_add(1))
+    }
+
+    fn frame_request(req: &ClientRequest) -> Option<Vec<u8>> {
+        match serde_json::to_string(req) {
             Ok(mut line) => {
                 line.push('\n');
-                line.into_bytes()
+                Some(line.into_bytes())
             }
             Err(e) => {
                 eprintln!("maestro-renderer: serialize failed: {e}");
-                return;
+                None
+            }
+        }
+    }
+
+    fn frame_requests(reqs: &[ClientRequest]) -> Option<Vec<Vec<u8>>> {
+        reqs.iter().map(Self::frame_request).collect()
+    }
+
+    fn admission_from(outcome: TryEnqueueOutcome) -> RequestAdmission {
+        match outcome {
+            TryEnqueueOutcome::Admitted => RequestAdmission::Admitted,
+            TryEnqueueOutcome::Contended { wake_now } => RequestAdmission::Unavailable {
+                reason: OutboundUnavailable::Contended,
+                wake_now,
+            },
+            TryEnqueueOutcome::Full => RequestAdmission::Unavailable {
+                reason: OutboundUnavailable::Full,
+                wake_now: false,
+            },
+            TryEnqueueOutcome::TooLarge => RequestAdmission::Unavailable {
+                reason: OutboundUnavailable::TooLarge,
+                wake_now: false,
+            },
+            TryEnqueueOutcome::Closed => RequestAdmission::Unavailable {
+                reason: OutboundUnavailable::Closed,
+                wake_now: false,
+            },
+            TryEnqueueOutcome::Poisoned => RequestAdmission::Unavailable {
+                reason: OutboundUnavailable::Poisoned,
+                wake_now: false,
+            },
+        }
+    }
+
+    fn note_admission(&self, admission: RequestAdmission) -> RequestAdmission {
+        match admission {
+            RequestAdmission::Admitted => {
+                self.outbound_unavailable_logged
+                    .store(false, Ordering::Release);
+            }
+            RequestAdmission::Unavailable { reason, .. } => {
+                if !self
+                    .outbound_unavailable_logged
+                    .swap(true, Ordering::AcqRel)
+                {
+                    eprintln!(
+                        "maestro-renderer: terminal outbound unavailable ({reason:?}); local viewport remains responsive"
+                    );
+                }
+            }
+        }
+        admission
+    }
+
+    /// Nonblockingly admit one owner/reader request. The returned typed outcome must drive either
+    /// local coalescing/retry or an explicit user-visible refusal; this method never waits for the
+    /// queue mutex, capacity, a condvar, or socket I/O.
+    #[cfg(test)]
+    pub fn send_request(&self, req: &ClientRequest) -> RequestAdmission {
+        self.send_request_batch(std::slice::from_ref(req))
+    }
+
+    pub(crate) fn operational_handoff_peer_matches(&self, claim: &AttachmentHandoffClaim) -> bool {
+        self.attachment_handoff_capable.load(Ordering::Acquire)
+            && self
+                .operational_daemon_instance
+                .get()
+                .and_then(Option::as_ref)
+                == Some(&claim.expected_daemon_instance)
+            && self.operational_server_pid.get().copied().flatten() == claim.expected_server_pid
+            && (!cfg!(target_os = "linux") || claim.expected_server_pid.is_some())
+    }
+
+    pub(crate) fn operational_daemon_instance(&self) -> Option<maestro_shell::DaemonInstanceId> {
+        self.operational_daemon_instance
+            .get()
+            .and_then(Option::as_ref)
+            .cloned()
+    }
+
+    /// All-or-none nonblocking admission for an ordered protocol transaction. Serialization happens
+    /// before queue lookup; an unavailable queue admits zero frames, so Detach/Attach/Resize/Snapshot
+    /// plans can never leave a partial prefix that callers mistake for a bound viewport.
+    #[cfg(test)]
+    pub fn send_request_batch(&self, reqs: &[ClientRequest]) -> RequestAdmission {
+        if self.connection_is_closed() {
+            return Self::closed_admission();
+        }
+        if reqs.iter().any(Self::request_is_terminal_mutation)
+            && !self
+                .generation_conditional_mutations
+                .load(Ordering::Acquire)
+        {
+            return self.note_admission(Self::mutation_unsupported_admission());
+        }
+        let Some(lines) = Self::frame_requests(reqs) else {
+            return self.note_admission(RequestAdmission::Unavailable {
+                reason: OutboundUnavailable::Serialize,
+                wake_now: false,
+            });
+        };
+        let Some(queue) = self.outbound.get() else {
+            return self.note_admission(RequestAdmission::Unavailable {
+                reason: OutboundUnavailable::NotConnected,
+                wake_now: false,
+            });
+        };
+        if self.connection_is_closed() {
+            return Self::closed_admission();
+        }
+        let admission = Self::admission_from(queue.try_enqueue_batch(lines));
+        if self.connection_is_closed() {
+            return Self::closed_admission();
+        }
+        self.note_admission(admission)
+    }
+
+    /// Admit one Detach-only cleanup transaction iff the connection is alive and the viewport is
+    /// still neutral at the queue linearization point. This is deliberately separate from
+    /// [`Self::clear_viewport`]: Clear revokes paint/input authority synchronously, while the owner
+    /// retains the exact old attachment set and retries this fail-fast daemon cleanup on capacity.
+    /// Holding `active` through the queue try-lock prevents a later published bind from being cut by
+    /// a delayed id-only Detach. A ready aggregate bind may instead consume these same ids as its
+    /// cleanup prefix.
+    pub(crate) fn try_detach_while_neutral(&self, ids: &[String]) -> Option<RequestAdmission> {
+        if self.connection_is_closed() {
+            return Some(Self::closed_admission());
+        }
+        let requests: Vec<ClientRequest> = ids
+            .iter()
+            .filter(|id| !id.is_empty())
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|id| ClientRequest::Detach { id })
+            .collect();
+        if requests.is_empty() {
+            return Some(RequestAdmission::Admitted);
+        }
+        let Some(lines) = Self::frame_requests(&requests) else {
+            return Some(RequestAdmission::Unavailable {
+                reason: OutboundUnavailable::Serialize,
+                wake_now: false,
+            });
+        };
+        let active = self.active.lock().unwrap();
+        if self.connection_is_closed() {
+            return Some(Self::closed_admission());
+        }
+        if active.id.is_some() {
+            return None;
+        }
+        let admission = self.outbound.get().map_or(
+            RequestAdmission::Unavailable {
+                reason: OutboundUnavailable::NotConnected,
+                wake_now: false,
+            },
+            |queue| Self::admission_from(queue.try_enqueue_batch(lines)),
+        );
+        drop(active);
+        if self.connection_is_closed() {
+            Some(Self::closed_admission())
+        } else {
+            Some(self.note_admission(admission))
+        }
+    }
+
+    /// Register/coalesce one exact-token recovery Snapshot and try its first nonblocking admission.
+    /// Reader SyncState remains unchanged on refusal; this registry supplies deterministic retry even
+    /// if the daemon emits no later event.
+    fn request_recovery_snapshot(&self, token: &ViewportBindingToken) -> RecoveryRequestResult {
+        if self.connection_is_closed() {
+            return RecoveryRequestResult::Refused(Self::closed_admission());
+        }
+        let id = match token {
+            ViewportBindingToken::Active(token) => token.session_id.clone(),
+            ViewportBindingToken::Pane { session_id, .. } => session_id.clone(),
+        };
+        let Some(line) = Self::frame_request(&ClientRequest::Snapshot { id }) else {
+            return RecoveryRequestResult::Refused(self.note_admission(
+                RequestAdmission::Unavailable {
+                    reason: OutboundUnavailable::Serialize,
+                    wake_now: false,
+                },
+            ));
+        };
+        let active = self.active.lock().unwrap();
+        if self.connection_is_closed() {
+            return RecoveryRequestResult::Refused(Self::closed_admission());
+        }
+        let pane_guard = match token {
+            ViewportBindingToken::Active(token) => {
+                if active.epoch != token.epoch
+                    || active.id.as_deref() != Some(token.session_id.as_str())
+                    || active.output_generation != Some(token.output_generation)
+                {
+                    return RecoveryRequestResult::Stale;
+                }
+                None
+            }
+            ViewportBindingToken::Pane {
+                session_id,
+                pane_epoch,
+                pane_kind,
+                viewport_epoch,
+                output_generation,
+            } => {
+                if active.id.is_none() || active.epoch != *viewport_epoch {
+                    return RecoveryRequestResult::Stale;
+                }
+                let sibling_id = self.sibling_id.lock().unwrap();
+                let stores = self.stores.lock().unwrap();
+                if !stores.get(session_id).is_some_and(|entry| {
+                    entry.kind == *pane_kind
+                        && (*pane_kind != PaneKind::Sibling
+                            || sibling_id.as_deref() == Some(session_id.as_str()))
+                        && entry.epoch == *pane_epoch
+                        && entry.output_generation == Some(*output_generation)
+                }) {
+                    return RecoveryRequestResult::Stale;
+                }
+                Some((sibling_id, stores))
             }
         };
-        let queue = self.outbound.lock().unwrap().clone();
-        if let Some(q) = queue {
-            if !q.enqueue(line) {
-                eprintln!("maestro-renderer: outbound queue closed; request dropped");
+        let mut recoveries = self.pending_recoveries.lock().unwrap();
+        if self.connection_is_closed() {
+            return RecoveryRequestResult::Refused(Self::closed_admission());
+        }
+        if let Some(existing) = recoveries.iter().find(|entry| entry.binding == *token) {
+            return if existing.admitted {
+                RecoveryRequestResult::AlreadyAdmitted
+            } else {
+                RecoveryRequestResult::Pending { wake_now: false }
+            };
+        }
+        let admission = self.outbound.get().map_or(
+            RequestAdmission::Unavailable {
+                reason: OutboundUnavailable::NotConnected,
+                wake_now: false,
+            },
+            |queue| Self::admission_from(queue.try_enqueue(line)),
+        );
+        if self.connection_is_closed() {
+            return RecoveryRequestResult::Refused(Self::closed_admission());
+        }
+        if admission.is_admitted() || admission.is_retryable() {
+            // The number of live routes bounds this naturally. Keep a defensive cap so a corrupted
+            // membership cannot turn recovery bookkeeping into unbounded memory.
+            if recoveries.len() >= 256 {
+                drop(recoveries);
+                drop(pane_guard);
+                drop(active);
+                return RecoveryRequestResult::Refused(RequestAdmission::Unavailable {
+                    reason: OutboundUnavailable::TooLarge,
+                    wake_now: false,
+                });
             }
+            recoveries.push(PendingRecovery {
+                binding: token.clone(),
+                admitted: admission.is_admitted(),
+            });
+        }
+        drop(recoveries);
+        drop(pane_guard);
+        drop(active);
+        let admission = self.note_admission(admission);
+        if admission.is_admitted() {
+            RecoveryRequestResult::Admitted
+        } else if admission.is_retryable() {
+            RecoveryRequestResult::Pending {
+                wake_now: admission.wake_now(),
+            }
+        } else {
+            RecoveryRequestResult::Refused(admission)
+        }
+    }
+
+    /// Retry all exact pending recoveries after a writable/immediate wake. Each entry transitions
+    /// Pending→Admitted under active(+store)→registry→nonblocking-queue locks, so reader events cannot
+    /// enqueue a duplicate in the handoff window. Stale bindings are removed without side effects.
+    pub fn retry_pending_recoveries(&self) -> RecoveryRetryResult {
+        if self.connection_is_closed() {
+            return RecoveryRetryResult {
+                wake_now: false,
+                terminal: true,
+            };
+        }
+        let candidates: Vec<ViewportBindingToken> = self
+            .pending_recoveries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|entry| !entry.admitted)
+            .map(|entry| entry.binding.clone())
+            .collect();
+        let mut result = RecoveryRetryResult::default();
+        for token in candidates {
+            let id = match &token {
+                ViewportBindingToken::Active(token) => token.session_id.clone(),
+                ViewportBindingToken::Pane { session_id, .. } => session_id.clone(),
+            };
+            let Some(line) = Self::frame_request(&ClientRequest::Snapshot { id }) else {
+                result.terminal = true;
+                break;
+            };
+            let active = self.active.lock().unwrap();
+            if self.connection_is_closed() {
+                result.terminal = true;
+                break;
+            }
+            let pane_guard = match &token {
+                ViewportBindingToken::Active(active_token) => {
+                    if active.epoch != active_token.epoch
+                        || active.id.as_deref() != Some(active_token.session_id.as_str())
+                        || active.output_generation != Some(active_token.output_generation)
+                    {
+                        drop(active);
+                        self.clear_recovery(&token);
+                        continue;
+                    }
+                    None
+                }
+                ViewportBindingToken::Pane {
+                    session_id,
+                    pane_epoch,
+                    pane_kind,
+                    viewport_epoch,
+                    output_generation,
+                } => {
+                    if active.id.is_none() || active.epoch != *viewport_epoch {
+                        drop(active);
+                        self.clear_recovery(&token);
+                        continue;
+                    }
+                    let sibling_id_guard = self.sibling_id.lock().unwrap();
+                    let stores = self.stores.lock().unwrap();
+                    if !stores.get(session_id).is_some_and(|entry| {
+                        entry.kind == *pane_kind
+                            && (*pane_kind != PaneKind::Sibling
+                                || sibling_id_guard.as_deref() == Some(session_id.as_str()))
+                            && entry.epoch == *pane_epoch
+                            && entry.output_generation == Some(*output_generation)
+                    }) {
+                        drop(stores);
+                        drop(active);
+                        self.clear_recovery(&token);
+                        continue;
+                    }
+                    Some((sibling_id_guard, stores))
+                }
+            };
+            let mut recoveries = self.pending_recoveries.lock().unwrap();
+            let Some(entry) = recoveries
+                .iter_mut()
+                .find(|entry| entry.binding == token && !entry.admitted)
+            else {
+                continue;
+            };
+            if self.connection_is_closed() {
+                result.terminal = true;
+                break;
+            }
+            let admission = self.outbound.get().map_or(
+                RequestAdmission::Unavailable {
+                    reason: OutboundUnavailable::NotConnected,
+                    wake_now: false,
+                },
+                |queue| Self::admission_from(queue.try_enqueue(line)),
+            );
+            if self.connection_is_closed() {
+                result.terminal = true;
+                break;
+            }
+            if admission.is_admitted() {
+                entry.admitted = true;
+            }
+            drop(recoveries);
+            drop(pane_guard);
+            drop(active);
+            let admission = self.note_admission(admission);
+            if admission.wake_now() {
+                result.wake_now = true;
+            }
+            if admission.is_connection_terminal() {
+                result.terminal = true;
+                break;
+            }
+        }
+        result
+    }
+
+    fn clear_recovery(&self, token: &ViewportBindingToken) {
+        self.pending_recoveries
+            .lock()
+            .unwrap()
+            .retain(|entry| entry.binding != *token);
+    }
+
+    /// Atomically validate one captured binding and nonblockingly admit an ordered request batch.
+    /// `None` means the incarnation is stale and must be discarded; `Some` carries the queue's typed
+    /// admission result. Serialization happens before locking. The active guard spans validation
+    /// through the approved fail-fast queue try-lock, so clear cannot linearize between check and
+    /// admission. No authority guard survives into logging, proxy work, or socket I/O.
+    pub fn send_request_batch_for_binding(
+        &self,
+        token: &ViewportBindingToken,
+        reqs: &[ClientRequest],
+        expected_generation: &SessionGeneration,
+        scroll_intent: Option<&ScrollRequestIntent>,
+    ) -> Option<RequestAdmission> {
+        if self.connection_is_closed() {
+            return Some(Self::closed_admission());
+        }
+        if reqs.iter().any(Self::request_is_terminal_mutation)
+            && !self
+                .generation_conditional_mutations
+                .load(Ordering::Acquire)
+        {
+            return Some(self.note_admission(Self::mutation_unsupported_admission()));
+        }
+        if !Self::mutations_match_generation(reqs, expected_generation) {
+            return None;
+        }
+        let Some(lines) = Self::frame_requests(reqs) else {
+            return Some(self.note_admission(RequestAdmission::Unavailable {
+                reason: OutboundUnavailable::Serialize,
+                wake_now: false,
+            }));
+        };
+        // A Scrollback correlation is part of the same exact admission transaction. It must be
+        // installed before the frame becomes visible to the writer, and removed again on any queue
+        // refusal. Only one query per exact route may be in flight; later gestures coalesce in App
+        // until consuming any matching/mismatched reply emits OutboundWritable.
+        let scroll_request = scroll_intent.and_then(|intent| match reqs {
+            [ClientRequest::Scrollback {
+                id,
+                offset_from_top,
+                ..
+            }] if *offset_from_top == intent.requested_offset => Some((id.as_str(), intent)),
+            _ => None,
+        });
+        let has_scrollback = reqs
+            .iter()
+            .any(|request| matches!(request, ClientRequest::Scrollback { .. }));
+        if scroll_intent.is_some() != has_scrollback || scroll_request.is_some() != has_scrollback {
+            return Some(self.note_admission(RequestAdmission::Unavailable {
+                reason: OutboundUnavailable::Serialize,
+                wake_now: false,
+            }));
+        }
+        let active = self.active.lock().unwrap();
+        if self.connection_is_closed() {
+            return Some(Self::closed_admission());
+        }
+        let admission = match token {
+            ViewportBindingToken::Active(token) => {
+                if active.epoch != token.epoch
+                    || active.id.as_deref() != Some(token.session_id.as_str())
+                    || active.output_generation != Some(token.output_generation)
+                {
+                    return None;
+                }
+                let grid = self.grid.lock().unwrap();
+                if self.connection_is_closed() {
+                    return Some(Self::closed_admission());
+                }
+                if grid.as_ref().map(|grid| &grid.generation) != Some(expected_generation) {
+                    return None;
+                }
+                if let Some((request_id, intent)) = scroll_request {
+                    if request_id != token.session_id {
+                        return None;
+                    }
+                    if expected_generation != &intent.expected_generation {
+                        return None;
+                    }
+                    let mut scrollback = self.scrollback.lock().unwrap();
+                    if self.connection_is_closed() {
+                        return Some(Self::closed_admission());
+                    }
+                    if scrollback.intent_epoch != intent.intent_epoch
+                        || scrollback.view_offset != intent.requested_offset
+                    {
+                        return None;
+                    }
+                    if scrollback.admitted_request.is_some() {
+                        drop(scrollback);
+                        drop(active);
+                        return Some(RequestAdmission::Unavailable {
+                            reason: OutboundUnavailable::ScrollbackInFlight,
+                            wake_now: false,
+                        });
+                    }
+                    scrollback.discard_admitted_reply_metadata = false;
+                    scrollback.admitted_request = Some((
+                        intent.intent_epoch,
+                        intent.requested_offset,
+                        intent.expected_generation.clone(),
+                    ));
+                    let admission = self.outbound.get().map_or(
+                        RequestAdmission::Unavailable {
+                            reason: OutboundUnavailable::NotConnected,
+                            wake_now: false,
+                        },
+                        |queue| Self::admission_from(queue.try_enqueue_batch(lines)),
+                    );
+                    if self.connection_is_closed() {
+                        scrollback.admitted_request = None;
+                        return Some(Self::closed_admission());
+                    }
+                    if !admission.is_admitted() {
+                        scrollback.admitted_request = None;
+                    }
+                    admission
+                } else {
+                    let admission = self.outbound.get().map_or(
+                        RequestAdmission::Unavailable {
+                            reason: OutboundUnavailable::NotConnected,
+                            wake_now: false,
+                        },
+                        |queue| Self::admission_from(queue.try_enqueue_batch(lines)),
+                    );
+                    if self.connection_is_closed() {
+                        return Some(Self::closed_admission());
+                    }
+                    admission
+                }
+            }
+            ViewportBindingToken::Pane {
+                session_id,
+                pane_epoch,
+                pane_kind,
+                viewport_epoch,
+                output_generation,
+            } => {
+                if active.id.is_none() || active.epoch != *viewport_epoch {
+                    return None;
+                }
+                let sibling_id = self.sibling_id.lock().unwrap();
+                let mut stores = self.stores.lock().unwrap();
+                if self.connection_is_closed() {
+                    return Some(Self::closed_admission());
+                }
+                let entry = stores.get_mut(session_id)?;
+                if !(entry.kind == *pane_kind
+                    && (*pane_kind != PaneKind::Sibling
+                        || sibling_id.as_deref() == Some(session_id.as_str()))
+                    && entry.epoch == *pane_epoch
+                    && entry.output_generation == Some(*output_generation))
+                {
+                    return None;
+                }
+                if entry.grid.as_ref().map(|grid| &grid.generation) != Some(expected_generation) {
+                    return None;
+                }
+                if let Some((request_id, intent)) = scroll_request {
+                    if request_id != session_id {
+                        return None;
+                    }
+                    if expected_generation != &intent.expected_generation
+                        || entry.scrollback.intent_epoch != intent.intent_epoch
+                        || entry.scrollback.view_offset != intent.requested_offset
+                    {
+                        return None;
+                    }
+                    if entry.scrollback.admitted_request.is_some() {
+                        drop(stores);
+                        drop(sibling_id);
+                        drop(active);
+                        return Some(RequestAdmission::Unavailable {
+                            reason: OutboundUnavailable::ScrollbackInFlight,
+                            wake_now: false,
+                        });
+                    }
+                    entry.scrollback.discard_admitted_reply_metadata = false;
+                    entry.scrollback.admitted_request = Some((
+                        intent.intent_epoch,
+                        intent.requested_offset,
+                        intent.expected_generation.clone(),
+                    ));
+                    let admission = self.outbound.get().map_or(
+                        RequestAdmission::Unavailable {
+                            reason: OutboundUnavailable::NotConnected,
+                            wake_now: false,
+                        },
+                        |queue| Self::admission_from(queue.try_enqueue_batch(lines)),
+                    );
+                    if self.connection_is_closed() {
+                        entry.scrollback.admitted_request = None;
+                        return Some(Self::closed_admission());
+                    }
+                    if !admission.is_admitted() {
+                        entry.scrollback.admitted_request = None;
+                    }
+                    admission
+                } else {
+                    let admission = self.outbound.get().map_or(
+                        RequestAdmission::Unavailable {
+                            reason: OutboundUnavailable::NotConnected,
+                            wake_now: false,
+                        },
+                        |queue| Self::admission_from(queue.try_enqueue_batch(lines)),
+                    );
+                    if self.connection_is_closed() {
+                        return Some(Self::closed_admission());
+                    }
+                    admission
+                }
+            }
+        };
+        // This is the sole narrow authority→outbound critical section. Both handle lookup and
+        // byte admission are fail-fast try-locks: never replace either with `lock`/`enqueue`, a
+        // condvar wait, or socket/proxy work while `active`/`stores` are held. The writer path has
+        // no queue/outbound→authority acquisition, so there is no reverse edge.
+        drop(active);
+        if self.connection_is_closed() {
+            Some(Self::closed_admission())
+        } else {
+            Some(self.note_admission(admission))
         }
     }
 
     /// Read the current active session (id + epoch) under a short lock.
     pub fn active_snapshot(&self) -> ActiveSession {
-        self.active.lock().unwrap().clone()
+        self.active_snapshot_after_precheck(|| {})
     }
 
-    /// Publish one accepted active-session grid and clear a historical viewport when the terminal
-    /// switches between the primary and alternate screens. Grid and scrollback remain separately
-    /// locked and are never held across each other; the draw path independently refuses history
-    /// over an alternate grid, so the short publication/reset interval cannot paint stale history.
-    pub fn publish_primary_grid(&self, grid: Arc<GridSnapshot>) {
-        let next_alt_screen = grid.alt_screen;
-        let previous_alt_screen = {
-            let mut held = self.grid.lock().unwrap();
-            let previous_alt_screen = held.as_ref().map(|previous| previous.alt_screen);
-            *held = Some(grid);
-            previous_alt_screen
+    fn active_snapshot_after_precheck(&self, before_lock: impl FnOnce()) -> ActiveSession {
+        if self.connection_is_closed() {
+            return ActiveSession::default();
+        }
+        before_lock();
+        let snapshot = self.active.lock().unwrap().clone();
+        if self.connection_is_closed() {
+            ActiveSession::default()
+        } else {
+            snapshot
+        }
+    }
+
+    #[cfg(test)]
+    fn active_snapshot_with_prelock_hook(&self, before_lock: impl FnOnce()) -> ActiveSession {
+        self.active_snapshot_after_precheck(before_lock)
+    }
+
+    /// Capture the exact current primary binding, or `None` while the viewport is neutral.
+    #[cfg(test)]
+    pub fn active_token(&self) -> Option<ActiveBindingToken> {
+        if self.connection_is_closed() {
+            return None;
+        }
+        let active = self.active.lock().unwrap();
+        if self.connection_is_closed() {
+            return None;
+        }
+        active
+            .id
+            .as_ref()
+            .zip(active.output_generation)
+            .map(|(session_id, output_generation)| ActiveBindingToken {
+                session_id: session_id.clone(),
+                epoch: active.epoch,
+                output_generation,
+            })
+    }
+
+    /// Whether `token` still names the exact live primary incarnation.
+    pub fn active_token_is_current(&self, token: &ActiveBindingToken) -> bool {
+        if self.connection_is_closed() {
+            return false;
+        }
+        let active = self.active.lock().unwrap();
+        if self.connection_is_closed() {
+            return false;
+        }
+        active.epoch == token.epoch
+            && active.id.as_deref() == Some(token.session_id.as_str())
+            && active.output_generation == Some(token.output_generation)
+    }
+
+    /// Consumer-side validation for queued terminal effects.
+    pub fn viewport_token_is_current(&self, token: &ViewportBindingToken) -> bool {
+        if self.connection_is_closed() {
+            return false;
+        }
+        let active = self.active.lock().unwrap();
+        if self.connection_is_closed() {
+            return false;
+        }
+        let current = match token {
+            ViewportBindingToken::Active(token) => {
+                active.epoch == token.epoch
+                    && active.id.as_deref() == Some(token.session_id.as_str())
+                    && active.output_generation == Some(token.output_generation)
+            }
+            ViewportBindingToken::Pane {
+                session_id,
+                pane_epoch,
+                pane_kind,
+                viewport_epoch,
+                output_generation,
+            } => {
+                if active.id.is_none() || active.epoch != *viewport_epoch {
+                    return false;
+                }
+                let sibling_id = self.sibling_id.lock().unwrap();
+                let stores = self.stores.lock().unwrap();
+                stores.get(session_id).is_some_and(|entry| {
+                    entry.kind == *pane_kind
+                        && (*pane_kind != PaneKind::Sibling
+                            || sibling_id.as_deref() == Some(session_id.as_str()))
+                        && entry.epoch == *pane_epoch
+                        && entry.output_generation == Some(*output_generation)
+                })
+            }
         };
-        reset_scrollback_for_screen_transition(
-            previous_alt_screen,
-            next_alt_screen,
-            &mut self.scrollback.lock().unwrap(),
-        );
+        !self.connection_is_closed() && current
     }
 
-    /// Initialize the active session to `id` at epoch 0 — the attach the reader does
-    /// at spawn. Called ONCE before the reader thread starts so the first
-    /// `sync_active_session` is a no-op (the reader's local epoch already matches).
-    fn init_active_session(&self, id: &str) {
+    /// Resolve the exact current route authority for `session_id` in one fixed lock order. Active
+    /// wins over the store roles, matching reader dispatch. Used after a blocking socket read to
+    /// detect same-id ABA without stamping old bytes with a newly rebuilt binding.
+    pub(crate) fn binding_token_for_session(
+        &self,
+        session_id: &str,
+    ) -> Option<ViewportBindingToken> {
+        if self.connection_is_closed() {
+            return None;
+        }
+        let active = self.active.lock().unwrap();
+        if self.connection_is_closed() {
+            return None;
+        }
+        if active.id.as_deref() == Some(session_id) {
+            let output_generation = active.output_generation?;
+            let token = ViewportBindingToken::Active(ActiveBindingToken {
+                session_id: session_id.to_string(),
+                epoch: active.epoch,
+                output_generation,
+            });
+            return (!self.connection_is_closed()).then_some(token);
+        }
+        active.id.as_ref()?;
+        let sibling_id = self.sibling_id.lock().unwrap();
+        let stores = self.stores.lock().unwrap();
+        let entry = stores.get(session_id)?;
+        if entry.kind == PaneKind::Sibling && sibling_id.as_deref() != Some(session_id) {
+            return None;
+        }
+        let token = ViewportBindingToken::Pane {
+            session_id: session_id.to_string(),
+            pane_epoch: entry.epoch,
+            pane_kind: entry.kind,
+            viewport_epoch: active.epoch,
+            output_generation: entry.output_generation?,
+        };
+        (!self.connection_is_closed()).then_some(token)
+    }
+
+    /// Clear the primary leaves while the caller holds `active`. The lock order is deliberately
+    /// active -> one leaf at a time; no leaf guard survives into the next acquisition.
+    fn clear_primary_state_while_active(&self) {
+        *self.last_revision.lock().unwrap() = None;
+        *self.grid.lock().unwrap() = None;
+        *self.exited.lock().unwrap() = None;
+        *self.scrollback.lock().unwrap() = ScrollbackState::default();
+    }
+
+    /// Initialize the first active binding and allocate its exact daemon-stream generation. Called
+    /// once before the initial Attach is enqueued. Allocation/epoch exhaustion leaves the viewport
+    /// neutral and returns `None` (fail closed; never reuse an ancient incarnation).
+    pub(crate) fn init_active_session(&self, id: &str) -> Option<ActiveBindingToken> {
+        self.init_active_session_with_generation(id, None)
+    }
+
+    fn init_active_session_with_generation(
+        &self,
+        id: &str,
+        expected_generation: Option<SessionGeneration>,
+    ) -> Option<ActiveBindingToken> {
+        if self.connection_is_closed() {
+            return None;
+        }
+        let output_generation = self.allocate_output_generation()?;
         let mut active = self.active.lock().unwrap();
-        active.id = id.to_string();
-        active.epoch = 0;
+        if self.connection_is_closed() {
+            return None;
+        }
+        let epoch = active.epoch.checked_add(1)?;
+        active.id = Some(id.to_string());
+        active.epoch = epoch;
+        active.output_generation = Some(output_generation);
+        active.expected_generation = expected_generation;
+        Some(ActiveBindingToken {
+            session_id: id.to_string(),
+            epoch,
+            output_generation,
+        })
     }
 
     /// Rebind the renderer to `new_id`, bumping the epoch so the reader thread rebuilds
@@ -822,24 +2688,506 @@ impl Shared {
     /// [`crate::App::attach_session`]); the reader notices the epoch change on its next
     /// event and rebases. A no-op-detecting caller must compare ids BEFORE calling this
     /// (this always bumps the epoch).
-    pub fn set_active_session(&self, new_id: &str) -> u64 {
+    #[cfg(test)]
+    pub fn set_active_session(&self, new_id: &str) -> Option<ActiveBindingToken> {
+        if self.connection_is_closed() {
+            return None;
+        }
+        let Some(output_generation) = self.allocate_output_generation() else {
+            self.clear_viewport();
+            return None;
+        };
+        let epoch = {
+            let mut active = self.active.lock().unwrap();
+            if self.connection_is_closed() {
+                return None;
+            }
+            let Some(epoch) = active.epoch.checked_add(1) else {
+                active.id = None;
+                active.output_generation = None;
+                active.expected_generation = None;
+                self.clear_primary_state_while_active();
+                drop(active);
+                // Revocation is mandatory even when no next epoch exists. Stores cannot survive a
+                // failed bind and later paint/reconcile as if the old viewport were still live.
+                self.clear_sibling_session();
+                self.clear_pane_sessions();
+                return None;
+            };
+            active.epoch = epoch;
+            active.id = Some(new_id.to_string());
+            active.output_generation = Some(output_generation);
+            active.expected_generation = None;
+            self.clear_primary_state_while_active();
+            epoch
+        };
+        Some(ActiveBindingToken {
+            session_id: new_id.to_string(),
+            epoch,
+            output_generation,
+        })
+    }
+
+    /// Admit one complete viewport topology transaction before publishing any new role authority.
+    /// Every old/pending Detach precedes every primary/pane Attach; each new role gets a unique
+    /// connection-global output generation; and App/reader mirrors advance only after the aggregate
+    /// byte batch is admitted. The fixed lock order is active→sibling_id→pane_generation→stores,
+    /// followed only by the approved nonblocking queue try-lock.
+    pub fn try_bind_viewport(
+        &self,
+        desired: &DesiredViewportBinding,
+        detach_ids: &[String],
+        primary_handoff: Option<&AttachmentHandoffClaim>,
+    ) -> Result<ViewportBindingSet, ActiveBindFailure> {
+        if self.connection_is_closed() {
+            return Err(ActiveBindFailure::Admission(Self::closed_admission()));
+        }
+        if !self.attachment_handoff_capable.load(Ordering::Acquire) {
+            return Err(ActiveBindFailure::HandoffPeerMismatch);
+        }
+        if desired.primary_session_id.is_empty()
+            || desired.primary_expected_generation.0.is_empty()
+            || desired.primary_expected_generation.0.len() > 128
+            || desired.panes.iter().any(|pane| {
+                pane.session_id.is_empty()
+                    || pane.expected_generation.0.is_empty()
+                    || pane.expected_generation.0.len() > 128
+            })
+        {
+            return Err(ActiveBindFailure::AuthorityExhausted);
+        }
+        if primary_handoff.is_some_and(|claim| {
+            claim.session_id != desired.primary_session_id
+                || claim.expected_generation != desired.primary_expected_generation.0
+                || !self.operational_handoff_peer_matches(claim)
+        }) {
+            return Err(ActiveBindFailure::HandoffPeerMismatch);
+        }
+        let mut unique_ids = std::collections::BTreeSet::new();
+        unique_ids.insert(desired.primary_session_id.as_str());
+        if desired
+            .panes
+            .iter()
+            .any(|pane| !unique_ids.insert(pane.session_id.as_str()))
+        {
+            return Err(ActiveBindFailure::AuthorityExhausted);
+        }
+        let Some(primary_output_generation) = self.allocate_output_generation() else {
+            return Err(ActiveBindFailure::AuthorityExhausted);
+        };
+        let mut pane_authority = Vec::with_capacity(desired.panes.len());
+        for pane in &desired.panes {
+            let Some(output_generation) = self.allocate_output_generation() else {
+                return Err(ActiveBindFailure::AuthorityExhausted);
+            };
+            let Some(epoch) = self.allocate_pane_epoch() else {
+                return Err(ActiveBindFailure::AuthorityExhausted);
+            };
+            pane_authority.push((pane.clone(), epoch, output_generation));
+        }
+
+        let unique_detaches: std::collections::BTreeSet<String> = detach_ids
+            .iter()
+            .filter(|id| !id.is_empty())
+            .cloned()
+            .collect();
+        let mut plan = Vec::with_capacity(unique_detaches.len() + 2 * (pane_authority.len() + 1));
+        plan.extend(
+            unique_detaches
+                .into_iter()
+                .map(|id| ClientRequest::Detach { id }),
+        );
+        plan.push(ClientRequest::Attach {
+            id: desired.primary_session_id.clone(),
+            want_raw_output: false,
+            expected_session_generation: Some(desired.primary_expected_generation.0.clone()),
+            output_generation: Some(primary_output_generation),
+            handoff: primary_handoff.map(|claim| maestro_shell::AttachmentHandoff::Claim {
+                token: claim.token.clone(),
+            }),
+        });
+        plan.push(ClientRequest::Snapshot {
+            id: desired.primary_session_id.clone(),
+        });
+        for (pane, _, output_generation) in &pane_authority {
+            plan.push(ClientRequest::Attach {
+                id: pane.session_id.clone(),
+                want_raw_output: false,
+                expected_session_generation: Some(pane.expected_generation.0.clone()),
+                output_generation: Some(*output_generation),
+                handoff: None,
+            });
+            plan.push(ClientRequest::Snapshot {
+                id: pane.session_id.clone(),
+            });
+        }
+        let Some(lines) = Self::frame_requests(&plan) else {
+            return Err(ActiveBindFailure::Admission(
+                RequestAdmission::Unavailable {
+                    reason: OutboundUnavailable::Serialize,
+                    wake_now: false,
+                },
+            ));
+        };
+
         let mut active = self.active.lock().unwrap();
-        active.id = new_id.to_string();
-        active.epoch += 1;
-        active.epoch
+        if self.connection_is_closed() {
+            return Err(ActiveBindFailure::Admission(Self::closed_admission()));
+        }
+        let Some(epoch) = active.epoch.checked_add(1) else {
+            return Err(ActiveBindFailure::AuthorityExhausted);
+        };
+        let mut sibling_id = self.sibling_id.lock().unwrap();
+        let mut pane_generation = self.pane_generation.lock().unwrap();
+        let Some(next_pane_generation) = pane_generation.checked_add(1) else {
+            return Err(ActiveBindFailure::AuthorityExhausted);
+        };
+        let mut stores = self.stores.lock().unwrap();
+        if self.connection_is_closed() {
+            return Err(ActiveBindFailure::Admission(Self::closed_admission()));
+        }
+        let Some(queue) = self.outbound.get() else {
+            return Err(ActiveBindFailure::Admission(
+                RequestAdmission::Unavailable {
+                    reason: OutboundUnavailable::NotConnected,
+                    wake_now: false,
+                },
+            ));
+        };
+        let primary_token = ActiveBindingToken {
+            session_id: desired.primary_session_id.clone(),
+            epoch,
+            output_generation: primary_output_generation,
+        };
+        let mut routes = Vec::with_capacity(pane_authority.len() + 1);
+        routes.push(ExactViewportRouteBinding {
+            token: ViewportBindingToken::Active(primary_token.clone()),
+            expected_generation: desired.primary_expected_generation.clone(),
+            primary: true,
+        });
+        for (pane, pane_epoch, output_generation) in &pane_authority {
+            routes.push(ExactViewportRouteBinding {
+                token: ViewportBindingToken::Pane {
+                    session_id: pane.session_id.clone(),
+                    pane_epoch: *pane_epoch,
+                    pane_kind: PaneKind::Pane,
+                    viewport_epoch: epoch,
+                    output_generation: *output_generation,
+                },
+                expected_generation: pane.expected_generation.clone(),
+                primary: false,
+            });
+        }
+        let proof = Arc::new(ExactViewportAdmissionProof {
+            routes,
+            progress: Mutex::new(ExactViewportAdmissionProgress::default()),
+            primary_authority: primary_handoff.map(|claim| claim.authority.clone()),
+            primary_claim_proven: AtomicBool::new(false),
+        });
+        if let Some(previous) = self
+            .exact_viewport_admission
+            .lock()
+            .unwrap()
+            .replace(Arc::clone(&proof))
+        {
+            previous.fail();
+        }
+        if let Some(claim) = primary_handoff {
+            // This shared authority bit is deliberately set before queue admission. Every clone,
+            // including a concurrently cancelling duplicate, must classify the Claim as possibly
+            // applied from this publication boundary onward, even if this local enqueue refuses.
+            claim.authority.mark_claim_admitted();
+        }
+        let admission = Self::admission_from(queue.try_enqueue_batch(lines));
+        if !admission.is_admitted() {
+            proof.fail();
+            self.exact_viewport_admission.lock().unwrap().take();
+            drop(stores);
+            drop(pane_generation);
+            drop(sibling_id);
+            drop(active);
+            let _ = self.note_admission(admission);
+            return Err(ActiveBindFailure::Admission(admission));
+        }
+        if self.connection_is_closed() {
+            proof.fail();
+            drop(stores);
+            drop(pane_generation);
+            drop(sibling_id);
+            drop(active);
+            let _ = self.note_admission(admission);
+            return Ok(ViewportBindingSet {
+                primary: primary_token,
+                proof,
+            });
+        }
+
+        active.epoch = epoch;
+        active.id = Some(desired.primary_session_id.clone());
+        active.output_generation = Some(primary_output_generation);
+        active.expected_generation = Some(desired.primary_expected_generation.clone());
+        self.clear_primary_state_while_active();
+        *sibling_id = None;
+        *pane_generation = next_pane_generation;
+        stores.clear();
+        for (pane, pane_epoch, output_generation) in pane_authority {
+            stores.insert(
+                pane.session_id,
+                PaneStore {
+                    kind: PaneKind::Pane,
+                    epoch: pane_epoch,
+                    output_generation: Some(output_generation),
+                    expected_generation: Some(pane.expected_generation),
+                    grid: None,
+                    exited: None,
+                    scrollback: ScrollbackState::default(),
+                },
+            );
+        }
+        self.pending_recoveries.lock().unwrap().clear();
+        drop(stores);
+        drop(pane_generation);
+        drop(sibling_id);
+        drop(active);
+        let _ = self.note_admission(admission);
+        Ok(ViewportBindingSet {
+            primary: primary_token,
+            proof,
+        })
+    }
+
+    /// Linearize a viewport clear locally. This never contacts the daemon: it first revokes the
+    /// active binding and clears every primary leaf while holding `active`, then releases that lock
+    /// before clearing the independent sibling/pane stores. Repeated calls remain neutral and merely
+    /// advance the epoch, invalidating any queued work captured between them.
+    pub fn clear_viewport(&self) -> u64 {
+        self.fail_exact_viewport_admission();
+        let epoch = {
+            let mut active = teardown_lock(&self.active);
+            active.epoch = active.epoch.saturating_add(1);
+            active.id = None;
+            active.output_generation = None;
+            active.expected_generation = None;
+            *teardown_lock(&self.last_revision) = None;
+            *teardown_lock(&self.grid) = None;
+            *teardown_lock(&self.exited) = None;
+            *teardown_lock(&self.scrollback) = ScrollbackState::default();
+            active.epoch
+        };
+        let mut sibling_id = teardown_lock(&self.sibling_id);
+        let had_sibling = sibling_id.take().is_some();
+        let mut sibling_epoch = teardown_lock(&self.sibling_epoch);
+        if had_sibling {
+            if let Some(next) = sibling_epoch.checked_add(1) {
+                *sibling_epoch = next;
+            }
+        }
+        let mut pane_generation = teardown_lock(&self.pane_generation);
+        let mut stores = teardown_lock(&self.stores);
+        let had_panes = stores.values().any(|entry| entry.kind == PaneKind::Pane);
+        stores.clear();
+        if had_panes {
+            if let Some(next) = pane_generation.checked_add(1) {
+                *pane_generation = next;
+            }
+        }
+        drop(stores);
+        drop(pane_generation);
+        drop(sibling_epoch);
+        drop(sibling_id);
+        teardown_lock(&self.pending_recoveries).clear();
+        epoch
+    }
+
+    fn fail_exact_viewport_admission(&self) {
+        if let Some(proof) = self.exact_viewport_admission.lock().unwrap().take() {
+            proof.fail();
+        }
+    }
+
+    fn note_exact_viewport_grid(
+        &self,
+        token: &ViewportBindingToken,
+        generation: &SessionGeneration,
+    ) -> Option<bool> {
+        let proof = self.exact_viewport_admission.lock().unwrap().clone()?;
+        Some(proof.note_grid(token, generation))
+    }
+
+    /// Read the primary grid only if `token` remains current. The active guard stays held through
+    /// the one leaf read so ClearViewport is the linearization point.
+    fn active_grid_for(&self, token: &ActiveBindingToken) -> Option<Arc<GridSnapshot>> {
+        if self.connection_is_closed() {
+            return None;
+        }
+        let active = self.active.lock().unwrap();
+        if self.connection_is_closed() {
+            return None;
+        }
+        if active.epoch != token.epoch
+            || active.id.as_deref() != Some(token.session_id.as_str())
+            || active.output_generation != Some(token.output_generation)
+        {
+            return None;
+        }
+        let grid = self.grid.lock().unwrap().clone();
+        (!self.connection_is_closed()).then_some(grid).flatten()
+    }
+
+    /// Commit an accepted active grid under the exact captured binding. Each leaf is touched alone
+    /// under the active guard; no proxy wake or outbound request happens while either lock is held.
+    fn commit_active_grid(
+        &self,
+        token: &ActiveBindingToken,
+        revision: Revision,
+        grid: Arc<GridSnapshot>,
+    ) -> bool {
+        if self.connection_is_closed() {
+            return false;
+        }
+        let active = self.active.lock().unwrap();
+        if self.connection_is_closed() {
+            return false;
+        }
+        if active.epoch != token.epoch
+            || active.id.as_deref() != Some(token.session_id.as_str())
+            || active.output_generation != Some(token.output_generation)
+        {
+            return false;
+        }
+        {
+            let mut last_revision = self.last_revision.lock().unwrap();
+            if self.connection_is_closed() {
+                return false;
+            }
+            *last_revision = Some((revision, Instant::now()));
+        }
+        let live_context_changed = {
+            let mut held = self.grid.lock().unwrap();
+            if self.connection_is_closed() {
+                return false;
+            }
+            let changed = held.as_ref().is_some_and(|previous| {
+                previous.generation != grid.generation || previous.alt_screen != grid.alt_screen
+            });
+            *held = Some(grid);
+            changed
+        };
+        if live_context_changed {
+            let mut scrollback = self.scrollback.lock().unwrap();
+            if self.connection_is_closed() {
+                return false;
+            }
+            scrollback.reset_for_live_context_change();
+        }
+        !self.connection_is_closed()
+    }
+
+    fn commit_active_resync(&self, token: &ActiveBindingToken) -> bool {
+        if self.connection_is_closed() {
+            return false;
+        }
+        let active = self.active.lock().unwrap();
+        if self.connection_is_closed() {
+            return false;
+        }
+        if active.epoch != token.epoch
+            || active.id.as_deref() != Some(token.session_id.as_str())
+            || active.output_generation != Some(token.output_generation)
+        {
+            return false;
+        }
+        let mut last_revision = self.last_revision.lock().unwrap();
+        if self.connection_is_closed() {
+            return false;
+        }
+        *last_revision = Some((Revision(u64::MAX), Instant::now()));
+        !self.connection_is_closed()
+    }
+
+    fn commit_active_exit(&self, token: &ActiveBindingToken, code: Option<i32>) -> bool {
+        if self.connection_is_closed() {
+            return false;
+        }
+        let active = self.active.lock().unwrap();
+        if self.connection_is_closed() {
+            return false;
+        }
+        if active.epoch != token.epoch
+            || active.id.as_deref() != Some(token.session_id.as_str())
+            || active.output_generation != Some(token.output_generation)
+        {
+            return false;
+        }
+        let mut exited = self.exited.lock().unwrap();
+        if self.connection_is_closed() {
+            return false;
+        }
+        *exited = Some(code);
+        !self.connection_is_closed()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_active_scrollback(
+        &self,
+        token: &ActiveBindingToken,
+        generation: SessionGeneration,
+        revision: Revision,
+        history_len: u32,
+        offset_from_top: u32,
+        rows: Vec<Vec<Cell>>,
+    ) -> bool {
+        if self.connection_is_closed() {
+            return false;
+        }
+        let active = self.active.lock().unwrap();
+        if self.connection_is_closed() {
+            return false;
+        }
+        if active.epoch != token.epoch
+            || active.id.as_deref() != Some(token.session_id.as_str())
+            || active.output_generation != Some(token.output_generation)
+        {
+            return false;
+        }
+        let live_generation = {
+            let grid = self.grid.lock().unwrap();
+            if self.connection_is_closed() {
+                return false;
+            }
+            grid.as_ref().map(|grid| grid.generation.clone())
+        };
+        let mut scrollback = self.scrollback.lock().unwrap();
+        if self.connection_is_closed() {
+            return false;
+        }
+        let applied = apply_scrollback_payload(
+            live_generation,
+            &mut scrollback,
+            generation,
+            revision,
+            history_len,
+            offset_from_top,
+            rows,
+        );
+        !self.connection_is_closed() && applied
     }
 
     /// Snapshot the rendered sibling (id + epoch + grid + exit) from the unified store under a
     /// short lock. Shim over [`Self::stores`]: reads the [`Self::sibling_id`] pointer, then the
     /// matching `kind == Sibling` entry. Returns the empty default when there is no split.
     pub fn sibling_snapshot(&self) -> SiblingSession {
+        if self.connection_is_closed() {
+            return SiblingSession::default();
+        }
         let id = self.sibling_id.lock().unwrap().clone();
         let stores = self.stores.lock().unwrap();
-        match id {
+        let snapshot = match id {
             Some(id) => match stores.get(&id) {
                 Some(entry) if entry.kind == PaneKind::Sibling => SiblingSession {
                     id: Some(id),
                     epoch: entry.epoch,
+                    output_generation: entry.output_generation,
                     grid: entry.grid.clone(),
                     exited: entry.exited,
                 },
@@ -848,12 +3196,90 @@ impl Shared {
                 _ => SiblingSession {
                     id: Some(id),
                     epoch: 0,
+                    output_generation: None,
                     grid: None,
                     exited: None,
                 },
             },
             None => SiblingSession::default(),
+        };
+        if self.connection_is_closed() {
+            SiblingSession::default()
+        } else {
+            snapshot
         }
+    }
+
+    /// Run one pane-store mutation only while the complete routed binding is still current. Lock
+    /// order is always `active -> sibling_id -> stores`; the active viewport guard makes
+    /// ClearViewport the linearization point, while role/entry epoch/output-generation prevent
+    /// remove/re-add and Pane↔Sibling ABA. The closure performs one leaf mutation and no proxy,
+    /// host, outbound, or socket work.
+    fn with_current_pane_store(
+        &self,
+        token: &ViewportBindingToken,
+        expected_kind: PaneKind,
+        f: impl FnOnce(&mut PaneStore) -> bool,
+    ) -> bool {
+        if self.connection_is_closed() {
+            return false;
+        }
+        let ViewportBindingToken::Pane {
+            session_id,
+            pane_epoch,
+            pane_kind,
+            viewport_epoch,
+            output_generation,
+        } = token
+        else {
+            return false;
+        };
+        if *pane_kind != expected_kind {
+            return false;
+        }
+        let active = self.active.lock().unwrap();
+        if self.connection_is_closed() {
+            return false;
+        }
+        if active.id.is_none() || active.epoch != *viewport_epoch {
+            return false;
+        }
+        let sibling_id = self.sibling_id.lock().unwrap();
+        if expected_kind == PaneKind::Sibling && sibling_id.as_deref() != Some(session_id.as_str())
+        {
+            return false;
+        }
+        let mut stores = self.stores.lock().unwrap();
+        if self.connection_is_closed() {
+            return false;
+        }
+        let applied = match stores.get_mut(session_id) {
+            Some(entry)
+                if entry.kind == expected_kind
+                    && entry.epoch == *pane_epoch
+                    && entry.output_generation == Some(*output_generation) =>
+            {
+                f(entry)
+            }
+            _ => false,
+        };
+        !self.connection_is_closed() && applied
+    }
+
+    /// Clone the held pane grid under the same full token gate used by commits. This closes the
+    /// accept→clear/rebind→held-read race before Damage is applied.
+    fn pane_grid_for_binding(
+        &self,
+        token: &ViewportBindingToken,
+        expected_kind: PaneKind,
+    ) -> Option<Arc<GridSnapshot>> {
+        let mut grid = None;
+        self.with_current_pane_store(token, expected_kind, |entry| {
+            grid = entry.grid.clone();
+            true
+        })
+        .then_some(grid)
+        .flatten()
     }
 
     /// Bind the sibling slot of the unified store to `new_id`, bumping its epoch and clearing the
@@ -865,10 +3291,33 @@ impl Shared {
     /// `kind == Sibling` entry. The PRIOR sibling entry (if a different id) is removed so the map
     /// never accumulates orphaned sibling slots.
     #[allow(dead_code)]
-    pub fn set_sibling_session(&self, new_id: &str) -> u64 {
+    pub fn set_sibling_session(&self, new_id: &str) -> Option<u64> {
+        if self.connection_is_closed() {
+            return None;
+        }
+        let Some(output_generation) = self.allocate_output_generation() else {
+            self.clear_sibling_session();
+            return None;
+        };
         let mut sibling_id = self.sibling_id.lock().unwrap();
         let mut sibling_epoch = self.sibling_epoch.lock().unwrap();
         let mut stores = self.stores.lock().unwrap();
+        if self.connection_is_closed() {
+            return None;
+        }
+        let Some(next_epoch) = sibling_epoch.checked_add(1) else {
+            // Exhaustion permanently closes this role. Revoke the old pointer/cache even though no
+            // fresh epoch can be minted; callers observe `None` and must not enqueue an Attach.
+            if let Some(old_id) = sibling_id.take() {
+                if stores
+                    .get(&old_id)
+                    .is_some_and(|entry| entry.kind == PaneKind::Sibling)
+                {
+                    stores.remove(&old_id);
+                }
+            }
+            return None;
+        };
         // Drop the previous sibling entry when rebinding to a different id so only one
         // `kind == Sibling` entry ever exists. (A same-id rebind reuses the slot below.)
         if let Some(prev) = sibling_id.as_deref() {
@@ -881,15 +3330,16 @@ impl Shared {
             }
         }
         // Bump the single monotonic counter and stamp it (matches old `SiblingSession::epoch`).
-        *sibling_epoch += 1;
+        *sibling_epoch = next_epoch;
         let entry = stores.entry(new_id.to_string()).or_default();
         entry.kind = PaneKind::Sibling;
         entry.epoch = *sibling_epoch;
+        entry.output_generation = Some(output_generation);
         entry.grid = None;
         entry.exited = None;
         entry.scrollback.reset_to_live();
         *sibling_id = Some(new_id.to_string());
-        *sibling_epoch
+        Some(*sibling_epoch)
     }
 
     /// Drop the sibling binding entirely (no split → no sibling to cache), bumping the epoch so any
@@ -905,7 +3355,9 @@ impl Shared {
         };
         // Bump the monotonic counter on unbind too, so a late frame from the just-cleared sibling
         // (or any later rebind of the same id) is rejected by a strictly-greater epoch.
-        *sibling_epoch += 1;
+        if let Some(next_epoch) = sibling_epoch.checked_add(1) {
+            *sibling_epoch = next_epoch;
+        }
         if let Some(e) = stores.get(&id) {
             if e.kind == PaneKind::Sibling {
                 stores.remove(&id);
@@ -918,99 +3370,183 @@ impl Shared {
     /// from a previous sibling and is dropped (returns `false`). Never touches the active
     /// grid. Returns `true` when the sibling cache was updated. Shim over the unified store
     /// (the `kind == Sibling` entry under `for_id`).
-    pub fn apply_sibling_grid(
-        &self,
-        for_id: &str,
-        for_epoch: u64,
-        grid: Arc<GridSnapshot>,
-    ) -> bool {
-        let sibling_id = self.sibling_id.lock().unwrap();
-        if sibling_id.as_deref() != Some(for_id) {
-            return false;
-        }
-        let mut stores = self.stores.lock().unwrap();
-        match stores.get_mut(for_id) {
-            Some(entry) if entry.kind == PaneKind::Sibling && entry.epoch == for_epoch => {
-                reset_scrollback_for_screen_transition(
-                    entry.grid.as_ref().map(|previous| previous.alt_screen),
-                    grid.alt_screen,
-                    &mut entry.scrollback,
-                );
-                entry.grid = Some(grid);
-                true
+    fn commit_sibling_grid(&self, token: &ViewportBindingToken, grid: Arc<GridSnapshot>) -> bool {
+        self.with_current_pane_store(token, PaneKind::Sibling, |entry| {
+            let live_context_changed = entry.grid.as_ref().is_some_and(|previous| {
+                previous.generation != grid.generation || previous.alt_screen != grid.alt_screen
+            });
+            entry.grid = Some(grid);
+            if live_context_changed {
+                entry.scrollback.reset_for_live_context_change();
             }
-            _ => false,
-        }
+            true
+        })
     }
 
     /// Record the sibling session's exit IF it belongs to the currently-bound sibling at
     /// `for_epoch`. An exit for a previous sibling is dropped (returns `false`). Never touches
     /// the active session. Returns `true` when recorded. Shim over the unified store.
-    pub fn apply_sibling_exit(&self, for_id: &str, for_epoch: u64, code: Option<i32>) -> bool {
-        let sibling_id = self.sibling_id.lock().unwrap();
-        if sibling_id.as_deref() != Some(for_id) {
-            return false;
-        }
-        let mut stores = self.stores.lock().unwrap();
-        match stores.get_mut(for_id) {
-            Some(entry) if entry.kind == PaneKind::Sibling && entry.epoch == for_epoch => {
-                entry.exited = Some(code);
-                true
-            }
-            _ => false,
-        }
+    fn commit_sibling_exit(&self, token: &ViewportBindingToken, code: Option<i32>) -> bool {
+        self.with_current_pane_store(token, PaneKind::Sibling, |entry| {
+            entry.exited = Some(code);
+            true
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn apply_sibling_scrollback(
+    fn commit_sibling_scrollback(
         &self,
-        for_id: &str,
-        for_epoch: u64,
+        token: &ViewportBindingToken,
         generation: SessionGeneration,
         revision: Revision,
         history_len: u32,
         offset_from_top: u32,
         rows: Vec<Vec<Cell>>,
     ) -> bool {
-        let sibling_id = self.sibling_id.lock().unwrap();
-        if sibling_id.as_deref() != Some(for_id) {
+        self.with_current_pane_store(token, PaneKind::Sibling, |entry| {
+            let live_generation = entry.grid.as_ref().map(|g| g.generation.clone());
+            apply_scrollback_payload(
+                live_generation,
+                &mut entry.scrollback,
+                generation,
+                revision,
+                history_len,
+                offset_from_top,
+                rows,
+            )
+        })
+    }
+
+    // Legacy-shaped test seams keep pre-existing cache tests concise while production handlers
+    // must pass their captured full token to the `commit_*` methods above. These wrappers still
+    // resolve and validate a live exact token; a neutral viewport or stale epoch returns false.
+    #[cfg(test)]
+    pub fn apply_sibling_grid(&self, id: &str, epoch: u64, grid: Arc<GridSnapshot>) -> bool {
+        let Some(
+            token @ ViewportBindingToken::Pane {
+                pane_epoch,
+                pane_kind: PaneKind::Sibling,
+                ..
+            },
+        ) = self.binding_token_for_session(id)
+        else {
             return false;
-        }
-        let mut stores = self.stores.lock().unwrap();
-        match stores.get_mut(for_id) {
-            Some(entry) if entry.kind == PaneKind::Sibling && entry.epoch == for_epoch => {
-                let live_generation = entry.grid.as_ref().map(|g| g.generation.clone());
-                apply_scrollback_payload(
-                    live_generation,
-                    &mut entry.scrollback,
-                    generation,
-                    revision,
-                    history_len,
-                    offset_from_top,
-                    rows,
-                )
-            }
-            _ => false,
-        }
+        };
+        pane_epoch == epoch && self.commit_sibling_grid(&token, grid)
+    }
+
+    #[cfg(test)]
+    pub fn apply_sibling_exit(&self, id: &str, epoch: u64, code: Option<i32>) -> bool {
+        let Some(
+            token @ ViewportBindingToken::Pane {
+                pane_epoch,
+                pane_kind: PaneKind::Sibling,
+                ..
+            },
+        ) = self.binding_token_for_session(id)
+        else {
+            return false;
+        };
+        pane_epoch == epoch && self.commit_sibling_exit(&token, code)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_sibling_scrollback(
+        &self,
+        id: &str,
+        epoch: u64,
+        generation: SessionGeneration,
+        revision: Revision,
+        history_len: u32,
+        offset_from_top: u32,
+        rows: Vec<Vec<Cell>>,
+    ) -> bool {
+        let Some(
+            token @ ViewportBindingToken::Pane {
+                pane_epoch,
+                pane_kind: PaneKind::Sibling,
+                ..
+            },
+        ) = self.binding_token_for_session(id)
+        else {
+            return false;
+        };
+        pane_epoch == epoch
+            && self.commit_sibling_scrollback(
+                &token,
+                generation,
+                revision,
+                history_len,
+                offset_from_top,
+                rows,
+            )
     }
 
     /// The current generation of the multi-pane membership (bumped on every membership change).
     /// The reader compares this to its local generation to know when to rebuild its per-pane
     /// `SyncState` set.
+    #[cfg(test)]
     pub fn pane_generation(&self) -> u64 {
-        *self.pane_generation.lock().unwrap()
+        if self.connection_is_closed() {
+            return u64::MAX;
+        }
+        let generation = *self.pane_generation.lock().unwrap();
+        if self.connection_is_closed() {
+            u64::MAX
+        } else {
+            generation
+        }
     }
 
     /// The `kind == Pane` session ids currently bound in the unified store, in sorted order
     /// (`BTreeMap` iteration order). The sibling entry is excluded.
+    #[cfg(test)]
     pub fn pane_ids(&self) -> Vec<String> {
-        self.stores
+        if self.connection_is_closed() {
+            return Vec::new();
+        }
+        let ids = self
+            .stores
             .lock()
             .unwrap()
             .iter()
             .filter(|(_, e)| e.kind == PaneKind::Pane)
             .map(|(id, _)| id.clone())
-            .collect()
+            .collect();
+        if self.connection_is_closed() {
+            Vec::new()
+        } else {
+            ids
+        }
+    }
+
+    /// Snapshot pane membership generation and every pane's binding epoch under one lock-order
+    /// consistent observation (`pane_generation` -> `stores`). Reader reconciliation must never
+    /// combine a generation from one membership with store epochs from another.
+    fn pane_bindings_snapshot(&self) -> PaneBindingsSnapshot {
+        if self.connection_is_closed() {
+            return (u64::MAX, Vec::new());
+        }
+        let generation = *self.pane_generation.lock().unwrap();
+        let stores = self.stores.lock().unwrap();
+        let bindings = stores
+            .iter()
+            .filter(|(_, entry)| entry.kind == PaneKind::Pane)
+            .map(|(id, entry)| {
+                (
+                    id.clone(),
+                    entry.epoch,
+                    entry.output_generation,
+                    entry.expected_generation.clone(),
+                )
+            })
+            .collect();
+        if self.connection_is_closed() {
+            (u64::MAX, Vec::new())
+        } else {
+            (generation, bindings)
+        }
     }
 
     /// Reconcile the multi-pane (`kind == Pane`) membership to exactly `ids` (the visible
@@ -1019,9 +3555,16 @@ impl Shared {
     /// binding of the same id is dropped. Bumps `generation` (and returns the new value) ONLY when
     /// membership actually changed. NEVER touches the active session or the rendered sibling entry
     /// (the `kind == Sibling` filter keeps the reconcile disjoint from the sibling slot).
-    pub fn set_pane_sessions(&self, ids: &[&str]) -> u64 {
+    #[cfg(test)]
+    pub fn set_pane_sessions(&self, ids: &[&str]) -> Option<u64> {
+        if self.connection_is_closed() {
+            return None;
+        }
         let mut generation = self.pane_generation.lock().unwrap();
         let mut stores = self.stores.lock().unwrap();
+        if self.connection_is_closed() {
+            return None;
+        }
         let wanted: std::collections::HashSet<&str> = ids.iter().copied().collect();
         // Remove only PANE entries no longer wanted; the sibling slot is untouched.
         let before: Vec<String> = stores
@@ -1029,36 +3572,60 @@ impl Shared {
             .filter(|(id, e)| e.kind == PaneKind::Pane && !wanted.contains(id.as_str()))
             .map(|(id, _)| id.clone())
             .collect();
-        let removed = before.len();
+        let additions: Vec<&str> = ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                !stores
+                    .get(*id)
+                    .is_some_and(|entry| entry.kind == PaneKind::Pane)
+            })
+            .collect();
+        if before.is_empty() && additions.is_empty() {
+            return Some(*generation);
+        }
+        let Some(next_generation) = generation.checked_add(1) else {
+            // No representable membership incarnation remains. Revoke every pane cache now and
+            // permanently refuse re-adds; keeping the prior stores would preserve stale authority.
+            stores.retain(|_, entry| entry.kind != PaneKind::Pane);
+            return None;
+        };
+        // Pre-allocate every proof before mutating the membership. Exhaustion leaves the old set
+        // byte-for-byte intact; no partially bound pane can escape without exact authorities.
+        let mut allocated = Vec::with_capacity(additions.len());
+        for id in additions {
+            let Some(epoch) = self.allocate_pane_epoch() else {
+                stores.retain(|_, entry| entry.kind != PaneKind::Pane);
+                *generation = next_generation;
+                return None;
+            };
+            let Some(output_generation) = self.allocate_output_generation() else {
+                stores.retain(|_, entry| entry.kind != PaneKind::Pane);
+                *generation = next_generation;
+                return None;
+            };
+            allocated.push((id.to_string(), epoch, output_generation));
+        }
         for id in &before {
             stores.remove(id);
         }
-        let mut added = 0u64;
-        for id in ids {
-            let is_pane_member = stores
-                .get(*id)
-                .map(|e| e.kind == PaneKind::Pane)
-                .unwrap_or(false);
-            if !is_pane_member {
-                let epoch = generation.wrapping_add(1).wrapping_add(added);
-                let entry = stores.entry((*id).to_string()).or_default();
-                entry.kind = PaneKind::Pane;
-                entry.epoch = epoch;
-                entry.grid = None;
-                entry.exited = None;
-                entry.scrollback.reset_to_live();
-                added += 1;
-            }
+        for (id, epoch, output_generation) in allocated {
+            let entry = stores.entry(id).or_default();
+            entry.kind = PaneKind::Pane;
+            entry.epoch = epoch;
+            entry.output_generation = Some(output_generation);
+            entry.grid = None;
+            entry.exited = None;
+            entry.scrollback.reset_to_live();
         }
-        if removed > 0 || added > 0 {
-            *generation += 1;
-        }
-        *generation
+        *generation = next_generation;
+        Some(*generation)
     }
 
     /// Drop ALL multi-pane (`kind == Pane`) entries (e.g. the layout collapsed back to two panes
     /// or no split), bumping `generation` so the reader drops every per-pane `SyncState`. No-op
     /// when there are no pane entries. Never touches the active session or the rendered sibling.
+    #[cfg(test)]
     pub fn clear_pane_sessions(&self) {
         let mut generation = self.pane_generation.lock().unwrap();
         let mut stores = self.stores.lock().unwrap();
@@ -1073,20 +3640,28 @@ impl Shared {
         for id in &panes {
             stores.remove(id);
         }
-        *generation += 1;
+        if let Some(next_generation) = generation.checked_add(1) {
+            *generation = next_generation;
+        }
     }
 
     /// The epoch currently bound to pane `id` in the unified store, or `None` when `id` is not a
     /// `kind == Pane` member. The reader stamps each frame it ingests with this so
     /// [`Self::apply_pane_grid`]/[`Self::apply_pane_exit`] can reject a frame whose id was removed
     /// and re-added since.
+    #[cfg(test)]
     pub fn pane_epoch(&self, id: &str) -> Option<u64> {
-        self.stores
+        if self.connection_is_closed() {
+            return None;
+        }
+        let epoch = self
+            .stores
             .lock()
             .unwrap()
             .get(id)
             .filter(|e| e.kind == PaneKind::Pane)
-            .map(|e| e.epoch)
+            .map(|e| e.epoch);
+        (!self.connection_is_closed()).then_some(epoch).flatten()
     }
 
     /// Snapshot pane `id`'s cached `(grid, exited)` for painting, or `None` when `id` is not a
@@ -1094,29 +3669,46 @@ impl Shared {
     /// first baseline); `exited` is `Some(code)` once the pane's process exited.
     #[cfg(test)]
     pub fn pane_snapshot(&self, id: &str) -> Option<PaneSnapshot> {
-        self.stores
+        if self.connection_is_closed() {
+            return None;
+        }
+        let snapshot = self
+            .stores
             .lock()
             .unwrap()
             .get(id)
             .filter(|e| e.kind == PaneKind::Pane)
-            .map(|e| (e.grid.clone(), e.exited))
+            .map(|e| (e.grid.clone(), e.exited));
+        (!self.connection_is_closed()).then_some(snapshot).flatten()
     }
 
-    /// Uniform per-pane paint resolution: the single source `draw` reads for every visible
+    /// Phase B UNIFORM per-pane paint resolution: the single source `draw` reads for EVERY visible
     /// pane, primary or not. `primary_id` is [`Self::active`]'s id (the pane the dedicated
     /// `grid`/`exited`/`scrollback` fields back); any other id resolves from its [`Self::stores`]
     /// entry. All grid `Arc`s + scrollback values are CLONED under short locks and returned OWNED, so
-    /// the caller holds no mutex across shaping/GPU submission — this is also how the
+    /// the caller holds no mutex across shaping/GPU submission (#gate9) — this is also how the
     /// active-session scrollback finally moves into the symmetric path without the
     /// guard-across-statements hazard: we snapshot, then drop the guard.
     ///
     /// For the primary pane the live grid/exit come from the dedicated fields and the scrollback view
-    /// from [`Self::scrollback`] (the same paint source used by the active path). For a
+    /// from [`Self::scrollback`] (byte-identical paint source to the pre-Phase-B active path). For a
     /// non-primary pane they come from its `PaneStore` (sibling OR extra pane — same shape), including
     /// that pane's OWN `scrollback`, so paint reads the scrollback of the pane being drawn. A non-primary
     /// pane with no scrollback reply yet simply reports offset 0 and paints live — the symmetric
     /// "live until you scroll" state. Returns the empty default for an unknown id (paints nothing).
     pub fn pane_paint(&self, id: &str, primary_id: &str) -> PanePaint {
+        if self.connection_is_closed() {
+            return PanePaint::default();
+        }
+        // Hold active through the one leaf snapshot. A neutral viewport (or an App still naming a
+        // retired primary id) paints nothing even if a stale store/grid was injected by queued work.
+        let active = self.active.lock().unwrap();
+        if self.connection_is_closed() {
+            return PanePaint::default();
+        }
+        if active.id.as_deref() != Some(primary_id) {
+            return PanePaint::default();
+        }
         if id == primary_id {
             // Primary: snapshot the dedicated fields under short, sequential locks and release each
             // before the next so we never hold two at once and never hold any past return.
@@ -1126,18 +3718,23 @@ impl Shared {
                 let sb = self.scrollback.lock().unwrap();
                 (sb.view_offset, sb.history_len, sb.historical.clone())
             };
-            return PanePaint {
+            let paint = PanePaint {
                 live,
                 exited,
                 scrolled_offset,
                 history_len,
                 historical,
             };
+            return if self.connection_is_closed() {
+                PanePaint::default()
+            } else {
+                paint
+            };
         }
         // Non-primary: one short lock over the store yields this pane's live grid, exit, and its OWN
         // scrollback view, all cloned out before the guard drops.
         let stores = self.stores.lock().unwrap();
-        match stores.get(id) {
+        let paint = match stores.get(id) {
             Some(entry) => PanePaint {
                 live: entry.grid.clone(),
                 exited: entry.exited,
@@ -1146,6 +3743,11 @@ impl Shared {
                 historical: entry.scrollback.historical.clone(),
             },
             None => PanePaint::default(),
+        };
+        if self.connection_is_closed() {
+            PanePaint::default()
+        } else {
+            paint
         }
     }
 
@@ -1154,83 +3756,277 @@ impl Shared {
     /// `PaneStore::scrollback` (the wheel acts on the FOCUSED pane's scrollback, whichever pane that is).
     /// An unknown non-primary id runs `f` against a throwaway default (a no-op edit, default reads) so a
     /// stale focus never panics. The guard never escapes `f`, so the caller holds no scrollback lock
-    /// across a redraw or request.
+    /// across a redraw/request (#gate9).
     pub fn with_pane_scrollback<R>(
         &self,
         id: &str,
         primary_id: &str,
         f: impl FnOnce(&mut ScrollbackState) -> R,
     ) -> R {
+        if self.connection_is_closed() {
+            return f(&mut ScrollbackState::default());
+        }
+        let active = self.active.lock().unwrap();
+        if self.connection_is_closed() {
+            return f(&mut ScrollbackState::default());
+        }
+        if active.id.as_deref() != Some(primary_id) {
+            return f(&mut ScrollbackState::default());
+        }
         if id == primary_id {
             let mut sb = self.scrollback.lock().unwrap();
+            if self.connection_is_closed() {
+                return f(&mut ScrollbackState::default());
+            }
             return f(&mut sb);
         }
         let mut stores = self.stores.lock().unwrap();
+        if self.connection_is_closed() {
+            return f(&mut ScrollbackState::default());
+        }
         match stores.get_mut(id) {
             Some(entry) => f(&mut entry.scrollback),
             None => f(&mut ScrollbackState::default()),
         }
     }
 
-    /// Apply a grid to pane `id` IF it is still a `kind == Pane` member at `for_epoch`. A frame for
-    /// a removed pane (no entry) or a stale epoch (the id was re-added) is dropped (`false`). Never
-    /// touches the active or sibling grid. Returns `true` when the pane cache was updated.
-    pub fn apply_pane_grid(&self, id: &str, for_epoch: u64, grid: Arc<GridSnapshot>) -> bool {
-        let mut stores = self.stores.lock().unwrap();
-        match stores.get_mut(id) {
-            Some(entry) if entry.kind == PaneKind::Pane && entry.epoch == for_epoch => {
-                reset_scrollback_for_screen_transition(
-                    entry.grid.as_ref().map(|previous| previous.alt_screen),
-                    grid.alt_screen,
-                    &mut entry.scrollback,
-                );
-                entry.grid = Some(grid);
-                true
+    /// Resolve the exact focused route, read its live PTY generation/geometry, and mutate its
+    /// scroll intent as one authority transaction. Grid generation rollover uses the same
+    /// active→grid→scrollback or active→sibling→stores lock order, so a gesture can never be
+    /// returned with generation A's offset and generation B's authority.
+    pub(crate) fn prepare_scroll_action(
+        &self,
+        id: &str,
+        primary_id: &str,
+        action: ScrollAction,
+    ) -> PreparedScrollAction {
+        if self.connection_is_closed() {
+            return PreparedScrollAction::Unavailable;
+        }
+        let active = self.active.lock().unwrap();
+        if self.connection_is_closed() {
+            return PreparedScrollAction::Unavailable;
+        }
+        if active.id.as_deref() != Some(primary_id) {
+            return PreparedScrollAction::Unavailable;
+        }
+        if id == primary_id {
+            let Some(output_generation) = active.output_generation else {
+                return PreparedScrollAction::Unavailable;
+            };
+            let grid = self.grid.lock().unwrap();
+            let Some(grid) = grid.as_deref() else {
+                return PreparedScrollAction::Unavailable;
+            };
+            let mut scrollback = self.scrollback.lock().unwrap();
+            if self.connection_is_closed() {
+                return PreparedScrollAction::Unavailable;
             }
-            _ => false,
+            return prepare_bound_scroll_action(
+                ViewportBindingToken::Active(ActiveBindingToken {
+                    session_id: id.to_string(),
+                    epoch: active.epoch,
+                    output_generation,
+                }),
+                grid,
+                &mut scrollback,
+                action,
+            );
+        }
+
+        let sibling_id = self.sibling_id.lock().unwrap();
+        let mut stores = self.stores.lock().unwrap();
+        if self.connection_is_closed() {
+            return PreparedScrollAction::Unavailable;
+        }
+        let Some(entry) = stores.get_mut(id) else {
+            return PreparedScrollAction::Unavailable;
+        };
+        if entry.kind == PaneKind::Sibling && sibling_id.as_deref() != Some(id) {
+            return PreparedScrollAction::Unavailable;
+        }
+        let Some(output_generation) = entry.output_generation else {
+            return PreparedScrollAction::Unavailable;
+        };
+        let Some(grid) = entry.grid.as_deref() else {
+            return PreparedScrollAction::Unavailable;
+        };
+        let binding = ViewportBindingToken::Pane {
+            session_id: id.to_string(),
+            pane_epoch: entry.epoch,
+            pane_kind: entry.kind,
+            viewport_epoch: active.epoch,
+            output_generation,
+        };
+        prepare_bound_scroll_action(binding, grid, &mut entry.scrollback, action)
+    }
+
+    /// Accepted PTY generation for one exact current binding. Owner-loop batches retain this proof
+    /// across queue pressure and are discarded if a later Grid changes the lifetime before retry.
+    pub(crate) fn live_generation_for_binding(
+        &self,
+        token: &ViewportBindingToken,
+    ) -> Option<SessionGeneration> {
+        if self.connection_is_closed() {
+            return None;
+        }
+        let active = self.active.lock().unwrap();
+        if self.connection_is_closed() {
+            return None;
+        }
+        let generation = match token {
+            ViewportBindingToken::Active(token)
+                if active.epoch == token.epoch
+                    && active.id.as_deref() == Some(token.session_id.as_str())
+                    && active.output_generation == Some(token.output_generation) =>
+            {
+                self.grid
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|grid| grid.generation.clone())
+            }
+            ViewportBindingToken::Pane {
+                session_id,
+                pane_epoch,
+                pane_kind,
+                viewport_epoch,
+                output_generation,
+            } if active.id.is_some() && active.epoch == *viewport_epoch => {
+                let sibling_id = self.sibling_id.lock().unwrap();
+                self.stores
+                    .lock()
+                    .unwrap()
+                    .get(session_id)
+                    .filter(|entry| {
+                        entry.kind == *pane_kind
+                            && (*pane_kind != PaneKind::Sibling
+                                || sibling_id.as_deref() == Some(session_id.as_str()))
+                            && entry.epoch == *pane_epoch
+                            && entry.output_generation == Some(*output_generation)
+                    })
+                    .and_then(|entry| entry.grid.as_ref())
+                    .map(|grid| grid.generation.clone())
+            }
+            _ => None,
+        };
+        if self.connection_is_closed() {
+            None
+        } else {
+            generation
         }
     }
 
+    /// Apply a grid to pane `id` IF it is still a `kind == Pane` member at `for_epoch`. A frame for
+    /// a removed pane (no entry) or a stale epoch (the id was re-added) is dropped (`false`). Never
+    /// touches the active or sibling grid. Returns `true` when the pane cache was updated.
+    fn commit_pane_grid(&self, token: &ViewportBindingToken, grid: Arc<GridSnapshot>) -> bool {
+        self.with_current_pane_store(token, PaneKind::Pane, |entry| {
+            let live_context_changed = entry.grid.as_ref().is_some_and(|previous| {
+                previous.generation != grid.generation || previous.alt_screen != grid.alt_screen
+            });
+            entry.grid = Some(grid);
+            if live_context_changed {
+                entry.scrollback.reset_for_live_context_change();
+            }
+            true
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
-    pub fn apply_pane_scrollback(
+    fn commit_pane_scrollback(
         &self,
-        id: &str,
-        for_epoch: u64,
+        token: &ViewportBindingToken,
         generation: SessionGeneration,
         revision: Revision,
         history_len: u32,
         offset_from_top: u32,
         rows: Vec<Vec<Cell>>,
     ) -> bool {
-        let mut stores = self.stores.lock().unwrap();
-        match stores.get_mut(id) {
-            Some(entry) if entry.kind == PaneKind::Pane && entry.epoch == for_epoch => {
-                let live_generation = entry.grid.as_ref().map(|g| g.generation.clone());
-                apply_scrollback_payload(
-                    live_generation,
-                    &mut entry.scrollback,
-                    generation,
-                    revision,
-                    history_len,
-                    offset_from_top,
-                    rows,
-                )
-            }
-            _ => false,
-        }
+        self.with_current_pane_store(token, PaneKind::Pane, |entry| {
+            let live_generation = entry.grid.as_ref().map(|g| g.generation.clone());
+            apply_scrollback_payload(
+                live_generation,
+                &mut entry.scrollback,
+                generation,
+                revision,
+                history_len,
+                offset_from_top,
+                rows,
+            )
+        })
     }
 
     /// Record pane `id`'s exit IF it is still a `kind == Pane` member at `for_epoch`. A late exit
     /// for a removed or replaced pane is dropped (`false`). Returns `true` when recorded.
-    pub fn apply_pane_exit(&self, id: &str, for_epoch: u64, code: Option<i32>) -> bool {
-        let mut stores = self.stores.lock().unwrap();
-        match stores.get_mut(id) {
-            Some(entry) if entry.kind == PaneKind::Pane && entry.epoch == for_epoch => {
-                entry.exited = Some(code);
-                true
-            }
-            _ => false,
-        }
+    fn commit_pane_exit(&self, token: &ViewportBindingToken, code: Option<i32>) -> bool {
+        self.with_current_pane_store(token, PaneKind::Pane, |entry| {
+            entry.exited = Some(code);
+            true
+        })
+    }
+
+    #[cfg(test)]
+    pub fn apply_pane_grid(&self, id: &str, epoch: u64, grid: Arc<GridSnapshot>) -> bool {
+        let Some(
+            token @ ViewportBindingToken::Pane {
+                pane_epoch,
+                pane_kind: PaneKind::Pane,
+                ..
+            },
+        ) = self.binding_token_for_session(id)
+        else {
+            return false;
+        };
+        pane_epoch == epoch && self.commit_pane_grid(&token, grid)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_pane_scrollback(
+        &self,
+        id: &str,
+        epoch: u64,
+        generation: SessionGeneration,
+        revision: Revision,
+        history_len: u32,
+        offset_from_top: u32,
+        rows: Vec<Vec<Cell>>,
+    ) -> bool {
+        let Some(
+            token @ ViewportBindingToken::Pane {
+                pane_epoch,
+                pane_kind: PaneKind::Pane,
+                ..
+            },
+        ) = self.binding_token_for_session(id)
+        else {
+            return false;
+        };
+        pane_epoch == epoch
+            && self.commit_pane_scrollback(
+                &token,
+                generation,
+                revision,
+                history_len,
+                offset_from_top,
+                rows,
+            )
+    }
+
+    #[cfg(test)]
+    pub fn apply_pane_exit(&self, id: &str, epoch: u64, code: Option<i32>) -> bool {
+        let Some(
+            token @ ViewportBindingToken::Pane {
+                pane_epoch,
+                pane_kind: PaneKind::Pane,
+                ..
+            },
+        ) = self.binding_token_for_session(id)
+        else {
+            return false;
+        };
+        pane_epoch == epoch && self.commit_pane_exit(&token, code)
     }
 
     /// Install a fresh, drainable outbound queue and hand back a handle to it, so a
@@ -1239,8 +4035,11 @@ impl Shared {
     #[cfg(test)]
     fn with_test_queue() -> (Arc<Shared>, Arc<OutboundQueue>) {
         let shared = Arc::new(Shared::default());
+        shared
+            .generation_conditional_mutations
+            .store(true, Ordering::Release);
         let queue = Arc::new(OutboundQueue::new());
-        *shared.outbound.lock().unwrap() = Some(Arc::clone(&queue));
+        assert!(shared.outbound.set(Arc::clone(&queue)).is_ok());
         (shared, queue)
     }
 
@@ -1251,16 +4050,93 @@ impl Shared {
         Self::with_test_queue().0
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_handoff_peer(
+        authority: &maestro_shell::AttachmentHandoffAuthority,
+    ) -> Arc<Shared> {
+        Self::with_test_handoff_peer_facts(
+            Some(authority.expected_daemon_instance().clone()),
+            authority.expected_server_pid(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_handoff_peer_facts(
+        daemon_instance: Option<maestro_shell::DaemonInstanceId>,
+        server_pid: Option<u32>,
+    ) -> Arc<Shared> {
+        let shared = Self::with_test_outbound();
+        shared
+            .attachment_handoff_capable
+            .store(true, Ordering::Release);
+        assert!(shared
+            .operational_daemon_instance
+            .set(daemon_instance)
+            .is_ok());
+        assert!(shared.operational_server_pid.set(server_pid).is_ok());
+        shared
+    }
+
     /// Drain and decode all requests currently queued by App. Returns empty if a test did not
     /// install the queue. Keeps the production outbound internals private.
     #[cfg(test)]
     pub(crate) fn drain_test_requests(&self) -> Vec<ClientRequest> {
         self.outbound
-            .lock()
-            .unwrap()
-            .as_ref()
+            .get()
             .map(|queue| queue.drain_requests())
             .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exhaust_test_output_generations(&self) {
+        self.next_output_generation
+            .store(u64::MAX, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_generation_conditional_mutations(&self, supported: bool) {
+        self.generation_conditional_mutations
+            .store(supported, Ordering::Release);
+    }
+
+    /// Test-only mirror of the reader's post-commit exact-Grid proof hook. Owner-loop tests use it
+    /// to drive aggregate publication without forging a production viewport authority or exposing
+    /// the private route receipt.
+    #[cfg(test)]
+    pub(crate) fn prove_test_exact_viewport_grid(&self, id: &str, generation: &str) -> bool {
+        let Some(token) = self.binding_token_for_session(id) else {
+            return false;
+        };
+        self.note_exact_viewport_grid(&token, &SessionGeneration(generation.to_string()))
+            == Some(true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_test_exact_viewport_admission(&self) {
+        self.fail_exact_viewport_admission();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn saturate_test_outbound(&self) {
+        self.outbound
+            .get()
+            .expect("test queue installed")
+            .saturate_raw();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn discard_test_outbound(&self) {
+        self.outbound
+            .get()
+            .expect("test queue installed")
+            .discard_all();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_outbound_contended<R>(&self, f: impl FnOnce() -> R) -> R {
+        let queue = self.outbound.get().expect("test queue installed");
+        let _guard = queue.inner.lock().unwrap();
+        f()
     }
 
     /// Clone one pane (`kind == Pane`) entry's `(epoch, grid, exited)` by id for assertions, or
@@ -1297,39 +4173,38 @@ struct PaneEntryView {
 ///    further old-session frames are produced after we rebase.
 /// 2. `Attach { new_id, want_raw_output: false }` — structured-only attach; the daemon
 ///    installs the live notification/damage forwarder before any geometry mutation.
-/// 3. `Resize { new_id, cols, rows }` — ONLY when `dims` is supplied (window geometry
-///    is known), followed by `Snapshot { new_id }`. Resize advances the grid revision and
-///    Snapshot supplies a deterministic final-size baseline even when the PTY is otherwise idle.
-///    Keeping Attach first also prevents a bell/title/OSC notification generated by SIGWINCH
-///    from falling into a pre-subscription gap.
+/// 3. `Snapshot { new_id }` — completes the read-only baseline transaction. Geometry is deliberately
+///    absent: the matching Grid supplies the exact PTY generation, after which the owner sends a
+///    generation-conditional Resize. No id-only/pre-baseline geometry mutation is possible.
 ///
 /// A same-session switch is the caller's responsibility to short-circuit BEFORE
 /// calling this (see [`crate::App::attach_session`]); this helper always assumes a
 /// real change and never emits a no-op.
-pub fn plan_attach_switch(
+#[cfg(test)]
+fn plan_attach_switch(
     old_id: &str,
     new_id: &str,
-    dims: Option<(u16, u16)>,
+    _dims: Option<(u16, u16)>,
+    output_generation: u64,
 ) -> Vec<ClientRequest> {
-    let mut plan = vec![
-        ClientRequest::Detach {
+    let mut plan = Vec::with_capacity(4);
+    if !old_id.is_empty() {
+        plan.push(ClientRequest::Detach {
             id: old_id.to_string(),
-        },
-        ClientRequest::Attach {
-            id: new_id.to_string(),
-            want_raw_output: false,
-        },
-    ];
-    if let Some((cols, rows)) = dims {
-        plan.push(ClientRequest::Resize {
-            id: new_id.to_string(),
-            cols,
-            rows,
-        });
-        plan.push(ClientRequest::Snapshot {
-            id: new_id.to_string(),
         });
     }
+    plan.push(ClientRequest::Attach {
+        id: new_id.to_string(),
+        want_raw_output: false,
+        expected_session_generation: None,
+        output_generation: Some(output_generation),
+        handoff: None,
+    });
+    // Always finish the one FIFO bind plan with an authoritative direct reply, even before the UI
+    // knows geometry or when external winsize ownership suppresses Resize.
+    plan.push(ClientRequest::Snapshot {
+        id: new_id.to_string(),
+    });
     plan
 }
 
@@ -1345,16 +4220,17 @@ pub fn plan_attach_switch(
 ///    short-circuited, but we still never emit a redundant detach+reattach of it).
 /// 2. `Attach { new_id, want_raw_output: false }` — structured-only attach of the new
 ///    sibling; the daemon replies with its authoritative baseline `Grid`.
-/// 3. `Resize { new_id, cols, rows }` — ONLY when `dims` (the inactive pane size) is
-///    supplied, so the sibling adopts the inactive-pane geometry. Sent AFTER Attach.
+/// 3. No Resize is sent until an exact Grid proves the new lifetime. The caller reconciles desired
+///    geometry afterward through the generation-conditional owner path.
 ///
 /// A same-sibling rebind (`old_id == Some(new_id)`) yields ONLY the optional Resize: no
 /// detach, no reattach — so a pane-size change for the unchanged sibling just resizes it.
-#[allow(dead_code)]
-pub fn plan_sibling_attach(
+#[cfg(test)]
+fn plan_sibling_attach(
     old_id: Option<&str>,
     new_id: &str,
-    dims: Option<(u16, u16)>,
+    _dims: Option<(u16, u16)>,
+    output_generation: u64,
 ) -> Vec<ClientRequest> {
     let same_sibling = old_id == Some(new_id);
     let mut plan = Vec::new();
@@ -1369,13 +4245,14 @@ pub fn plan_sibling_attach(
         plan.push(ClientRequest::Attach {
             id: new_id.to_string(),
             want_raw_output: false,
+            expected_session_generation: None,
+            output_generation: Some(output_generation),
+            handoff: None,
         });
     }
-    if let Some((cols, rows)) = dims {
-        plan.push(ClientRequest::Resize {
+    if !same_sibling {
+        plan.push(ClientRequest::Snapshot {
             id: new_id.to_string(),
-            cols,
-            rows,
         });
     }
     plan
@@ -1387,6 +4264,7 @@ pub fn plan_sibling_attach(
 /// `Shared` and assert grid/exit/scrollback are cleared. Called by the reader thread
 /// on a session rebind (the UI thread already cleared its own selection/view state in
 /// [`crate::App::attach_session`]; this clears the reader-owned shared fields).
+#[cfg(test)]
 pub fn reset_session_state(shared: &Shared) {
     *shared.grid.lock().unwrap() = None;
     *shared.exited.lock().unwrap() = None;
@@ -1395,6 +4273,365 @@ pub fn reset_session_state(shared: &Shared) {
     // to the old PTY just as much as its grid does; retaining it can clamp the new session
     // to another pane's stale depth (including a permanent `Some(0)` fixed point).
     *shared.scrollback.lock().unwrap() = ScrollbackState::default();
+}
+
+/// Wire ownership state for one exact renderer binding. The canonical daemon proves the handoff by
+/// echoing `output_generation` on the Attach restore Grid; only then may untagged direct replies
+/// (Snapshot/Scrollback) inherit this route. Every live-forwarder event must always carry the exact
+/// top-level tag. The sole compatibility exception is the first binding on a fresh socket: with no
+/// older forwarder or request backlog, its first untagged Grid may establish a legacy route. Any
+/// later clear/rebind starts `ExactPending` and therefore stays blank on an echo-less old daemon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamProof {
+    InitialPending,
+    ExactPending,
+    ExactConfirmed,
+    LegacyInitial,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecodeFailureAction {
+    Ignore,
+    Recover,
+    FailClosed,
+}
+
+struct RoutedSyncState {
+    session_id: String,
+    output_generation: u64,
+    expected_generation: Option<SessionGeneration>,
+    proof: StreamProof,
+    legacy_incompatibility_reported: bool,
+    sync: SyncState,
+}
+
+impl RoutedSyncState {
+    fn new(session_id: String, output_generation: u64, initial: bool) -> Self {
+        Self::new_with_expected_generation(session_id, output_generation, None, initial)
+    }
+
+    fn new_with_expected_generation(
+        session_id: String,
+        output_generation: u64,
+        expected_generation: Option<SessionGeneration>,
+        initial: bool,
+    ) -> Self {
+        Self {
+            sync: SyncState::new(session_id.clone()),
+            session_id,
+            output_generation,
+            expected_generation,
+            legacy_incompatibility_reported: false,
+            proof: if initial {
+                StreamProof::InitialPending
+            } else {
+                StreamProof::ExactPending
+            },
+        }
+    }
+
+    fn event_generation_is_authorized(&self, event: &DaemonEvent) -> bool {
+        let Some(expected) = self.expected_generation.as_ref() else {
+            return true;
+        };
+        match event {
+            DaemonEvent::Grid { grid, .. } => &grid.generation == expected,
+            DaemonEvent::Damage { frame } => &frame.generation == expected,
+            DaemonEvent::ScrollbackRows { generation, .. } => generation == expected,
+            _ => true,
+        }
+    }
+
+    /// Whether this line claims the currently bound forwarder/direct-reply route. A conflicting
+    /// PTY generation is terminal only with this causal proof. Untagged or differently tagged
+    /// bytes observed while a new exact Attach is still pending can belong to the retired route and
+    /// must remain inert rather than tearing down the replacement connection.
+    fn event_claims_current_route(&self, route: EventRouteMetadata) -> bool {
+        match (route.output_generation, route.live_output_generation) {
+            (Some(_), Some(_)) => false,
+            (Some(generation), None) | (None, Some(generation)) => {
+                generation == self.output_generation
+            }
+            (None, None) => matches!(
+                self.proof,
+                StreamProof::ExactConfirmed | StreamProof::LegacyInitial
+            ),
+        }
+    }
+
+    /// Admit one line into this binding's SyncState. Confirmation occurs at the exact FIFO point of
+    /// the matching Attach restore Grid, never when the request was merely queued. Before that cut,
+    /// old tagged live frames and old untagged Snapshot replies are both rejected.
+    fn accepts(&mut self, event: &DaemonEvent, route: EventRouteMetadata) -> bool {
+        if event_session_id(event) != Some(self.session_id.as_str()) {
+            return false;
+        }
+        if !self.event_generation_is_authorized(event) {
+            return false;
+        }
+        let is_grid = matches!(event, DaemonEvent::Grid { .. });
+        let is_direct_reply = is_grid || matches!(event, DaemonEvent::ScrollbackRows { .. });
+
+        match self.proof {
+            StreamProof::InitialPending | StreamProof::ExactPending => {
+                // Confirmation is transactional with baseline validation. Probe a clone first so a
+                // typed-but-invalid matching echo (bad dimensions/version/wide layout/retired PTY
+                // generation) cannot open the route proof and authorize later untagged replies.
+                let baseline_is_valid = match event {
+                    DaemonEvent::Grid { id, grid } => {
+                        let mut probe = self.sync.clone();
+                        probe.on_grid(id, grid).is_ok()
+                    }
+                    _ => false,
+                };
+                if is_grid
+                    && baseline_is_valid
+                    && route.live_output_generation.is_none()
+                    && route.output_generation == Some(self.output_generation)
+                {
+                    self.proof = StreamProof::ExactConfirmed;
+                    return true;
+                }
+                if self.proof == StreamProof::InitialPending
+                    && is_grid
+                    && baseline_is_valid
+                    && route.output_generation.is_none()
+                    && route.live_output_generation.is_none()
+                {
+                    self.proof = StreamProof::LegacyInitial;
+                    return true;
+                }
+                if self.proof == StreamProof::ExactPending
+                    && is_grid
+                    && route.output_generation.is_none()
+                    && route.live_output_generation.is_none()
+                    && !self.legacy_incompatibility_reported
+                {
+                    // Fixed, low-cardinality diagnostic: no session id, payload, or generation is
+                    // logged, and each affected binding reports at most once.
+                    eprintln!(
+                        "maestro-renderer: retained daemon lacks output-generation echo; rebound viewport remains blank"
+                    );
+                    self.legacy_incompatibility_reported = true;
+                }
+                false
+            }
+            StreamProof::ExactConfirmed => {
+                if let Some(live) = route.live_output_generation {
+                    return route.output_generation.is_none() && live == self.output_generation;
+                }
+                if let Some(echoed) = route.output_generation {
+                    return is_grid && echoed == self.output_generation;
+                }
+                // Only request/reply events are legitimately untagged after confirmation. Canonical
+                // live Damage/resync/title/bell/OSC52/exit lines always carry the forwarder tag.
+                is_direct_reply
+            }
+            StreamProof::LegacyInitial => {
+                route.output_generation.is_none() && route.live_output_generation.is_none()
+            }
+        }
+    }
+
+    fn exact_token_generation(&self) -> u64 {
+        self.output_generation
+    }
+
+    /// Classify a decode failure only from its bounded envelope proof. A malformed exact Attach echo
+    /// cannot confirm a pending binding, and the following untagged Snapshot cannot repair that proof,
+    /// so the connection must fail closed. Likewise a generation-proven malformed Scrollback reply
+    /// cannot safely leave the route's sole admitted correlation occupied forever. Stale, conflicting,
+    /// and untagged failures remain inert; they may never perturb a revived same-id binding.
+    fn decode_failure_action(
+        &self,
+        session_id: &str,
+        kind: EventRouteKind,
+        route: EventRouteMetadata,
+    ) -> DecodeFailureAction {
+        if session_id != self.session_id
+            || (route.output_generation.is_some() && route.live_output_generation.is_some())
+        {
+            return DecodeFailureAction::Ignore;
+        }
+        match self.proof {
+            StreamProof::InitialPending | StreamProof::ExactPending
+                if kind == EventRouteKind::Grid
+                    && route.output_generation == Some(self.output_generation)
+                    && route.live_output_generation.is_none() =>
+            {
+                DecodeFailureAction::FailClosed
+            }
+            StreamProof::ExactConfirmed => {
+                if kind == EventRouteKind::ScrollbackRows
+                    && route.output_generation == Some(self.output_generation)
+                    && route.live_output_generation.is_none()
+                {
+                    return DecodeFailureAction::FailClosed;
+                }
+                if kind == EventRouteKind::ScrollbackRows
+                    && route.output_generation.is_none()
+                    && route.live_output_generation.is_none()
+                {
+                    // Canonical ScrollbackRows replies are direct, untagged FIFO replies. Once the
+                    // exact Attach echo has crossed this socket's FIFO cut they cannot belong to an
+                    // older route; fail closed rather than strand the sole correlation slot.
+                    return DecodeFailureAction::FailClosed;
+                }
+                if kind == EventRouteKind::Grid {
+                    return match (route.output_generation, route.live_output_generation) {
+                        (Some(generation), None) | (None, Some(generation))
+                            if generation == self.output_generation =>
+                        {
+                            DecodeFailureAction::FailClosed
+                        }
+                        // Canonical Snapshot replies are likewise untagged direct replies ordered
+                        // after the exact Attach echo. A malformed current reply can strand both
+                        // SyncState and the Shared recovery registry, so terminate the connection.
+                        (None, None) => DecodeFailureAction::FailClosed,
+                        _ => DecodeFailureAction::Ignore,
+                    };
+                }
+                if kind != EventRouteKind::Damage {
+                    return DecodeFailureAction::Ignore;
+                }
+                match (route.output_generation, route.live_output_generation) {
+                    (None, Some(live)) if live == self.output_generation => {
+                        DecodeFailureAction::Recover
+                    }
+                    _ => DecodeFailureAction::Ignore,
+                }
+            }
+            // Once the only permitted legacy incarnation has accepted its first untagged Grid,
+            // there cannot be an older route on this fresh connection. An untagged malformed
+            // Damage addressed to that exact session is therefore safe to recover through the
+            // current binding token. No other untagged legacy failure has enough causal proof.
+            StreamProof::LegacyInitial
+                if kind == EventRouteKind::Damage
+                    && route.output_generation.is_none()
+                    && route.live_output_generation.is_none() =>
+            {
+                DecodeFailureAction::Recover
+            }
+            StreamProof::LegacyInitial
+                if matches!(kind, EventRouteKind::Grid | EventRouteKind::ScrollbackRows)
+                    && route.output_generation.is_none()
+                    && route.live_output_generation.is_none() =>
+            {
+                // The first connection has no older direct-reply route. A malformed Grid can
+                // otherwise strand an admitted recovery, while malformed ScrollbackRows can
+                // strand its single correlation slot; both are terminal protocol failures.
+                DecodeFailureAction::FailClosed
+            }
+            StreamProof::LegacyInitial
+            | StreamProof::InitialPending
+            | StreamProof::ExactPending => DecodeFailureAction::Ignore,
+        }
+    }
+}
+
+const MAX_RETIRED_EXIT_BINDINGS: usize = 256;
+
+/// Bounded durable-exit authority for bindings retired by clear/reconcile. A canonical daemon may
+/// finish one already-admitted tagged exit after Detach/Attach, so dropping the old SyncState at the
+/// paint boundary would lose the only lifecycle observation. We retain only the accepted PTY
+/// generation and exact socket generation—never a grid or side-effect authority. The cap bounds a
+/// pathological switch storm; normal app inventory reconciliation remains the eventual fallback for
+/// an entry old enough to be evicted before its process exits.
+#[derive(Default)]
+struct RetiredExitBindings {
+    order: VecDeque<u64>,
+    by_output_generation: HashMap<u64, RoutedSyncState>,
+}
+
+impl RetiredExitBindings {
+    fn retain(&mut self, state: RoutedSyncState) {
+        // Legacy post-clear lines are deliberately unprovable, so never create an untagged retired
+        // authority. ExactPending is retained: Clear may retire it while its echoed baseline and
+        // one-shot exit are already queued; the echo may advance only this off-paint tombstone.
+        if state.proof == StreamProof::LegacyInitial {
+            return;
+        }
+        let output_generation = state.output_generation;
+        // Output generations are connection-global and never reused. Repeated reconciliation of
+        // a transiently lingering Shared store must not replace an already-retired Confirmed state
+        // with a freshly recreated ExactPending state or duplicate its eviction-order entry.
+        if self.by_output_generation.contains_key(&output_generation) {
+            return;
+        }
+        self.order.push_back(output_generation);
+        self.by_output_generation.insert(output_generation, state);
+        while self.by_output_generation.len() > MAX_RETIRED_EXIT_BINDINGS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.by_output_generation.remove(&oldest);
+            }
+        }
+    }
+
+    fn event_generation_contradicted(
+        &self,
+        event: &DaemonEvent,
+        route: EventRouteMetadata,
+    ) -> bool {
+        let Some(output_generation) = route.output_generation.or(route.live_output_generation)
+        else {
+            return false;
+        };
+        self.by_output_generation
+            .get(&output_generation)
+            .is_some_and(|retired| !retired.event_generation_is_authorized(event))
+    }
+
+    /// Consume only the two lifecycle events needed after retirement: an exact Attach echo may
+    /// establish the PTY generation off-paint, and its exact tagged exit may then emit one durable
+    /// observation. No retired Grid reaches a cache and no retired Damage/notification is acted on.
+    fn observe_durable_event(
+        &mut self,
+        event: &DaemonEvent,
+        route: EventRouteMetadata,
+        proxy: &dyn UserEventSender,
+    ) -> bool {
+        if route.output_generation.is_some() && route.live_output_generation.is_some() {
+            return false;
+        }
+        let Some(output_generation) = route.output_generation.or(route.live_output_generation)
+        else {
+            return false;
+        };
+        let Some(retired) = self.by_output_generation.get_mut(&output_generation) else {
+            return false;
+        };
+        if event_session_id(event) != Some(retired.session_id.as_str()) {
+            return false;
+        }
+        match event {
+            DaemonEvent::Grid { id, grid } => {
+                if route.output_generation != Some(output_generation)
+                    || !retired.accepts(event, route)
+                {
+                    return false;
+                }
+                // Validate the same schema/generation invariants as a live baseline, but deliberately
+                // discard the grid instead of touching any renderer cache.
+                let _ = retired.sync.on_grid(id, grid);
+                true
+            }
+            DaemonEvent::SessionExited { id, code } => {
+                if route.live_output_generation != Some(output_generation)
+                    || !retired.accepts(event, route)
+                    || !matches!(retired.sync.on_session_exited(id), Ok(Action::Exited))
+                {
+                    return false;
+                }
+                let observed_generation = retired.sync.accepted_generation().map(str::to_string);
+                notify_session_exit(proxy, id, *code, observed_generation.as_deref());
+                self.by_output_generation.remove(&output_generation);
+                self.order
+                    .retain(|generation| *generation != output_generation);
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 /// If the UI thread switched the active session since the reader last checked
@@ -1409,18 +4646,46 @@ pub fn reset_session_state(shared: &Shared) {
 /// (b) any late frame from the OLD session is rejected as `WrongSession`.
 fn sync_active_session(
     shared: &Shared,
-    session_id: &mut String,
-    sync: &mut SyncState,
+    session_id: &mut Option<String>,
+    sync: &mut Option<RoutedSyncState>,
     local_epoch: &mut u64,
+    retired: &mut RetiredExitBindings,
 ) -> bool {
     let active = shared.active_snapshot();
-    if active.epoch == *local_epoch {
+    let local_output_generation = sync.as_ref().map(|state| state.output_generation);
+    let local_expected_generation = sync
+        .as_ref()
+        .and_then(|state| state.expected_generation.as_ref());
+    if active.epoch == *local_epoch
+        && active.id.as_ref() == session_id.as_ref()
+        && active.output_generation == local_output_generation
+        && active.expected_generation.as_ref() == local_expected_generation
+    {
         return false;
     }
+    if let Some(previous) = sync.take() {
+        retired.retain(previous);
+    }
     *local_epoch = active.epoch;
-    *session_id = active.id.clone();
-    *sync = SyncState::new(active.id);
-    reset_session_state(shared);
+    match (
+        active.id,
+        active.output_generation,
+        active.expected_generation,
+    ) {
+        (Some(id), Some(output_generation), expected_generation) => {
+            *sync = Some(RoutedSyncState::new_with_expected_generation(
+                id.clone(),
+                output_generation,
+                expected_generation,
+                false,
+            ));
+            *session_id = Some(id);
+        }
+        _ => {
+            *session_id = None;
+            *sync = None;
+        }
+    }
     true
 }
 
@@ -1437,20 +4702,38 @@ fn sync_active_session(
 fn sync_sibling_session(
     shared: &Shared,
     sibling_id: &mut Option<String>,
-    sibling_sync: &mut Option<SyncState>,
+    sibling_sync: &mut Option<RoutedSyncState>,
     local_epoch: &mut u64,
+    retired: &mut RetiredExitBindings,
 ) -> bool {
-    let sib = shared.sibling_snapshot();
-    if sib.epoch == *local_epoch {
+    let mut sib = shared.sibling_snapshot();
+    let active = shared.active_snapshot();
+    if active.id.is_none() || active.id.as_ref() == sib.id.as_ref() {
+        // Active/neutral authority wins even while the UI has not yet torn down the old sibling
+        // store. Exclude it before constructing a new RoutedSyncState so repeated reconciles cannot
+        // shadow or dilute the retired lifecycle proof.
+        sib.id = None;
+        sib.output_generation = None;
+        sib.grid = None;
+        sib.exited = None;
+    }
+    let local_output_generation = sibling_sync.as_ref().map(|state| state.output_generation);
+    if sib.epoch == *local_epoch
+        && sib.id.as_ref() == sibling_id.as_ref()
+        && sib.output_generation == local_output_generation
+    {
         return false;
     }
+    if let Some(previous) = sibling_sync.take() {
+        retired.retain(previous);
+    }
     *local_epoch = sib.epoch;
-    match sib.id {
-        Some(id) => {
-            *sibling_sync = Some(SyncState::new(id.clone()));
+    match (sib.id, sib.output_generation) {
+        (Some(id), Some(output_generation)) => {
+            *sibling_sync = Some(RoutedSyncState::new(id.clone(), output_generation, false));
             *sibling_id = Some(id);
         }
-        None => {
+        _ => {
             *sibling_id = None;
             *sibling_sync = None;
         }
@@ -1470,28 +4753,218 @@ fn sync_sibling_session(
 /// forwarder. Returns `true` when the membership changed.
 fn sync_pane_sessions(
     shared: &Shared,
-    pane_syncs: &mut HashMap<String, SyncState>,
+    pane_syncs: &mut HashMap<String, PaneSyncState>,
     local_generation: &mut u64,
+    retired: &mut RetiredExitBindings,
 ) -> bool {
-    let generation = shared.pane_generation();
-    if generation == *local_generation {
+    let (generation, mut bindings) = shared.pane_bindings_snapshot();
+    let active = shared.active_snapshot();
+    match active.id.as_deref() {
+        Some(active_id) => bindings.retain(|(id, _, _, _)| id != active_id),
+        None => bindings.clear(),
+    }
+    let bindings_unchanged = generation == *local_generation
+        && bindings.len() == pane_syncs.len()
+        && bindings
+            .iter()
+            .all(|(id, epoch, output_generation, expected_generation)| {
+                pane_syncs.get(id).is_some_and(|state| {
+                    state.epoch == *epoch
+                        && Some(state.routed.output_generation) == *output_generation
+                        && state.routed.expected_generation.as_ref() == expected_generation.as_ref()
+                })
+            });
+    if bindings_unchanged {
         return false;
     }
     *local_generation = generation;
-    let ids = shared.pane_ids();
-    // Reader-local only: the UI-side pane-role reconcile owns the corresponding daemon Detach.
-    // Keeping socket lifecycle out of this asynchronously-running reader prevents a stale removed
-    // `Pane` role from detaching the same session after it has already become the active role.
-    pane_syncs.retain(|id, _| ids.iter().any(|i| i == id));
-    // Add a fresh sync for each newly bound pane. The UI already sent the structured-only Attach
-    // after publishing this membership, so the fresh SyncState is ready before that baseline is
-    // decoded. Sending another Attach here would only replace the same daemon forwarder.
-    for id in ids {
-        if !pane_syncs.contains_key(&id) {
-            pane_syncs.insert(id.clone(), SyncState::new(id.clone()));
+    let mut next = HashMap::with_capacity(bindings.len());
+    for (id, epoch, output_generation, expected_generation) in bindings {
+        let Some(output_generation) = output_generation else {
+            continue;
+        };
+        let state = match pane_syncs.remove(&id) {
+            Some(existing)
+                if existing.epoch == epoch
+                    && existing.routed.output_generation == output_generation
+                    && existing.routed.expected_generation == expected_generation =>
+            {
+                existing
+            }
+            Some(existing) => {
+                retired.retain(existing.routed);
+                PaneSyncState {
+                    epoch,
+                    routed: RoutedSyncState::new_with_expected_generation(
+                        id.clone(),
+                        output_generation,
+                        expected_generation.clone(),
+                        false,
+                    ),
+                }
+            }
+            _ => PaneSyncState {
+                epoch,
+                routed: RoutedSyncState::new_with_expected_generation(
+                    id.clone(),
+                    output_generation,
+                    expected_generation,
+                    false,
+                ),
+            },
+        };
+        next.insert(id, state);
+    }
+    for (_, removed) in pane_syncs.drain() {
+        retired.retain(removed.routed);
+    }
+    *pane_syncs = next;
+    true
+}
+
+/// Enforce the reader's one-route-per-session invariant after observing a binding snapshot. Active
+/// wins over sibling, which wins over pane. Most importantly, a neutral active viewport retires
+/// every non-active route immediately—even if UI clear has not yet removed Shared stores—and an
+/// active promotion retires the former pane/sibling route before the old exact tagged exit is
+/// dispatched. Retired states retain lifecycle authority only; they can never paint or emit OSC.
+fn retire_shadowed_reader_routes(
+    active_id: Option<&str>,
+    sibling_id: &mut Option<String>,
+    sibling_sync: &mut Option<RoutedSyncState>,
+    pane_syncs: &mut HashMap<String, PaneSyncState>,
+    retired: &mut RetiredExitBindings,
+) {
+    let Some(active_id) = active_id else {
+        if let Some(state) = sibling_sync.take() {
+            retired.retain(state);
+        }
+        *sibling_id = None;
+        for (_, state) in pane_syncs.drain() {
+            retired.retain(state.routed);
+        }
+        return;
+    };
+
+    if sibling_id.as_deref() == Some(active_id) {
+        if let Some(state) = sibling_sync.take() {
+            retired.retain(state);
+        }
+        *sibling_id = None;
+    }
+    if let Some(state) = pane_syncs.remove(active_id) {
+        retired.retain(state.routed);
+    }
+    if let Some(sibling) = sibling_id.as_deref() {
+        if let Some(state) = pane_syncs.remove(sibling) {
+            retired.retain(state.routed);
         }
     }
-    true
+}
+
+/// Reader-local state for one exact pane-store incarnation. Same-id removal/re-add must rebuild the
+/// sync machine even when routing still finds the same map key.
+struct PaneSyncState {
+    epoch: u64,
+    routed: RoutedSyncState,
+}
+
+/// Resolve one event id against the reader's PRE-block binding table. Comparing this with
+/// [`Shared::binding_token_for_session`] after `read_until` detects only a change to this exact
+/// route; an unrelated pane membership update cannot make us discard a valid active line.
+#[allow(clippy::too_many_arguments)]
+fn local_binding_token_for_session(
+    event_id: &str,
+    session_id: Option<&str>,
+    active_sync: Option<&RoutedSyncState>,
+    active_epoch: u64,
+    sibling_id: Option<&str>,
+    sibling_sync: Option<&RoutedSyncState>,
+    sibling_epoch: u64,
+    pane_syncs: &HashMap<String, PaneSyncState>,
+) -> Option<ViewportBindingToken> {
+    if session_id == Some(event_id) {
+        let routed = active_sync?;
+        return Some(ViewportBindingToken::Active(ActiveBindingToken {
+            session_id: event_id.to_string(),
+            epoch: active_epoch,
+            output_generation: routed.exact_token_generation(),
+        }));
+    }
+    if sibling_id == Some(event_id) {
+        let routed = sibling_sync?;
+        return Some(ViewportBindingToken::Pane {
+            session_id: event_id.to_string(),
+            pane_epoch: sibling_epoch,
+            pane_kind: PaneKind::Sibling,
+            viewport_epoch: active_epoch,
+            output_generation: routed.exact_token_generation(),
+        });
+    }
+    let pane = pane_syncs.get(event_id)?;
+    Some(ViewportBindingToken::Pane {
+        session_id: event_id.to_string(),
+        pane_epoch: pane.epoch,
+        pane_kind: PaneKind::Pane,
+        viewport_epoch: active_epoch,
+        output_generation: pane.routed.exact_token_generation(),
+    })
+}
+
+fn request_local_recovery(
+    shared: &Arc<Shared>,
+    sync: &mut SyncState,
+    proxy: &dyn UserEventSender,
+    binding: &ViewportBindingToken,
+    id: &str,
+) {
+    if !sync.can_request_local_resync(id) {
+        return;
+    }
+    match shared.request_recovery_snapshot(binding) {
+        RecoveryRequestResult::Admitted | RecoveryRequestResult::AlreadyAdmitted => {
+            let _ = sync.local_resync_request_admitted(id);
+        }
+        RecoveryRequestResult::Pending { wake_now } => {
+            if wake_now {
+                let _ = proxy.send(UserEvent::OutboundWritable);
+            }
+        }
+        RecoveryRequestResult::Stale => {}
+        RecoveryRequestResult::Refused(admission) => {
+            // Recovery registry exhaustion is not safely droppable: without a retained Snapshot
+            // transaction this exact route can remain stale forever. Treat every hard refusal as a
+            // fail-closed connection outcome; only Pending/Full/Contended is retryable.
+            if admission.is_connection_terminal() || !admission.is_retryable() {
+                shared.fail_closed_connection(proxy);
+            }
+        }
+    }
+}
+
+fn request_snapshot_after_grid(
+    shared: &Arc<Shared>,
+    sync: &mut SyncState,
+    proxy: &dyn UserEventSender,
+    binding: &ViewportBindingToken,
+) {
+    match shared.request_recovery_snapshot(binding) {
+        RecoveryRequestResult::Admitted | RecoveryRequestResult::AlreadyAdmitted => {}
+        RecoveryRequestResult::Pending { wake_now } => {
+            sync.snapshot_request_not_admitted();
+            if wake_now {
+                let _ = proxy.send(UserEvent::OutboundWritable);
+            }
+        }
+        RecoveryRequestResult::Stale => {
+            sync.snapshot_request_not_admitted();
+        }
+        RecoveryRequestResult::Refused(admission) => {
+            sync.snapshot_request_not_admitted();
+            if admission.is_connection_terminal() || !admission.is_retryable() {
+                shared.fail_closed_connection(proxy);
+            }
+        }
+    }
 }
 
 /// Ingest a frame for one of the extra non-active panes into the multi-pane cache. The N-pane
@@ -1501,24 +4974,33 @@ fn sync_pane_sessions(
 /// is dropped). Scrollback rows update the pane's own renderer-owned viewport state; raw Output
 /// stays ignored on structured-only attaches. The UI is woken only on an accepted grid, exit, or
 /// scrollback update.
-fn handle_pane_event(
+#[allow(clippy::too_many_arguments)]
+fn handle_pane_event_for_binding(
     shared: &Arc<Shared>,
     sync: &mut SyncState,
     proxy: &dyn UserEventSender,
     pane_id: &str,
+    pane_epoch: u64,
+    viewport_epoch: u64,
+    output_generation: u64,
     ev: DaemonEvent,
 ) {
-    let Some(epoch) = shared.pane_epoch(pane_id) else {
-        return; // pane removed since routing was decided; drop the frame.
+    let binding = ViewportBindingToken::Pane {
+        session_id: pane_id.to_string(),
+        pane_epoch,
+        pane_kind: PaneKind::Pane,
+        viewport_epoch,
+        output_generation,
     };
     match ev {
         DaemonEvent::Grid { id, grid } => match sync.on_grid(&id, &grid) {
             Ok(outcome) => {
-                if outcome.repaint && shared.apply_pane_grid(pane_id, epoch, Arc::new(grid)) {
+                shared.clear_recovery(&binding);
+                if outcome.repaint && shared.commit_pane_grid(&binding, Arc::new(grid)) {
                     wake(proxy);
                 }
                 if outcome.request_snapshot {
-                    shared.send_request(&ClientRequest::Snapshot { id: pane_id.into() });
+                    request_snapshot_after_grid(shared, sync, proxy, &binding);
                 }
             }
             Err(reason) => eprintln!("maestro-renderer: rejected pane snapshot: {reason:?}"),
@@ -1527,24 +5009,15 @@ fn handle_pane_event(
             if frame.id.as_str() != pane_id {
                 return;
             }
-            let held = {
-                let stores = shared.stores.lock().unwrap();
-                match stores.get(pane_id) {
-                    Some(entry) if entry.kind == PaneKind::Pane && entry.epoch == epoch => {
-                        entry.grid.clone()
-                    }
-                    _ => return,
-                }
-            };
+            let held = shared.pane_grid_for_binding(&binding, PaneKind::Pane);
             let Some(held) = held else {
-                if sync.on_resync_required(pane_id).is_ok() {
-                    shared.send_request(&ClientRequest::Snapshot { id: pane_id.into() });
-                }
+                request_local_recovery(shared, sync, proxy, &binding, pane_id);
                 return;
             };
             match sync.on_damage(&frame.id, &frame, &held) {
                 DamageOutcome::Applied(grid) => {
-                    if shared.apply_pane_grid(pane_id, epoch, Arc::from(grid)) {
+                    if shared.commit_pane_grid(&binding, Arc::from(grid)) {
+                        shared.clear_recovery(&binding);
                         wake(proxy);
                     }
                 }
@@ -1553,9 +5026,7 @@ fn handle_pane_event(
                     eprintln!(
                         "maestro-renderer: pane damage not applicable ({reason:?}); resyncing"
                     );
-                    if sync.on_resync_required(pane_id).is_ok() {
-                        shared.send_request(&ClientRequest::Snapshot { id: pane_id.into() });
-                    }
+                    request_local_recovery(shared, sync, proxy, &binding, pane_id);
                 }
             }
         }
@@ -1566,9 +5037,10 @@ fn handle_pane_event(
         }
         DaemonEvent::SessionExited { id, code } => {
             if let Ok(Action::Exited) = sync.on_session_exited(&id) {
-                if shared.apply_pane_exit(pane_id, epoch, code) {
-                    notify_session_exit(proxy, pane_id, code, sync.accepted_generation());
-                }
+                // Paint-cache authority may have been revoked after read, but the durable app
+                // observation remains generation-guarded and must not be lost for stashed records.
+                shared.commit_pane_exit(&binding, code);
+                notify_session_exit(proxy, pane_id, code, sync.accepted_generation());
             }
         }
         DaemonEvent::ScrollbackRows {
@@ -1579,56 +5051,149 @@ fn handle_pane_event(
             rows,
             ..
         } => {
-            if shared.apply_pane_scrollback(
-                pane_id,
-                epoch,
+            let repaint = shared.commit_pane_scrollback(
+                &binding,
                 generation,
                 revision,
                 history_len,
                 offset_from_top,
                 rows,
-            ) {
+            );
+            // Consuming even a stale/mismatched reply releases the route's single in-flight slot.
+            // Retry the one coalesced latest owner intent without waiting for another daemon event.
+            let _ = proxy.send(UserEvent::OutboundWritable);
+            if repaint {
                 wake(proxy);
             }
         }
-        DaemonEvent::TerminalBell { id } if id == pane_id => {
-            let _ = proxy.send(UserEvent::TerminalBell);
+        DaemonEvent::TerminalBell { id }
+            if id == pane_id && sync.accepted_generation().is_some() =>
+        {
+            let _ = proxy.send(UserEvent::TerminalBell {
+                binding: binding.clone(),
+            });
         }
-        DaemonEvent::TerminalTitle { id, title } if id == pane_id => {
-            let _ = proxy.send(UserEvent::TerminalTitle { title });
+        DaemonEvent::TerminalTitle { id, title }
+            if id == pane_id && sync.accepted_generation().is_some() =>
+        {
+            let _ = proxy.send(UserEvent::TerminalTitle {
+                binding: binding.clone(),
+                title,
+            });
         }
-        DaemonEvent::TerminalClipboardStore { id, text } if id == pane_id => {
-            let _ = proxy.send(UserEvent::TerminalClipboardStore { text });
+        DaemonEvent::TerminalClipboardStore { id, text }
+            if id == pane_id && sync.accepted_generation().is_some() =>
+        {
+            let _ = proxy.send(UserEvent::TerminalClipboardStore { binding, text });
         }
         DaemonEvent::TerminalBell { .. }
         | DaemonEvent::TerminalTitle { .. }
         | DaemonEvent::TerminalClipboardStore { .. }
         | DaemonEvent::Output { .. }
+        | DaemonEvent::DaemonInfo { .. }
+        | DaemonEvent::SessionAttachRefused { .. }
         | DaemonEvent::Error { .. }
         | DaemonEvent::Other => {}
     }
 }
 
-/// Spawn the reader thread. Returns the shared state. The reader validates every
+#[cfg(test)]
+fn handle_pane_event(
+    shared: &Arc<Shared>,
+    sync: &mut SyncState,
+    proxy: &dyn UserEventSender,
+    pane_id: &str,
+    ev: DaemonEvent,
+) {
+    let Some(ViewportBindingToken::Pane {
+        pane_epoch,
+        pane_kind: PaneKind::Pane,
+        viewport_epoch,
+        output_generation,
+        ..
+    }) = shared.binding_token_for_session(pane_id)
+    else {
+        return;
+    };
+    handle_pane_event_for_binding(
+        shared,
+        sync,
+        proxy,
+        pane_id,
+        pane_epoch,
+        viewport_epoch,
+        output_generation,
+        ev,
+    );
+}
+
+pub(crate) struct SpawnedClient {
+    pub(crate) shared: Arc<Shared>,
+    /// Immutable queue-publication proof captured before either worker can clear mutable Shared
+    /// state. `Some` means the initial Attach+Snapshot batch entered the writer FIFO.
+    pub(crate) initial_binding: Option<ActiveBindingToken>,
+    pub(crate) initial_exact_viewport: Option<ViewportBindingSet>,
+}
+
+/// Spawn the reader thread and retain immutable initial publication proof for the renderer owner.
+/// The reader validates every
 /// event, publishes accepted snapshots, and wakes the OWNER event loop via `proxy`
-/// (the platform-neutral [`UserEventSender`]) only after a validated state change. It also owns a
-/// write handle so it can request a fresh snapshot when
+/// (the platform-neutral [`UserEventSender`]) only after a validated state change
+/// (#gate8). It also owns a write handle so it can request a fresh snapshot when
 /// live output advances the revision or a resync is needed.
-pub fn spawn(
+pub(crate) fn spawn_with_initial_binding(
     socket_path: String,
     session_id: String,
+    exact_viewport: Option<DesiredViewportBinding>,
+    attachment_handoff: Option<AttachmentHandoffClaim>,
     proxy: Box<dyn UserEventSender>,
-) -> Arc<Shared> {
+) -> SpawnedClient {
     let shared = Arc::new(Shared::default());
 
-    let stream = match UnixStream::connect(&socket_path) {
-        Ok(s) => s,
+    let transport = match connect_daemon_transport(&socket_path, attachment_handoff.as_ref()) {
+        Ok(transport) => transport,
         Err(e) => {
             eprintln!("maestro-renderer: failed to connect to {socket_path}: {e}");
             // Return empty shared state; the window will show nothing.
-            return shared;
+            shared.connection_closed.store(true, Ordering::Release);
+            return SpawnedClient {
+                shared,
+                initial_binding: None,
+                initial_exact_viewport: None,
+            };
         }
     };
+    let DaemonTransport {
+        stream,
+        mutation_capable,
+        legacy_attach_compatible,
+        peer,
+    } = transport;
+    shared
+        .generation_conditional_mutations
+        .store(mutation_capable, Ordering::Release);
+    shared
+        .attachment_handoff_capable
+        .store(peer.attachment_handoff_capable, Ordering::Release);
+    assert!(shared
+        .operational_daemon_instance
+        .set(peer.daemon_instance_id)
+        .is_ok());
+    assert!(shared.operational_server_pid.set(peer.server_pid).is_ok());
+
+    let shutdown_stream = match stream.try_clone() {
+        Ok(stream) => stream,
+        Err(e) => {
+            eprintln!("maestro-renderer: failed to clone shutdown handle: {e}");
+            let _ = stream.shutdown(Shutdown::Both);
+            return SpawnedClient {
+                shared,
+                initial_binding: None,
+                initial_exact_viewport: None,
+            };
+        }
+    };
+    assert!(shared.shutdown_stream.set(shutdown_stream).is_ok());
 
     // The dedicated writer's own socket handle. One thread owns it and drains the
     // bounded outbound queue in strict FIFO order — no other thread touches the
@@ -1637,51 +5202,133 @@ pub fn spawn(
         Ok(s) => s,
         Err(e) => {
             eprintln!("maestro-renderer: failed to clone stream: {e}");
-            return shared;
+            return SpawnedClient {
+                shared,
+                initial_binding: None,
+                initial_exact_viewport: None,
+            };
         }
     };
+    if let Err(e) = write_half.set_write_timeout(Some(OUTBOUND_WRITE_TIMEOUT)) {
+        eprintln!("maestro-renderer: failed to bound socket writes: {e}");
+        let _ = write_half.shutdown(Shutdown::Both);
+        return SpawnedClient {
+            shared,
+            initial_binding: None,
+            initial_exact_viewport: None,
+        };
+    }
 
     // Publish the queue so producers (reader + UI) can enqueue, then start the
     // writer thread that drains it.
     let outbound = Arc::new(OutboundQueue::new());
-    *shared.outbound.lock().unwrap() = Some(Arc::clone(&outbound));
+    assert!(shared.outbound.set(Arc::clone(&outbound)).is_ok());
+
+    // Exact startup uses the same aggregate Detach/Attach receipt as every runtime topology change.
+    // A canonical mutation-capable peer never accepts a textual id without an immutable generation
+    // cohort. A retained peer that failed the v3 capability proof may still receive the original
+    // read-only Attach shape on this same reviewed socket; terminal mutations remain disabled
+    // for the entire connection and a later clear/rebind cannot recreate that legacy authority.
+    let (initial_token, initial_exact_viewport) = if let Some(desired) = exact_viewport {
+        if desired.primary_session_id != session_id {
+            shared.abort_connection();
+            return SpawnedClient {
+                shared,
+                initial_binding: None,
+                initial_exact_viewport: None,
+            };
+        }
+        match shared.try_bind_viewport(&desired, &[], attachment_handoff.as_ref()) {
+            Ok(binding) => (binding.primary().clone(), Some(binding)),
+            Err(_) => {
+                shared.abort_connection();
+                return SpawnedClient {
+                    shared,
+                    initial_binding: None,
+                    initial_exact_viewport: None,
+                };
+            }
+        }
+    } else if attachment_handoff.is_none() && legacy_attach_compatible {
+        let Some(token) = shared.init_active_session(&session_id) else {
+            shared.abort_connection();
+            return SpawnedClient {
+                shared,
+                initial_binding: None,
+                initial_exact_viewport: None,
+            };
+        };
+        let initial_plan = [
+            ClientRequest::Attach {
+                id: session_id.clone(),
+                want_raw_output: false,
+                expected_session_generation: None,
+                output_generation: Some(token.output_generation),
+                handoff: None,
+            },
+            ClientRequest::Snapshot {
+                id: session_id.clone(),
+            },
+        ];
+        let Some(initial_lines) = Shared::frame_requests(&initial_plan) else {
+            shared.abort_connection();
+            return SpawnedClient {
+                shared,
+                initial_binding: None,
+                initial_exact_viewport: None,
+            };
+        };
+        // `Attach` is conservatively classified with terminal mutations everywhere else. This one
+        // bypass is narrower: the same freshly probed socket already failed canonical capability,
+        // no handoff exists, the writer has not started, and only Attach+Snapshot bytes are present.
+        let admission = shared.note_admission(Shared::admission_from(
+            outbound.try_enqueue_batch(initial_lines),
+        ));
+        if !admission.is_admitted() {
+            shared.abort_connection();
+            return SpawnedClient {
+                shared,
+                initial_binding: None,
+                initial_exact_viewport: None,
+            };
+        }
+        (token, None)
+    } else {
+        shared.abort_connection();
+        return SpawnedClient {
+            shared,
+            initial_binding: None,
+            initial_exact_viewport: None,
+        };
+    };
+    let initial_binding = initial_token.clone();
+
+    // Only now start the writer. The initial Attach+Snapshot transaction was admitted into an empty,
+    // uncontended queue, so startup cannot fail because the writer happened to hold the queue mutex.
     {
         let outbound = Arc::clone(&outbound);
-        let shared = Arc::clone(&shared);
+        let writer_shared = Arc::clone(&shared);
+        let writer_proxy = proxy.clone_sender();
         std::thread::spawn(move || {
-            while let Some(line) = outbound.dequeue() {
-                if let Err(e) = write_half.write_all(&line) {
-                    eprintln!("maestro-renderer: write failed: {e}");
-                    break;
+            while let Some((line, wake_retry)) = outbound.dequeue() {
+                if wake_retry {
+                    let _ = writer_proxy.send(UserEvent::OutboundWritable);
+                }
+                if let Err(e) =
+                    write_frame_before_deadline(&mut write_half, &line, OUTBOUND_WRITE_TIMEOUT)
+                {
+                    eprintln!("maestro-renderer: bounded socket write failed: {e}");
+                    // A timeout may leave a partial JSON frame on the stream. Tear down the whole
+                    // client connection so the daemon drops every forwarder and no later frame can
+                    // be misparsed as a continuation.
+                    let _ = write_half.shutdown(Shutdown::Both);
+                    writer_shared.fail_closed_connection(writer_proxy.as_ref());
+                    return;
                 }
             }
-            // Socket write side is dead: close the queue so any blocked producer
-            // unblocks, and clear it from Shared so later requests are no-ops.
             outbound.close();
-            *shared.outbound.lock().unwrap() = None;
         });
     }
-
-    // Attach only. Attach already guarantees an authoritative baseline Grid (the
-    // daemon replays the restore grid on the attach path), so we do NOT send a
-    // redundant Snapshot here — the first Grid event will baseline us. This is the
-    // FIRST item enqueued, so strict FIFO guarantees it reaches the daemon before
-    // any Snapshot/Write/Resize that depends on the attach.
-    // With `want_raw_output: false`, this renderer is structured-only. The daemon
-    // ships the baseline Grid plus live `Damage` frames (and ResyncRequired+Grid for
-    // resize/generation/lag recovery) — never raw `Output`. Damage is the normal live
-    // update path; raw bytes are never re-parsed here (no second VT parser). If an
-    // Output ever arrives anyway it is debug-ignored, NOT turned into a Snapshot
-    // request (see the Output arm of `handle_event`).
-    shared.send_request(&ClientRequest::Attach {
-        id: session_id.clone(),
-        want_raw_output: false,
-    });
-
-    // Seed the shared active session BEFORE the reader starts so its local epoch (0)
-    // already matches — the first `sync_active_session` is a no-op. A later tab switch
-    // bumps the epoch via `set_active_session` and the reader rebases on its next event.
-    shared.init_active_session(&session_id);
 
     // Reader thread: parse events, validate, publish accepted snapshots, wake the
     // UI on validated change. The SyncState is owned solely by this thread (sole
@@ -1689,39 +5336,64 @@ pub fn spawn(
     // are REBOUND in-place when the UI thread switches the active session (a tab
     // switch): `sync_active_session` rebuilds the `SyncState` for the new id and
     // resets the shared grid/exit/scrollback so stale old-session rows can't paint.
+    let initial_expected_generation = shared.active_snapshot().expected_generation;
+    let initial_is_exact = initial_exact_viewport.is_some();
     {
         let shared = Arc::clone(&shared);
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stream);
-            let mut session_id = session_id;
-            let mut sync = SyncState::new(session_id.clone());
-            let mut epoch: u64 = 0;
+            let mut session_id = Some(session_id.clone());
+            let mut sync = Some(RoutedSyncState::new_with_expected_generation(
+                session_id
+                    .as_ref()
+                    .expect("initial reader session is bound")
+                    .clone(),
+                initial_token.output_generation,
+                initial_expected_generation,
+                !initial_is_exact,
+            ));
+            let mut epoch = initial_token.epoch;
             // Reader-local sibling binding, independent of the active session above. The
             // UI thread fills `shared.sibling` from the split frame; `sync_sibling_session`
             // adopts it here so sibling frames are ingested into the sibling cache. `None`
             // until/unless there is a split with a resolved inactive session.
             let mut sibling_id: Option<String> = None;
-            let mut sibling_sync: Option<SyncState> = None;
+            let mut sibling_sync: Option<RoutedSyncState> = None;
             let mut sibling_epoch: u64 = 0;
             // Reader-local multi-pane cache binding (the extra non-active panes beyond the
             // rendered sibling). One `SyncState` per bound pane id, rebuilt on a membership
             // generation bump by `sync_pane_sessions`. Empty for the two-pane case.
-            let mut pane_syncs: HashMap<String, SyncState> = HashMap::new();
+            let mut pane_syncs: HashMap<String, PaneSyncState> = HashMap::new();
             let mut pane_generation: u64 = 0;
+            let mut retired = RetiredExitBindings::default();
             let mut line_buf: Vec<u8> = Vec::new();
-            loop {
+            'reader: loop {
                 // Rebase to the active session if the UI switched it since the last
                 // event. Done at the TOP of the loop so the first frame after a switch
                 // is already filtered against the new id and a late old-session frame
                 // is rejected by the fresh `SyncState`/filter.
-                sync_active_session(&shared, &mut session_id, &mut sync, &mut epoch);
+                sync_active_session(
+                    &shared,
+                    &mut session_id,
+                    &mut sync,
+                    &mut epoch,
+                    &mut retired,
+                );
                 sync_sibling_session(
                     &shared,
                     &mut sibling_id,
                     &mut sibling_sync,
                     &mut sibling_epoch,
+                    &mut retired,
                 );
-                sync_pane_sessions(&shared, &mut pane_syncs, &mut pane_generation);
+                sync_pane_sessions(&shared, &mut pane_syncs, &mut pane_generation, &mut retired);
+                retire_shadowed_reader_routes(
+                    session_id.as_deref(),
+                    &mut sibling_id,
+                    &mut sibling_sync,
+                    &mut pane_syncs,
+                    &mut retired,
+                );
                 line_buf.clear();
                 // Bounded framing: cap one line at MAX_LINE_BYTES + 1 so a peer can't
                 // make us buffer an unbounded line before parsing. An oversized,
@@ -1747,50 +5419,187 @@ pub fn spawn(
                     Ok(s) => s.trim(),
                     Err(_) => {
                         eprintln!("maestro-renderer: event line is not valid UTF-8");
-                        continue;
+                        break;
                     }
                 };
                 if line.is_empty() {
                     continue;
                 }
-                // Rebase AGAIN here, after the blocking `read_until` returned. The
-                // top-of-loop rebase ran BEFORE we blocked; if the UI switched the active
-                // session while we were parked in `read_until`, the line we just read
-                // belongs to (or arrived during) the old binding. Re-checking the epoch now
-                // — before decode/handle — guarantees the just-read frame is filtered
-                // against the NEW active session: a late old-session frame is rejected, and
-                // the new session's baseline `Grid` is accepted into the fresh `SyncState`
-                // instead of being wrongly rejected as `WrongSession`.
-                sync_active_session(&shared, &mut session_id, &mut sync, &mut epoch);
-                sync_sibling_session(
-                    &shared,
-                    &mut sibling_id,
-                    &mut sibling_sync,
-                    &mut sibling_epoch,
-                );
-                sync_pane_sessions(&shared, &mut pane_syncs, &mut pane_generation);
                 // Decode via the bounded discriminator: it reads the `ev` tag from a
                 // minimal envelope and enforces MAX_DAMAGE_BYTES BEFORE fully parsing a
                 // damage payload's nested cells.
-                let mut ev = match decode_event(line) {
-                    Ok(ev) => ev,
+                let decoded = decode_event_with_route(line);
+                let (mut ev, event_route) = match decoded {
+                    Ok(decoded) => decoded,
                     Err(err) => {
                         // A line we can't decode is a frame we've lost on the wire. On the
                         // structured-only path the dropped frame may have been a Damage
                         // mutation, so merely logging would leave the screen permanently
                         // stale. Every decode failure therefore drops to resync to pull a
                         // fresh authoritative grid — see `decode_error_requires_resync`.
-                        eprintln!("maestro-renderer: {}", describe_decode_error(&err));
-                        if decode_error_requires_resync(&err)
-                            && sync.on_resync_required(&session_id).is_ok()
-                        {
-                            shared.send_request(&ClientRequest::Snapshot {
-                                id: session_id.clone(),
-                            });
+                        eprintln!("maestro-renderer: {}", describe_decode_error(&err.error));
+                        let unattributable_protocol_failure = err.route.is_none()
+                            || err.kind.is_none()
+                            || (matches!(
+                                err.kind,
+                                Some(
+                                    EventRouteKind::Grid
+                                        | EventRouteKind::Damage
+                                        | EventRouteKind::ScrollbackRows
+                                )
+                            ) && err.session_id.is_none());
+                        if unattributable_protocol_failure {
+                            // Without a bounded route/id proof we cannot know whether the lost line
+                            // mutated the current terminal. Continuing could preserve stale pixels
+                            // indefinitely or let later buffered effects run after a corrupted frame.
+                            shared.fail_closed_connection(proxy.as_ref());
+                            break 'reader;
+                        }
+                        let pre_token = err.session_id.as_deref().and_then(|id| {
+                            local_binding_token_for_session(
+                                id,
+                                session_id.as_deref(),
+                                sync.as_ref(),
+                                epoch,
+                                sibling_id.as_deref(),
+                                sibling_sync.as_ref(),
+                                sibling_epoch,
+                                &pane_syncs,
+                            )
+                        });
+                        let post_token = err
+                            .session_id
+                            .as_deref()
+                            .and_then(|id| shared.binding_token_for_session(id));
+                        sync_active_session(
+                            &shared,
+                            &mut session_id,
+                            &mut sync,
+                            &mut epoch,
+                            &mut retired,
+                        );
+                        sync_sibling_session(
+                            &shared,
+                            &mut sibling_id,
+                            &mut sibling_sync,
+                            &mut sibling_epoch,
+                            &mut retired,
+                        );
+                        sync_pane_sessions(
+                            &shared,
+                            &mut pane_syncs,
+                            &mut pane_generation,
+                            &mut retired,
+                        );
+                        retire_shadowed_reader_routes(
+                            session_id.as_deref(),
+                            &mut sibling_id,
+                            &mut sibling_sync,
+                            &mut pane_syncs,
+                            &mut retired,
+                        );
+                        // Never inject a reader Snapshot across a binding handoff: it could overtake
+                        // the UI owner's Detach→Attach→Resize→Snapshot FIFO plan. On an unchanged,
+                        // already-proven route, a decode loss may still request one token-gated
+                        // recovery baseline.
+                        if decode_error_requires_resync(&err.error) && pre_token == post_token {
+                            if let (Some(route), Some(kind), Some(id), Some(token)) = (
+                                err.route,
+                                err.kind,
+                                err.session_id.as_deref(),
+                                post_token.as_ref(),
+                            ) {
+                                let action = match token {
+                                    ViewportBindingToken::Active(_) => sync
+                                        .as_ref()
+                                        .map(|routed| routed.decode_failure_action(id, kind, route))
+                                        .unwrap_or(DecodeFailureAction::Ignore),
+                                    ViewportBindingToken::Pane {
+                                        pane_kind: PaneKind::Sibling,
+                                        ..
+                                    } => sibling_sync
+                                        .as_ref()
+                                        .map(|routed| routed.decode_failure_action(id, kind, route))
+                                        .unwrap_or(DecodeFailureAction::Ignore),
+                                    ViewportBindingToken::Pane {
+                                        pane_kind: PaneKind::Pane,
+                                        ..
+                                    } => pane_syncs
+                                        .get(id)
+                                        .map(|pane| {
+                                            pane.routed.decode_failure_action(id, kind, route)
+                                        })
+                                        .unwrap_or(DecodeFailureAction::Ignore),
+                                };
+                                match action {
+                                    DecodeFailureAction::FailClosed => {
+                                        shared.fail_closed_connection(proxy.as_ref());
+                                        break 'reader;
+                                    }
+                                    DecodeFailureAction::Recover => match token {
+                                        ViewportBindingToken::Active(_) => {
+                                            if let Some(routed) = sync.as_mut() {
+                                                if routed.sync.can_request_local_resync(id) {
+                                                    request_local_recovery(
+                                                        &shared,
+                                                        &mut routed.sync,
+                                                        proxy.as_ref(),
+                                                        token,
+                                                        id,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        ViewportBindingToken::Pane {
+                                            pane_kind: PaneKind::Sibling,
+                                            ..
+                                        } => {
+                                            if let Some(routed) = sibling_sync.as_mut() {
+                                                if routed.sync.can_request_local_resync(id) {
+                                                    request_local_recovery(
+                                                        &shared,
+                                                        &mut routed.sync,
+                                                        proxy.as_ref(),
+                                                        token,
+                                                        id,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        ViewportBindingToken::Pane {
+                                            pane_kind: PaneKind::Pane,
+                                            ..
+                                        } => {
+                                            if let Some(pane) = pane_syncs.get_mut(id) {
+                                                if pane.routed.sync.can_request_local_resync(id) {
+                                                    request_local_recovery(
+                                                        &shared,
+                                                        &mut pane.routed.sync,
+                                                        proxy.as_ref(),
+                                                        token,
+                                                        id,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    },
+                                    DecodeFailureAction::Ignore => {}
+                                }
+                            }
                         }
                         continue;
                     }
                 };
+                if matches!(ev, DaemonEvent::SessionAttachRefused { .. }) {
+                    // A handoff Claim's daemon-atomic lifetime precondition failed before Grid.
+                    // No renderer projection may survive or process later queued frames.
+                    shared.fail_closed_connection(proxy.as_ref());
+                    break 'reader;
+                }
+                if retired.event_generation_contradicted(&ev, event_route) {
+                    shared.fail_closed_connection(proxy.as_ref());
+                    break 'reader;
+                }
                 // Compatibility for retained daemons started by an older Hydra build: alternate-
                 // screen shrink could serialize a lone wide lead/spacer at a viewport boundary.
                 // Repair ONLY those two provably malformed boundary cells. Interior corruption
@@ -1804,6 +5613,71 @@ pub fn spawn(
                     }
                 }
 
+                let event_id = event_session_id(&ev).map(str::to_string);
+                let pre_token = event_id.as_deref().and_then(|id| {
+                    local_binding_token_for_session(
+                        id,
+                        session_id.as_deref(),
+                        sync.as_ref(),
+                        epoch,
+                        sibling_id.as_deref(),
+                        sibling_sync.as_ref(),
+                        sibling_epoch,
+                        &pane_syncs,
+                    )
+                });
+                let post_token = event_id
+                    .as_deref()
+                    .and_then(|id| shared.binding_token_for_session(id));
+
+                // Reconcile only after capturing the pre-block route. Removed states move into the
+                // bounded durable-exit table; no local cache write occurs during reconciliation.
+                sync_active_session(
+                    &shared,
+                    &mut session_id,
+                    &mut sync,
+                    &mut epoch,
+                    &mut retired,
+                );
+                sync_sibling_session(
+                    &shared,
+                    &mut sibling_id,
+                    &mut sibling_sync,
+                    &mut sibling_epoch,
+                    &mut retired,
+                );
+                sync_pane_sessions(&shared, &mut pane_syncs, &mut pane_generation, &mut retired);
+                retire_shadowed_reader_routes(
+                    session_id.as_deref(),
+                    &mut sibling_id,
+                    &mut sibling_sync,
+                    &mut pane_syncs,
+                    &mut retired,
+                );
+
+                let is_exact_post_attach_echo = matches!(ev, DaemonEvent::Grid { .. })
+                    && event_route.live_output_generation.is_none()
+                    && post_token.as_ref().is_some_and(|token| {
+                        let expected = match token {
+                            ViewportBindingToken::Active(token) => token.output_generation,
+                            ViewportBindingToken::Pane {
+                                output_generation, ..
+                            } => *output_generation,
+                        };
+                        event_route.output_generation == Some(expected)
+                    });
+                if pre_token != post_token && !is_exact_post_attach_echo {
+                    // Ambiguous/stale bytes may still carry the sole exact durable exit, but they
+                    // can never paint or emit terminal side effects under the new binding.
+                    retired.observe_durable_event(&ev, event_route, proxy.as_ref());
+                    continue;
+                }
+                // Never re-stamp an already-read line with a fresh Shared token during dispatch.
+                // This captured authority is the exact pre/post-equal route (or the exact post-bind
+                // Attach echo). A clear/rebind after this point makes commit-time validation fail;
+                // fetching `shared.active_token()` later would let an A line commit under B.
+                let dispatch_token = post_token.clone();
+
                 // Dispatch by the event's session id. A frame for the active session takes the
                 // existing active path; a frame for the rendered sibling takes the sibling path;
                 // a frame for one of the EXTRA non-active panes takes the multi-pane cache path;
@@ -1816,41 +5690,151 @@ pub fn spawn(
                     Sibling,
                     Pane(String),
                 }
-                let route = match event_session_id(&ev) {
-                    Some(id) if id == session_id.as_str() => Route::Active,
+                let route = match event_id.as_deref() {
+                    Some(id) if session_id.as_deref() == Some(id) => Route::Active,
                     Some(id) if sibling_id.as_deref() == Some(id) => Route::Sibling,
                     Some(id) if pane_syncs.contains_key(id) => Route::Pane(id.to_string()),
                     _ => Route::Active,
                 };
                 match route {
                     Route::Sibling => {
-                        if let (Some(s_sync), Some(s_id)) =
+                        if let (Some(routed), Some(s_id)) =
                             (sibling_sync.as_mut(), sibling_id.as_deref())
                         {
-                            handle_sibling_event(
-                                &shared,
-                                s_sync,
-                                proxy.as_ref(),
-                                s_id,
-                                sibling_epoch,
-                                ev,
-                            );
+                            if !routed.event_generation_is_authorized(&ev)
+                                && routed.event_claims_current_route(event_route)
+                            {
+                                shared.fail_closed_connection(proxy.as_ref());
+                                break 'reader;
+                            }
+                            if routed.accepts(&ev, event_route) {
+                                if let (DaemonEvent::Grid { grid, .. }, Some(token)) =
+                                    (&ev, dispatch_token.as_ref())
+                                {
+                                    if shared.note_exact_viewport_grid(token, &grid.generation)
+                                        == Some(false)
+                                    {
+                                        shared.fail_closed_connection(proxy.as_ref());
+                                        break 'reader;
+                                    }
+                                }
+                                let output_generation = routed.output_generation;
+                                handle_sibling_event_for_binding(
+                                    &shared,
+                                    &mut routed.sync,
+                                    proxy.as_ref(),
+                                    s_id,
+                                    sibling_epoch,
+                                    epoch,
+                                    output_generation,
+                                    ev,
+                                );
+                            } else {
+                                retired.observe_durable_event(&ev, event_route, proxy.as_ref());
+                            }
                         }
                     }
                     Route::Pane(id) => {
-                        if let Some(p_sync) = pane_syncs.get_mut(&id) {
-                            handle_pane_event(&shared, p_sync, proxy.as_ref(), &id, ev);
+                        if let Some(pane) = pane_syncs.get_mut(&id) {
+                            if !pane.routed.event_generation_is_authorized(&ev)
+                                && pane.routed.event_claims_current_route(event_route)
+                            {
+                                shared.fail_closed_connection(proxy.as_ref());
+                                break 'reader;
+                            }
+                            if pane.routed.accepts(&ev, event_route) {
+                                if let (DaemonEvent::Grid { grid, .. }, Some(token)) =
+                                    (&ev, dispatch_token.as_ref())
+                                {
+                                    if shared.note_exact_viewport_grid(token, &grid.generation)
+                                        == Some(false)
+                                    {
+                                        shared.fail_closed_connection(proxy.as_ref());
+                                        break 'reader;
+                                    }
+                                }
+                                let output_generation = pane.routed.output_generation;
+                                handle_pane_event_for_binding(
+                                    &shared,
+                                    &mut pane.routed.sync,
+                                    proxy.as_ref(),
+                                    &id,
+                                    pane.epoch,
+                                    epoch,
+                                    output_generation,
+                                    ev,
+                                );
+                            } else {
+                                retired.observe_durable_event(&ev, event_route, proxy.as_ref());
+                            }
                         }
                     }
                     Route::Active => {
-                        handle_event(&shared, &mut sync, proxy.as_ref(), &session_id, ev);
+                        if let (Some(routed), Some(ViewportBindingToken::Active(token))) =
+                            (sync.as_mut(), dispatch_token)
+                        {
+                            if !routed.event_generation_is_authorized(&ev)
+                                && routed.event_claims_current_route(event_route)
+                            {
+                                shared.fail_closed_connection(proxy.as_ref());
+                                break 'reader;
+                            }
+                            if routed.accepts(&ev, event_route) {
+                                if let DaemonEvent::Grid { grid, .. } = &ev {
+                                    if shared.note_exact_viewport_grid(
+                                        &ViewportBindingToken::Active(token.clone()),
+                                        &grid.generation,
+                                    ) == Some(false)
+                                    {
+                                        shared.fail_closed_connection(proxy.as_ref());
+                                        break 'reader;
+                                    }
+                                }
+                                handle_event_for_binding(
+                                    &shared,
+                                    &mut routed.sync,
+                                    proxy.as_ref(),
+                                    &token,
+                                    ev,
+                                );
+                            } else {
+                                retired.observe_durable_event(&ev, event_route, proxy.as_ref());
+                            }
+                        } else {
+                            retired.observe_durable_event(&ev, event_route, proxy.as_ref());
+                        }
                     }
                 }
             }
+            // EOF, read error, or framing termination all revoke the exact connection authority.
+            // Any accepted SessionExited notifications were already delivered in FIFO order before
+            // reaching this point; teardown only removes paint/input/effect authority.
+            // Reader EOF/framing failure invalidates the whole client connection. Shutdown first
+            // to interrupt a writer clone that may be inside a bounded partial write, then abort
+            // queued frames, revoke all local paint authority, and wake the owner exactly once.
+            let _ = reader.get_ref().shutdown(Shutdown::Both);
+            shared.fail_closed_connection(proxy.as_ref());
         });
     }
 
-    shared
+    SpawnedClient {
+        shared,
+        initial_binding: Some(initial_binding),
+        initial_exact_viewport,
+    }
+}
+
+/// Compatibility entrypoint used by ordinary callers and existing client tests that need only the
+/// live shared state. Startup handoff ownership uses [`spawn_with_initial_binding`] so it never
+/// reconstructs publication from mutable state after worker launch.
+#[cfg(test)]
+pub fn spawn(
+    socket_path: String,
+    session_id: String,
+    attachment_handoff: Option<AttachmentHandoffClaim>,
+    proxy: Box<dyn UserEventSender>,
+) -> Arc<Shared> {
+    spawn_with_initial_binding(socket_path, session_id, None, attachment_handoff, proxy).shared
 }
 
 /// Wake the owner event loop to repaint. A closed event loop (window gone) is not
@@ -1884,18 +5868,15 @@ fn notify_session_exit(
 /// bridge — Damage drives live updates. So this always returns `None`. Extracted as a
 /// pure fn purely so the "no Snapshot request on Output" invariant is unit-testable
 /// without standing up a winit event loop.
-/// Should an undecodable event line drive a resync? On the structured-only path a
-/// line we can't parse is a frame lost on the wire; if it was a Damage mutation,
-/// skipping it silently would leave the screen stale forever. So EVERY decode error
-/// (bad envelope, bad payload, oversized damage) requests one fresh authoritative
-/// snapshot. Pulled out as a pure predicate so the policy is unit-testable without a
-/// socket. The cost of an over-eager resync is one extra Snapshot; the cost of NOT
-/// resyncing on a dropped Damage frame is permanent visual staleness — so we resync.
+/// Whether a framing/payload failure requires route-classified state repair. This does not mean
+/// every error requests a Snapshot: an exact current Damage may recover, a current malformed
+/// baseline/direct reply or unattributable envelope fails the connection closed, and a proven
+/// stale/wrong-route frame stays inert.
 fn decode_error_requires_resync(err: &DecodeError) -> bool {
     match err {
-        DecodeError::DamageTooLarge { .. }
-        | DecodeError::BadEnvelope
-        | DecodeError::BadPayload { .. } => true,
+        DecodeError::DamageTooLarge { .. } | DecodeError::BadEnvelope | DecodeError::BadPayload => {
+            true
+        }
     }
 }
 
@@ -1925,17 +5906,14 @@ fn normalize_legacy_snapshot_wide_boundaries(grid: &mut GridSnapshot) -> usize {
     repaired
 }
 
-/// Human-readable log line for a decode failure. Separated from the resync decision so
-/// the message wording can't drift from the policy.
-fn describe_decode_error(err: &DecodeError) -> String {
+/// Fixed, low-cardinality diagnostic category for a decode failure. Never include the raw line,
+/// session id, generation, or serde's error text: malformed terminal-controlled fields may contain
+/// user secrets. The route-specific Recover/Ignore/FailClosed action is logged separately by flow.
+fn describe_decode_error(err: &DecodeError) -> &'static str {
     match err {
-        DecodeError::DamageTooLarge { bytes } => {
-            format!("damage frame {bytes} bytes exceeds cap; resyncing")
-        }
-        DecodeError::BadEnvelope => "event line is not a valid envelope; resyncing".to_string(),
-        DecodeError::BadPayload { message } => {
-            format!("bad event JSON ({message}); resyncing")
-        }
+        DecodeError::DamageTooLarge { .. } => "structured damage frame exceeds limit",
+        DecodeError::BadEnvelope => "structured event envelope decode failed",
+        DecodeError::BadPayload => "structured event payload decode failed",
     }
 }
 
@@ -1949,13 +5927,15 @@ fn on_structured_output(revision: Revision) -> Option<ClientRequest> {
     None
 }
 
-fn handle_event(
+fn handle_event_for_binding(
     shared: &Arc<Shared>,
     sync: &mut SyncState,
     proxy: &dyn UserEventSender,
-    session_id: &str,
+    token: &ActiveBindingToken,
     ev: DaemonEvent,
 ) {
+    let session_id = token.session_id.as_str();
+    let binding = ViewportBindingToken::Active(token.clone());
     match ev {
         DaemonEvent::Grid { id, grid } => {
             // Gate every snapshot through the sync state machine. A wrong-session,
@@ -1969,16 +5949,15 @@ fn handle_event(
             // (trailing output the daemon hasn't shipped us yet). We honor both.
             match sync.on_grid(&id, &grid) {
                 Ok(outcome) => {
+                    shared.clear_recovery(&binding);
                     if outcome.repaint {
                         let rev = grid.revision;
-                        *shared.last_revision.lock().unwrap() = Some((rev, Instant::now()));
-                        shared.publish_primary_grid(Arc::new(grid));
-                        wake(proxy);
+                        if shared.commit_active_grid(token, rev, Arc::new(grid)) {
+                            wake(proxy);
+                        }
                     }
                     if outcome.request_snapshot {
-                        shared.send_request(&ClientRequest::Snapshot {
-                            id: session_id.into(),
-                        });
+                        request_snapshot_after_grid(shared, sync, proxy, &binding);
                     }
                 }
                 Err(reason) => eprintln!("maestro-renderer: rejected snapshot: {reason:?}"),
@@ -1995,9 +5974,7 @@ fn handle_event(
             // Delegate the decision to a pure helper so the "never request a Snapshot"
             // invariant is unit-testable without an event loop. It returns the request
             // (if any) the Output should trigger — structured-only, that is always None.
-            if let Some(req) = on_structured_output(revision) {
-                shared.send_request(&req);
-            }
+            debug_assert!(on_structured_output(revision).is_none());
         }
         DaemonEvent::ResyncRequired { id } => {
             // After lag our view is stale. The daemon GUARANTEES ResyncRequired is
@@ -2006,12 +5983,14 @@ fn handle_event(
             if let Err(reason) = sync.on_resync_required(&id) {
                 eprintln!("maestro-renderer: ignored resync: {reason:?}");
             } else {
-                *shared.last_revision.lock().unwrap() = Some((Revision(u64::MAX), Instant::now()));
+                shared.commit_active_resync(token);
             }
         }
         DaemonEvent::SessionExited { id, code } => {
             if let Ok(Action::Exited) = sync.on_session_exited(&id) {
-                *shared.exited.lock().unwrap() = Some(code);
+                // Local paint commit is binding-gated; the app observation is independently guarded
+                // by the accepted daemon generation and survives viewport clear/rebind races.
+                shared.commit_active_exit(token, code);
                 notify_session_exit(proxy, session_id, code, sync.accepted_generation());
             }
         }
@@ -2031,34 +6010,30 @@ fn handle_event(
             // Clone the held Arc under a short lock so we don't hold `grid` across the
             // apply. (The reader thread is the sole writer of `shared.grid`, so the
             // value can't change underneath us between this read and the commit below.)
-            let held = shared.grid.lock().unwrap().clone();
+            let held = shared.active_grid_for(token);
             let Some(held) = held else {
+                if !shared.active_token_is_current(token) {
+                    return;
+                }
                 // No baseline yet — a damage frame (for OUR session) before the first
                 // Grid can't be applied. Resync once to pull an authoritative baseline.
-                if sync.on_resync_required(session_id).is_ok() {
-                    shared.send_request(&ClientRequest::Snapshot {
-                        id: session_id.into(),
-                    });
-                }
+                request_local_recovery(shared, sync, proxy, &binding, session_id);
                 return;
             };
             match sync.on_damage(&frame.id, &frame, &held) {
                 DamageOutcome::Applied(grid) => {
                     let rev = grid.revision;
-                    *shared.last_revision.lock().unwrap() = Some((rev, Instant::now()));
-                    shared.publish_primary_grid(Arc::from(grid));
-                    wake(proxy);
+                    if shared.commit_active_grid(token, rev, Arc::from(grid)) {
+                        shared.clear_recovery(&binding);
+                        wake(proxy);
+                    }
                 }
                 DamageOutcome::Ignore => {
                     // Duplicate/stale frame — keep the current screen, no resync.
                 }
                 DamageOutcome::Resync { reason } => {
                     eprintln!("maestro-renderer: damage not applicable ({reason:?}); resyncing");
-                    if sync.on_resync_required(session_id).is_ok() {
-                        shared.send_request(&ClientRequest::Snapshot {
-                            id: session_id.into(),
-                        });
-                    }
+                    request_local_recovery(shared, sync, proxy, &binding, session_id);
                 }
             }
         }
@@ -2080,33 +6055,65 @@ fn handle_event(
         } => {
             // The accept/reject + state-update decision is pure (no proxy/event loop), so
             // it is unit-tested directly. We only translate its result into a wake here.
-            if apply_scrollback_rows(
-                shared,
-                session_id,
-                &id,
-                generation,
-                revision,
-                history_len,
-                offset_from_top,
-                rows,
-            ) {
-                wake(proxy);
+            if id == session_id {
+                let repaint = shared.commit_active_scrollback(
+                    token,
+                    generation,
+                    revision,
+                    history_len,
+                    offset_from_top,
+                    rows,
+                );
+                let _ = proxy.send(UserEvent::OutboundWritable);
+                if repaint {
+                    wake(proxy);
+                }
             }
         }
-        DaemonEvent::TerminalBell { id } if id == session_id => {
-            let _ = proxy.send(UserEvent::TerminalBell);
+        DaemonEvent::TerminalBell { id }
+            if id == session_id && sync.accepted_generation().is_some() =>
+        {
+            let _ = proxy.send(UserEvent::TerminalBell {
+                binding: binding.clone(),
+            });
         }
-        DaemonEvent::TerminalTitle { id, title } if id == session_id => {
-            let _ = proxy.send(UserEvent::TerminalTitle { title });
+        DaemonEvent::TerminalTitle { id, title }
+            if id == session_id && sync.accepted_generation().is_some() =>
+        {
+            let _ = proxy.send(UserEvent::TerminalTitle {
+                binding: binding.clone(),
+                title,
+            });
         }
-        DaemonEvent::TerminalClipboardStore { id, text } if id == session_id => {
-            let _ = proxy.send(UserEvent::TerminalClipboardStore { text });
+        DaemonEvent::TerminalClipboardStore { id, text }
+            if id == session_id && sync.accepted_generation().is_some() =>
+        {
+            let _ = proxy.send(UserEvent::TerminalClipboardStore { binding, text });
         }
-        DaemonEvent::TerminalBell { .. }
+        DaemonEvent::DaemonInfo { .. }
+        | DaemonEvent::SessionAttachRefused { .. }
+        | DaemonEvent::TerminalBell { .. }
         | DaemonEvent::TerminalTitle { .. }
         | DaemonEvent::TerminalClipboardStore { .. } => {}
         DaemonEvent::Other => {}
     }
+}
+
+#[cfg(test)]
+fn handle_event(
+    shared: &Arc<Shared>,
+    sync: &mut SyncState,
+    proxy: &dyn UserEventSender,
+    session_id: &str,
+    ev: DaemonEvent,
+) {
+    let Some(token) = shared.active_token() else {
+        return;
+    };
+    if token.session_id != session_id {
+        return;
+    }
+    handle_event_for_binding(shared, sync, proxy, &token, ev);
 }
 
 /// The session id a daemon event is addressed to, used to route a frame to the active
@@ -2123,7 +6130,8 @@ fn event_session_id(ev: &DaemonEvent) -> Option<&str> {
         | DaemonEvent::TerminalTitle { id, .. }
         | DaemonEvent::TerminalClipboardStore { id, .. } => Some(id.as_str()),
         DaemonEvent::Damage { frame } => Some(frame.id.as_str()),
-        DaemonEvent::Error { .. } | DaemonEvent::Other => None,
+        DaemonEvent::DaemonInfo { .. } | DaemonEvent::Error { .. } | DaemonEvent::Other => None,
+        DaemonEvent::SessionAttachRefused { id, .. } => Some(id.as_str()),
     }
 }
 
@@ -2136,27 +6144,34 @@ fn event_session_id(ev: &DaemonEvent) -> Option<&str> {
 /// and the resulting grid is published via [`Shared::apply_sibling_grid`] (id+epoch gated
 /// so a late frame from a previous sibling is dropped). Scrollback rows update the sibling's
 /// own renderer-owned viewport state; raw Output stays ignored on structured-only attaches.
-/// The UI is woken only on an accepted sibling grid, exit, or scrollback update.
-fn handle_sibling_event(
+/// The UI is woken only on an accepted sibling grid, exit, or scrollback update (#gate8).
+#[allow(clippy::too_many_arguments)]
+fn handle_sibling_event_for_binding(
     shared: &Arc<Shared>,
     sync: &mut SyncState,
     proxy: &dyn UserEventSender,
     sibling_id: &str,
     sibling_epoch: u64,
+    viewport_epoch: u64,
+    output_generation: u64,
     ev: DaemonEvent,
 ) {
+    let binding = ViewportBindingToken::Pane {
+        session_id: sibling_id.to_string(),
+        pane_epoch: sibling_epoch,
+        pane_kind: PaneKind::Sibling,
+        viewport_epoch,
+        output_generation,
+    };
     match ev {
         DaemonEvent::Grid { id, grid } => match sync.on_grid(&id, &grid) {
             Ok(outcome) => {
-                if outcome.repaint
-                    && shared.apply_sibling_grid(sibling_id, sibling_epoch, Arc::new(grid))
-                {
+                shared.clear_recovery(&binding);
+                if outcome.repaint && shared.commit_sibling_grid(&binding, Arc::new(grid)) {
                     wake(proxy);
                 }
                 if outcome.request_snapshot {
-                    shared.send_request(&ClientRequest::Snapshot {
-                        id: sibling_id.into(),
-                    });
+                    request_snapshot_after_grid(shared, sync, proxy, &binding);
                 }
             }
             Err(reason) => eprintln!("maestro-renderer: rejected sibling snapshot: {reason:?}"),
@@ -2167,33 +6182,16 @@ fn handle_sibling_event(
             if frame.id.as_str() != sibling_id {
                 return;
             }
-            let held = {
-                let bound = shared.sibling_id.lock().unwrap();
-                if bound.as_deref() != Some(sibling_id) {
-                    return;
-                }
-                let stores = shared.stores.lock().unwrap();
-                match stores.get(sibling_id) {
-                    Some(entry)
-                        if entry.kind == PaneKind::Sibling && entry.epoch == sibling_epoch =>
-                    {
-                        entry.grid.clone()
-                    }
-                    _ => return,
-                }
-            };
+            let held = shared.pane_grid_for_binding(&binding, PaneKind::Sibling);
             let Some(held) = held else {
                 // No sibling baseline yet — request one snapshot to seed the cache.
-                if sync.on_resync_required(sibling_id).is_ok() {
-                    shared.send_request(&ClientRequest::Snapshot {
-                        id: sibling_id.into(),
-                    });
-                }
+                request_local_recovery(shared, sync, proxy, &binding, sibling_id);
                 return;
             };
             match sync.on_damage(&frame.id, &frame, &held) {
                 DamageOutcome::Applied(grid) => {
-                    if shared.apply_sibling_grid(sibling_id, sibling_epoch, Arc::from(grid)) {
+                    if shared.commit_sibling_grid(&binding, Arc::from(grid)) {
+                        shared.clear_recovery(&binding);
                         wake(proxy);
                     }
                 }
@@ -2202,11 +6200,7 @@ fn handle_sibling_event(
                     eprintln!(
                         "maestro-renderer: sibling damage not applicable ({reason:?}); resyncing"
                     );
-                    if sync.on_resync_required(sibling_id).is_ok() {
-                        shared.send_request(&ClientRequest::Snapshot {
-                            id: sibling_id.into(),
-                        });
-                    }
+                    request_local_recovery(shared, sync, proxy, &binding, sibling_id);
                 }
             }
         }
@@ -2217,9 +6211,8 @@ fn handle_sibling_event(
         }
         DaemonEvent::SessionExited { id, code } => {
             if let Ok(Action::Exited) = sync.on_session_exited(&id) {
-                if shared.apply_sibling_exit(sibling_id, sibling_epoch, code) {
-                    notify_session_exit(proxy, sibling_id, code, sync.accepted_generation());
-                }
+                shared.commit_sibling_exit(&binding, code);
+                notify_session_exit(proxy, sibling_id, code, sync.accepted_generation());
             }
         }
         DaemonEvent::ScrollbackRows {
@@ -2230,32 +6223,89 @@ fn handle_sibling_event(
             rows,
             ..
         } => {
-            if shared.apply_sibling_scrollback(
-                sibling_id,
-                sibling_epoch,
+            let repaint = shared.commit_sibling_scrollback(
+                &binding,
                 generation,
                 revision,
                 history_len,
                 offset_from_top,
                 rows,
-            ) {
+            );
+            let _ = proxy.send(UserEvent::OutboundWritable);
+            if repaint {
                 wake(proxy);
             }
+        }
+        DaemonEvent::TerminalBell { id }
+            if id == sibling_id && sync.accepted_generation().is_some() =>
+        {
+            let _ = proxy.send(UserEvent::TerminalBell {
+                binding: binding.clone(),
+            });
+        }
+        DaemonEvent::TerminalTitle { id, title }
+            if id == sibling_id && sync.accepted_generation().is_some() =>
+        {
+            let _ = proxy.send(UserEvent::TerminalTitle {
+                binding: binding.clone(),
+                title,
+            });
+        }
+        DaemonEvent::TerminalClipboardStore { id, text }
+            if id == sibling_id && sync.accepted_generation().is_some() =>
+        {
+            let _ = proxy.send(UserEvent::TerminalClipboardStore { binding, text });
         }
         DaemonEvent::TerminalBell { .. }
         | DaemonEvent::TerminalTitle { .. }
         | DaemonEvent::TerminalClipboardStore { .. }
         | DaemonEvent::Output { .. }
+        | DaemonEvent::DaemonInfo { .. }
+        | DaemonEvent::SessionAttachRefused { .. }
         | DaemonEvent::Error { .. }
         | DaemonEvent::Other => {}
     }
 }
 
+#[cfg(test)]
+fn handle_sibling_event(
+    shared: &Arc<Shared>,
+    sync: &mut SyncState,
+    proxy: &dyn UserEventSender,
+    sibling_id: &str,
+    sibling_epoch: u64,
+    ev: DaemonEvent,
+) {
+    let Some(ViewportBindingToken::Pane {
+        pane_epoch,
+        pane_kind: PaneKind::Sibling,
+        viewport_epoch,
+        output_generation,
+        ..
+    }) = shared.binding_token_for_session(sibling_id)
+    else {
+        return;
+    };
+    if pane_epoch != sibling_epoch {
+        return;
+    }
+    handle_sibling_event_for_binding(
+        shared,
+        sync,
+        proxy,
+        sibling_id,
+        pane_epoch,
+        viewport_epoch,
+        output_generation,
+        ev,
+    );
+}
+
 // ============================================================================
-// Input encoding (pure, unit-testable). These functions PRODUCE bytes for
+// C2 input encoding (pure, unit-testable). These functions PRODUCE bytes for
 // the PTY; they do not parse output, so the "no second VT parser" rule does not
 // apply here. Correct encoding depends on the terminal's current input modes,
-// which the daemon owns and ships on every SnapshotV2.
+// which the daemon owns and now ships on every SnapshotV2 (#C2).
 // ============================================================================
 
 /// The terminal input modes the encoder needs, mirrored from the latest accepted
@@ -2387,7 +6437,7 @@ impl Clipboard for SystemClipboard {
 /// on macOS this is what recovers `b` from Option-b (whose `text` is the glyph `∫`).
 /// It comes from winit's `key_without_modifiers()`; when unavailable, pass `None`.
 ///
-/// Order matters: platform-shortcut suppression comes first — when Super/Command is
+/// Order matters: platform-shortcut suppression FIRST (#3) — when Super/Command is
 /// held we never leak printable input into the PTY, so Cmd-C/V/W behave as app
 /// shortcuts. Then Ctrl chords, then mode-aware named keys, then Alt/Option-as-Meta
 /// (ESC prefix), then plain printable text.
@@ -2398,7 +6448,7 @@ pub fn encode_key(
     mods: &HostModifiers,
     modes: TermModes,
 ) -> Option<String> {
-    // Command/Super suppresses PTY encoding entirely. Application shortcut
+    // #3: Command/Super suppresses PTY encoding entirely. Application shortcut
     // handling (copy/paste/close) precedes the terminal.
     if mods.super_key {
         return None;
@@ -2687,7 +6737,7 @@ pub fn paste_payload(clipboard: &mut dyn Clipboard, modes: TermModes) -> Option<
     encode_paste(&raw, modes.bracketed_paste)
 }
 
-/// Focus change encoding: `\x1b[I` on focus-in, `\x1b[O` on focus-out, but
+/// Focus change encoding (#8): `\x1b[I` on focus-in, `\x1b[O` on focus-out, but
 /// ONLY when focus-reporting mode is enabled; otherwise send nothing.
 pub fn encode_focus(focused: bool, modes: TermModes) -> Option<String> {
     if !modes.focus_reporting {
@@ -2714,7 +6764,7 @@ pub enum CommandPaletteNavKey {
 /// title/query header and the empty-state line are skipped. The returned `usize` is an index INTO
 /// `lines` (not into the action-row sub-sequence), so the caller can flip `selected` flags directly.
 ///
-/// Behavior:
+/// Behavior (matches the slice's contract):
 /// - With no selectable lines: always `None` (keys are still consumed by the caller, but nothing moves).
 /// - `Down` advances to the next selectable line, wrapping the last selectable line to the first.
 /// - `Up` retreats to the previous selectable line, wrapping the first selectable line to the last.
@@ -3062,7 +7112,7 @@ pub fn extract_selection(rows_cells: &[Vec<Cell>], anchor: CellPos, focus: CellP
     lines.join("\n")
 }
 
-/// Latest-wins resize throttle. A burst of distinct geometries during a drag
+/// Latest-wins resize throttle (#7). A burst of distinct geometries during a drag
 /// collapses to at most one send per `min_interval`, and the settled geometry is
 /// always flushed by a trailing call. Time is injected (`now`) so the policy is
 /// pure and unit-testable without a real clock or window.
@@ -3127,6 +7177,14 @@ impl ResizeCoalescer {
         self.last_sent = None;
     }
 
+    /// Roll back the optimistic `flush` bookkeeping when owner-loop admission was refused. The
+    /// latest target stays pending and is immediately retryable; it is not described as daemon-sent.
+    pub fn request_not_admitted(&mut self, dims: (u16, u16)) {
+        self.last_sent = None;
+        self.last_sent_at = None;
+        self.pending = Some(dims);
+    }
+
     /// Whether a geometry is still waiting for a trailing flush.
     pub fn has_pending(&self) -> bool {
         self.pending.is_some()
@@ -3143,7 +7201,7 @@ mod input_tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    /// On the structured-only path a stray `Output` event must be ignored and
+    /// C3.7: on the structured-only path a stray `Output` event must be ignored and
     /// must NOT enqueue a Snapshot request (which would resurrect the polling bridge).
     /// We drive the exact decision the Output arm makes and assert it produces no
     /// request, then confirm the outbound queue stays empty even if we route the
@@ -3160,7 +7218,7 @@ mod input_tests {
 
         // Mirror the production call site: only enqueue if the helper returned Some.
         if let Some(req) = on_structured_output(Revision(123)) {
-            shared.send_request(&req);
+            assert_eq!(shared.send_request(&req), RequestAdmission::Admitted);
         }
         assert_eq!(
             queue.len(),
@@ -3170,9 +7228,12 @@ mod input_tests {
 
         // Sanity: the queue DOES enqueue when something is actually sent — proves the
         // empty assertion above is meaningful, not a dead queue.
-        shared.send_request(&ClientRequest::Snapshot {
-            id: "s1".to_string(),
-        });
+        assert_eq!(
+            shared.send_request(&ClientRequest::Snapshot {
+                id: "s1".to_string(),
+            }),
+            RequestAdmission::Admitted
+        );
         assert_eq!(queue.len(), 1, "a real request enqueues exactly one frame");
     }
 
@@ -4090,81 +8151,86 @@ mod input_tests {
         assert!(c.has_pending());
     }
 
-    // ---- Outbound queue ----
+    // ---- Outbound queue (#55) ----
 
     #[test]
     fn outbound_preserves_strict_fifo_order() {
         let q = OutboundQueue::new();
         for i in 0..5u8 {
-            assert!(q.enqueue(vec![i]));
+            assert_eq!(q.try_enqueue(vec![i]), TryEnqueueOutcome::Admitted);
         }
         for i in 0..5u8 {
-            assert_eq!(q.dequeue(), Some(vec![i]), "FIFO order must be preserved");
+            assert_eq!(
+                q.dequeue().map(|(frame, _)| frame),
+                Some(vec![i]),
+                "FIFO order must be preserved"
+            );
         }
     }
 
     #[test]
-    fn outbound_backpressures_then_admits_after_drain() {
-        // A queue at capacity must BLOCK a further enqueue (never drop), and
-        // admit it once the writer drains room. We drive the drain from another
-        // thread so the blocked producer can make progress.
-        let q = Arc::new(OutboundQueue::new());
+    fn outbound_full_refuses_promptly_then_admits_after_drain_wake() {
+        // Owner/reader producers never wait. A queue at capacity returns typed Full and arms the
+        // next dequeue wake; the caller retains its batch and retries after that transition.
+        let q = OutboundQueue::new();
         // Fill to just under the cap with one big item, plus one more that fits.
         let big = vec![0u8; OUTBOUND_CAP_BYTES - 1];
-        assert!(q.enqueue(big));
-        assert!(q.enqueue(vec![1u8])); // now exactly at cap
+        assert_eq!(q.try_enqueue(big), TryEnqueueOutcome::Admitted);
+        assert_eq!(q.try_enqueue(vec![1u8]), TryEnqueueOutcome::Admitted);
+        assert_eq!(q.try_enqueue(vec![2u8, 3u8]), TryEnqueueOutcome::Full);
 
-        // This enqueue cannot fit (cap exceeded, queue non-empty) -> it blocks.
-        let producer = {
-            let q = Arc::clone(&q);
-            std::thread::spawn(move || q.enqueue(vec![2u8, 3u8]))
-        };
-
-        // Drain the two items; each pop frees room and notifies the producer.
-        assert_eq!(q.dequeue().map(|v| v.len()), Some(OUTBOUND_CAP_BYTES - 1));
-        assert_eq!(q.dequeue(), Some(vec![1u8]));
-
-        // The producer's item is admitted (never dropped) and dequeues in order.
-        assert!(
-            producer.join().unwrap(),
-            "blocked enqueue must eventually admit"
-        );
-        assert_eq!(q.dequeue(), Some(vec![2u8, 3u8]));
+        let (first, wake) = q.dequeue().expect("writer drains first frame");
+        assert_eq!(first.len(), OUTBOUND_CAP_BYTES - 1);
+        assert!(wake, "the capacity transition wakes the retained producer");
+        assert_eq!(q.try_enqueue(vec![2u8, 3u8]), TryEnqueueOutcome::Admitted);
+        assert_eq!(q.dequeue().map(|(frame, _)| frame), Some(vec![1u8]));
+        assert_eq!(q.dequeue().map(|(frame, _)| frame), Some(vec![2u8, 3u8]));
     }
 
     #[test]
-    fn outbound_admits_oversized_item_into_empty_queue() {
-        // A single item larger than the whole cap must still go through (otherwise
-        // a legitimate large paste could deadlock forever).
+    fn outbound_rejects_oversized_item_even_when_empty() {
         let q = OutboundQueue::new();
         let huge = vec![7u8; OUTBOUND_CAP_BYTES + 4096];
-        assert!(
-            q.enqueue(huge.clone()),
-            "oversized item must be admitted, not dropped"
+        assert_eq!(
+            q.try_enqueue(huge),
+            TryEnqueueOutcome::TooLarge,
+            "the documented 1MiB limit is a hard cap"
         );
-        assert_eq!(q.dequeue(), Some(huge));
+        assert_eq!(q.len(), 0, "TooLarge admission is all-or-none");
     }
 
     #[test]
-    fn outbound_close_unblocks_and_drains_remaining() {
-        let q = Arc::new(OutboundQueue::new());
-        assert!(q.enqueue(vec![1u8]));
-        assert!(q.enqueue(vec![2u8]));
-        // Close: a producer blocked on a full queue would now return false, and the
-        // writer's dequeue drains what's buffered, THEN returns None to exit.
+    fn outbound_close_aborts_buffered_frames_and_refuses_later_admission() {
+        let q = OutboundQueue::new();
+        assert_eq!(q.try_enqueue(vec![1u8]), TryEnqueueOutcome::Admitted);
+        assert_eq!(q.try_enqueue(vec![2u8]), TryEnqueueOutcome::Admitted);
         q.close();
         assert_eq!(
-            q.dequeue(),
-            Some(vec![1u8]),
-            "buffered items drain after close"
+            q.len(),
+            0,
+            "fail-closed teardown discards queued secret writes"
         );
-        assert_eq!(q.dequeue(), Some(vec![2u8]));
-        assert_eq!(q.dequeue(), None, "closed + drained -> writer exits");
-        // Enqueue after close is refused (not silently buffered into a dead queue).
-        assert!(!q.enqueue(vec![3u8]));
+        assert_eq!(
+            q.dequeue(),
+            None,
+            "closed queue exits without draining frames"
+        );
+        assert_eq!(q.try_enqueue(vec![3u8]), TryEnqueueOutcome::Closed);
     }
 
-    // ---- Selection hit-test + extraction + copy/interrupt ----
+    #[test]
+    fn outbound_mutex_contention_is_fail_fast_and_requests_immediate_retry() {
+        let q = OutboundQueue::new();
+        let guard = q.inner.lock().unwrap();
+        assert_eq!(
+            q.try_enqueue(vec![1u8]),
+            TryEnqueueOutcome::Contended { wake_now: true }
+        );
+        drop(guard);
+        assert_eq!(q.len(), 0);
+    }
+
+    // ---- P2: selection hit-test + extraction + copy/interrupt ----
 
     fn sel_cell(text: &str, width: u8) -> Cell {
         Cell {
@@ -4182,6 +8248,7 @@ mod input_tests {
             strikeout: false,
             dim: false,
             hidden: false,
+            hyperlink: None,
             width,
         }
     }
@@ -4741,6 +8808,7 @@ mod scrollback_view_tests {
             strikeout: false,
             dim: false,
             hidden: false,
+            hyperlink: None,
             width: 1,
         }
     }
@@ -4784,12 +8852,28 @@ mod scrollback_view_tests {
     /// any `send_request` is observable. Returns the shared state.
     fn shared_with_live(gen: &str, cols: usize, rows: usize) -> Arc<Shared> {
         let (shared, _q) = Shared::with_test_queue();
+        shared
+            .init_active_session("my-session")
+            .expect("fixture installs exact active authority");
         *shared.grid.lock().unwrap() = Some(Arc::new(live_grid(gen, cols, rows, false)));
         shared
     }
 
     fn hist_rows(cols: usize, rows: usize) -> Vec<Vec<Cell>> {
         (0..rows).map(|i| row(&format!("hist{i}"), cols)).collect()
+    }
+
+    fn admit_scrollback_reply(shared: &Arc<Shared>, offset: u32, expected_generation: &str) {
+        let mut scrollback = shared.scrollback.lock().unwrap();
+        let intent = scrollback
+            .advance_intent()
+            .expect("test scroll intent remains representable");
+        scrollback.view_offset = offset;
+        scrollback.admitted_request = Some((
+            intent,
+            offset,
+            SessionGeneration(expected_generation.to_string()),
+        ));
     }
 
     // --- 1: view_offset clamps to [0, history_len] --------------------------
@@ -5089,6 +9173,7 @@ mod scrollback_view_tests {
                 hist_rows(40, 6),
             ))),
             historical_generation: Some(SessionGeneration("g".into())),
+            ..ScrollbackState::default()
         };
         assert!(sb.is_scrolled());
         sb.reset_to_live();
@@ -5098,6 +9183,98 @@ mod scrollback_view_tests {
             "alt-screen reset drops history window"
         );
         assert!(!sb.is_scrolled());
+    }
+
+    #[test]
+    fn primary_and_sibling_screen_transitions_reset_only_their_own_history() {
+        fn seed(sb: &mut ScrollbackState, offset: u32, generation: &str) {
+            sb.view_offset = offset;
+            sb.history_len = Some(100);
+            sb.historical = Some(Arc::new(live_grid(generation, 40, 6, false)));
+            sb.historical_generation = Some(SessionGeneration(generation.to_string()));
+        }
+
+        fn assert_reset(sb: &ScrollbackState) {
+            assert_eq!(sb.view_offset, 0);
+            assert!(sb.history_len.is_none());
+            assert!(sb.historical.is_none());
+            assert!(sb.historical_generation.is_none());
+        }
+
+        let (shared, _queue) = Shared::with_test_queue();
+        let active = shared.init_active_session("primary").unwrap();
+        assert!(shared.commit_active_grid(
+            &active,
+            Revision(1),
+            Arc::new(live_grid("primary-gen", 40, 6, false)),
+        ));
+        let sibling_epoch = shared.set_sibling_session("sibling").unwrap();
+        assert!(shared.apply_sibling_grid(
+            "sibling",
+            sibling_epoch,
+            Arc::new(live_grid("sibling-gen", 40, 6, false)),
+        ));
+
+        {
+            let mut primary = shared.scrollback.lock().unwrap();
+            seed(&mut primary, 5, "primary-gen");
+            let intent = primary.advance_intent().unwrap();
+            primary.admitted_request =
+                Some((intent, 5, SessionGeneration("primary-gen".to_string())));
+        }
+        shared.with_pane_scrollback("sibling", "primary", |sibling| {
+            seed(sibling, 7, "sibling-gen");
+        });
+
+        assert!(shared.commit_active_grid(
+            &active,
+            Revision(2),
+            Arc::new(live_grid("primary-gen", 40, 6, true)),
+        ));
+        assert_reset(&shared.scrollback.lock().unwrap());
+        assert!(!shared.commit_active_scrollback(
+            &active,
+            SessionGeneration("primary-gen".to_string()),
+            Revision(2),
+            100,
+            5,
+            hist_rows(40, 6),
+        ));
+        assert_reset(&shared.scrollback.lock().unwrap());
+        assert!(shared.scrollback.lock().unwrap().admitted_request.is_none());
+        assert_eq!(
+            shared.with_pane_scrollback("sibling", "primary", |sibling| sibling.view_offset),
+            7,
+            "primary transition must not leak into the sibling viewport"
+        );
+
+        seed(&mut shared.scrollback.lock().unwrap(), 4, "primary-gen");
+        assert!(shared.commit_active_grid(
+            &active,
+            Revision(3),
+            Arc::new(live_grid("primary-gen", 40, 6, false)),
+        ));
+        assert_reset(&shared.scrollback.lock().unwrap());
+
+        seed(&mut shared.scrollback.lock().unwrap(), 3, "primary-gen");
+        assert!(shared.apply_sibling_grid(
+            "sibling",
+            sibling_epoch,
+            Arc::new(live_grid("sibling-gen", 40, 6, true)),
+        ));
+        shared.with_pane_scrollback("sibling", "primary", |sibling| {
+            assert_reset(sibling);
+            seed(sibling, 2, "sibling-gen");
+        });
+        assert_eq!(shared.scrollback.lock().unwrap().view_offset, 3);
+
+        assert!(shared.apply_sibling_grid(
+            "sibling",
+            sibling_epoch,
+            Arc::new(live_grid("sibling-gen", 40, 6, false)),
+        ));
+        shared.with_pane_scrollback("sibling", "primary", |sibling| assert_reset(sibling));
+        assert_eq!(shared.scrollback.lock().unwrap().view_offset, 3);
     }
 
     // --- 6: resize forces scrollback off ------------------------------------
@@ -5114,6 +9291,7 @@ mod scrollback_view_tests {
                 hist_rows(40, 6),
             ))),
             historical_generation: None,
+            ..ScrollbackState::default()
         };
         sb.reset_to_live();
         assert_eq!(sb.view_offset, 0);
@@ -5124,10 +9302,37 @@ mod scrollback_view_tests {
     // --- 7: ScrollbackRows for wrong session / generation ignored -----------
 
     #[test]
+    fn scrollback_rows_over_terminal_hyperlink_cell_cap_are_rejected() {
+        let generation = SessionGeneration("gen-a".into());
+        let mut scrollback = ScrollbackState::default();
+        let intent = scrollback.advance_intent().unwrap();
+        scrollback.view_offset = 1;
+        scrollback.admitted_request = Some((intent, 1, generation.clone()));
+        let mut linked = cell("x");
+        linked.hyperlink = Some("https://scrollback-cap.example.test".to_owned());
+
+        assert!(!apply_scrollback_payload(
+            Some(generation.clone()),
+            &mut scrollback,
+            generation,
+            Revision(50),
+            100,
+            1,
+            vec![vec![
+                linked;
+                maestro_protocol::MAX_TERMINAL_LINK_CELLS_PER_FRAME + 1
+            ]],
+        ));
+        assert!(scrollback.admitted_request.is_none());
+        assert!(scrollback.historical.is_none());
+        assert_eq!(scrollback.history_len, None);
+    }
+
+    #[test]
     fn scrollback_rows_wrong_session_ignored() {
         let shared = shared_with_live("gen-a", 40, 6);
         // Scroll up so a valid reply WOULD be adopted.
-        shared.scrollback.lock().unwrap().view_offset = 5;
+        admit_scrollback_reply(&shared, 5, "gen-a");
 
         let woke = apply_scrollback_rows(
             &shared,
@@ -5151,7 +9356,7 @@ mod scrollback_view_tests {
     #[test]
     fn scrollback_rows_stale_generation_ignored() {
         let shared = shared_with_live("gen-a", 40, 6);
-        shared.scrollback.lock().unwrap().view_offset = 5;
+        admit_scrollback_reply(&shared, 5, "gen-b");
 
         // Live grid is gen-a; this reply is for gen-b (session was re-baselined).
         let woke = apply_scrollback_rows(
@@ -5171,12 +9376,66 @@ mod scrollback_view_tests {
         );
     }
 
+    #[test]
+    fn stale_generation_reply_retires_single_slot_before_current_reply() {
+        let mut scrollback = ScrollbackState::default();
+
+        let old_intent = scrollback.advance_intent().unwrap();
+        scrollback.view_offset = 5;
+        scrollback.admitted_request = Some((old_intent, 5, SessionGeneration("gen-old".into())));
+
+        // A new baseline arrives, the user explicitly returns to live, then starts a new scroll
+        // intent against that baseline. The old ordered reply must release the sole admission slot.
+        scrollback.reset_to_live();
+        let current_intent = scrollback.advance_intent().unwrap();
+        scrollback.view_offset = 9;
+        // The single-in-flight transaction cannot admit this until the old reply retires. Model the
+        // owner wake by installing the coalesced current request immediately after that retirement.
+        let pending_current = (current_intent, 9, SessionGeneration("gen-current".into()));
+
+        assert!(!apply_scrollback_payload(
+            Some(SessionGeneration("gen-current".into())),
+            &mut scrollback,
+            SessionGeneration("gen-old".into()),
+            Revision(50),
+            10,
+            5,
+            hist_rows(40, 6),
+        ));
+        assert!(
+            scrollback.admitted_request.is_none(),
+            "the rejected old-generation response retires the one exact in-flight slot"
+        );
+        assert_eq!(scrollback.view_offset, 9);
+        assert!(scrollback.historical.is_none());
+
+        scrollback.admitted_request = Some(pending_current);
+        assert!(apply_scrollback_payload(
+            Some(SessionGeneration("gen-current".into())),
+            &mut scrollback,
+            SessionGeneration("gen-current".into()),
+            Revision(51),
+            100,
+            9,
+            hist_rows(40, 6),
+        ));
+        assert!(scrollback.admitted_request.is_none());
+        assert_eq!(scrollback.view_offset, 9);
+        assert_eq!(
+            scrollback
+                .historical_generation
+                .as_ref()
+                .map(|generation| generation.0.as_str()),
+            Some("gen-current")
+        );
+    }
+
     // --- 8: ScrollbackRows while offset>0 becomes the painted window --------
 
     #[test]
     fn scrollback_rows_while_scrolled_becomes_historical_window() {
         let shared = shared_with_live("gen-a", 40, 6);
-        shared.scrollback.lock().unwrap().view_offset = 10;
+        admit_scrollback_reply(&shared, 10, "gen-a");
 
         let woke = apply_scrollback_rows(
             &shared,
@@ -5211,7 +9470,9 @@ mod scrollback_view_tests {
     #[test]
     fn scrollback_rows_after_return_to_live_does_not_resurrect() {
         let shared = shared_with_live("gen-a", 40, 6);
-        // view_offset == 0 (live).
+        // One query was admitted while scrolled, then a newer local intent returned to live.
+        admit_scrollback_reply(&shared, 5, "gen-a");
+        shared.scrollback.lock().unwrap().reset_to_live();
         let woke = apply_scrollback_rows(
             &shared,
             "my-session",
@@ -5255,11 +9516,14 @@ mod scrollback_view_tests {
             "first PageUp moves even with unknown history"
         );
         shared.scrollback.lock().unwrap().view_offset = new_offset;
-        shared.send_request(&ClientRequest::Scrollback {
-            id: "my-session".to_string(),
-            offset_from_top: new_offset,
-            count: page as u16,
-        });
+        assert_eq!(
+            shared.send_request(&ClientRequest::Scrollback {
+                id: "my-session".to_string(),
+                offset_from_top: new_offset,
+                count: page as u16,
+            }),
+            RequestAdmission::Admitted
+        );
 
         assert_eq!(
             queue.len(),
@@ -5274,7 +9538,7 @@ mod scrollback_view_tests {
     fn no_history_reply_returns_to_live() {
         let shared = shared_with_live("gen-a", 40, 6);
         // We provisionally scrolled up (offset 6) before knowing the length.
-        shared.scrollback.lock().unwrap().view_offset = 6;
+        admit_scrollback_reply(&shared, 6, "gen-a");
 
         let woke = apply_scrollback_rows(
             &shared,
@@ -5300,7 +9564,7 @@ mod scrollback_view_tests {
     fn live_update_while_scrolled_keeps_historical_viewport() {
         let shared = shared_with_live("gen-a", 40, 6);
         // Adopt a historical window at offset 10.
-        shared.scrollback.lock().unwrap().view_offset = 10;
+        admit_scrollback_reply(&shared, 10, "gen-a");
         apply_scrollback_rows(
             &shared,
             "my-session",
@@ -5431,6 +9695,21 @@ mod scrollback_view_tests {
     }
 
     #[test]
+    fn wheel_focus_change_discards_prior_pane_residue() {
+        let mut wheel = WheelAccumulator::default();
+        assert_eq!(wheel.add_pixels(WHEEL_PIXELS_PER_LINE / 2.0), 0);
+
+        wheel.reset();
+
+        assert_eq!(
+            wheel.add_pixels(WHEEL_PIXELS_PER_LINE / 2.0),
+            0,
+            "half a line from the old pane must not complete half a line in the new pane"
+        );
+        assert_eq!(wheel.add_pixels(WHEEL_PIXELS_PER_LINE / 2.0), 1);
+    }
+
+    #[test]
     fn wheel_sign_matches_scroll_action_up_into_history() {
         // Positive accumulated delta maps to ScrollAction::Lines positive = up into
         // history; negative = down toward live. Lock that mapping in.
@@ -5443,80 +9722,53 @@ mod scrollback_view_tests {
     }
 
     #[test]
-    fn wheel_route_mouse_reporting_precedes_alternate_fallback() {
+    fn wheel_input_policy_selects_one_bounded_owner_with_mouse_precedence() {
         assert_eq!(
-            wheel_route(3, true, true),
-            WheelRoute::MouseReport {
-                event: MouseEvent::WheelUp,
+            wheel_input_action_for(0, false, false),
+            WheelInputAction::NoOp
+        );
+        assert_eq!(
+            wheel_input_action_for(0, true, true),
+            WheelInputAction::NoOp,
+            "mouse/alternate modes cannot manufacture a step before accumulation"
+        );
+        assert_eq!(
+            wheel_input_action_for(3, true, true),
+            WheelInputAction::MouseReport {
+                direction: WheelDirection::Up,
                 steps: 3,
             }
         );
         assert_eq!(
-            wheel_route(-2, true, true),
-            WheelRoute::MouseReport {
-                event: MouseEvent::WheelDown,
+            wheel_input_action_for(-2, true, true),
+            WheelInputAction::MouseReport {
+                direction: WheelDirection::Down,
                 steps: 2,
             }
         );
-    }
-
-    #[test]
-    fn wheel_route_alt_screen_without_mouse_uses_cursor_keys() {
+        let cap = MAX_WHEEL_STEPS_PER_EVENT;
         assert_eq!(
-            wheel_route(4, true, false),
-            WheelRoute::AlternateScroll {
-                key: HostNamedKey::ArrowUp,
-                steps: 4,
+            wheel_input_action_for(i64::MAX, false, true),
+            WheelInputAction::AlternateScrollKeys {
+                direction: WheelDirection::Up,
+                steps: cap,
             }
         );
         assert_eq!(
-            wheel_route(-5, true, false),
-            WheelRoute::AlternateScroll {
-                key: HostNamedKey::ArrowDown,
-                steps: 5,
+            wheel_input_action_for(i64::MIN, false, true),
+            WheelInputAction::AlternateScrollKeys {
+                direction: WheelDirection::Down,
+                steps: cap,
             }
         );
-    }
-
-    #[test]
-    fn wheel_route_normal_screen_uses_bounded_renderer_scrollback() {
         assert_eq!(
-            wheel_route(3, false, false),
-            WheelRoute::RendererScroll(ScrollAction::Lines(3))
+            wheel_input_action_for(i64::MAX, false, false),
+            WheelInputAction::RendererScrollback(ScrollAction::Lines(i64::from(cap)))
         );
         assert_eq!(
-            wheel_route(i64::MAX, false, false),
-            WheelRoute::RendererScroll(ScrollAction::Lines(MAX_WHEEL_STEPS_PER_EVENT))
+            wheel_input_action_for(i64::MIN, false, false),
+            WheelInputAction::RendererScrollback(ScrollAction::Lines(-i64::from(cap)))
         );
-        assert_eq!(
-            wheel_route(i64::MIN, false, false),
-            WheelRoute::RendererScroll(ScrollAction::Lines(-MAX_WHEEL_STEPS_PER_EVENT))
-        );
-        assert_eq!(wheel_route(0, true, true), WheelRoute::NoOp);
-    }
-
-    #[test]
-    fn alternate_scroll_keys_honor_application_cursor_mode() {
-        let plain = encode_key(
-            &HostKey::Named(HostNamedKey::ArrowUp),
-            None,
-            None,
-            &HostModifiers::default(),
-            TermModes::default(),
-        );
-        assert_eq!(plain.as_deref(), Some("\x1b[A"));
-
-        let application = encode_key(
-            &HostKey::Named(HostNamedKey::ArrowUp),
-            None,
-            None,
-            &HostModifiers::default(),
-            TermModes {
-                app_cursor: true,
-                ..TermModes::default()
-            },
-        );
-        assert_eq!(application.as_deref(), Some("\x1bOA"));
     }
 }
 
@@ -5524,14 +9776,19 @@ mod scrollback_view_tests {
 mod decode_error_tests {
     use super::*;
 
+    fn route(output: Option<u64>, live: Option<u64>) -> EventRouteMetadata {
+        EventRouteMetadata {
+            output_generation: output,
+            live_output_generation: live,
+        }
+    }
+
     #[test]
     fn every_decode_error_requires_resync() {
-        // A dropped frame may have been a Damage mutation; the structured-only renderer
-        // cannot just log and stay stale. All three decode failures must resync.
+        // Each category requires route-aware repair. The caller still decides between an exact
+        // Snapshot recovery, inert stale-frame rejection, and terminal fail-close.
         assert!(decode_error_requires_resync(&DecodeError::BadEnvelope));
-        assert!(decode_error_requires_resync(&DecodeError::BadPayload {
-            message: "trailing comma".to_string(),
-        }));
+        assert!(decode_error_requires_resync(&DecodeError::BadPayload));
         assert!(decode_error_requires_resync(&DecodeError::DamageTooLarge {
             bytes: 999_999,
         }));
@@ -5541,7 +9798,7 @@ mod decode_error_tests {
     fn malformed_damage_line_decodes_to_resync_decision() {
         // End-to-end through the real decoder: a damage event with a structurally
         // broken payload fails to decode, and that failure is classified as needing a
-        // resync (not a silent skip). This guards the BadPayload path specifically.
+        // route-classified repair (not a silent unconditional skip). This guards BadPayload.
         let line =
             r#"{"ev":"damage","id":"s1","base_revision":1,"revision":2,"ops":[{"bogus":true}]}"#;
         let err = decode_event(line).expect_err("malformed damage payload must not decode");
@@ -5549,6 +9806,1901 @@ mod decode_error_tests {
             decode_error_requires_resync(&err),
             "a malformed damage frame must trigger resync, got {err:?}"
         );
+    }
+
+    #[test]
+    fn payload_decode_diagnostic_never_contains_terminal_controlled_value() {
+        const SENTINEL: &str = "TOP_SECRET_TERMINAL_SENTINEL";
+        let line = format!(r#"{{"ev":"damage","frame":{{"id":"s1","revision":"{SENTINEL}"}}}}"#);
+        let err = decode_event(&line).expect_err("typed Damage field is malformed");
+        assert_eq!(err, DecodeError::BadPayload);
+        assert!(!describe_decode_error(&err).contains(SENTINEL));
+        assert!(
+            !format!("{err:?}").contains(SENTINEL),
+            "DecodeError itself must not retain serde text or raw terminal values"
+        );
+    }
+
+    #[test]
+    fn pending_exact_attach_echo_failure_is_terminal_but_ambiguous_frames_are_inert() {
+        let routed = RoutedSyncState::new("same".to_string(), 41, false);
+
+        assert_eq!(
+            routed.decode_failure_action("same", EventRouteKind::Grid, route(Some(41), None),),
+            DecodeFailureAction::FailClosed,
+            "a malformed exact Attach echo cannot leave the rebound route blank forever"
+        );
+        assert_eq!(
+            routed.decode_failure_action("same", EventRouteKind::Grid, route(None, None),),
+            DecodeFailureAction::Ignore,
+            "an untagged legacy Grid must not repair or perturb a rebound route"
+        );
+        assert_eq!(
+            routed.decode_failure_action("same", EventRouteKind::Grid, route(Some(40), None),),
+            DecodeFailureAction::Ignore,
+            "an old exact echo is stale, not authority for the new route"
+        );
+        assert_eq!(
+            routed.decode_failure_action("other", EventRouteKind::Grid, route(Some(41), None),),
+            DecodeFailureAction::Ignore,
+            "even a matching generation cannot authorize the wrong session id"
+        );
+    }
+
+    #[test]
+    fn confirmed_exact_decode_failures_use_generation_aware_terminal_or_recovery_policy() {
+        let mut routed = RoutedSyncState::new("same".to_string(), 41, false);
+        routed.proof = StreamProof::ExactConfirmed;
+
+        for route in [route(Some(41), None), route(None, Some(41))] {
+            assert_eq!(
+                routed.decode_failure_action("same", EventRouteKind::Grid, route),
+                DecodeFailureAction::FailClosed,
+                "a generation-proven malformed Grid could strand recovery bookkeeping"
+            );
+        }
+        assert_eq!(
+            routed.decode_failure_action(
+                "same",
+                EventRouteKind::ScrollbackRows,
+                route(Some(41), None),
+            ),
+            DecodeFailureAction::FailClosed,
+            "a malformed exact Scrollback reply cannot leave its sole slot occupied"
+        );
+        assert_eq!(
+            routed.decode_failure_action("same", EventRouteKind::Damage, route(None, Some(41)),),
+            DecodeFailureAction::Recover,
+        );
+
+        for kind in [EventRouteKind::Grid, EventRouteKind::ScrollbackRows] {
+            assert_eq!(
+                routed.decode_failure_action("same", kind, route(None, None)),
+                DecodeFailureAction::FailClosed,
+                "current untagged direct replies are ordered after the exact Attach echo"
+            );
+        }
+        for (kind, stale_route) in [
+            (EventRouteKind::Grid, route(Some(40), None)),
+            (EventRouteKind::ScrollbackRows, route(Some(40), None)),
+            (EventRouteKind::Damage, route(None, None)),
+            (EventRouteKind::Damage, route(None, Some(40))),
+        ] {
+            assert_eq!(
+                routed.decode_failure_action("same", kind, stale_route),
+                DecodeFailureAction::Ignore,
+                "untagged or old-generation malformed input must not perturb the current route"
+            );
+        }
+    }
+
+    #[test]
+    fn initial_legacy_route_recovers_only_matching_untagged_damage() {
+        let mut routed = RoutedSyncState::new("initial".to_string(), 1, true);
+        routed.proof = StreamProof::LegacyInitial;
+
+        assert_eq!(
+            routed.decode_failure_action("initial", EventRouteKind::Damage, route(None, None),),
+            DecodeFailureAction::Recover,
+            "the first connection has no older route, so its exact untagged Damage is recoverable"
+        );
+        for (id, kind, route) in [
+            ("other", EventRouteKind::Damage, route(None, None)),
+            ("initial", EventRouteKind::Damage, route(Some(1), None)),
+            ("initial", EventRouteKind::Other, route(None, None)),
+        ] {
+            assert_eq!(
+                routed.decode_failure_action(id, kind, route),
+                DecodeFailureAction::Ignore,
+                "only the exact untagged legacy Damage route is recoverable"
+            );
+        }
+        for kind in [EventRouteKind::Grid, EventRouteKind::ScrollbackRows] {
+            assert_eq!(
+                routed.decode_failure_action("initial", kind, route(None, None)),
+                DecodeFailureAction::FailClosed,
+                "a malformed direct reply on the sole legacy route is terminal"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod reader_terminal_failure_tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+
+    static NEXT_SOCKET: AtomicU64 = AtomicU64::new(1);
+
+    #[derive(Clone)]
+    struct ChannelSender(mpsc::Sender<UserEvent>);
+
+    impl UserEventSender for ChannelSender {
+        fn send(&self, event: UserEvent) -> Result<(), UserEvent> {
+            self.0.send(event).map_err(|error| error.0)
+        }
+
+        fn clone_sender(&self) -> Box<dyn UserEventSender> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn socket_path(_label: &str) -> PathBuf {
+        // macOS limits AF_UNIX paths to 104 bytes, while the per-user TMPDIR can already be quite
+        // long. Keep this test fixture in the system's short, process-unique `/tmp` namespace.
+        PathBuf::from("/tmp").join(format!(
+            "mr-{}-{}.sock",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn spawn_exact_test_client(
+        socket_path: String,
+        session_id: &str,
+        expected_generation: &str,
+        proxy: Box<dyn UserEventSender>,
+    ) -> Arc<Shared> {
+        spawn_with_initial_binding(
+            socket_path,
+            session_id.to_string(),
+            Some(DesiredViewportBinding {
+                primary_session_id: session_id.to_string(),
+                primary_expected_generation: SessionGeneration(expected_generation.to_string()),
+                primary_dims: None,
+                panes: Vec::new(),
+            }),
+            None,
+            proxy,
+        )
+        .shared
+    }
+
+    fn cell() -> Cell {
+        Cell {
+            text: "x".to_string(),
+            fg: crate::wire::Color::Named {
+                name: crate::wire::NamedColor::Foreground,
+            },
+            bg: crate::wire::Color::Named {
+                name: crate::wire::NamedColor::Background,
+            },
+            bold: false,
+            italic: false,
+            underline: Default::default(),
+            inverse: false,
+            strikeout: false,
+            dim: false,
+            hidden: false,
+            hyperlink: None,
+            width: 1,
+        }
+    }
+
+    fn grid(generation: &str, revision: u64) -> GridSnapshot {
+        GridSnapshot {
+            version: crate::sync::SUPPORTED_VERSION,
+            generation: SessionGeneration(generation.to_string()),
+            revision: Revision(revision),
+            base_revision: Revision(revision),
+            cols: 1,
+            rows: 1,
+            rows_cells: vec![vec![cell()]],
+            cursor_line: 0,
+            cursor_col: 0,
+            cursor_visible: true,
+            cursor_shape: CursorShape::Block,
+            alt_screen: false,
+            app_cursor: false,
+            bracketed_paste: false,
+            focus_reporting: false,
+            mouse_report: false,
+            mouse_drag: false,
+            mouse_motion: false,
+            mouse_sgr: false,
+        }
+    }
+
+    fn damage(id: &str, generation: &str, base: u64, revision: u64) -> crate::wire::DamageFrame {
+        use crate::wire::{CursorState, DamageOp, ModeState, DAMAGE_SCHEMA};
+        crate::wire::DamageFrame {
+            schema: DAMAGE_SCHEMA,
+            id: id.to_string(),
+            generation: SessionGeneration(generation.to_string()),
+            base_revision: Revision(base),
+            revision: Revision(revision),
+            cols: 1,
+            rows: 1,
+            cursor: CursorState {
+                line: 0,
+                col: 0,
+                visible: true,
+                shape: CursorShape::Block,
+            },
+            modes: ModeState {
+                alt_screen: false,
+                app_cursor: false,
+                bracketed_paste: false,
+                focus_reporting: false,
+                mouse_report: false,
+                mouse_drag: false,
+                mouse_motion: false,
+                mouse_sgr: false,
+            },
+            ops: vec![DamageOp::ClearAll {
+                cell: Cell {
+                    text: " ".to_string(),
+                    ..cell()
+                },
+            }],
+        }
+    }
+
+    fn write_event(stream: &mut UnixStream, event: DaemonEvent, output_generation: Option<u64>) {
+        let mut value = serde_json::to_value(event).expect("event serializes");
+        if let Some(generation) = output_generation {
+            value["output_generation"] = serde_json::json!(generation);
+        }
+        serde_json::to_writer(&mut *stream, &value).expect("event writes");
+        stream.write_all(b"\n").expect("event delimiter writes");
+    }
+
+    fn write_live_event(stream: &mut UnixStream, event: DaemonEvent, live_output_generation: u64) {
+        let mut value = serde_json::to_value(event).expect("event serializes");
+        value["live_output_generation"] = serde_json::json!(live_output_generation);
+        serde_json::to_writer(&mut *stream, &value).expect("event writes");
+        stream.write_all(b"\n").expect("event delimiter writes");
+    }
+
+    fn oversized_damage_line(id: &str, live_output_generation: u64) -> Vec<u8> {
+        let prefix = format!(
+            "{{\"ev\":\"damage\",\"frame\":{{\"id\":{}}},\"live_output_generation\":{},\"padding\":\"",
+            serde_json::to_string(id).unwrap(),
+            live_output_generation
+        );
+        let mut line = Vec::with_capacity(crate::wire::MAX_DAMAGE_BYTES + prefix.len() + 16);
+        line.extend_from_slice(prefix.as_bytes());
+        line.resize(line.len() + crate::wire::MAX_DAMAGE_BYTES, b'x');
+        line.extend_from_slice(b"\"}\n");
+        line
+    }
+
+    fn assert_no_request_before_timeout(reader: &mut BufReader<UnixStream>) {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Ok(0) => panic!("renderer connection closed while proving request inactivity"),
+            Ok(_) => panic!("unexpected renderer request: {line}"),
+            Err(error) => panic!("unexpected request read failure: {error}"),
+        }
+    }
+
+    fn read_request(reader: &mut BufReader<UnixStream>) -> ClientRequest {
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("request line reads");
+        assert!(!line.is_empty(), "client closed before expected request");
+        serde_json::from_str(&line).expect("request decodes")
+    }
+
+    fn read_initial_plan(reader: &mut BufReader<UnixStream>, stream: &mut UnixStream) -> u64 {
+        assert!(matches!(read_request(reader), ClientRequest::DaemonInfo));
+        write_event(
+            stream,
+            DaemonEvent::DaemonInfo {
+                protocol_version: REQUIRED_MUTATION_PROTOCOL_VERSION,
+                build_version: "test-v3".into(),
+                daemon_instance_id: Some("22222222222242228222222222222222".parse().unwrap()),
+                output_generation_echo: true,
+                child_environment: true,
+                generation_conditional_mutations: true,
+                attachment_aware_conditional_kill: true,
+                generation_conditional_attach: true,
+            },
+            None,
+        );
+        let attach = read_request(reader);
+        let generation = match attach {
+            ClientRequest::Attach {
+                id,
+                output_generation: Some(generation),
+                ..
+            } => {
+                assert_eq!(id, "s");
+                generation
+            }
+            other => panic!("initial request must be exact Attach, got {other:?}"),
+        };
+        assert!(matches!(
+            read_request(reader),
+            ClientRequest::Snapshot { id } if id == "s"
+        ));
+        generation
+    }
+
+    #[test]
+    fn legacy_v2_probe_and_attach_share_socket_across_path_replacement_and_stay_read_only() {
+        let path = socket_path("legacy-v2-read-only");
+        let listener = UnixListener::bind(&path).expect("bind test socket");
+        let replacement_path = path.clone();
+        let (mutation_window_tx, mutation_window_rx) = mpsc::channel();
+        let (painted_tx, painted_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            // A v2 reply downgrades this exact reviewed socket to read-only. Attach/Snapshot must
+            // follow on the same connection so a path replacement cannot receive textual Attach.
+            let (mut probe, _) = listener.accept().expect("accept capability probe");
+            probe
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut probe_reader = BufReader::new(probe.try_clone().unwrap());
+            assert!(matches!(
+                read_request(&mut probe_reader),
+                ClientRequest::DaemonInfo
+            ));
+            write_event(
+                &mut probe,
+                DaemonEvent::DaemonInfo {
+                    protocol_version: 2,
+                    build_version: "retained-v2".into(),
+                    daemon_instance_id: None,
+                    output_generation_echo: false,
+                    child_environment: false,
+                    generation_conditional_mutations: false,
+                    attachment_aware_conditional_kill: false,
+                    generation_conditional_attach: false,
+                },
+                None,
+            );
+            fs::remove_file(&replacement_path).expect("unlink probed socket path");
+            let replacement = UnixListener::bind(&replacement_path)
+                .expect("bind current-v3 replacement between probe and attach");
+            replacement.set_nonblocking(true).unwrap();
+
+            probe
+                .set_read_timeout(Some(Duration::from_millis(300)))
+                .unwrap();
+            let mut stream = probe;
+            let mut reader = probe_reader;
+            assert!(matches!(
+                read_request(&mut reader),
+                ClientRequest::Attach { id, .. } if id == "s"
+            ));
+            assert!(matches!(
+                read_request(&mut reader),
+                ClientRequest::Snapshot { id } if id == "s"
+            ));
+            write_event(
+                &mut stream,
+                DaemonEvent::Grid {
+                    id: "s".to_string(),
+                    grid: grid("legacy-pty", 1),
+                },
+                None,
+            );
+
+            // The client attempts both key input and automatic geometry reconciliation while the
+            // read-only socket is live. Neither request may reach this legacy daemon.
+            assert_no_request_before_timeout(&mut reader);
+            mutation_window_tx.send(()).unwrap();
+
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            assert!(matches!(
+                read_request(&mut reader),
+                ClientRequest::Snapshot { id } if id == "s"
+            ));
+            write_event(
+                &mut stream,
+                DaemonEvent::Grid {
+                    id: "s".to_string(),
+                    grid: grid("legacy-pty", 2),
+                },
+                None,
+            );
+            painted_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("reader consumed later read-only event");
+            assert!(
+                matches!(
+                    replacement.accept(),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                ),
+                "renderer reconnected through the replaced socket path"
+            );
+        });
+
+        let (tx, rx) = mpsc::channel();
+        let shared = spawn(
+            path.to_string_lossy().into_owned(),
+            "s".to_string(),
+            None,
+            Box::new(ChannelSender(tx)),
+        );
+        let first = recv_until(&rx, |event| matches!(event, UserEvent::Redraw));
+        assert!(first
+            .iter()
+            .all(|event| !matches!(event, UserEvent::ConnectionClosed)));
+        assert_eq!(
+            shared
+                .grid
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|grid| grid.revision),
+            Some(Revision(1))
+        );
+        let binding = shared
+            .binding_token_for_session("s")
+            .expect("legacy grid establishes exact local binding");
+        let generation = shared
+            .live_generation_for_binding(&binding)
+            .expect("legacy grid carries PTY generation");
+        let refusal = shared
+            .send_request_batch_for_binding(
+                &binding,
+                &[
+                    ClientRequest::Write {
+                        id: "s".to_string(),
+                        expected_generation: generation.clone(),
+                        data: "keypress".to_string(),
+                    },
+                    ClientRequest::Resize {
+                        id: "s".to_string(),
+                        expected_generation: generation.clone(),
+                        cols: 120,
+                        rows: 40,
+                    },
+                ],
+                &generation,
+                None,
+            )
+            .expect("binding remains current");
+        assert!(refusal.is_mutation_unsupported());
+        mutation_window_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("server observed zero mutation wire bytes");
+        assert!(!shared.connection_is_closed());
+
+        assert!(shared
+            .send_request_batch_for_binding(
+                &binding,
+                &[ClientRequest::Snapshot {
+                    id: "s".to_string(),
+                }],
+                &generation,
+                None,
+            )
+            .is_some_and(RequestAdmission::is_admitted));
+        let second = recv_until(&rx, |_| {
+            shared
+                .grid
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|grid| grid.revision == Revision(2))
+        });
+        assert!(second
+            .iter()
+            .all(|event| !matches!(event, UserEvent::ConnectionClosed)));
+        assert!(!shared.connection_is_closed());
+        painted_tx.send(()).unwrap();
+        server.join().unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn aligned_legacy_error_probe_keeps_same_socket_attach_only() {
+        let path = socket_path("aligned-legacy-error-read-only");
+        let listener = UnixListener::bind(&path).expect("bind legacy error test socket");
+        let (mutation_attempt_tx, mutation_attempt_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept capability probe");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            assert!(matches!(
+                read_request(&mut reader),
+                ClientRequest::DaemonInfo
+            ));
+            write_event(
+                &mut stream,
+                DaemonEvent::Error {
+                    message: "unknown request: daemon_info".to_string(),
+                },
+                None,
+            );
+            assert!(matches!(
+                read_request(&mut reader),
+                ClientRequest::Attach { id, .. } if id == "s"
+            ));
+            assert!(matches!(
+                read_request(&mut reader),
+                ClientRequest::Snapshot { id } if id == "s"
+            ));
+            write_event(
+                &mut stream,
+                DaemonEvent::Grid {
+                    id: "s".to_string(),
+                    grid: grid("legacy-error-pty", 1),
+                },
+                None,
+            );
+            mutation_attempt_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("client attempted locally refused mutations");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(300)))
+                .unwrap();
+            assert_no_request_before_timeout(&mut reader);
+        });
+
+        let (tx, rx) = mpsc::channel();
+        let shared = spawn(
+            path.to_string_lossy().into_owned(),
+            "s".to_string(),
+            None,
+            Box::new(ChannelSender(tx)),
+        );
+        let observed = recv_until(&rx, |event| matches!(event, UserEvent::Redraw));
+        assert!(observed
+            .iter()
+            .all(|event| !matches!(event, UserEvent::ConnectionClosed)));
+        let binding = shared
+            .binding_token_for_session("s")
+            .expect("legacy grid establishes the local binding");
+        let generation = shared
+            .live_generation_for_binding(&binding)
+            .expect("legacy grid carries the PTY generation");
+        let refusal = shared
+            .send_request_batch_for_binding(
+                &binding,
+                &[
+                    ClientRequest::Write {
+                        id: "s".to_string(),
+                        expected_generation: generation.clone(),
+                        data: "keypress".to_string(),
+                    },
+                    ClientRequest::Resize {
+                        id: "s".to_string(),
+                        expected_generation: generation.clone(),
+                        cols: 120,
+                        rows: 40,
+                    },
+                ],
+                &generation,
+                None,
+            )
+            .expect("binding remains current");
+        assert!(refusal.is_mutation_unsupported());
+        mutation_attempt_tx.send(()).unwrap();
+        server.join().unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn current_v3_without_exact_authority_never_downgrades_to_textual_attach() {
+        for generation_capable in [false, true] {
+            let path = socket_path(if generation_capable {
+                "current-v3-no-authority-full"
+            } else {
+                "current-v3-no-authority-incomplete"
+            });
+            let listener = UnixListener::bind(&path).expect("bind current-v3 test socket");
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept capability probe");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                assert!(matches!(
+                    read_request(&mut reader),
+                    ClientRequest::DaemonInfo
+                ));
+                write_event(
+                    &mut stream,
+                    DaemonEvent::DaemonInfo {
+                        protocol_version: REQUIRED_MUTATION_PROTOCOL_VERSION,
+                        build_version: "current-v3".into(),
+                        daemon_instance_id: Some(
+                            "22222222222242228222222222222222".parse().unwrap(),
+                        ),
+                        output_generation_echo: generation_capable,
+                        child_environment: generation_capable,
+                        generation_conditional_mutations: generation_capable,
+                        attachment_aware_conditional_kill: generation_capable,
+                        generation_conditional_attach: generation_capable,
+                    },
+                    None,
+                );
+                stream.flush().unwrap();
+                let mut remainder = String::new();
+                reader.read_to_string(&mut remainder).unwrap();
+                remainder
+            });
+
+            let (tx, _rx) = mpsc::channel();
+            let spawned = spawn_with_initial_binding(
+                path.to_string_lossy().into_owned(),
+                "s".to_string(),
+                None,
+                None,
+                Box::new(ChannelSender(tx)),
+            );
+            assert!(spawned.initial_binding.is_none());
+            assert!(spawned.initial_exact_viewport.is_none());
+            assert!(spawned.shared.connection_is_closed());
+            assert_eq!(
+                server.join().unwrap(),
+                "",
+                "current v3 received an authority-free Attach/Snapshot"
+            );
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    fn recv_until(
+        rx: &mpsc::Receiver<UserEvent>,
+        predicate: impl Fn(&UserEvent) -> bool,
+    ) -> Vec<UserEvent> {
+        let mut observed = Vec::new();
+        loop {
+            let event = rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("reader emitted expected owner event before deadline");
+            let done = predicate(&event);
+            observed.push(event);
+            if done {
+                return observed;
+            }
+        }
+    }
+
+    fn assert_terminally_neutral(shared: &Shared, observed: &[UserEvent]) {
+        assert!(shared.active_snapshot().id.is_none());
+        assert!(shared.grid.lock().unwrap().is_none());
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event, UserEvent::ConnectionClosed))
+                .count(),
+            1,
+            "terminal corruption emits one idempotent owner close"
+        );
+        assert!(
+            observed
+                .iter()
+                .all(|event| !matches!(event, UserEvent::TerminalBell { .. })),
+            "buffered effects after a terminal frame must never escape"
+        );
+    }
+
+    #[test]
+    fn same_id_rebind_rejects_multiple_old_frames_but_preserves_exact_retired_exit() {
+        enum ServerCommand {
+            ReadRebindAndSendOld,
+            SendNewBaseline,
+            Close,
+        }
+
+        let path = socket_path("same-id-generation-barrier");
+        let listener = UnixListener::bind(&path).expect("bind test socket");
+        let (server_tx, server_rx) = mpsc::channel();
+        let (generation_tx, generation_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept exact renderer");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let generation_a = read_initial_plan(&mut reader, &mut stream);
+            write_event(
+                &mut stream,
+                DaemonEvent::Grid {
+                    id: "s".to_string(),
+                    grid: grid("pty-a", 1),
+                },
+                Some(generation_a),
+            );
+
+            assert!(matches!(
+                server_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+                ServerCommand::ReadRebindAndSendOld
+            ));
+            assert!(matches!(
+                read_request(&mut reader),
+                ClientRequest::Detach { id } if id == "s"
+            ));
+            let generation_b = match read_request(&mut reader) {
+                ClientRequest::Attach {
+                    id,
+                    output_generation: Some(generation),
+                    ..
+                } => {
+                    assert_eq!(id, "s");
+                    generation
+                }
+                other => panic!("same-id rebind requires exact Attach, got {other:?}"),
+            };
+            assert_ne!(generation_a, generation_b);
+            assert!(matches!(
+                read_request(&mut reader),
+                ClientRequest::Snapshot { id } if id == "s"
+            ));
+            generation_tx.send((generation_a, generation_b)).unwrap();
+
+            // This untagged direct Grid can have been queued before the Detach/Attach FIFO cut. The
+            // new ExactPending binding must not mistake it for its baseline. Every later tagged A
+            // event is likewise rejected by generation, including all terminal side effects.
+            write_event(
+                &mut stream,
+                DaemonEvent::Grid {
+                    id: "s".to_string(),
+                    grid: grid("pty-a", 2),
+                },
+                None,
+            );
+            write_live_event(
+                &mut stream,
+                DaemonEvent::Grid {
+                    id: "s".to_string(),
+                    grid: grid("pty-a", 3),
+                },
+                generation_a,
+            );
+            write_live_event(
+                &mut stream,
+                DaemonEvent::Damage {
+                    frame: damage("s", "pty-a", 1, 2),
+                },
+                generation_a,
+            );
+            write_live_event(
+                &mut stream,
+                DaemonEvent::TerminalTitle {
+                    id: "s".to_string(),
+                    title: Some("stale-title".to_string()),
+                },
+                generation_a,
+            );
+            write_live_event(
+                &mut stream,
+                DaemonEvent::TerminalBell {
+                    id: "s".to_string(),
+                },
+                generation_a,
+            );
+            write_live_event(
+                &mut stream,
+                DaemonEvent::TerminalClipboardStore {
+                    id: "s".to_string(),
+                    text: "stale-clipboard".to_string(),
+                },
+                generation_a,
+            );
+            for _ in 0..2 {
+                write_live_event(
+                    &mut stream,
+                    DaemonEvent::SessionExited {
+                        id: "s".to_string(),
+                        code: Some(17),
+                    },
+                    generation_a,
+                );
+            }
+
+            assert!(matches!(
+                server_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+                ServerCommand::SendNewBaseline
+            ));
+            write_event(
+                &mut stream,
+                DaemonEvent::Grid {
+                    id: "s".to_string(),
+                    grid: grid("pty-b", 1),
+                },
+                Some(generation_b),
+            );
+            write_live_event(
+                &mut stream,
+                DaemonEvent::Damage {
+                    frame: damage("s", "pty-b", 1, 2),
+                },
+                generation_b,
+            );
+            assert!(matches!(
+                server_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+                ServerCommand::Close
+            ));
+        });
+
+        let (event_tx, event_rx) = mpsc::channel();
+        let shared = spawn_exact_test_client(
+            path.to_string_lossy().into_owned(),
+            "s",
+            "pty-a",
+            Box::new(ChannelSender(event_tx)),
+        );
+        let initial = recv_until(&event_rx, |event| matches!(event, UserEvent::Redraw));
+        assert!(initial.iter().all(|event| !matches!(
+            event,
+            UserEvent::TerminalBell { .. }
+                | UserEvent::TerminalTitle { .. }
+                | UserEvent::TerminalClipboardStore { .. }
+        )));
+        assert_eq!(
+            shared
+                .grid
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|grid| grid.generation.0.as_str()),
+            Some("pty-a")
+        );
+
+        shared.clear_viewport();
+        let token_b = shared
+            .try_bind_viewport(
+                &DesiredViewportBinding {
+                    primary_session_id: "s".to_string(),
+                    primary_expected_generation: SessionGeneration("pty-b".to_string()),
+                    primary_dims: None,
+                    panes: Vec::new(),
+                },
+                &["s".to_string()],
+                None,
+            )
+            .expect("same-id aggregate rebind admits");
+        server_tx.send(ServerCommand::ReadRebindAndSendOld).unwrap();
+        let (generation_a, generation_b) =
+            generation_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(token_b.primary().output_generation, generation_b);
+        assert_ne!(generation_a, generation_b);
+
+        let old_observed = recv_until(&event_rx, |event| {
+            matches!(event, UserEvent::SessionExited { .. })
+        });
+        assert!(
+            shared.grid.lock().unwrap().is_none(),
+            "B remains blank until its exact Attach echo"
+        );
+        assert_eq!(
+            old_observed
+                .iter()
+                .filter(|event| matches!(event, UserEvent::SessionExited { .. }))
+                .count(),
+            1,
+            "the exact retired A exit is durable but idempotent"
+        );
+        assert!(old_observed.iter().any(|event| matches!(
+            event,
+            UserEvent::SessionExited {
+                session_id,
+                code: Some(17),
+                observed_generation: Some(observed),
+            } if session_id == "s" && observed == "pty-a"
+        )));
+        assert!(old_observed.iter().all(|event| !matches!(
+            event,
+            UserEvent::TerminalBell { .. }
+                | UserEvent::TerminalTitle { .. }
+                | UserEvent::TerminalClipboardStore { .. }
+        )));
+
+        server_tx.send(ServerCommand::SendNewBaseline).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "B baseline/damage did not commit"
+            );
+            let event = event_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+            assert!(
+                matches!(event, UserEvent::Redraw | UserEvent::OutboundWritable),
+                "no duplicate retired exit or stale effect may precede B's redraw: {event:?}"
+            );
+            if matches!(event, UserEvent::Redraw)
+                && shared.grid.lock().unwrap().as_ref().is_some_and(|grid| {
+                    grid.generation.0 == "pty-b" && grid.revision == Revision(2)
+                })
+            {
+                break;
+            }
+        }
+        server_tx.send(ServerCommand::Close).unwrap();
+        server.join().unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn oversized_damage_recovers_only_for_the_exact_current_live_generation() {
+        enum ServerCommand {
+            ReadRebind,
+            SendStaleOversize,
+            Close,
+        }
+        enum ServerStatus {
+            ExactRecovered(u64),
+            Rebound(u64),
+            StaleInert,
+        }
+
+        let path = socket_path("oversized-damage-route");
+        let listener = UnixListener::bind(&path).expect("bind test socket");
+        let (server_tx, server_rx) = mpsc::channel();
+        let (status_tx, status_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept renderer");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let generation_a = read_initial_plan(&mut reader, &mut stream);
+            write_event(
+                &mut stream,
+                DaemonEvent::Grid {
+                    id: "s".to_string(),
+                    grid: grid("pty-a", 1),
+                },
+                Some(generation_a),
+            );
+
+            stream
+                .write_all(&oversized_damage_line("s", generation_a))
+                .unwrap();
+            assert!(matches!(
+                read_request(&mut reader),
+                ClientRequest::Snapshot { id } if id == "s"
+            ));
+            stream
+                .set_read_timeout(Some(Duration::from_millis(250)))
+                .unwrap();
+            assert_no_request_before_timeout(&mut reader);
+            status_tx
+                .send(ServerStatus::ExactRecovered(generation_a))
+                .unwrap();
+
+            assert!(matches!(
+                server_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+                ServerCommand::ReadRebind
+            ));
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            assert!(matches!(
+                read_request(&mut reader),
+                ClientRequest::Detach { id } if id == "s"
+            ));
+            let generation_b = match read_request(&mut reader) {
+                ClientRequest::Attach {
+                    id,
+                    output_generation: Some(generation),
+                    ..
+                } => {
+                    assert_eq!(id, "s");
+                    generation
+                }
+                other => panic!("rebind Attach expected, got {other:?}"),
+            };
+            assert!(matches!(
+                read_request(&mut reader),
+                ClientRequest::Snapshot { id } if id == "s"
+            ));
+            write_event(
+                &mut stream,
+                DaemonEvent::Grid {
+                    id: "s".to_string(),
+                    grid: grid("pty-b", 1),
+                },
+                Some(generation_b),
+            );
+            status_tx.send(ServerStatus::Rebound(generation_b)).unwrap();
+
+            assert!(matches!(
+                server_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+                ServerCommand::SendStaleOversize
+            ));
+            stream
+                .write_all(&oversized_damage_line("s", generation_a))
+                .unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            assert_no_request_before_timeout(&mut reader);
+            status_tx.send(ServerStatus::StaleInert).unwrap();
+            assert!(matches!(
+                server_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+                ServerCommand::Close
+            ));
+        });
+
+        let (event_tx, event_rx) = mpsc::channel();
+        let shared = spawn_exact_test_client(
+            path.to_string_lossy().into_owned(),
+            "s",
+            "pty-a",
+            Box::new(ChannelSender(event_tx)),
+        );
+        let _ = recv_until(&event_rx, |event| matches!(event, UserEvent::Redraw));
+        let generation_a = match status_rx.recv_timeout(Duration::from_secs(3)).unwrap() {
+            ServerStatus::ExactRecovered(generation) => generation,
+            _ => unreachable!(),
+        };
+
+        shared.clear_viewport();
+        let token_b = shared
+            .try_bind_viewport(
+                &DesiredViewportBinding {
+                    primary_session_id: "s".to_string(),
+                    primary_expected_generation: SessionGeneration("pty-b".to_string()),
+                    primary_dims: None,
+                    panes: Vec::new(),
+                },
+                &["s".to_string()],
+                None,
+            )
+            .expect("same-id B rebind admits");
+        server_tx.send(ServerCommand::ReadRebind).unwrap();
+        let generation_b = match status_rx.recv_timeout(Duration::from_secs(3)).unwrap() {
+            ServerStatus::Rebound(generation) => generation,
+            _ => unreachable!(),
+        };
+        assert_eq!(token_b.primary().output_generation, generation_b);
+        assert_ne!(generation_a, generation_b);
+        let _ = recv_until(&event_rx, |event| matches!(event, UserEvent::Redraw));
+        assert_eq!(
+            shared
+                .grid
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|grid| grid.generation.0.as_str()),
+            Some("pty-b")
+        );
+
+        server_tx.send(ServerCommand::SendStaleOversize).unwrap();
+        assert!(matches!(
+            status_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+            ServerStatus::StaleInert
+        ));
+        assert_eq!(
+            shared
+                .grid
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|grid| grid.generation.0.as_str()),
+            Some("pty-b"),
+            "stale oversized A cannot perturb B's SyncState or paint cache"
+        );
+        server_tx.send(ServerCommand::Close).unwrap();
+        server.join().unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn output_generation_and_active_epoch_exhaustion_never_publish_or_preserve_authority() {
+        let daemon_instance: maestro_shell::DaemonInstanceId =
+            "44444444444444448444444444444444".parse().unwrap();
+        let shared = Shared::with_test_handoff_peer_facts(Some(daemon_instance), None);
+        shared
+            .next_output_generation
+            .store(u64::MAX, Ordering::Release);
+        assert!(matches!(
+            shared.try_bind_viewport(
+                &DesiredViewportBinding {
+                    primary_session_id: "never-bound".to_string(),
+                    primary_expected_generation: SessionGeneration("never-generation".to_string()),
+                    primary_dims: Some((80, 24)),
+                    panes: Vec::new(),
+                },
+                &[],
+                None,
+            ),
+            Err(ActiveBindFailure::AuthorityExhausted)
+        ));
+        assert!(shared.active_snapshot().id.is_none());
+        assert!(shared.drain_test_requests().is_empty());
+
+        let shared = Shared::with_test_outbound();
+        let active = shared.init_active_session("old").unwrap();
+        assert!(shared.commit_active_grid(&active, Revision(1), Arc::new(grid("pty-old", 1))));
+        shared.set_sibling_session("sibling").unwrap();
+        shared.set_pane_sessions(&["pane"]).unwrap();
+        shared.active.lock().unwrap().epoch = u64::MAX;
+        assert!(shared.set_active_session("new").is_none());
+        assert!(shared.active_snapshot().id.is_none());
+        assert!(shared.grid.lock().unwrap().is_none());
+        assert!(shared.sibling_snapshot().id.is_none());
+        assert!(shared.pane_ids().is_empty());
+        assert!(shared.drain_test_requests().is_empty());
+
+        // Clear is authority revocation even when no numeric successor exists. MAX remains a
+        // terminal-neutral sentinel; it is never wrapped/reused for a later live incarnation.
+        shared.clear_viewport();
+        assert_eq!(shared.active.lock().unwrap().epoch, u64::MAX);
+        assert!(shared.active_snapshot().id.is_none());
+        assert!(shared.set_active_session("still-refused").is_none());
+        assert!(shared.active_snapshot().id.is_none());
+    }
+
+    #[test]
+    fn exact_three_route_viewport_is_one_all_or_none_generation_bound_batch() {
+        let daemon_instance: maestro_shell::DaemonInstanceId =
+            "33333333333343338333333333333333".parse().unwrap();
+        let shared = Shared::with_test_handoff_peer_facts(Some(daemon_instance), None);
+        let desired = DesiredViewportBinding {
+            primary_session_id: "primary".to_string(),
+            primary_expected_generation: SessionGeneration("gen-primary".to_string()),
+            primary_dims: Some((120, 40)),
+            panes: vec![
+                DesiredPaneBinding {
+                    session_id: "pane-b".to_string(),
+                    expected_generation: SessionGeneration("gen-b".to_string()),
+                    dims: Some((60, 40)),
+                },
+                DesiredPaneBinding {
+                    session_id: "pane-c".to_string(),
+                    expected_generation: SessionGeneration("gen-c".to_string()),
+                    dims: Some((60, 40)),
+                },
+            ],
+        };
+
+        let binding = shared
+            .try_bind_viewport(
+                &desired,
+                &[
+                    "old-z".to_string(),
+                    "old-a".to_string(),
+                    "old-z".to_string(),
+                ],
+                None,
+            )
+            .expect("the complete exact cohort admits atomically");
+        assert_eq!(binding.status(), ExactViewportAdmissionStatus::Pending);
+
+        let requests = shared.drain_test_requests();
+        assert_eq!(requests.len(), 8);
+        assert!(matches!(
+            &requests[0],
+            ClientRequest::Detach { id } if id == "old-a"
+        ));
+        assert!(matches!(
+            &requests[1],
+            ClientRequest::Detach { id } if id == "old-z"
+        ));
+
+        let mut attaches = Vec::new();
+        for pair in requests[2..].chunks_exact(2) {
+            let ClientRequest::Attach {
+                id,
+                expected_session_generation: Some(expected_generation),
+                output_generation: Some(output_generation),
+                handoff: None,
+                ..
+            } = &pair[0]
+            else {
+                panic!("each route must begin with one exact Attach: {:?}", pair[0]);
+            };
+            assert!(matches!(
+                &pair[1],
+                ClientRequest::Snapshot { id: snapshot_id } if snapshot_id == id
+            ));
+            attaches.push((
+                id.as_str(),
+                expected_generation.as_str(),
+                *output_generation,
+            ));
+        }
+        assert_eq!(
+            attaches
+                .iter()
+                .map(|(id, generation, _)| (*id, *generation))
+                .collect::<Vec<_>>(),
+            vec![
+                ("primary", "gen-primary"),
+                ("pane-b", "gen-b"),
+                ("pane-c", "gen-c"),
+            ]
+        );
+        let output_generations = attaches
+            .iter()
+            .map(|(_, _, output_generation)| *output_generation)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(output_generations.len(), 3);
+        assert!(output_generations.iter().all(|generation| *generation != 0));
+        assert!(requests
+            .iter()
+            .all(|request| !matches!(request, ClientRequest::Resize { .. })));
+
+        let active = shared.active.lock().unwrap();
+        assert_eq!(active.id.as_deref(), Some("primary"));
+        assert_eq!(
+            active
+                .expected_generation
+                .as_ref()
+                .map(|generation| generation.0.as_str()),
+            Some("gen-primary")
+        );
+        drop(active);
+        for (id, expected) in [("pane-b", "gen-b"), ("pane-c", "gen-c")] {
+            let stores = shared.stores.lock().unwrap();
+            let pane = stores.get(id).expect("exact pane store");
+            assert_eq!(
+                pane.expected_generation
+                    .as_ref()
+                    .map(|generation| generation.0.as_str()),
+                Some(expected)
+            );
+            assert!(pane.grid.is_none(), "no partial viewport is paintable");
+        }
+    }
+
+    #[test]
+    fn exact_viewport_refuses_missing_capability_or_duplicate_role_before_wire() {
+        let desired = DesiredViewportBinding {
+            primary_session_id: "primary".to_string(),
+            primary_expected_generation: SessionGeneration("gen-primary".to_string()),
+            primary_dims: None,
+            panes: vec![DesiredPaneBinding {
+                session_id: "pane".to_string(),
+                expected_generation: SessionGeneration("gen-pane".to_string()),
+                dims: None,
+            }],
+        };
+        let unsupported = Shared::with_test_outbound();
+        assert!(matches!(
+            unsupported.try_bind_viewport(&desired, &[], None),
+            Err(ActiveBindFailure::HandoffPeerMismatch)
+        ));
+        assert!(unsupported.drain_test_requests().is_empty());
+        assert!(unsupported.active_snapshot().id.is_none());
+
+        let daemon_instance: maestro_shell::DaemonInstanceId =
+            "33333333333343338333333333333333".parse().unwrap();
+        let supported = Shared::with_test_handoff_peer_facts(Some(daemon_instance), None);
+        let duplicate = DesiredViewportBinding {
+            primary_session_id: "same".to_string(),
+            primary_expected_generation: SessionGeneration("gen-a".to_string()),
+            primary_dims: None,
+            panes: vec![DesiredPaneBinding {
+                session_id: "same".to_string(),
+                expected_generation: SessionGeneration("gen-b".to_string()),
+                dims: None,
+            }],
+        };
+        assert!(matches!(
+            supported.try_bind_viewport(&duplicate, &[], None),
+            Err(ActiveBindFailure::AuthorityExhausted)
+        ));
+        assert!(supported.drain_test_requests().is_empty());
+        assert!(supported.active_snapshot().id.is_none());
+    }
+
+    #[test]
+    fn pane_and_sibling_counter_exhaustion_revokes_caches_without_epoch_collision() {
+        let shared = Shared::with_test_outbound();
+        shared.init_active_session("primary").unwrap();
+
+        shared.set_sibling_session("old-sibling").unwrap();
+        *shared.sibling_epoch.lock().unwrap() = u64::MAX;
+        assert!(shared.set_sibling_session("new-sibling").is_none());
+        assert!(shared.sibling_snapshot().id.is_none());
+        assert!(shared
+            .stores
+            .lock()
+            .unwrap()
+            .values()
+            .all(|entry| entry.kind != PaneKind::Sibling));
+        shared.clear_sibling_session();
+        assert_eq!(*shared.sibling_epoch.lock().unwrap(), u64::MAX);
+
+        shared.set_pane_sessions(&["old-pane"]).unwrap();
+        *shared.pane_generation.lock().unwrap() = u64::MAX;
+        shared.clear_pane_sessions();
+        assert!(shared.pane_ids().is_empty());
+        assert_eq!(*shared.pane_generation.lock().unwrap(), u64::MAX);
+        assert!(shared.set_pane_sessions(&["new-pane"]).is_none());
+        assert!(shared.pane_ids().is_empty());
+
+        let shared = Shared::with_test_outbound();
+        shared.init_active_session("primary").unwrap();
+        shared.next_pane_epoch.store(u64::MAX, Ordering::Release);
+        assert!(shared.set_pane_sessions(&["never-authorized"]).is_none());
+        assert!(shared.pane_ids().is_empty());
+        assert_eq!(shared.next_pane_epoch.load(Ordering::Acquire), u64::MAX);
+    }
+
+    #[test]
+    fn reader_reconcile_uses_full_binding_when_saturated_epoch_is_numerically_equal() {
+        let shared = Shared::with_test_outbound();
+        {
+            let mut active = shared.active.lock().unwrap();
+            active.id = Some("new".to_string());
+            active.epoch = u64::MAX;
+            active.output_generation = Some(22);
+        }
+        let mut session_id = Some("old".to_string());
+        let mut sync = Some(RoutedSyncState::new("old".to_string(), 11, false));
+        let mut local_epoch = u64::MAX;
+        let mut retired = RetiredExitBindings::default();
+
+        assert!(sync_active_session(
+            &shared,
+            &mut session_id,
+            &mut sync,
+            &mut local_epoch,
+            &mut retired,
+        ));
+        assert_eq!(session_id.as_deref(), Some("new"));
+        assert_eq!(sync.as_ref().map(|state| state.output_generation), Some(22));
+        assert!(retired.by_output_generation.contains_key(&11));
+        assert_eq!(local_epoch, u64::MAX);
+    }
+
+    #[test]
+    fn unattributable_bad_envelope_fails_closed_before_later_buffered_effect() {
+        let path = socket_path("bad-envelope");
+        let listener = UnixListener::bind(&path).expect("bind test socket");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept renderer");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let generation = read_initial_plan(&mut reader, &mut stream);
+            stream
+                .write_all(
+                    format!(
+                        "not-json\n{{\"ev\":\"terminal_bell\",\"id\":\"s\",\"live_output_generation\":{generation}}}\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+        let (tx, rx) = mpsc::channel();
+        let shared = spawn_exact_test_client(
+            path.to_string_lossy().into_owned(),
+            "s",
+            "pty-a",
+            Box::new(ChannelSender(tx)),
+        );
+        let observed = recv_until(&rx, |event| matches!(event, UserEvent::ConnectionClosed));
+        server.join().unwrap();
+        let _ = fs::remove_file(path);
+        assert_terminally_neutral(&shared, &observed);
+    }
+
+    #[test]
+    fn stateful_damage_envelope_missing_frame_id_fails_closed() {
+        let path = socket_path("damage-missing-id");
+        let listener = UnixListener::bind(&path).expect("bind test socket");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept renderer");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let generation = read_initial_plan(&mut reader, &mut stream);
+            stream
+                .write_all(
+                    format!(
+                        "{{\"ev\":\"damage\",\"frame\":{{\"bad\":true}}}}\n{{\"ev\":\"terminal_bell\",\"id\":\"s\",\"live_output_generation\":{generation}}}\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+        let (tx, rx) = mpsc::channel();
+        let shared = spawn_exact_test_client(
+            path.to_string_lossy().into_owned(),
+            "s",
+            "pty-a",
+            Box::new(ChannelSender(tx)),
+        );
+        let observed = recv_until(&rx, |event| matches!(event, UserEvent::ConnectionClosed));
+        server.join().unwrap();
+        let _ = fs::remove_file(path);
+        assert_terminally_neutral(&shared, &observed);
+    }
+
+    #[test]
+    fn exact_confirmed_untagged_malformed_grid_is_terminal_and_stops_buffered_effects() {
+        let path = socket_path("bad-grid");
+        let listener = UnixListener::bind(&path).expect("bind test socket");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept renderer");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let generation = read_initial_plan(&mut reader, &mut stream);
+            write_event(
+                &mut stream,
+                DaemonEvent::Grid {
+                    id: "s".to_string(),
+                    grid: grid("pty-a", 1),
+                },
+                Some(generation),
+            );
+            stream
+                .write_all(
+                    format!(
+                        "{{\"ev\":\"grid\",\"id\":\"s\",\"grid\":{{\"bad\":true}}}}\n{{\"ev\":\"terminal_bell\",\"id\":\"s\",\"live_output_generation\":{generation}}}\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+        let (tx, rx) = mpsc::channel();
+        let shared = spawn_exact_test_client(
+            path.to_string_lossy().into_owned(),
+            "s",
+            "pty-a",
+            Box::new(ChannelSender(tx)),
+        );
+        let observed = recv_until(&rx, |event| matches!(event, UserEvent::ConnectionClosed));
+        server.join().unwrap();
+        let _ = fs::remove_file(path);
+        assert!(observed
+            .iter()
+            .any(|event| matches!(event, UserEvent::Redraw)));
+        assert_terminally_neutral(&shared, &observed);
+    }
+
+    #[test]
+    fn canonical_untagged_malformed_scrollback_reply_fails_closed() {
+        let path = socket_path("bad-scrollback");
+        let listener = UnixListener::bind(&path).expect("bind test socket");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept renderer");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let generation = read_initial_plan(&mut reader, &mut stream);
+            write_event(
+                &mut stream,
+                DaemonEvent::Grid {
+                    id: "s".to_string(),
+                    grid: grid("pty-a", 1),
+                },
+                Some(generation),
+            );
+            assert!(matches!(
+                read_request(&mut reader),
+                ClientRequest::Scrollback { id, .. } if id == "s"
+            ));
+            stream
+                .write_all(b"{\"ev\":\"scrollback_rows\",\"id\":\"s\",\"rows\":\"bad\"}\n")
+                .unwrap();
+        });
+        let (tx, rx) = mpsc::channel();
+        let shared = spawn_exact_test_client(
+            path.to_string_lossy().into_owned(),
+            "s",
+            "pty-a",
+            Box::new(ChannelSender(tx)),
+        );
+        let _ = recv_until(&rx, |event| matches!(event, UserEvent::Redraw));
+        let PreparedScrollAction::Moved {
+            binding,
+            request,
+            count,
+        } = shared.prepare_scroll_action("s", "s", ScrollAction::Lines(1))
+        else {
+            panic!("baseline permits one scroll request");
+        };
+        assert!(shared
+            .send_request_batch_for_binding(
+                &binding,
+                &[ClientRequest::Scrollback {
+                    id: "s".to_string(),
+                    offset_from_top: request.requested_offset,
+                    count,
+                }],
+                &request.expected_generation,
+                Some(&request),
+            )
+            .is_some_and(RequestAdmission::is_admitted));
+        let observed = recv_until(&rx, |event| matches!(event, UserEvent::ConnectionClosed));
+        server.join().unwrap();
+        let _ = fs::remove_file(path);
+        assert_terminally_neutral(&shared, &observed);
+    }
+
+    #[test]
+    fn initial_legacy_malformed_damage_recovers_then_malformed_grid_fails_closed() {
+        let path = socket_path("legacy-recovery");
+        let listener = UnixListener::bind(&path).expect("bind test socket");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept capability probe");
+            probe
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut probe_reader = BufReader::new(probe.try_clone().unwrap());
+            assert!(matches!(
+                read_request(&mut probe_reader),
+                ClientRequest::DaemonInfo
+            ));
+            write_event(
+                &mut probe,
+                DaemonEvent::DaemonInfo {
+                    protocol_version: 2,
+                    build_version: "retained-v2".into(),
+                    daemon_instance_id: None,
+                    output_generation_echo: false,
+                    child_environment: false,
+                    generation_conditional_mutations: false,
+                    attachment_aware_conditional_kill: false,
+                    generation_conditional_attach: false,
+                },
+                None,
+            );
+
+            probe
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut stream = probe;
+            let mut reader = probe_reader;
+            assert!(matches!(
+                read_request(&mut reader),
+                ClientRequest::Attach {
+                    id,
+                    expected_session_generation: None,
+                    handoff: None,
+                    ..
+                } if id == "s"
+            ));
+            assert!(matches!(
+                read_request(&mut reader),
+                ClientRequest::Snapshot { id } if id == "s"
+            ));
+            write_event(
+                &mut stream,
+                DaemonEvent::Grid {
+                    id: "s".to_string(),
+                    grid: grid("legacy-pty", 1),
+                },
+                None,
+            );
+            stream
+                .write_all(b"{\"ev\":\"damage\",\"frame\":{\"id\":\"s\",\"bad\":true}}\n")
+                .unwrap();
+            assert!(matches!(
+                read_request(&mut reader),
+                ClientRequest::Snapshot { id } if id == "s"
+            ));
+            stream
+                .write_all(b"{\"ev\":\"grid\",\"id\":\"s\",\"grid\":{\"bad\":true}}\n")
+                .unwrap();
+        });
+        let (tx, rx) = mpsc::channel();
+        let shared = spawn(
+            path.to_string_lossy().into_owned(),
+            "s".to_string(),
+            None,
+            Box::new(ChannelSender(tx)),
+        );
+        let observed = recv_until(&rx, |event| matches!(event, UserEvent::ConnectionClosed));
+        server.join().unwrap();
+        let _ = fs::remove_file(path);
+        assert!(observed
+            .iter()
+            .any(|event| matches!(event, UserEvent::Redraw)));
+        assert_terminally_neutral(&shared, &observed);
+    }
+
+    #[test]
+    fn fail_closed_teardown_recovers_poisoned_authority_grid_and_store_locks() {
+        let (shared, queue) = Shared::with_test_queue();
+        shared.init_active_session("s").unwrap();
+        *shared.grid.lock().unwrap() = Some(Arc::new(grid("pty-a", 1)));
+        shared.set_pane_sessions(&["pane"]).unwrap();
+        assert!(shared
+            .send_request(&ClientRequest::Write {
+                id: "s".to_string(),
+                expected_generation: SessionGeneration("pty-a".into()),
+                data: "queued-secret".to_string(),
+            })
+            .is_admitted());
+
+        for poison in [
+            {
+                let shared = Arc::clone(&shared);
+                thread::spawn(move || {
+                    let _guard = shared.active.lock().unwrap();
+                    panic!("poison active authority");
+                })
+            },
+            {
+                let shared = Arc::clone(&shared);
+                thread::spawn(move || {
+                    let _guard = shared.grid.lock().unwrap();
+                    panic!("poison primary grid");
+                })
+            },
+            {
+                let shared = Arc::clone(&shared);
+                thread::spawn(move || {
+                    let _guard = shared.stores.lock().unwrap();
+                    panic!("poison pane stores");
+                })
+            },
+        ] {
+            assert!(poison.join().is_err());
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let sender = ChannelSender(tx);
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            shared.fail_closed_connection(&sender)
+        }))
+        .expect("terminal teardown must recover poison rather than panic");
+
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            UserEvent::ConnectionClosed
+        ));
+        assert!(shared.active_snapshot().id.is_none());
+        assert!(shared.grid.lock().unwrap().is_none());
+        assert!(shared.stores.lock().unwrap().is_empty());
+        assert!(
+            queue.drain_requests().is_empty(),
+            "queued secret was aborted"
+        );
+        assert!(matches!(
+            shared.send_request(&ClientRequest::Snapshot {
+                id: "s".to_string()
+            }),
+            RequestAdmission::Unavailable {
+                reason: OutboundUnavailable::Closed,
+                ..
+            }
+        ));
+
+        // The connection latch remains exactly-once even after poison recovery.
+        shared.fail_closed_connection(&sender);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn connection_latch_projects_neutral_before_teardown_can_acquire_active_lock() {
+        let (shared, queue) = Shared::with_test_queue();
+        let active_token = shared.init_active_session("s").unwrap();
+        assert!(shared.commit_active_grid(&active_token, Revision(1), Arc::new(grid("pty-a", 1))));
+        shared.set_pane_sessions(&["pane"]).unwrap();
+        let pane_token = shared.binding_token_for_session("pane").unwrap();
+        let active_binding = ViewportBindingToken::Active(active_token.clone());
+
+        // Hold the authority mutex so terminal teardown must stop after publishing its atomic latch.
+        let held_active = shared.active.lock().unwrap();
+        let held_queue = queue.inner.lock().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let closing = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || shared.fail_closed_connection(&ChannelSender(tx)))
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !shared.connection_closed.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "fail-close did not publish its latch"
+            );
+            thread::yield_now();
+        }
+
+        // Every new authority/paint/effect/input predicate observes neutral from the latch without
+        // waiting for the deliberately-held mutex. Teardown will erase the physical leaves later.
+        let started = Instant::now();
+        assert!(shared.active_snapshot().id.is_none());
+        assert!(shared.active_token().is_none());
+        assert!(!shared.active_token_is_current(&active_token));
+        assert!(!shared.viewport_token_is_current(&active_binding));
+        assert!(!shared.viewport_token_is_current(&pane_token));
+        assert!(shared.binding_token_for_session("s").is_none());
+        assert!(shared.pane_paint("s", "s").paint_grid().is_none());
+        assert!(!shared.commit_active_grid(
+            &active_token,
+            Revision(2),
+            Arc::new(grid("must-not-commit", 2))
+        ));
+        assert!(matches!(
+            shared.send_request(&ClientRequest::Write {
+                id: "s".to_string(),
+                expected_generation: SessionGeneration("pty-a".into()),
+                data: "must-not-send".to_string(),
+            }),
+            RequestAdmission::Unavailable {
+                reason: OutboundUnavailable::Closed,
+                ..
+            }
+        ));
+        assert!(started.elapsed() < Duration::from_millis(200));
+
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            UserEvent::ConnectionClosed
+        ));
+        assert!(rx.try_recv().is_err());
+
+        drop(held_queue);
+        // After the queue abort completes, teardown is still deliberately blocked on active.
+        assert!(shared.active_snapshot().id.is_none());
+        drop(held_active);
+        closing.join().unwrap();
+        assert!(rx.try_recv().is_err());
+        assert!(shared.grid.lock().unwrap().is_none());
+        assert!(shared.stores.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn active_snapshot_that_prechecked_before_fail_close_cannot_return_stale_authority() {
+        let (shared, _queue) = Shared::with_test_queue();
+        shared.init_active_session("s").unwrap();
+
+        let held_active = shared.active.lock().unwrap();
+        let (prechecked_tx, prechecked_rx) = mpsc::channel();
+        let snapshot = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || {
+                shared.active_snapshot_with_prelock_hook(|| prechecked_tx.send(()).unwrap())
+            })
+        };
+        prechecked_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("snapshot passed its initial latch check before blocking on active");
+
+        let (event_tx, event_rx) = mpsc::channel();
+        let closing = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || shared.fail_closed_connection(&ChannelSender(event_tx)))
+        };
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            UserEvent::ConnectionClosed
+        ));
+        assert!(shared.connection_is_closed());
+
+        drop(held_active);
+        assert!(
+            snapshot.join().unwrap().id.is_none(),
+            "the post-lock latch check must erase authority captured after fail-close"
+        );
+        closing.join().unwrap();
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn active_scroll_intent_captured_on_generation_a_cannot_be_admitted_after_b() {
+        let (shared, queue) = Shared::with_test_queue();
+        let token = shared.init_active_session("s").unwrap();
+        assert!(shared.commit_active_grid(&token, Revision(1), Arc::new(grid("pty-a", 1))));
+        let PreparedScrollAction::Moved {
+            binding,
+            request,
+            count,
+        } = shared.prepare_scroll_action("s", "s", ScrollAction::Lines(1))
+        else {
+            panic!("generation A produces one scroll intent");
+        };
+
+        // Deterministic pause point: the gesture already mutated A's view, but queue admission has
+        // not run. A live Grid rolls the exact binding to generation B and resets the viewport.
+        assert!(shared.commit_active_grid(&token, Revision(1), Arc::new(grid("pty-b", 1))));
+        assert_eq!(shared.scrollback.lock().unwrap().view_offset, 0);
+        assert!(shared
+            .send_request_batch_for_binding(
+                &binding,
+                &[ClientRequest::Scrollback {
+                    id: "s".to_string(),
+                    offset_from_top: request.requested_offset,
+                    count,
+                }],
+                &request.expected_generation,
+                Some(&request),
+            )
+            .is_none());
+        assert!(queue.drain_requests().is_empty());
+        assert_eq!(shared.scrollback.lock().unwrap().view_offset, 0);
+    }
+
+    #[test]
+    fn pane_scroll_intent_captured_on_generation_a_cannot_be_admitted_after_b() {
+        let (shared, queue) = Shared::with_test_queue();
+        shared.init_active_session("primary").unwrap();
+        shared.set_pane_sessions(&["pane"]).unwrap();
+        let epoch = shared.pane_epoch("pane").unwrap();
+        assert!(shared.apply_pane_grid("pane", epoch, Arc::new(grid("pty-a", 1))));
+        let PreparedScrollAction::Moved {
+            binding,
+            request,
+            count,
+        } = shared.prepare_scroll_action("pane", "primary", ScrollAction::Lines(1))
+        else {
+            panic!("pane generation A produces one scroll intent");
+        };
+
+        assert!(shared.apply_pane_grid("pane", epoch, Arc::new(grid("pty-b", 1))));
+        assert_eq!(
+            shared.with_pane_scrollback("pane", "primary", |scrollback| scrollback.view_offset),
+            0
+        );
+        assert!(shared
+            .send_request_batch_for_binding(
+                &binding,
+                &[ClientRequest::Scrollback {
+                    id: "pane".to_string(),
+                    offset_from_top: request.requested_offset,
+                    count,
+                }],
+                &request.expected_generation,
+                Some(&request),
+            )
+            .is_none());
+        assert!(queue.drain_requests().is_empty());
+    }
+
+    #[test]
+    fn retained_owner_batch_generation_proof_drops_write_and_resize_after_pty_rollover() {
+        let (shared, queue) = Shared::with_test_queue();
+        let token = shared.init_active_session("s").unwrap();
+        assert!(shared.commit_active_grid(&token, Revision(1), Arc::new(grid("pty-a", 1))));
+        let binding = ViewportBindingToken::Active(token.clone());
+        let expected = SessionGeneration("pty-a".to_string());
+
+        assert!(shared.commit_active_grid(&token, Revision(1), Arc::new(grid("pty-b", 1))));
+        assert!(shared
+            .send_request_batch_for_binding(
+                &binding,
+                &[
+                    ClientRequest::Write {
+                        id: "s".to_string(),
+                        expected_generation: expected.clone(),
+                        data: "old-input".to_string(),
+                    },
+                    ClientRequest::Resize {
+                        id: "s".to_string(),
+                        expected_generation: expected.clone(),
+                        cols: 80,
+                        rows: 24,
+                    },
+                ],
+                &expected,
+                None,
+            )
+            .is_none());
+        assert!(queue.drain_requests().is_empty());
     }
 }
 
@@ -5593,6 +11745,7 @@ mod rebind_tests {
             strikeout: false,
             dim: false,
             hidden: false,
+            hyperlink: None,
             width: 1,
         }
     }
@@ -5619,6 +11772,39 @@ mod rebind_tests {
             mouse_motion: false,
             mouse_sgr: false,
         }
+    }
+
+    fn admit_scrollback_query(
+        shared: &Arc<Shared>,
+        id: &str,
+        primary_id: &str,
+        action: ScrollAction,
+        expected_offset: u32,
+    ) {
+        let PreparedScrollAction::Moved {
+            binding,
+            request,
+            count,
+        } = shared.prepare_scroll_action(id, primary_id, action)
+        else {
+            panic!("scroll action for {id} must produce one exact query");
+        };
+        assert_eq!(request.requested_offset, expected_offset);
+        let queued = ClientRequest::Scrollback {
+            id: id.to_string(),
+            offset_from_top: request.requested_offset,
+            count,
+        };
+        let admission = shared
+            .send_request_batch_for_binding(
+                &binding,
+                std::slice::from_ref(&queued),
+                &request.expected_generation,
+                Some(&request),
+            )
+            .expect("binding remains exact through admission");
+        assert!(admission.is_admitted());
+        assert_eq!(shared.drain_test_requests(), vec![queued]);
     }
 
     fn damage(id: &str, gen: &str, base: u64, rev: u64) -> crate::wire::DamageFrame {
@@ -5656,9 +11842,9 @@ mod rebind_tests {
     // --- pure switch-plan ordering ------------------------------------------
 
     #[test]
-    fn switch_plan_with_dims_is_detach_attach_resize_snapshot_in_order() {
-        let plan = plan_attach_switch("old", "new", Some((120, 40)));
-        assert_eq!(plan.len(), 4);
+    fn switch_plan_with_dims_is_read_only_detach_attach_snapshot_in_order() {
+        let plan = plan_attach_switch("old", "new", Some((120, 40)), 77);
+        assert_eq!(plan.len(), 3);
         match &plan[0] {
             ClientRequest::Detach { id } => assert_eq!(id, "old"),
             other => panic!("first request must be Detach{{old}}, got {other:?}"),
@@ -5667,33 +11853,50 @@ mod rebind_tests {
             ClientRequest::Attach {
                 id,
                 want_raw_output,
+                output_generation,
+                handoff,
+                ..
             } => {
                 assert_eq!(id, "new");
                 assert!(!want_raw_output, "switch attach must be structured-only");
+                assert_eq!(*output_generation, Some(77));
+                assert!(handoff.is_none());
             }
             other => panic!("second request must be Attach{{new}}, got {other:?}"),
         }
         match &plan[2] {
-            ClientRequest::Resize { id, cols, rows } => {
-                assert_eq!(id, "new");
-                assert_eq!((*cols, *rows), (120, 40));
-            }
-            other => panic!("third request must be Resize{{new}}, got {other:?}"),
-        }
-        match &plan[3] {
             ClientRequest::Snapshot { id } => assert_eq!(id, "new"),
-            other => panic!("fourth request must be Snapshot{{new}}, got {other:?}"),
+            other => panic!("third request must be Snapshot{{new}}, got {other:?}"),
         }
+        assert!(!plan.iter().any(Shared::request_is_terminal_mutation));
+    }
+
+    #[test]
+    fn switch_plan_never_emits_an_empty_detach_id() {
+        let plan = plan_attach_switch("", "new", None, 77);
+        assert_eq!(plan.len(), 2);
+        assert!(matches!(
+            &plan[0],
+            ClientRequest::Attach { id, output_generation: Some(77), .. } if id == "new"
+        ));
+        assert!(matches!(
+            &plan[1],
+            ClientRequest::Snapshot { id } if id == "new"
+        ));
+        assert!(!plan
+            .iter()
+            .any(|request| matches!(request, ClientRequest::Detach { id } if id.is_empty())));
     }
 
     #[test]
     fn switch_plan_without_dims_omits_resize() {
-        let plan = plan_attach_switch("old", "new", None);
-        assert_eq!(plan.len(), 2, "no geometry -> no Resize");
+        let plan = plan_attach_switch("old", "new", None, 78);
+        assert_eq!(plan.len(), 3, "no geometry omits Resize but keeps baseline");
         assert!(matches!(&plan[0], ClientRequest::Detach { id } if id == "old"));
         assert!(
-            matches!(&plan[1], ClientRequest::Attach { id, want_raw_output } if id == "new" && !*want_raw_output)
+            matches!(&plan[1], ClientRequest::Attach { id, want_raw_output, output_generation: Some(78), .. } if id == "new" && !*want_raw_output)
         );
+        assert!(matches!(&plan[2], ClientRequest::Snapshot { id } if id == "new"));
     }
 
     #[test]
@@ -5764,23 +11967,27 @@ mod rebind_tests {
     #[test]
     fn set_active_session_bumps_epoch_and_swaps_id() {
         let shared = Arc::new(Shared::default());
-        shared.init_active_session("s-old");
+        let old = shared.init_active_session("s-old").unwrap();
         let before = shared.active_snapshot();
         assert_eq!(
             before,
             ActiveSession {
-                id: "s-old".into(),
-                epoch: 0
+                id: Some("s-old".into()),
+                epoch: old.epoch,
+                output_generation: Some(old.output_generation),
+                expected_generation: None,
             }
         );
 
-        let epoch = shared.set_active_session("s-new");
-        assert_eq!(epoch, 1);
+        let token = shared.set_active_session("s-new").unwrap();
+        assert_eq!(token.epoch, old.epoch + 1);
         assert_eq!(
             shared.active_snapshot(),
             ActiveSession {
-                id: "s-new".into(),
-                epoch: 1
+                id: Some("s-new".into()),
+                epoch: token.epoch,
+                output_generation: Some(token.output_generation),
+                expected_generation: None,
             }
         );
     }
@@ -5788,16 +11995,25 @@ mod rebind_tests {
     #[test]
     fn sync_active_session_rebinds_reader_id_and_sync_and_resets_state() {
         let shared = Arc::new(Shared::default());
-        shared.init_active_session("s-old");
+        let old = shared.init_active_session("s-old").unwrap();
 
         // The reader's thread-locals, as in `spawn`.
-        let mut session_id = "s-old".to_string();
-        let mut sync = SyncState::new(session_id.clone());
-        let mut epoch = 0u64;
+        let mut session_id = Some("s-old".to_string());
+        let mut sync = Some(RoutedSyncState::new(
+            "s-old".to_string(),
+            old.output_generation,
+            true,
+        ));
+        let mut epoch = old.epoch;
+        let mut retired = RetiredExitBindings::default();
 
         // Bring the old session to Synchronized and seed shared state that a switch
         // must clear so stale rows can't paint as the new session.
-        sync.on_grid("s-old", &grid("gen-old", 100)).unwrap();
+        sync.as_mut()
+            .unwrap()
+            .sync
+            .on_grid("s-old", &grid("gen-old", 100))
+            .unwrap();
         *shared.grid.lock().unwrap() = Some(Arc::new(grid("gen-old", 100)));
         *shared.exited.lock().unwrap() = Some(Some(0));
         shared.scrollback.lock().unwrap().view_offset = 5;
@@ -5807,7 +12023,8 @@ mod rebind_tests {
             &shared,
             &mut session_id,
             &mut sync,
-            &mut epoch
+            &mut epoch,
+            &mut retired,
         ));
 
         // The UI thread switches.
@@ -5816,13 +12033,17 @@ mod rebind_tests {
             &shared,
             &mut session_id,
             &mut sync,
-            &mut epoch
+            &mut epoch,
+            &mut retired,
         ));
 
         // Reader thread-locals now follow the new session.
-        assert_eq!(session_id, "s-new");
-        assert_eq!(epoch, 1);
-        assert_eq!(sync.phase(), SyncPhase::AwaitingBaseline);
+        assert_eq!(session_id.as_deref(), Some("s-new"));
+        assert_eq!(epoch, shared.active_snapshot().epoch);
+        assert_eq!(
+            sync.as_ref().unwrap().sync.phase(),
+            SyncPhase::AwaitingBaseline
+        );
 
         // Shared published state was reset (no stale old-session rows survive).
         assert!(shared.grid.lock().unwrap().is_none());
@@ -5834,43 +12055,67 @@ mod rebind_tests {
     #[test]
     fn old_session_frame_rejected_and_new_session_baseline_accepted_after_switch() {
         let shared = Arc::new(Shared::default());
-        shared.init_active_session("s-old");
-        let mut session_id = "s-old".to_string();
-        let mut sync = SyncState::new(session_id.clone());
-        let mut epoch = 0u64;
-        sync.on_grid("s-old", &grid("gen-old", 100)).unwrap();
+        let old = shared.init_active_session("s-old").unwrap();
+        let mut session_id = Some("s-old".to_string());
+        let mut sync = Some(RoutedSyncState::new(
+            "s-old".to_string(),
+            old.output_generation,
+            true,
+        ));
+        let mut epoch = old.epoch;
+        let mut retired = RetiredExitBindings::default();
+        sync.as_mut()
+            .unwrap()
+            .sync
+            .on_grid("s-old", &grid("gen-old", 100))
+            .unwrap();
 
         // Switch to the new session; the reader rebases on its next event.
         shared.set_active_session("s-new");
-        sync_active_session(&shared, &mut session_id, &mut sync, &mut epoch);
+        sync_active_session(
+            &shared,
+            &mut session_id,
+            &mut sync,
+            &mut epoch,
+            &mut retired,
+        );
 
         // A LATE frame still tagged with the old session id is rejected — it cannot
         // repaint over the new session.
-        let stale = sync.on_grid("s-old", &grid("gen-old", 101));
+        let stale = sync
+            .as_mut()
+            .unwrap()
+            .sync
+            .on_grid("s-old", &grid("gen-old", 101));
         assert_eq!(stale, Err(Reject::WrongSession));
 
         // The new session's baseline is accepted into the fresh `SyncState`.
         let outcome = sync
+            .as_mut()
+            .unwrap()
+            .sync
             .on_grid("s-new", &grid("gen-new", 1))
             .expect("new-session baseline must be accepted");
         assert!(outcome.repaint, "the new baseline must paint");
-        assert_eq!(sync.phase(), SyncPhase::Synchronized);
+        assert_eq!(sync.as_ref().unwrap().sync.phase(), SyncPhase::Synchronized);
     }
 
     #[test]
     fn pane_to_active_promotion_reader_reconcile_cannot_detach_or_freeze_new_primary() {
         let (shared, queue) = Shared::with_test_queue();
-        shared.init_active_session("C");
+        let old = shared.init_active_session("C").unwrap();
 
         // SetTabStrip arrives before AttachSession: while C is still primary, the just-created D is
         // temporarily a non-primary pane member. The UI owns its Attach; reader adoption is local.
         shared.set_pane_sessions(&["A", "B", "D"]);
         let mut pane_syncs = HashMap::new();
         let mut pane_generation = 0;
+        let mut retired = RetiredExitBindings::default();
         assert!(sync_pane_sessions(
             &shared,
             &mut pane_syncs,
-            &mut pane_generation
+            &mut pane_generation,
+            &mut retired,
         ));
         assert!(pane_syncs.contains_key("D"));
         assert!(queue.drain_requests().is_empty());
@@ -5880,21 +12125,27 @@ mod rebind_tests {
         // daemon forwarder and leaving D frozen at its initial blank baseline.
         shared.set_active_session("D");
         shared.set_pane_sessions(&["A", "B", "C"]);
-        let mut active_id = "C".to_string();
-        let mut active_sync = SyncState::new("C");
-        let mut active_epoch = 0;
+        let mut active_id = Some("C".to_string());
+        let mut active_sync = Some(RoutedSyncState::new(
+            "C".to_string(),
+            old.output_generation,
+            true,
+        ));
+        let mut active_epoch = old.epoch;
         assert!(sync_active_session(
             &shared,
             &mut active_id,
             &mut active_sync,
-            &mut active_epoch
+            &mut active_epoch,
+            &mut retired,
         ));
         assert!(sync_pane_sessions(
             &shared,
             &mut pane_syncs,
-            &mut pane_generation
+            &mut pane_generation,
+            &mut retired,
         ));
-        assert_eq!(active_id, "D");
+        assert_eq!(active_id.as_deref(), Some("D"));
         assert!(!pane_syncs.contains_key("D"));
         assert!(pane_syncs.contains_key("C"));
         assert!(
@@ -5904,21 +12155,21 @@ mod rebind_tests {
 
         // With the active subscription left alive, both its baseline and subsequent structured
         // damage continue through the dedicated primary grid.
-        handle_event(
+        handle_event_for_binding(
             &shared,
-            &mut active_sync,
+            &mut active_sync.as_mut().unwrap().sync,
             &SinkSender,
-            "D",
+            &shared.active_token().unwrap(),
             DaemonEvent::Grid {
                 id: "D".to_string(),
                 grid: grid("gen-D", 1),
             },
         );
-        handle_event(
+        handle_event_for_binding(
             &shared,
-            &mut active_sync,
+            &mut active_sync.as_mut().unwrap().sync,
             &SinkSender,
-            "D",
+            &shared.active_token().unwrap(),
             DaemonEvent::Damage {
                 frame: damage("D", "gen-D", 1, 2),
             },
@@ -5974,20 +12225,30 @@ mod rebind_tests {
     #[test]
     fn reader_rebases_after_blocked_read_then_accepts_new_baseline() {
         let shared = Arc::new(Shared::default());
-        shared.init_active_session("s-old");
-        let mut session_id = "s-old".to_string();
-        let mut sync = SyncState::new(session_id.clone());
-        let mut epoch = 0u64;
-        sync.on_grid("s-old", &grid("gen-old", 100)).unwrap();
+        let old = shared.init_active_session("s-old").unwrap();
+        let mut session_id = Some("s-old".to_string());
+        let mut sync = Some(RoutedSyncState::new(
+            "s-old".to_string(),
+            old.output_generation,
+            true,
+        ));
+        let mut epoch = old.epoch;
+        let mut retired = RetiredExitBindings::default();
+        sync.as_mut()
+            .unwrap()
+            .sync
+            .on_grid("s-old", &grid("gen-old", 100))
+            .unwrap();
 
         // Top-of-loop rebase: no switch yet, so it is a no-op and we stay on s-old.
         assert!(!sync_active_session(
             &shared,
             &mut session_id,
             &mut sync,
-            &mut epoch
+            &mut epoch,
+            &mut retired,
         ));
-        assert_eq!(session_id, "s-old");
+        assert_eq!(session_id.as_deref(), Some("s-old"));
 
         // The reader is now "blocked in read_until". The UI switches the active session.
         shared.set_active_session("s-new");
@@ -5995,7 +12256,10 @@ mod rebind_tests {
         // A new-session baseline `Grid` is delivered. WITHOUT the post-read rebase the
         // reader is still bound to s-old, so the new baseline would be rejected:
         assert_eq!(
-            sync.on_grid("s-new", &grid("gen-new", 1)),
+            sync.as_mut()
+                .unwrap()
+                .sync
+                .on_grid("s-new", &grid("gen-new", 1)),
             Err(Reject::WrongSession),
             "control: pre-rebase the new baseline is rejected as wrong-session"
         );
@@ -6005,17 +12269,24 @@ mod rebind_tests {
             &shared,
             &mut session_id,
             &mut sync,
-            &mut epoch
+            &mut epoch,
+            &mut retired,
         ));
-        assert_eq!(session_id, "s-new");
-        assert_eq!(sync.phase(), SyncPhase::AwaitingBaseline);
+        assert_eq!(session_id.as_deref(), Some("s-new"));
+        assert_eq!(
+            sync.as_ref().unwrap().sync.phase(),
+            SyncPhase::AwaitingBaseline
+        );
 
         // Now the SAME just-read new-session baseline is accepted into the fresh state.
         let outcome = sync
+            .as_mut()
+            .unwrap()
+            .sync
             .on_grid("s-new", &grid("gen-new", 1))
             .expect("post-rebase the new baseline must be accepted");
         assert!(outcome.repaint);
-        assert_eq!(sync.phase(), SyncPhase::Synchronized);
+        assert_eq!(sync.as_ref().unwrap().sync.phase(), SyncPhase::Synchronized);
     }
 
     // UI-switch race: `App::attach_session` must clear the SHARED
@@ -6027,7 +12298,7 @@ mod rebind_tests {
     #[test]
     fn ui_switch_clears_shared_state_before_reader_runs() {
         let shared = Arc::new(Shared::default());
-        shared.init_active_session("s-old");
+        let old = shared.init_active_session("s-old").unwrap();
 
         // Seed shared published state as if s-old were live and Synchronized.
         *shared.grid.lock().unwrap() = Some(Arc::new(grid("gen-old", 100)));
@@ -6048,16 +12319,22 @@ mod rebind_tests {
 
         // The reader's later rebase is idempotent: it observes the epoch, rebinds, and
         // resetting again leaves the shared state clear (no panic, still empty).
-        let mut session_id = "s-old".to_string();
-        let mut sync = SyncState::new(session_id.clone());
-        let mut epoch = 0u64;
+        let mut session_id = Some("s-old".to_string());
+        let mut sync = Some(RoutedSyncState::new(
+            "s-old".to_string(),
+            old.output_generation,
+            true,
+        ));
+        let mut epoch = old.epoch;
+        let mut retired = RetiredExitBindings::default();
         assert!(sync_active_session(
             &shared,
             &mut session_id,
             &mut sync,
-            &mut epoch
+            &mut epoch,
+            &mut retired,
         ));
-        assert_eq!(session_id, "s-new");
+        assert_eq!(session_id.as_deref(), Some("s-new"));
         assert!(shared.grid.lock().unwrap().is_none());
         assert!(shared.exited.lock().unwrap().is_none());
     }
@@ -6065,17 +12342,15 @@ mod rebind_tests {
     // --- inactive-pane sibling session cache (attach + cache only) -----------
 
     #[test]
-    fn sibling_attach_plan_attaches_and_resizes_without_detaching_active() {
-        // First sibling (no prior sibling): Attach(new) then Resize(new) — and crucially NO
+    fn sibling_attach_plan_is_read_only_without_detaching_active() {
+        // First sibling (no prior sibling): Attach(new) then Snapshot(new) — and crucially NO
         // Detach of anything, so the active session is never disturbed by binding the sibling.
-        let plan = plan_sibling_attach(None, "sib-1", Some((40, 12)));
+        let plan = plan_sibling_attach(None, "sib-1", Some((40, 12)), 81);
         assert_eq!(plan.len(), 2);
         assert!(
-            matches!(&plan[0], ClientRequest::Attach { id, want_raw_output } if id == "sib-1" && !*want_raw_output)
+            matches!(&plan[0], ClientRequest::Attach { id, want_raw_output, output_generation: Some(81), .. } if id == "sib-1" && !*want_raw_output)
         );
-        assert!(
-            matches!(&plan[1], ClientRequest::Resize { id, cols, rows } if id == "sib-1" && (*cols, *rows) == (40, 12))
-        );
+        assert!(matches!(&plan[1], ClientRequest::Snapshot { id } if id == "sib-1"));
         assert!(
             !plan
                 .iter()
@@ -6087,39 +12362,33 @@ mod rebind_tests {
     #[test]
     fn sibling_replace_detaches_only_the_old_sibling_then_attaches_new() {
         // Replacing the sibling detaches the OLD SIBLING only (never the active session),
-        // then attaches+resizes the new sibling.
-        let plan = plan_sibling_attach(Some("sib-old"), "sib-new", Some((30, 10)));
+        // then attaches+snapshots the new sibling.
+        let plan = plan_sibling_attach(Some("sib-old"), "sib-new", Some((30, 10)), 82);
         assert_eq!(plan.len(), 3);
         assert!(matches!(&plan[0], ClientRequest::Detach { id } if id == "sib-old"));
         assert!(
-            matches!(&plan[1], ClientRequest::Attach { id, want_raw_output } if id == "sib-new" && !*want_raw_output)
+            matches!(&plan[1], ClientRequest::Attach { id, want_raw_output, output_generation: Some(82), .. } if id == "sib-new" && !*want_raw_output)
         );
-        assert!(
-            matches!(&plan[2], ClientRequest::Resize { id, cols, rows } if id == "sib-new" && (*cols, *rows) == (30, 10))
-        );
+        assert!(matches!(&plan[2], ClientRequest::Snapshot { id } if id == "sib-new"));
     }
 
     #[test]
-    fn same_sibling_replan_resizes_only_no_detach_or_reattach() {
-        // A same-sibling draw with a new pane size resizes the bound sibling and does NOT
-        // detach/reattach it.
-        let plan = plan_sibling_attach(Some("sib-1"), "sib-1", Some((50, 14)));
-        assert_eq!(plan.len(), 1);
-        assert!(
-            matches!(&plan[0], ClientRequest::Resize { id, cols, rows } if id == "sib-1" && (*cols, *rows) == (50, 14))
-        );
+    fn same_sibling_replan_defers_resize_until_generation_bound_owner_path() {
+        let plan = plan_sibling_attach(Some("sib-1"), "sib-1", Some((50, 14)), 83);
+        assert!(plan.is_empty());
     }
 
     #[test]
     fn changing_inactive_session_replaces_cache_and_ignores_late_old_sibling_frame() {
         let shared = Arc::new(Shared::default());
+        shared.init_active_session("active").unwrap();
         // Bind sibling A, cache a grid for it.
-        let epoch_a = shared.set_sibling_session("sib-a");
+        let epoch_a = shared.set_sibling_session("sib-a").unwrap();
         assert!(shared.apply_sibling_grid("sib-a", epoch_a, Arc::new(grid("gen-a", 1))));
         assert!(shared.sibling_snapshot().grid.is_some());
 
         // Inactive pane changes to sibling B: cache is replaced (cleared) and epoch bumps.
-        let epoch_b = shared.set_sibling_session("sib-b");
+        let epoch_b = shared.set_sibling_session("sib-b").unwrap();
         assert_ne!(epoch_a, epoch_b);
         let snap = shared.sibling_snapshot();
         assert_eq!(snap.id.as_deref(), Some("sib-b"));
@@ -6141,7 +12410,7 @@ mod rebind_tests {
     fn active_and_sibling_grids_update_independent_caches() {
         let shared = Arc::new(Shared::default());
         shared.init_active_session("s-active");
-        let epoch = shared.set_sibling_session("s-sibling");
+        let epoch = shared.set_sibling_session("s-sibling").unwrap();
 
         // An active-session grid lands in `shared.grid` and must NOT touch the sibling cache.
         *shared.grid.lock().unwrap() = Some(Arc::new(grid("gen-active", 1)));
@@ -6236,7 +12505,7 @@ mod rebind_tests {
         *shared.grid.lock().unwrap() = Some(Arc::new(grid("gen-active", 1)));
         let active_before = shared.grid.lock().unwrap().clone();
 
-        let epoch = shared.set_sibling_session("s-sib");
+        let epoch = shared.set_sibling_session("s-sib").unwrap();
         let mut sync = SyncState::new("s-sib".to_string());
 
         // A sibling baseline Grid: gate through the sibling SyncState, then publish.
@@ -6252,81 +12521,10 @@ mod rebind_tests {
     }
 
     #[test]
-    fn primary_screen_transition_resets_only_stale_scrollback_view() {
-        let shared = Arc::new(Shared::default());
-        shared.publish_primary_grid(Arc::new(grid("gen-active", 1)));
-        shared.scrollback.lock().unwrap().view_offset = 7;
-
-        // Ordinary primary-screen damage preserves the user's historical position.
-        shared.publish_primary_grid(Arc::new(grid("gen-active", 2)));
-        assert_eq!(shared.scrollback.lock().unwrap().view_offset, 7);
-
-        // Entering alternate screen invalidates that renderer-owned historical viewport.
-        let mut alt = grid("gen-active", 3);
-        alt.alt_screen = true;
-        shared.publish_primary_grid(Arc::new(alt));
-        assert_eq!(shared.scrollback.lock().unwrap().view_offset, 0);
-
-        // Defensive symmetry: a stale offset cannot survive the transition back either.
-        shared.scrollback.lock().unwrap().view_offset = 5;
-        shared.publish_primary_grid(Arc::new(grid("gen-active", 4)));
-        assert_eq!(shared.scrollback.lock().unwrap().view_offset, 0);
-    }
-
-    #[test]
-    fn sibling_screen_transition_resets_its_own_scrollback_only() {
-        let shared = Arc::new(Shared::default());
-        let epoch = shared.set_sibling_session("s-sib");
-        assert!(shared.apply_sibling_grid("s-sib", epoch, Arc::new(grid("gen-sib", 1))));
-        shared.with_pane_scrollback("s-sib", "s-active", |sb| sb.view_offset = 9);
-        shared.scrollback.lock().unwrap().view_offset = 4;
-
-        let mut alt = grid("gen-sib", 2);
-        alt.alt_screen = true;
-        assert!(shared.apply_sibling_grid("s-sib", epoch, Arc::new(alt)));
-
-        assert_eq!(
-            shared.with_pane_scrollback("s-sib", "s-active", |sb| sb.view_offset),
-            0,
-            "sibling transition clears the sibling viewport"
-        );
-        assert_eq!(
-            shared.scrollback.lock().unwrap().view_offset,
-            4,
-            "sibling transition never clears the primary viewport"
-        );
-    }
-
-    #[test]
-    fn extra_pane_screen_transition_resets_that_pane_only() {
-        let shared = Arc::new(Shared::default());
-        shared.set_pane_sessions(&["pane-b", "pane-c"]);
-        let epoch_b = shared.pane_epoch("pane-b").unwrap();
-        let epoch_c = shared.pane_epoch("pane-c").unwrap();
-        assert!(shared.apply_pane_grid("pane-b", epoch_b, Arc::new(grid("gen-b", 1))));
-        assert!(shared.apply_pane_grid("pane-c", epoch_c, Arc::new(grid("gen-c", 1))));
-        shared.with_pane_scrollback("pane-b", "primary", |sb| sb.view_offset = 6);
-        shared.with_pane_scrollback("pane-c", "primary", |sb| sb.view_offset = 8);
-
-        let mut alt = grid("gen-b", 2);
-        alt.alt_screen = true;
-        assert!(shared.apply_pane_grid("pane-b", epoch_b, Arc::new(alt)));
-
-        assert_eq!(
-            shared.with_pane_scrollback("pane-b", "primary", |sb| sb.view_offset),
-            0
-        );
-        assert_eq!(
-            shared.with_pane_scrollback("pane-c", "primary", |sb| sb.view_offset),
-            8,
-            "another pane's transition cannot leak into this pane"
-        );
-    }
-
-    #[test]
     fn sibling_damage_updates_cache_only_after_sibling_baseline() {
         let shared = Arc::new(Shared::default());
-        let epoch = shared.set_sibling_session("s-sib");
+        shared.init_active_session("active").unwrap();
+        let epoch = shared.set_sibling_session("s-sib").unwrap();
         let mut sync = SyncState::new("s-sib".to_string());
 
         // BEFORE baseline: the sibling cache holds no grid. `handle_sibling_event`'s
@@ -6357,10 +12555,11 @@ mod rebind_tests {
     #[test]
     fn late_old_sibling_frame_ignored_after_sibling_epoch_changes() {
         let shared = Arc::new(Shared::default());
-        let epoch_a = shared.set_sibling_session("sib-a");
+        shared.init_active_session("active").unwrap();
+        let epoch_a = shared.set_sibling_session("sib-a").unwrap();
 
         // The inactive pane changes to sibling B (epoch bumps, cache cleared).
-        let epoch_b = shared.set_sibling_session("sib-b");
+        let epoch_b = shared.set_sibling_session("sib-b").unwrap();
         assert_ne!(epoch_a, epoch_b);
 
         // A late Grid from the OLD sibling routes by id, but `apply_sibling_grid` drops it:
@@ -6376,7 +12575,8 @@ mod rebind_tests {
     #[test]
     fn sibling_session_exited_updates_exit_state() {
         let shared = Arc::new(Shared::default());
-        let epoch = shared.set_sibling_session("s-sib");
+        shared.init_active_session("active").unwrap();
+        let epoch = shared.set_sibling_session("s-sib").unwrap();
         let mut sync = SyncState::new("s-sib".to_string());
         // A baseline so the SyncState is past AwaitingBaseline before the exit.
         sync.on_grid("s-sib", &grid("gen-sib", 1)).unwrap();
@@ -6396,7 +12596,7 @@ mod rebind_tests {
     #[test]
     fn late_old_sibling_exit_ignored_after_epoch_change() {
         let shared = Arc::new(Shared::default());
-        let epoch_a = shared.set_sibling_session("sib-a");
+        let epoch_a = shared.set_sibling_session("sib-a").unwrap();
         shared.set_sibling_session("sib-b"); // rebind: epoch bumps, exit cleared
         assert!(!shared.apply_sibling_exit("sib-a", epoch_a, Some(1)));
         assert!(shared.sibling_snapshot().exited.is_none());
@@ -6437,16 +12637,19 @@ mod rebind_tests {
     #[test]
     fn sync_sibling_session_rebinds_on_epoch_change_and_drops_on_unbind() {
         let shared = Arc::new(Shared::default());
+        shared.init_active_session("active").unwrap();
         let mut sib_id: Option<String> = None;
-        let mut sib_sync: Option<SyncState> = None;
+        let mut sib_sync: Option<RoutedSyncState> = None;
         let mut local_epoch = 0u64;
+        let mut retired = RetiredExitBindings::default();
 
         // No sibling yet (epoch 0 default): no rebind.
         assert!(!sync_sibling_session(
             &shared,
             &mut sib_id,
             &mut sib_sync,
-            &mut local_epoch
+            &mut local_epoch,
+            &mut retired,
         ));
         assert!(sib_sync.is_none());
 
@@ -6456,7 +12659,8 @@ mod rebind_tests {
             &shared,
             &mut sib_id,
             &mut sib_sync,
-            &mut local_epoch
+            &mut local_epoch,
+            &mut retired,
         ));
         assert_eq!(sib_id.as_deref(), Some("s-sib"));
         assert!(sib_sync.is_some());
@@ -6467,7 +12671,8 @@ mod rebind_tests {
             &shared,
             &mut sib_id,
             &mut sib_sync,
-            &mut local_epoch
+            &mut local_epoch,
+            &mut retired,
         ));
         assert!(sib_id.is_none());
         assert!(sib_sync.is_none());
@@ -6478,8 +12683,9 @@ mod rebind_tests {
     #[test]
     fn three_pane_membership_binds_a_cache_entry_per_non_active_pane() {
         let shared = Arc::new(Shared::default());
+        shared.init_active_session("active").unwrap();
         // A 3-pane layout's two non-active panes are bound as cache members; the generation bumps.
-        let gen = shared.set_pane_sessions(&["pane-b", "pane-c"]);
+        let gen = shared.set_pane_sessions(&["pane-b", "pane-c"]).unwrap();
         assert!(gen > 0);
         let mut ids = shared.pane_ids();
         ids.sort();
@@ -6502,6 +12708,7 @@ mod rebind_tests {
     #[test]
     fn removing_a_pane_clears_only_its_cache_entry() {
         let shared = Arc::new(Shared::default());
+        shared.init_active_session("active").unwrap();
         shared.set_pane_sessions(&["pane-b", "pane-c"]);
         let eb = shared.pane_epoch("pane-b").unwrap();
         let ec = shared.pane_epoch("pane-c").unwrap();
@@ -6526,6 +12733,7 @@ mod rebind_tests {
     #[test]
     fn late_frame_from_removed_or_replaced_pane_is_dropped() {
         let shared = Arc::new(Shared::default());
+        shared.init_active_session("active").unwrap();
         shared.set_pane_sessions(&["pane-b", "pane-c"]);
         let ec_old = shared.pane_epoch("pane-c").unwrap();
 
@@ -6550,9 +12758,9 @@ mod rebind_tests {
     #[test]
     fn unchanged_membership_does_not_bump_generation_and_clear_empties_cache() {
         let shared = Arc::new(Shared::default());
-        let g1 = shared.set_pane_sessions(&["pane-b", "pane-c"]);
+        let g1 = shared.set_pane_sessions(&["pane-b", "pane-c"]).unwrap();
         // Re-binding the SAME set is a no-op: the generation does not move.
-        let g2 = shared.set_pane_sessions(&["pane-c", "pane-b"]);
+        let g2 = shared.set_pane_sessions(&["pane-c", "pane-b"]).unwrap();
         assert_eq!(g1, g2);
         // clear_pane_sessions empties the cache and bumps the generation.
         shared.clear_pane_sessions();
@@ -6578,12 +12786,14 @@ mod rebind_tests {
 
     #[test]
     fn sibling_scrollback_rows_update_sibling_view_state() {
-        let shared = Arc::new(Shared::default());
-        let epoch = shared.set_sibling_session("s-sib");
+        let shared = Shared::with_test_outbound();
+        shared.init_active_session("s-active").unwrap();
+        let epoch = shared.set_sibling_session("s-sib").unwrap();
         assert!(shared.apply_sibling_grid("s-sib", epoch, Arc::new(grid("gen-sib", 1))));
         shared.with_pane_scrollback("s-sib", "s-active", |sb| {
-            sb.view_offset = 3;
+            sb.history_len = Some(20);
         });
+        admit_scrollback_query(&shared, "s-sib", "s-active", ScrollAction::Lines(3), 3);
 
         assert!(shared.apply_sibling_scrollback(
             "s-sib",
@@ -6601,15 +12811,17 @@ mod rebind_tests {
 
     #[test]
     fn extra_pane_scrollback_rows_update_that_pane_only() {
-        let shared = Arc::new(Shared::default());
+        let shared = Shared::with_test_outbound();
+        shared.init_active_session("s-active").unwrap();
         shared.set_pane_sessions(&["pane-b", "pane-c"]);
         let eb = shared.pane_epoch("pane-b").unwrap();
         let ec = shared.pane_epoch("pane-c").unwrap();
         assert!(shared.apply_pane_grid("pane-b", eb, Arc::new(grid("gen-b", 1))));
         assert!(shared.apply_pane_grid("pane-c", ec, Arc::new(grid("gen-c", 1))));
         shared.with_pane_scrollback("pane-b", "s-active", |sb| {
-            sb.view_offset = 4;
+            sb.history_len = Some(30);
         });
+        admit_scrollback_query(&shared, "pane-b", "s-active", ScrollAction::Lines(4), 4);
 
         assert!(shared.apply_pane_scrollback(
             "pane-b",
@@ -6631,14 +12843,17 @@ mod rebind_tests {
     #[test]
     fn sync_pane_sessions_rebuilds_only_reader_state_on_generation_change() {
         let (shared, queue) = Shared::with_test_queue();
-        let mut pane_syncs: HashMap<String, SyncState> = HashMap::new();
+        shared.init_active_session("active").unwrap();
+        let mut pane_syncs: HashMap<String, PaneSyncState> = HashMap::new();
         let mut local_generation = 0u64;
+        let mut retired = RetiredExitBindings::default();
 
         // No panes yet: no rebuild.
         assert!(!sync_pane_sessions(
             &shared,
             &mut pane_syncs,
-            &mut local_generation
+            &mut local_generation,
+            &mut retired,
         ));
         assert!(pane_syncs.is_empty());
 
@@ -6648,7 +12863,8 @@ mod rebind_tests {
         assert!(sync_pane_sessions(
             &shared,
             &mut pane_syncs,
-            &mut local_generation
+            &mut local_generation,
+            &mut retired,
         ));
         assert!(pane_syncs.contains_key("pane-b"));
         assert!(pane_syncs.contains_key("pane-c"));
@@ -6663,7 +12879,8 @@ mod rebind_tests {
         assert!(!sync_pane_sessions(
             &shared,
             &mut pane_syncs,
-            &mut local_generation
+            &mut local_generation,
+            &mut retired,
         ));
         assert_eq!(
             queue.drain_requests().len(),
@@ -6678,7 +12895,8 @@ mod rebind_tests {
         assert!(sync_pane_sessions(
             &shared,
             &mut pane_syncs,
-            &mut local_generation
+            &mut local_generation,
+            &mut retired,
         ));
         assert!(pane_syncs.contains_key("pane-b"));
         assert!(!pane_syncs.contains_key("pane-c"));
@@ -6688,7 +12906,162 @@ mod rebind_tests {
         );
     }
 
-    // --- uniform per-pane paint resolution -----------------------------------
+    // --- Phase B: uniform per-pane paint resolution --------------------------
+
+    #[test]
+    fn pane_paint_rejects_historical_pixels_from_another_live_generation() {
+        let paint = PanePaint {
+            live: Some(Arc::new(grid("gen-b", 9))),
+            scrolled_offset: 4,
+            history_len: Some(20),
+            historical: Some(Arc::new(grid("gen-a", 5))),
+            ..PanePaint::default()
+        };
+
+        let painted = paint.paint_grid().expect("live grid remains paintable");
+        assert_eq!(painted.generation.0, "gen-b");
+        assert_eq!(painted.revision, Revision(9));
+    }
+
+    #[test]
+    fn active_grid_generation_change_drops_history_but_retires_old_reply() {
+        let shared = Arc::new(Shared::default());
+        let token = shared.init_active_session("primary").unwrap();
+        assert!(shared.commit_active_grid(&token, Revision(1), Arc::new(grid("gen-a", 1))));
+        {
+            let mut scrollback = shared.scrollback.lock().unwrap();
+            let old_intent = scrollback.advance_intent().unwrap();
+            scrollback.view_offset = 4;
+            scrollback.history_len = Some(20);
+            scrollback.historical = Some(Arc::new(grid("gen-a", 5)));
+            scrollback.historical_generation = Some(SessionGeneration("gen-a".into()));
+            scrollback.admitted_request = Some((old_intent, 4, SessionGeneration("gen-a".into())));
+        }
+        assert_eq!(
+            shared
+                .pane_paint("primary", "primary")
+                .paint_grid()
+                .unwrap()
+                .revision,
+            Revision(5)
+        );
+
+        assert!(shared.commit_active_grid(&token, Revision(9), Arc::new(grid("gen-b", 9))));
+        {
+            let scrollback = shared.scrollback.lock().unwrap();
+            assert_eq!(scrollback.view_offset, 0);
+            assert!(scrollback.history_len.is_none());
+            assert!(scrollback.historical.is_none());
+            assert!(scrollback.historical_generation.is_none());
+            assert!(
+                scrollback.admitted_request.is_some(),
+                "the old ordered reply must still be able to release its admission slot"
+            );
+        }
+        let painted = shared
+            .pane_paint("primary", "primary")
+            .paint_grid()
+            .unwrap();
+        assert_eq!(painted.generation.0, "gen-b");
+        assert_eq!(painted.revision, Revision(9));
+
+        assert!(!shared.commit_active_scrollback(
+            &token,
+            SessionGeneration("gen-a".into()),
+            Revision(10),
+            20,
+            4,
+            vec![vec![cell(), cell()]],
+        ));
+        assert!(shared.scrollback.lock().unwrap().admitted_request.is_none());
+        assert_eq!(
+            shared
+                .pane_paint("primary", "primary")
+                .paint_grid()
+                .unwrap()
+                .generation
+                .0,
+            "gen-b"
+        );
+
+        {
+            let mut scrollback = shared.scrollback.lock().unwrap();
+            let current_intent = scrollback.advance_intent().unwrap();
+            scrollback.view_offset = 2;
+            scrollback.admitted_request =
+                Some((current_intent, 2, SessionGeneration("gen-b".into())));
+        }
+        assert!(shared.commit_active_scrollback(
+            &token,
+            SessionGeneration("gen-b".into()),
+            Revision(11),
+            30,
+            2,
+            vec![vec![cell(), cell()]],
+        ));
+        let painted = shared
+            .pane_paint("primary", "primary")
+            .paint_grid()
+            .unwrap();
+        assert_eq!(painted.generation.0, "gen-b");
+        assert_eq!(painted.revision, Revision(11));
+    }
+
+    #[test]
+    fn pane_grid_generation_change_drops_history_but_retires_old_reply() {
+        let shared = Arc::new(Shared::default());
+        shared.init_active_session("primary").unwrap();
+        shared.set_pane_sessions(&["pane-x"]).unwrap();
+        let token = shared.binding_token_for_session("pane-x").unwrap();
+        assert!(shared.commit_pane_grid(&token, Arc::new(grid("gen-a", 1))));
+        shared.with_pane_scrollback("pane-x", "primary", |scrollback| {
+            let old_intent = scrollback.advance_intent().unwrap();
+            scrollback.view_offset = 4;
+            scrollback.history_len = Some(20);
+            scrollback.historical = Some(Arc::new(grid("gen-a", 5)));
+            scrollback.historical_generation = Some(SessionGeneration("gen-a".into()));
+            scrollback.admitted_request = Some((old_intent, 4, SessionGeneration("gen-a".into())));
+        });
+
+        assert!(shared.commit_pane_grid(&token, Arc::new(grid("gen-b", 9))));
+        shared.with_pane_scrollback("pane-x", "primary", |scrollback| {
+            assert_eq!(scrollback.view_offset, 0);
+            assert!(scrollback.history_len.is_none());
+            assert!(scrollback.historical.is_none());
+            assert!(scrollback.historical_generation.is_none());
+            assert!(scrollback.admitted_request.is_some());
+        });
+        let painted = shared.pane_paint("pane-x", "primary").paint_grid().unwrap();
+        assert_eq!(painted.generation.0, "gen-b");
+        assert_eq!(painted.revision, Revision(9));
+
+        assert!(!shared.commit_pane_scrollback(
+            &token,
+            SessionGeneration("gen-a".into()),
+            Revision(10),
+            20,
+            4,
+            vec![vec![cell(), cell()]],
+        ));
+        shared.with_pane_scrollback("pane-x", "primary", |scrollback| {
+            assert!(scrollback.admitted_request.is_none());
+            let current_intent = scrollback.advance_intent().unwrap();
+            scrollback.view_offset = 2;
+            scrollback.admitted_request =
+                Some((current_intent, 2, SessionGeneration("gen-b".into())));
+        });
+        assert!(shared.commit_pane_scrollback(
+            &token,
+            SessionGeneration("gen-b".into()),
+            Revision(11),
+            30,
+            2,
+            vec![vec![cell(), cell()]],
+        ));
+        let painted = shared.pane_paint("pane-x", "primary").paint_grid().unwrap();
+        assert_eq!(painted.generation.0, "gen-b");
+        assert_eq!(painted.revision, Revision(11));
+    }
 
     #[test]
     fn pane_paint_resolves_primary_from_dedicated_fields() {
@@ -6748,7 +13121,7 @@ mod rebind_tests {
     fn pane_paint_resolves_sibling_store_even_when_not_a_pane_member() {
         let shared = Arc::new(Shared::default());
         shared.init_active_session("primary");
-        let epoch = shared.set_sibling_session("sibling-x");
+        let epoch = shared.set_sibling_session("sibling-x").unwrap();
         assert!(shared.apply_sibling_grid("sibling-x", epoch, Arc::new(grid("gen-sibling", 17))));
 
         assert!(
@@ -6847,11 +13220,11 @@ mod user_event_sender_tests {
                 "exit:{session_id}:{code:?}:{}",
                 observed_generation.as_deref().unwrap_or("<none>")
             ),
-            UserEvent::TerminalBell => "bell".to_string(),
-            UserEvent::TerminalTitle { title } => {
+            UserEvent::TerminalBell { .. } => "bell".to_string(),
+            UserEvent::TerminalTitle { title, .. } => {
                 format!("title:{}", title.clone().unwrap_or_default())
             }
-            UserEvent::TerminalClipboardStore { text } => format!("clipboard:{text}"),
+            UserEvent::TerminalClipboardStore { text, .. } => format!("clipboard:{text}"),
             other => format!("other:{other:?}"),
         }
     }
@@ -6880,6 +13253,7 @@ mod user_event_sender_tests {
             strikeout: false,
             dim: false,
             hidden: false,
+            hyperlink: None,
             width: 1,
         }
     }
@@ -6906,6 +13280,51 @@ mod user_event_sender_tests {
             mouse_motion: false,
             mouse_sgr: false,
         }
+    }
+
+    fn app_for_shared(shared: Arc<Shared>, session_id: &str) -> crate::App {
+        let generation = shared
+            .grid
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("scroll fixture has an accepted primary Grid")
+            .generation
+            .0
+            .clone();
+        let target = crate::RendererExactSessionTarget {
+            session_id: session_id.to_string(),
+            generation,
+        };
+        let mut app = crate::App::new(
+            shared,
+            session_id.to_string(),
+            crate::DEFAULT_WINDOW_TITLE.to_string(),
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        app.exact_viewport = Some(crate::RendererExactViewport {
+            window_id: "scroll-test-window".to_string(),
+            primary_tab_id: "scroll-test-tab".to_string(),
+            primary: target.clone(),
+            roles: vec![crate::RendererExactViewportRole {
+                tab_id: "scroll-test-tab".to_string(),
+                target: target.clone(),
+            }],
+            unique_targets: vec![target],
+        });
+        app
     }
 
     /// A `ClearAll` damage frame over the 2-col x 1-row shape `grid()` produces,
@@ -7013,6 +13432,353 @@ mod user_event_sender_tests {
     }
 
     #[test]
+    fn applied_live_damage_completes_recovery_even_when_older_snapshot_arrives_late() {
+        let (shared, queue) = Shared::with_test_queue();
+        shared.init_active_session("s-a");
+        let mut sync = SyncState::new("s-a");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sender = RecordingSender(log);
+
+        handle_event(
+            &shared,
+            &mut sync,
+            &sender,
+            "s-a",
+            DaemonEvent::Grid {
+                id: "s-a".to_string(),
+                grid: grid("gen", 1),
+            },
+        );
+
+        // A gap admits one recovery Snapshot and raises SyncState's local in-flight bit.
+        handle_event(
+            &shared,
+            &mut sync,
+            &sender,
+            "s-a",
+            DaemonEvent::Damage {
+                frame: damage_frame("s-a", "gen", 2, 3),
+            },
+        );
+        let first_recovery = queue.drain_requests();
+        assert!(matches!(
+            first_recovery.as_slice(),
+            [ClientRequest::Snapshot { id }] if id == "s-a"
+        ));
+        assert!(sync.request_in_flight());
+
+        // The live stream catches us up before that Snapshot reply. This Applied commit is an
+        // equally authoritative recovery completion and must clear the Shared registry entry.
+        handle_event(
+            &shared,
+            &mut sync,
+            &sender,
+            "s-a",
+            DaemonEvent::Damage {
+                frame: damage_frame("s-a", "gen", 1, 2),
+            },
+        );
+        assert!(!sync.request_in_flight());
+        assert!(shared.pending_recoveries.lock().unwrap().is_empty());
+
+        // The older recovery Grid is now stale and changes neither pixels nor bookkeeping.
+        handle_event(
+            &shared,
+            &mut sync,
+            &sender,
+            "s-a",
+            DaemonEvent::Grid {
+                id: "s-a".to_string(),
+                grid: grid("gen", 1),
+            },
+        );
+        assert!(queue.drain_requests().is_empty());
+
+        // A later independent gap must start a second recovery cycle, not wedge behind an orphaned
+        // `AlreadyAdmitted` registry record from the first cycle.
+        handle_event(
+            &shared,
+            &mut sync,
+            &sender,
+            "s-a",
+            DaemonEvent::Damage {
+                frame: damage_frame("s-a", "gen", 3, 4),
+            },
+        );
+        let second_recovery = queue.drain_requests();
+        assert!(matches!(
+            second_recovery.as_slice(),
+            [ClientRequest::Snapshot { id }] if id == "s-a"
+        ));
+        assert!(sync.request_in_flight());
+    }
+
+    #[test]
+    fn old_generation_scrollback_reply_wakes_app_to_admit_latest_generation_intent() {
+        let (shared, queue) = Shared::with_test_queue();
+        shared.init_active_session("s-a");
+        let mut sync = SyncState::new("s-a");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sender = RecordingSender(log.clone());
+        handle_event(
+            &shared,
+            &mut sync,
+            &sender,
+            "s-a",
+            DaemonEvent::Grid {
+                id: "s-a".to_string(),
+                grid: grid("gen-a", 1),
+            },
+        );
+        let mut app = app_for_shared(shared.clone(), "s-a");
+
+        // A query for generation A is admitted and owns the route's sole reply slot.
+        assert!(app.apply_scroll(ScrollAction::Lines(1)));
+        let first = queue.drain_requests();
+        assert!(matches!(
+            first.as_slice(),
+            [ClientRequest::Scrollback { id, .. }] if id == "s-a"
+        ));
+
+        // A new PTY lifetime resets visible history but deliberately preserves A's admitted slot
+        // until its FIFO reply arrives. The user's new B gesture is retained behind that slot.
+        handle_event(
+            &shared,
+            &mut sync,
+            &sender,
+            "s-a",
+            DaemonEvent::Grid {
+                id: "s-a".to_string(),
+                grid: grid("gen-b", 1),
+            },
+        );
+        assert!(app.apply_scroll(ScrollAction::Lines(1)));
+        assert_eq!(app.pending_owner_requests.len(), 1);
+        assert!(queue.drain_requests().is_empty());
+
+        log.lock().unwrap().clear();
+        handle_event(
+            &shared,
+            &mut sync,
+            &sender,
+            "s-a",
+            DaemonEvent::ScrollbackRows {
+                id: "s-a".to_string(),
+                generation: SessionGeneration("gen-a".to_string()),
+                revision: Revision(1),
+                history_len: 10,
+                offset_from_top: 1,
+                rows: vec![vec![cell(), cell()]],
+            },
+        );
+        let events = std::mem::take(&mut *log.lock().unwrap());
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, UserEvent::OutboundWritable)));
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, UserEvent::Redraw)));
+        for event in events {
+            if matches!(event, UserEvent::OutboundWritable) {
+                app.handle_user_event(event);
+            }
+        }
+
+        let retried = queue.drain_requests();
+        assert!(matches!(
+            retried.as_slice(),
+            [ClientRequest::Scrollback {
+                id,
+                offset_from_top: 1,
+                ..
+            }] if id == "s-a"
+        ));
+        assert!(app.pending_owner_requests.is_empty());
+        assert!(matches!(
+            shared.scrollback.lock().unwrap().admitted_request.as_ref(),
+            Some((_, 1, generation)) if generation.0 == "gen-b"
+        ));
+
+        // The current reply now paints B history; A never reopened the viewport.
+        handle_event(
+            &shared,
+            &mut sync,
+            &sender,
+            "s-a",
+            DaemonEvent::ScrollbackRows {
+                id: "s-a".to_string(),
+                generation: SessionGeneration("gen-b".to_string()),
+                revision: Revision(1),
+                history_len: 10,
+                offset_from_top: 1,
+                rows: vec![vec![cell(), cell()]],
+            },
+        );
+        let scrollback = shared.scrollback.lock().unwrap();
+        assert_eq!(
+            scrollback
+                .historical
+                .as_ref()
+                .map(|grid| grid.generation.0.as_str()),
+            Some("gen-b")
+        );
+    }
+
+    #[test]
+    fn hundreds_of_gestures_behind_one_admitted_scroll_query_keep_one_bounded_latest_intent() {
+        let (shared, queue) = Shared::with_test_queue();
+        let token = shared.init_active_session("s-a").unwrap();
+        assert!(shared.commit_active_grid(&token, Revision(1), Arc::new(grid("gen-a", 1))));
+        let mut app = app_for_shared(shared.clone(), "s-a");
+
+        assert!(app.apply_scroll(ScrollAction::Lines(1)));
+        assert!(matches!(
+            queue.drain_requests().as_slice(),
+            [ClientRequest::Scrollback { id, .. }] if id == "s-a"
+        ));
+        for _ in 0..300 {
+            assert!(app.apply_scroll(ScrollAction::Lines(1)));
+        }
+
+        let scrollback = shared.scrollback.lock().unwrap();
+        assert!(
+            scrollback.admitted_request.is_some(),
+            "exactly one wire reply slot"
+        );
+        let desired = scrollback.view_offset;
+        drop(scrollback);
+        assert_eq!(
+            app.pending_owner_requests.len(),
+            1,
+            "latest-wins coalescing"
+        );
+        let pending = app.pending_owner_requests.front().unwrap();
+        assert!(matches!(
+            pending.requests.as_slice(),
+            [ClientRequest::Scrollback { offset_from_top, .. }] if *offset_from_top == desired
+        ));
+        assert!(app.pending_owner_request_bytes <= OUTBOUND_CAP_BYTES);
+        assert!(queue.drain_requests().is_empty());
+    }
+
+    #[test]
+    fn canonical_reply_immediately_after_request_visibility_finds_registered_correlation() {
+        let (shared, queue) = Shared::with_test_queue();
+        shared.init_active_session("s-a");
+        let mut sync = SyncState::new("s-a");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sender = RecordingSender(log);
+        handle_event(
+            &shared,
+            &mut sync,
+            &sender,
+            "s-a",
+            DaemonEvent::Grid {
+                id: "s-a".to_string(),
+                grid: grid("gen-a", 1),
+            },
+        );
+        let mut app = app_for_shared(shared.clone(), "s-a");
+
+        assert!(app.apply_scroll(ScrollAction::Lines(1)));
+        let visible = queue.drain_requests();
+        assert!(matches!(
+            visible.as_slice(),
+            [ClientRequest::Scrollback {
+                id,
+                offset_from_top: 1,
+                ..
+            }] if id == "s-a"
+        ));
+        assert!(
+            shared.scrollback.lock().unwrap().admitted_request.is_some(),
+            "correlation is installed before the request can become writer-visible"
+        );
+        handle_event(
+            &shared,
+            &mut sync,
+            &sender,
+            "s-a",
+            DaemonEvent::ScrollbackRows {
+                id: "s-a".to_string(),
+                generation: SessionGeneration("gen-a".to_string()),
+                revision: Revision(1),
+                history_len: 10,
+                offset_from_top: 1,
+                rows: vec![vec![cell(), cell()]],
+            },
+        );
+        assert_eq!(
+            shared
+                .scrollback
+                .lock()
+                .unwrap()
+                .historical
+                .as_ref()
+                .map(|grid| grid.generation.0.as_str()),
+            Some("gen-a")
+        );
+    }
+
+    #[test]
+    fn full_queue_coalesced_scroll_then_end_cannot_be_resurrected_by_old_reply() {
+        let (shared, queue) = Shared::with_test_queue();
+        shared.init_active_session("s-a");
+        let mut sync = SyncState::new("s-a");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sender = RecordingSender(log.clone());
+        handle_event(
+            &shared,
+            &mut sync,
+            &sender,
+            "s-a",
+            DaemonEvent::Grid {
+                id: "s-a".to_string(),
+                grid: grid("gen-a", 1),
+            },
+        );
+        let mut app = app_for_shared(shared.clone(), "s-a");
+
+        assert!(app.apply_scroll(ScrollAction::Lines(1)));
+        queue.drain_requests();
+        queue.saturate_raw();
+        for _ in 0..8 {
+            assert!(app.apply_scroll(ScrollAction::Lines(1)));
+        }
+        assert_eq!(app.pending_owner_requests.len(), 1);
+        assert!(app.apply_scroll(ScrollAction::End));
+        assert!(app.pending_owner_requests.is_empty());
+        assert_eq!(shared.scrollback.lock().unwrap().view_offset, 0);
+
+        queue.discard_all();
+        log.lock().unwrap().clear();
+        handle_event(
+            &shared,
+            &mut sync,
+            &sender,
+            "s-a",
+            DaemonEvent::ScrollbackRows {
+                id: "s-a".to_string(),
+                generation: SessionGeneration("gen-a".to_string()),
+                revision: Revision(1),
+                history_len: 10,
+                offset_from_top: 1,
+                rows: vec![vec![cell(), cell()]],
+            },
+        );
+        for event in std::mem::take(&mut *log.lock().unwrap()) {
+            app.handle_user_event(event);
+        }
+        let scrollback = shared.scrollback.lock().unwrap();
+        assert_eq!(scrollback.view_offset, 0);
+        assert!(scrollback.historical.is_none());
+        assert!(scrollback.admitted_request.is_none());
+        drop(scrollback);
+        assert!(app.pending_owner_requests.is_empty());
+        assert!(queue.drain_requests().is_empty());
+    }
+
+    #[test]
     fn active_exit_delivers_identity_code_and_generation_exactly_once() {
         let shared = Arc::new(Shared::default());
         shared.init_active_session("s-a");
@@ -7056,7 +13822,7 @@ mod user_event_sender_tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let sender = RecordingSender(log.clone());
 
-        let sibling_epoch = shared.set_sibling_session("sibling");
+        let sibling_epoch = shared.set_sibling_session("sibling").unwrap();
         let mut sibling_sync = SyncState::new("sibling");
         handle_sibling_event(
             &shared,
@@ -7202,7 +13968,7 @@ mod user_event_sender_tests {
     fn sibling_ingest_wakes_through_the_neutral_sender() {
         let shared = Arc::new(Shared::default());
         shared.init_active_session("s-active");
-        let epoch = shared.set_sibling_session("s-sib");
+        let epoch = shared.set_sibling_session("s-sib").unwrap();
         let mut sync = SyncState::new("s-sib".to_string());
         let log = Arc::new(Mutex::new(Vec::new()));
         let sender = RecordingSender(log.clone());
@@ -7277,10 +14043,18 @@ mod user_event_sender_tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let a: Box<dyn UserEventSender> = Box::new(RecordingSender(log.clone()));
         let b = a.clone_sender();
+        let binding = ViewportBindingToken::Active(ActiveBindingToken {
+            session_id: "s".to_string(),
+            epoch: 1,
+            output_generation: 1,
+        });
 
         let _ = a.send(UserEvent::Redraw);
-        let _ = b.send(UserEvent::TerminalBell);
+        let _ = b.send(UserEvent::TerminalBell {
+            binding: binding.clone(),
+        });
         let _ = a.send(UserEvent::TerminalClipboardStore {
+            binding,
             text: "x".to_string(),
         });
 

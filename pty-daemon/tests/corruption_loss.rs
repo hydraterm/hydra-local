@@ -138,7 +138,12 @@ fn split_utf8_survives() {
     );
     send(&mut stream, &format!(r#"{{"op":"attach","id":"{id}"}}"#));
     // Drain the initial Grid restore event so we then read live Output.
-    let _ = read_until(&mut reader, "\"grid\"", Duration::from_secs(5));
+    let baseline = read_until(&mut reader, "\"grid\"", Duration::from_secs(5));
+    let generation = serde_json::from_str::<serde_json::Value>(baseline.trim())
+        .expect("initial Grid JSON")["grid"]["generation"]
+        .as_str()
+        .expect("initial Grid generation")
+        .to_string();
     std::thread::sleep(Duration::from_millis(100));
 
     // 'ş' = bytes 0xC5 0x9F. The fix under test is the OUTPUT path: the PTY
@@ -148,7 +153,13 @@ fn split_utf8_survives() {
     // base64 framing carries raw bytes losslessly regardless of read boundaries.
     send(
         &mut stream,
-        &format!(r#"{{"op":"write","id":"{id}","data":"ş\n"}}"#),
+        &serde_json::json!({
+            "op": "write",
+            "id": id,
+            "data": "ş\n",
+            "expected_generation": generation
+        })
+        .to_string(),
     );
 
     // Collect echoed Output until we've seen the 2 bytes of 'ş'.

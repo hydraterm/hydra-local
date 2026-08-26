@@ -1016,12 +1016,40 @@ impl ExtensionTransportError {
             Self::Refused {
                 code: RemoteDesktopErrorCode::EnrollmentRejected,
                 ..
-            } => "Enrollment was rejected. Generate a fresh code and try again.",
+            } => "Enrollment was rejected without a confirmed reason. Keep this code and update Hydra Remote before trying again.",
+            Self::Refused {
+                code: RemoteDesktopErrorCode::EnrollmentCodeInvalid,
+                ..
+            } => "This code is invalid, expired, or already used. Generate a fresh code and try again.",
+            Self::Refused {
+                code: RemoteDesktopErrorCode::EnrollmentOwnerMismatch,
+                ..
+            } => "The enrollment service refused this account binding. Update Hydra, then use a fresh passkey-authorized Add Desktop code.",
+            Self::Refused {
+                code: RemoteDesktopErrorCode::EnrollmentAuthorityStale,
+                ..
+            } => "This code was authorized by an older account passkey state. Generate a fresh Add Desktop code.",
+            Self::Refused {
+                code: RemoteDesktopErrorCode::EnrollmentIncompatible,
+                ..
+            } => "Hydra Remote and the enrollment service are incompatible. Update Hydra before trying again.",
+            Self::Refused {
+                code: RemoteDesktopErrorCode::EnrollmentTemporarilyUnavailable,
+                ..
+            } => "Enrollment is temporarily unavailable. Keep this code and try again shortly.",
+            Self::Refused {
+                code: RemoteDesktopErrorCode::EnrollmentLocalFailure,
+                ..
+            } => "This desktop could not safely prepare enrollment. Restart Hydra and try the same code again.",
+            Self::Refused {
+                code: RemoteDesktopErrorCode::EnrollmentOutcomeUnconfirmed,
+                ..
+            } => "Hydra could not confirm whether enrollment completed. Keep this code; do not generate another one yet.",
             Self::Refused {
                 code: RemoteDesktopErrorCode::RemoteUnavailable,
                 retryable: true,
             } if operation == ExtensionOperation::Enroll => {
-                "The code was accepted, but Remote could not start. Generate a fresh code and try again."
+                "The code was accepted, but Remote could not start. Restart Hydra and wait for cleanup to finish before generating a fresh code."
             }
             Self::Refused {
                 code: RemoteDesktopErrorCode::RemoteUnavailable,
@@ -1051,6 +1079,19 @@ impl ExtensionTransportError {
                 code: RemoteDesktopErrorCode::ViewportUnavailable,
                 ..
             } => "The remote viewport changed. Try again.",
+            Self::Io
+            | Self::Timeout
+            | Self::OversizedFrame
+            | Self::MalformedFrame
+            | Self::MismatchedRequestId
+            | Self::MismatchedNoticeId
+            | Self::UnexpectedResponse
+            | Self::ExtraOutput
+            | Self::ChildFailed
+                if operation == ExtensionOperation::Enroll =>
+            {
+                "Hydra could not confirm whether enrollment completed. Keep this code; do not retry or generate another one yet. Update or restart Hydra Remote first."
+            }
             Self::Timeout => "Remote extension timed out. Try again.",
             Self::Incompatible | Self::MissingCapability => {
                 "Hydra Remote components are incompatible. Update Hydra and try again."
@@ -1202,6 +1243,7 @@ fn host_hello() -> ExtensionHello {
     ExtensionHello::host([
         Capability::external_viewport_lease_v1(),
         Capability::filesystem_mode_migration_v1(),
+        Capability::enrollment_failure_v1(),
         Capability::remote_desktop_lifecycle_v1(),
     ])
     .expect("host capabilities are compile-time constants")
@@ -1480,12 +1522,53 @@ printf '%s\n' '{response}'"#
         assert!(host_hello().capabilities().iter().any(
             |capability| capability.known() == Some(KnownCapability::FilesystemModeMigrationV1)
         ));
+        assert!(host_hello()
+            .capabilities()
+            .iter()
+            .any(|capability| capability.known() == Some(KnownCapability::EnrollmentFailureV1)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typed_enrollment_failure_requires_the_child_to_advertise_its_capability() {
+        let response = r#"{"type":"error","request_id":7,"error":{"code":"enrollment_outcome_unconfirmed","message":"unconfirmed","retryable":false}}"#;
+        let request = RemoteDesktopHostRequest::Enroll {
+            request_id: request_id(),
+            code: EnrollmentCode::new("A2B3C4D5").unwrap(),
+        };
+        for (capability, expected) in [
+            ("", Err(ExtensionTransportError::MalformedFrame)),
+            (
+                ",\"enrollment_failure_v1\"",
+                Ok(RemoteDesktopErrorCode::EnrollmentOutcomeUnconfirmed),
+            ),
+        ] {
+            let body = format!(
+                r#"IFS= read -r hello
+printf '%s\n' '{{"protocol":{{"min":1,"max":1}},"capabilities":["remote_desktop_lifecycle_v1"{capability}]}}'
+IFS= read -r request
+printf '%s\n' '{response}'"#
+            );
+            let (_directory, binary) = script(&body);
+            let result = exchange_with_binary(&binary, &request, Duration::from_secs(2));
+            match expected {
+                Err(error) => assert_eq!(result, Err(error)),
+                Ok(code) => {
+                    let response = result.unwrap().response;
+                    assert!(matches!(
+                        response,
+                        RemoteDesktopExtensionResponse::Error { error, .. }
+                            if error.code() == code
+                    ));
+                }
+            }
+        }
     }
 
     #[cfg(unix)]
     #[test]
     fn enrollment_secret_never_enters_argv_environment_or_errors() {
-        let secret = "SECRET-CODE-9713";
+        let secret = "A2B3C4D5";
         let directory = tempfile::tempdir().unwrap();
         let capture = directory.path().join("capture.txt");
         let capture_escaped = capture.to_string_lossy().replace('\'', "'\\''");
@@ -1686,7 +1769,7 @@ done"#
         ] {
             let request = RemoteDesktopHostRequest::Enroll {
                 request_id: request_id(),
-                code: EnrollmentCode::new("TEST-CODE").unwrap(),
+                code: EnrollmentCode::new("A2B3C4D5").unwrap(),
             };
             let response = RemoteDesktopExtensionResponse::Error {
                 request_id: request_id(),
@@ -1758,7 +1841,7 @@ done"#
                     retryable: false,
                 },
                 Enroll,
-                "Enrollment was rejected. Generate a fresh code and try again.",
+                "Enrollment was rejected without a confirmed reason. Keep this code and update Hydra Remote before trying again.",
             ),
             (
                 Error::Refused {
@@ -1766,7 +1849,7 @@ done"#
                     retryable: true,
                 },
                 Enroll,
-                "The code was accepted, but Remote could not start. Generate a fresh code and try again.",
+                "The code was accepted, but Remote could not start. Restart Hydra and wait for cleanup to finish before generating a fresh code.",
             ),
             (
                 Error::Refused {
@@ -1837,32 +1920,32 @@ done"#
             (
                 Error::OversizedFrame,
                 Enroll,
-                "Hydra Remote returned an invalid protocol response. Update Hydra and try again.",
+                "Hydra could not confirm whether enrollment completed. Keep this code; do not retry or generate another one yet. Update or restart Hydra Remote first.",
             ),
             (
                 Error::MalformedFrame,
                 Enroll,
-                "Hydra Remote returned an invalid protocol response. Update Hydra and try again.",
+                "Hydra could not confirm whether enrollment completed. Keep this code; do not retry or generate another one yet. Update or restart Hydra Remote first.",
             ),
             (
                 Error::MismatchedRequestId,
                 Enroll,
-                "Hydra Remote returned an invalid protocol response. Update Hydra and try again.",
+                "Hydra could not confirm whether enrollment completed. Keep this code; do not retry or generate another one yet. Update or restart Hydra Remote first.",
             ),
             (
                 Error::MismatchedNoticeId,
                 Enroll,
-                "Hydra Remote returned an invalid protocol response. Update Hydra and try again.",
+                "Hydra could not confirm whether enrollment completed. Keep this code; do not retry or generate another one yet. Update or restart Hydra Remote first.",
             ),
             (
                 Error::UnexpectedResponse,
                 Enroll,
-                "Hydra Remote returned an invalid protocol response. Update Hydra and try again.",
+                "Hydra could not confirm whether enrollment completed. Keep this code; do not retry or generate another one yet. Update or restart Hydra Remote first.",
             ),
             (
                 Error::ExtraOutput,
                 Enroll,
-                "Hydra Remote returned an invalid protocol response. Update Hydra and try again.",
+                "Hydra could not confirm whether enrollment completed. Keep this code; do not retry or generate another one yet. Update or restart Hydra Remote first.",
             ),
             (
                 Error::Spawn,
@@ -1872,17 +1955,17 @@ done"#
             (
                 Error::Io,
                 Enroll,
-                "Hydra Remote stopped unexpectedly. Restart Hydra and try again.",
+                "Hydra could not confirm whether enrollment completed. Keep this code; do not retry or generate another one yet. Update or restart Hydra Remote first.",
             ),
             (
                 Error::ChildFailed,
                 Enroll,
-                "Hydra Remote stopped unexpectedly. Restart Hydra and try again.",
+                "Hydra could not confirm whether enrollment completed. Keep this code; do not retry or generate another one yet. Update or restart Hydra Remote first.",
             ),
             (
                 Error::Timeout,
                 Enroll,
-                "Remote extension timed out. Try again.",
+                "Hydra could not confirm whether enrollment completed. Keep this code; do not retry or generate another one yet. Update or restart Hydra Remote first.",
             ),
         ];
 
@@ -1891,6 +1974,68 @@ done"#
             assert_eq!(message, expected);
             assert!(!message.contains("unavailable or incompatible"));
         }
+    }
+
+    #[test]
+    fn enrollment_failure_v1_copy_is_closed_and_never_overpromises_ambiguous_replay() {
+        use ExtensionTransportError as Error;
+        use RemoteDesktopErrorCode as Code;
+
+        let cases = [
+            (
+                Code::EnrollmentCodeInvalid,
+                "This code is invalid, expired, or already used. Generate a fresh code and try again.",
+            ),
+            (
+                Code::EnrollmentOwnerMismatch,
+                "The enrollment service refused this account binding. Update Hydra, then use a fresh passkey-authorized Add Desktop code.",
+            ),
+            (
+                Code::EnrollmentAuthorityStale,
+                "This code was authorized by an older account passkey state. Generate a fresh Add Desktop code.",
+            ),
+            (
+                Code::EnrollmentIncompatible,
+                "Hydra Remote and the enrollment service are incompatible. Update Hydra before trying again.",
+            ),
+            (
+                Code::EnrollmentTemporarilyUnavailable,
+                "Enrollment is temporarily unavailable. Keep this code and try again shortly.",
+            ),
+            (
+                Code::EnrollmentLocalFailure,
+                "This desktop could not safely prepare enrollment. Restart Hydra and try the same code again.",
+            ),
+            (
+                Code::EnrollmentOutcomeUnconfirmed,
+                "Hydra could not confirm whether enrollment completed. Keep this code; do not generate another one yet.",
+            ),
+        ];
+        for (code, expected) in cases {
+            assert_eq!(
+                Error::Refused {
+                    code,
+                    retryable: code == Code::EnrollmentTemporarilyUnavailable,
+                }
+                .user_message(ExtensionOperation::Enroll),
+                expected
+            );
+        }
+        let ambiguous = Error::Refused {
+            code: Code::EnrollmentOutcomeUnconfirmed,
+            retryable: false,
+        }
+        .user_message(ExtensionOperation::Enroll);
+        assert!(!ambiguous.contains("try again"));
+        assert!(!ambiguous.contains("fresh"));
+
+        let owner = Error::Refused {
+            code: Code::EnrollmentOwnerMismatch,
+            retryable: false,
+        }
+        .user_message(ExtensionOperation::Enroll);
+        assert!(!owner.contains("Remove Remote"));
+        assert!(!owner.contains("transfer before"));
     }
 
     #[test]

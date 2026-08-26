@@ -20,13 +20,13 @@
 //!   AgentTask records against session records via [`AgentTaskReconciler`].
 //! - `agent-start  --agent-task-id <id> --project-id <id> --goal <text>`
 //!   `              --session-id <id> --workspace-id <id> <cwd-mode> -- <argv...>`
-//!   Create a NEW agent task and start its first session (`SessionKind::Agent`) via
-//!   [`AgentTaskRuntime::start_new_agent_task`].
+//!   Transaction-prepare a NEW agent task and its first session, then conditionally publish the
+//!   exact daemon lifetime (`SessionKind::Agent`).
 //! - `agent-resume --agent-task-id <id> --session-id <id> --workspace-id <id>`
 //!   `              <cwd-mode> -- <argv...>`
-//!   Resume/retry an EXISTING agent task on a fresh session (`SessionKind::Agent`) via
-//!   [`AgentTaskRuntime::resume_agent_task`]. The caller supplies fresh argv — the task's
-//!   stored `LaunchSpec` is never replayed.
+//!   Transaction-prepare a fresh Session for an EXISTING agent task and conditionally publish it
+//!   (`SessionKind::Agent`). The caller supplies fresh argv — the task's stored `LaunchSpec` is
+//!   never replayed.
 //!
 //! Cwd selection — exactly one of:
 //! - `--cwd <dir>`: the caller's existing directory, verbatim.
@@ -64,15 +64,19 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use maestro_shell::agent_task_runtime::{
+    PreparedAgentTaskRuntimeError, PreparedAgentTaskSettlementError,
+};
 use maestro_shell::{
-    grant_consent, load_one, prepare_scratch_cwd, prepare_workspace_with_consent, write_record,
-    AgentTaskReconcileReport, AgentTaskReconciler, AgentTaskRuntime, AgentTaskRuntimeError,
-    AgentTaskState, AppPaths, Attention, AttentionSource, AttentionState, DashboardSnapshot,
-    DashboardSnapshotService, LoadOutcome, ReconcileOutcome, RecordKind, SessionKind, ShellRuntime,
-    ShellRuntimeError, SplitAxis, StartAgentTaskOutcome, StartParams, StartSessionOutcome,
-    WindowLayout, WindowLayoutError, WindowLayoutService, WindowTabView, Workspace,
-    WorkspaceConsent, WorkspaceConsentError, WorkspaceConsentKind, WorkspaceExecError,
-    WorkspacePolicy,
+    cleanup_fresh_scratch_cwd, grant_consent, load_one, prepare_fresh_scratch_cwd,
+    prepare_workspace_with_consent, write_record, AgentTaskReconcileReport, AgentTaskReconciler,
+    AgentTaskRuntime, AgentTaskRuntimeError, AgentTaskService, AgentTaskState, AppPaths, Attention,
+    AttentionSource, AttentionState, DashboardSnapshot, DashboardSnapshotService,
+    FreshScratchCwdReceipt, LoadOutcome, PreparedNewSessionRuntimeError, PreparedWorkspace,
+    Project, ProjectService, ReconcileOutcome, RecordKind, SessionKind, ShellRuntime,
+    ShellRuntimeError, SplitAxis, StartAgentTaskOutcome, StartSessionOutcome, WindowLayout,
+    WindowLayoutError, WindowLayoutService, WindowTabView, Workspace, WorkspaceConsent,
+    WorkspaceConsentError, WorkspaceConsentKind, WorkspaceExecError, WorkspacePolicy,
 };
 use serde_json::json;
 
@@ -214,60 +218,135 @@ fn window_usage() -> SmokeError {
 fn run_start(parsed: &StartArgs) -> Result<StartSessionOutcome, SmokeError> {
     let paths = resolve_paths(parsed.base.as_deref())?;
     let now = now_ms();
-    let cwd = resolve_cwd(
+    let mut prepared_workspace = prepare_cli_workspace(
         &paths,
         &parsed.workspace_id,
         &parsed.session_id,
         &parsed.cwd,
         now,
+        None,
     )?;
-    let rt = ShellRuntime::new(&paths);
-    let params = StartParams::adhoc(
-        parsed.session_id.clone(),
-        parsed.workspace_id.clone(),
+    let session = match prepared_workspace.prepared.adhoc_session_spec_with_env(
         parsed.kind,
-        cwd,
         &parsed.argv,
+        &maestro_shell::ProcessLaunchEnv,
         parsed.cols,
         parsed.rows,
         now,
-    );
-    rt.start_session(parsed.socket.clone(), &maestro_shell::ProcessEnv, &params)
-        .map_err(SmokeError::from)
+    ) {
+        Ok(session) => session,
+        Err(error) => {
+            let error = SmokeError::from(error);
+            return Err(prepared_workspace.append_scratch_cleanup(&paths, error));
+        }
+    };
+    let start = match WindowLayoutService::new(&paths).prepare_unplaced_session_with_spec(
+        &prepared_workspace.project,
+        &prepared_workspace.workspace,
+        session,
+    ) {
+        Ok(start) => start,
+        Err(error) => {
+            let error = prepared_start_error(error, false);
+            return Err(prepared_workspace.append_scratch_cleanup(&paths, error));
+        }
+    };
+    match ShellRuntime::new(&paths).start_prepared_new_session(
+        parsed.socket.clone(),
+        &maestro_shell::ProcessEnv,
+        start,
+    ) {
+        Ok(outcome) => {
+            let (socket_path, record, _success_compensation, _handoff) = outcome.into_parts();
+            Ok(StartSessionOutcome::new(socket_path, record))
+        }
+        Err(PreparedNewSessionRuntimeError::DefinitelyUnpublished { error, start }) => {
+            let compensation =
+                WindowLayoutService::new(&paths).cancel_prepared_new_session(start, now_ms());
+            let error = append_compensation_note(
+                SmokeError::from(error),
+                "exact session cancellation",
+                compensation,
+            );
+            Err(prepared_workspace.append_scratch_cleanup(&paths, error))
+        }
+        Err(PreparedNewSessionRuntimeError::Refused {
+            error,
+            compensation,
+        }) => {
+            let compensation = WindowLayoutService::new(&paths)
+                .compensate_prepared_new_session(compensation, now_ms());
+            let error = append_compensation_note(
+                SmokeError::from(error),
+                "exact session compensation",
+                compensation,
+            );
+            Err(prepared_workspace.append_scratch_cleanup(&paths, error))
+        }
+        Err(PreparedNewSessionRuntimeError::PossiblyApplied { error }) => {
+            // No compensation or scratch cleanup: the daemon may own the PTY and the exact
+            // durable Unknown row must remain available for forward recovery.
+            Err(SmokeError::from(error))
+        }
+    }
 }
 
-/// Create a NEW agent task and start its first session (`SessionKind::Agent`). Same cwd-mode
-/// preparation as `start`; the runtime forces `params.agent_task_id` to the task being created.
+/// Create a NEW agent task and start its first session (`SessionKind::Agent`). Task A, Session A,
+/// and the recovery journal are inserted atomically before the conditional daemon Start.
 fn run_agent_start(parsed: &AgentStartArgs) -> Result<StartAgentTaskOutcome, SmokeError> {
     let paths = resolve_paths(parsed.base.as_deref())?;
     let now = now_ms();
-    let cwd = resolve_cwd(
+    let mut prepared_workspace = prepare_cli_workspace(
         &paths,
         &parsed.workspace_id,
         &parsed.session_id,
         &parsed.cwd,
         now,
+        Some(&parsed.project_id),
     )?;
     let rt = AgentTaskRuntime::new(&paths);
-    let params = StartParams::adhoc(
-        parsed.session_id.clone(),
-        parsed.workspace_id.clone(),
+    let session = match prepared_workspace.prepared.adhoc_session_spec_with_env(
         SessionKind::Agent,
-        cwd,
         &parsed.argv,
+        &maestro_shell::ProcessLaunchEnv,
         parsed.cols,
         parsed.rows,
         now,
-    );
-    rt.start_new_agent_task(
-        parsed.socket.clone(),
-        &maestro_shell::ProcessEnv,
+    ) {
+        Ok(session) => session,
+        Err(error) => {
+            let error = SmokeError::from(error);
+            return Err(prepared_workspace.append_scratch_cleanup(&paths, error));
+        }
+    };
+    let prepared = match rt.prepare_new_agent_task_unplaced(
+        &prepared_workspace.project,
+        &prepared_workspace.workspace,
         parsed.agent_task_id.clone(),
-        parsed.project_id.clone(),
         parsed.goal.clone(),
-        params,
+        now,
+        session,
+    ) {
+        Ok(prepared) => prepared,
+        Err(PreparedAgentTaskRuntimeError::Prepare(error)) => {
+            let error = prepared_start_error(error, true);
+            return Err(prepared_workspace.append_scratch_cleanup(&paths, error));
+        }
+        Err(other) => {
+            let error = SmokeError {
+                kind: "agent_runtime",
+                message: other.to_string(),
+            };
+            return Err(prepared_workspace.append_scratch_cleanup(&paths, error));
+        }
+    };
+    execute_prepared_agent_task_start(
+        &paths,
+        parsed.socket.clone(),
+        &rt,
+        prepared,
+        &mut prepared_workspace,
     )
-    .map_err(SmokeError::from)
 }
 
 /// Resume/retry an EXISTING agent task on a fresh session (`SessionKind::Agent`). The caller's
@@ -275,31 +354,136 @@ fn run_agent_start(parsed: &AgentStartArgs) -> Result<StartAgentTaskOutcome, Smo
 fn run_agent_resume(parsed: &AgentResumeArgs) -> Result<StartAgentTaskOutcome, SmokeError> {
     let paths = resolve_paths(parsed.base.as_deref())?;
     let now = now_ms();
-    let cwd = resolve_cwd(
+    let task = AgentTaskService::new(&paths)
+        .load(&parsed.agent_task_id)
+        .map_err(|error| SmokeError {
+            kind: "task",
+            message: error.to_string(),
+        })?
+        .ok_or_else(|| SmokeError {
+            kind: "task",
+            message: format!("agent task {:?} not found", parsed.agent_task_id),
+        })?;
+    let mut prepared_workspace = prepare_cli_workspace(
         &paths,
         &parsed.workspace_id,
         &parsed.session_id,
         &parsed.cwd,
         now,
+        Some(&task.project_id),
     )?;
     let rt = AgentTaskRuntime::new(&paths);
-    let params = StartParams::adhoc(
-        parsed.session_id.clone(),
-        parsed.workspace_id.clone(),
+    let session = match prepared_workspace.prepared.adhoc_session_spec_with_env(
         SessionKind::Agent,
-        cwd,
         &parsed.argv,
+        &maestro_shell::ProcessLaunchEnv,
         parsed.cols,
         parsed.rows,
         now,
-    );
-    rt.resume_agent_task(
-        parsed.socket.clone(),
-        &maestro_shell::ProcessEnv,
+    ) {
+        Ok(session) => session,
+        Err(error) => {
+            let error = SmokeError::from(error);
+            return Err(prepared_workspace.append_scratch_cleanup(&paths, error));
+        }
+    };
+    let prepared = match rt.prepare_resumed_agent_task_unplaced(
+        &prepared_workspace.project,
+        &prepared_workspace.workspace,
         &parsed.agent_task_id,
-        params,
+        session,
+    ) {
+        Ok(prepared) => prepared,
+        Err(PreparedAgentTaskRuntimeError::Prepare(error)) => {
+            let error = prepared_start_error(error, true);
+            return Err(prepared_workspace.append_scratch_cleanup(&paths, error));
+        }
+        Err(other) => {
+            let error = SmokeError {
+                kind: "agent_runtime",
+                message: other.to_string(),
+            };
+            return Err(prepared_workspace.append_scratch_cleanup(&paths, error));
+        }
+    };
+    execute_prepared_agent_task_start(
+        &paths,
+        parsed.socket.clone(),
+        &rt,
+        prepared,
+        &mut prepared_workspace,
     )
-    .map_err(SmokeError::from)
+}
+
+/// Execute one task-aware transaction-prepared Start. A single settlement call is bounded by the
+/// daemon client's existing absolute deadline. If it cannot decide the operation, the durable
+/// operation journal remains the only recovery authority; neither task/session compensation nor
+/// scratch cleanup is attempted.
+fn execute_prepared_agent_task_start(
+    paths: &AppPaths,
+    socket: Option<PathBuf>,
+    runtime: &AgentTaskRuntime<'_>,
+    prepared: maestro_shell::window_layout::PreparedAgentTaskSessionStart,
+    prepared_workspace: &mut PreparedCliWorkspace,
+) -> Result<StartAgentTaskOutcome, SmokeError> {
+    match runtime.start_prepared_agent_task(socket, &maestro_shell::ProcessEnv, prepared, None) {
+        Ok(outcome) => Ok(outcome),
+        Err(PreparedAgentTaskRuntimeError::DefinitelyUnpublished { error, start }) => {
+            let compensation =
+                WindowLayoutService::new(paths).cancel_prepared_agent_task_session(start, now_ms());
+            let error = append_compensation_note(
+                SmokeError::from(error),
+                "exact task/session cancellation",
+                compensation,
+            );
+            Err(prepared_workspace.append_scratch_cleanup(paths, error))
+        }
+        Err(PreparedAgentTaskRuntimeError::Refused {
+            error,
+            compensation,
+        }) => {
+            let compensation = WindowLayoutService::new(paths)
+                .compensate_prepared_agent_task_session(compensation, now_ms());
+            let error = append_compensation_note(
+                SmokeError::from(error),
+                "exact task/session compensation",
+                compensation,
+            );
+            Err(prepared_workspace.append_scratch_cleanup(paths, error))
+        }
+        Err(PreparedAgentTaskRuntimeError::PossiblyApplied { error, recovery }) => {
+            let initial = SmokeError::from(error);
+            match runtime.settle_prepared_agent_task(recovery) {
+                Ok(outcome) => Ok(outcome),
+                Err(PreparedAgentTaskSettlementError::Pending { recovery, error }) => {
+                    let detail = error
+                        .map(|error| format!("; settlement error: {error}"))
+                        .unwrap_or_default();
+                    Err(append_message(
+                        initial,
+                        format!(
+                            "agent task {:?} session {:?} remains pending exact publication{detail}; durable recovery was preserved",
+                            recovery.agent_task_id(),
+                            recovery.session_id(),
+                        ),
+                    ))
+                }
+                Err(PreparedAgentTaskSettlementError::Changed { recovery, error }) => {
+                    Err(append_message(
+                        initial,
+                        format!(
+                            "agent task {:?} session {:?} requires forward-only recovery after its exact graph changed: {error}; durable recovery was preserved",
+                            recovery.agent_task_id(),
+                            recovery.session_id(),
+                        ),
+                    ))
+                }
+            }
+        }
+        Err(PreparedAgentTaskRuntimeError::Prepare(error)) => {
+            Err(prepared_start_error(error, true))
+        }
+    }
 }
 
 fn run_task_reconcile(parsed: &TaskReconcileArgs) -> Result<AgentTaskReconcileReport, SmokeError> {
@@ -476,48 +660,181 @@ fn run_window_view(parsed: &WindowShowArgs) -> Result<Vec<WindowTabView>, SmokeE
         .map_err(SmokeError::from)
 }
 
-/// Turn a parsed cwd mode into the actual session cwd handed to `StartParams`. This is where the
-/// side-effecting workspace preparation happens (scratch mkdir / consent-gated worktree). Shared
-/// by `start`, `agent-start`, and `agent-resume` so all three prepare cwd identically.
-fn resolve_cwd(
+/// Exact durable graph snapshot plus the prepared cwd and, only for a leaf created by this call,
+/// consume-once scratch cleanup authority. Keeping these together prevents a caller from pairing
+/// cwd authority from one Workspace with Project/Workspace bytes from another snapshot.
+struct PreparedCliWorkspace {
+    project: Project,
+    workspace: Workspace,
+    prepared: PreparedWorkspace,
+    scratch_cleanup: Option<FreshScratchCwdReceipt>,
+}
+
+impl PreparedCliWorkspace {
+    fn append_scratch_cleanup(&mut self, paths: &AppPaths, error: SmokeError) -> SmokeError {
+        let Some(receipt) = self.scratch_cleanup.take() else {
+            return error;
+        };
+        match cleanup_fresh_scratch_cwd(paths, receipt) {
+            Ok(outcome) => append_message(error, format!("fresh scratch cleanup: {outcome:?}")),
+            Err(cleanup_error) => append_message(
+                error,
+                format!("fresh scratch cleanup remains pending: {cleanup_error}"),
+            ),
+        }
+    }
+}
+
+fn append_message(mut error: SmokeError, message: impl AsRef<str>) -> SmokeError {
+    error.message.push_str("; ");
+    error.message.push_str(message.as_ref());
+    error
+}
+
+fn append_compensation_note<T: std::fmt::Debug>(
+    error: SmokeError,
+    label: &str,
+    compensation: Result<T, WindowLayoutError>,
+) -> SmokeError {
+    match compensation {
+        Ok(outcome) => append_message(error, format!("{label}: {outcome:?}")),
+        Err(compensation_error) => append_message(
+            error,
+            format!("{label} remains pending: {compensation_error}"),
+        ),
+    }
+}
+
+/// Preserve the established CLI error buckets even though preparation is now implemented by the
+/// layout transaction service. Prepared Session identity conflicts remain `session`; AgentTask
+/// identity conflicts remain `task`; graph ownership conflicts remain `workspace`.
+fn prepared_start_error(error: WindowLayoutError, task_aware: bool) -> SmokeError {
+    let kind = match &error {
+        WindowLayoutError::SessionAlreadyExists { .. }
+        | WindowLayoutError::SessionIdentityReferenced { .. } => "session",
+        WindowLayoutError::AgentTaskAlreadyExists { .. }
+        | WindowLayoutError::AgentTaskChanged { .. }
+            if task_aware =>
+        {
+            "task"
+        }
+        WindowLayoutError::WorkspaceChanged { .. } => "workspace",
+        WindowLayoutError::FutureVersion { .. }
+        | WindowLayoutError::Corrupt { .. }
+        | WindowLayoutError::Store(_) => "store",
+        _ => "window_layout",
+    };
+    SmokeError {
+        kind,
+        message: error.to_string(),
+    }
+}
+
+fn load_workspace_snapshot(paths: &AppPaths, workspace_id: &str) -> Result<Workspace, SmokeError> {
+    match load_one::<Workspace>(paths, RecordKind::Workspace, workspace_id)
+        .map_err(|error| SmokeError::store(error.to_string()))?
+    {
+        Some(LoadOutcome::Loaded(workspace)) => Ok(workspace),
+        Some(LoadOutcome::FutureVersion { path, ours, got }) => Err(SmokeError::store(format!(
+            "workspace record {} has future schema_version {got} (this build understands {ours}); left unmodified",
+            path.display(),
+        ))),
+        Some(LoadOutcome::Quarantined {
+            original,
+            moved_to,
+            reason,
+        }) => Err(SmokeError::store(format!(
+            "workspace record {} was corrupt ({reason}); quarantined to {}",
+            original.display(),
+            moved_to.display(),
+        ))),
+        None => Err(SmokeError::store(format!(
+            "workspace record {workspace_id:?} does not exist"
+        ))),
+    }
+}
+
+fn load_project_snapshot(paths: &AppPaths, project_id: &str) -> Result<Project, SmokeError> {
+    ProjectService::new(paths)
+        .load(project_id)
+        .map_err(|error| SmokeError::store(error.to_string()))?
+        .ok_or_else(|| SmokeError::store(format!("project record {project_id:?} does not exist")))
+}
+
+/// Prepare the selected cwd and load the exact Project+Workspace bytes that the transaction-aware
+/// Session constructor will revalidate under its writer fence. Worktree/RepoWrite retain their
+/// explicit consent gates. Scratch uses the receipt-bearing fresh constructor so every zero-wire
+/// or daemon-refused path can safely remove only the leaf this invocation created.
+fn prepare_cli_workspace(
     paths: &AppPaths,
     workspace_id: &str,
     session_id: &str,
     cwd: &CwdMode,
     now_ms: u64,
-) -> Result<String, SmokeError> {
-    match cwd {
-        CwdMode::Explicit(dir) => Ok(dir.clone()),
-        // Prepare the shell-owned scratch dir (0700) and run the session there.
-        // No associated repo root in this dev CLI, hence "".
-        CwdMode::Scratch => Ok(prepare_scratch_cwd(paths, workspace_id, session_id, "")?
-            .cwd
-            .to_string_lossy()
-            .into_owned()),
-        // Workspace record (with worktree_create consent) -> worktree executor.
+    expected_project_id: Option<&str>,
+) -> Result<PreparedCliWorkspace, SmokeError> {
+    let workspace = match cwd {
         CwdMode::Worktree { repo_root } => {
-            let workspace = ensure_worktree_workspace(paths, workspace_id, repo_root, now_ms)?;
-            let prepared = prepare_workspace_with_consent(
+            ensure_worktree_workspace(paths, workspace_id, repo_root, now_ms)?
+        }
+        CwdMode::RepoWrite { repo_root } => {
+            ensure_repo_write_workspace(paths, workspace_id, repo_root, now_ms)?
+        }
+        CwdMode::Explicit(_) | CwdMode::Scratch => load_workspace_snapshot(paths, workspace_id)?,
+    };
+    let project = load_project_snapshot(paths, &workspace.project_id)?;
+    if let Some(expected_project_id) = expected_project_id {
+        if project.project_id != expected_project_id {
+            return Err(SmokeError {
+                kind: "workspace",
+                message: format!(
+                    "workspace {workspace_id:?} belongs to project {:?}, not the requested project {expected_project_id:?}",
+                    project.project_id,
+                ),
+            });
+        }
+    }
+
+    let (prepared, scratch_cleanup) = match cwd {
+        CwdMode::Explicit(dir) => (
+            PreparedWorkspace::unsealed(
+                workspace.policy,
+                workspace.workspace_id.clone(),
+                session_id,
+                PathBuf::from(dir),
+            ),
+            None,
+        ),
+        CwdMode::Scratch => {
+            let fresh = prepare_fresh_scratch_cwd(paths, workspace_id, session_id, "")?;
+            let (prepared, cleanup) = fresh.into_parts();
+            (prepared, Some(cleanup))
+        }
+        CwdMode::Worktree { .. } => (
+            prepare_workspace_with_consent(
                 paths,
                 WorkspacePolicy::Worktree,
                 &workspace,
                 session_id,
-            )?;
-            Ok(prepared.cwd.to_string_lossy().into_owned())
-        }
-        // Workspace record (with repo_write consent) -> consent-gated executor that
-        // verifies the root and returns it VERBATIM as the session cwd. No git, no mutation.
-        CwdMode::RepoWrite { repo_root } => {
-            let workspace = ensure_repo_write_workspace(paths, workspace_id, repo_root, now_ms)?;
-            let prepared = prepare_workspace_with_consent(
+            )?,
+            None,
+        ),
+        CwdMode::RepoWrite { .. } => (
+            prepare_workspace_with_consent(
                 paths,
                 WorkspacePolicy::RepoWrite,
                 &workspace,
                 session_id,
-            )?;
-            Ok(prepared.cwd.to_string_lossy().into_owned())
-        }
-    }
+            )?,
+            None,
+        ),
+    };
+    Ok(PreparedCliWorkspace {
+        project,
+        workspace,
+        prepared,
+        scratch_cleanup,
+    })
 }
 
 /// Create or load the Workspace record backing `--worktree` mode. The parser already proved the
@@ -2662,6 +2979,184 @@ mod tests {
             .ok();
     }
 
+    fn seed_scratch_workspace(paths: &AppPaths, project_id: &str, workspace_id: &str) {
+        let workspace = Workspace {
+            workspace_id: workspace_id.into(),
+            project_id: project_id.into(),
+            root: "/r".into(),
+            policy: WorkspacePolicy::ScratchCwd,
+            consent: WorkspaceConsent::default(),
+        };
+        write_record(paths, RecordKind::Workspace, workspace_id, 1, &workspace).unwrap();
+    }
+
+    fn assert_record_absent<T: serde::de::DeserializeOwned>(
+        paths: &AppPaths,
+        kind: RecordKind,
+        id: &str,
+    ) {
+        assert!(
+            load_one::<T>(paths, kind, id).unwrap().is_none(),
+            "{kind:?} {id:?} must be absent"
+        );
+    }
+
+    #[test]
+    fn prepared_start_zero_wire_failure_compensates_session_and_fresh_scratch() {
+        let (_tmp, paths) = temp_paths();
+        seed_project(&paths, "project-start");
+        seed_scratch_workspace(&paths, "project-start", "workspace-start");
+        let parsed = StartArgs {
+            base: Some(paths.base().to_path_buf()),
+            socket: Some(paths.base().join("missing.sock")),
+            session_id: "session-start".into(),
+            workspace_id: "workspace-start".into(),
+            cwd: CwdMode::Scratch,
+            cols: 80,
+            rows: 24,
+            kind: SessionKind::Shell,
+            argv: vec!["/bin/sh".into()],
+        };
+
+        let error = run_start(&parsed).unwrap_err();
+        assert_eq!(error.kind, "daemon");
+        assert!(error.message.contains("exact session cancellation"));
+        assert!(error.message.contains("fresh scratch cleanup: Removed"));
+        assert_record_absent::<maestro_shell::SessionRecord>(
+            &paths,
+            RecordKind::Session,
+            "session-start",
+        );
+        assert!(!paths.scratch_base().join("session-start").exists());
+    }
+
+    #[test]
+    fn prepared_agent_start_zero_wire_failure_preserves_draft_and_cleans_session_scratch() {
+        let (_tmp, paths) = temp_paths();
+        seed_project(&paths, "project-agent-start");
+        seed_scratch_workspace(&paths, "project-agent-start", "workspace-agent-start");
+        let parsed = AgentStartArgs {
+            base: Some(paths.base().to_path_buf()),
+            socket: Some(paths.base().join("missing.sock")),
+            agent_task_id: "task-start".into(),
+            project_id: "project-agent-start".into(),
+            goal: "goal".into(),
+            session_id: "session-agent-start".into(),
+            workspace_id: "workspace-agent-start".into(),
+            cwd: CwdMode::Scratch,
+            cols: 80,
+            rows: 24,
+            argv: vec!["/bin/sh".into()],
+        };
+
+        let error = run_agent_start(&parsed).unwrap_err();
+        assert_eq!(error.kind, "daemon");
+        assert!(error.message.contains("exact task/session cancellation"));
+        assert!(error.message.contains("fresh scratch cleanup: Removed"));
+        let task = AgentTaskService::new(&paths)
+            .load("task-start")
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.state, AgentTaskState::Draft);
+        assert_eq!(task.current_session_id, None);
+        assert!(task.session_history.is_empty());
+        assert_record_absent::<maestro_shell::SessionRecord>(
+            &paths,
+            RecordKind::Session,
+            "session-agent-start",
+        );
+        assert!(!paths.scratch_base().join("session-agent-start").exists());
+    }
+
+    #[test]
+    fn prepared_agent_start_duplicate_task_preserves_task_error_bucket_and_cleans_scratch() {
+        let (_tmp, paths) = temp_paths();
+        seed_project(&paths, "project-agent-duplicate");
+        seed_scratch_workspace(
+            &paths,
+            "project-agent-duplicate",
+            "workspace-agent-duplicate",
+        );
+        AgentTaskService::new(&paths)
+            .create_draft(
+                "task-duplicate",
+                "project-agent-duplicate",
+                "original goal",
+                2,
+            )
+            .unwrap();
+        let parsed = AgentStartArgs {
+            base: Some(paths.base().to_path_buf()),
+            socket: Some(paths.base().join("must-not-connect.sock")),
+            agent_task_id: "task-duplicate".into(),
+            project_id: "project-agent-duplicate".into(),
+            goal: "replacement goal".into(),
+            session_id: "session-agent-duplicate".into(),
+            workspace_id: "workspace-agent-duplicate".into(),
+            cwd: CwdMode::Scratch,
+            cols: 80,
+            rows: 24,
+            argv: vec!["/bin/sh".into()],
+        };
+
+        let error = run_agent_start(&parsed).unwrap_err();
+        assert_eq!(error.kind, "task");
+        assert!(error.message.contains("already exists"));
+        assert!(error.message.contains("fresh scratch cleanup: Removed"));
+        assert_record_absent::<maestro_shell::SessionRecord>(
+            &paths,
+            RecordKind::Session,
+            "session-agent-duplicate",
+        );
+        assert!(!paths
+            .scratch_base()
+            .join("session-agent-duplicate")
+            .exists());
+    }
+
+    #[test]
+    fn prepared_agent_resume_zero_wire_failure_preserves_task_and_cleans_session_scratch() {
+        let (_tmp, paths) = temp_paths();
+        seed_project(&paths, "project-agent-resume");
+        seed_scratch_workspace(&paths, "project-agent-resume", "workspace-agent-resume");
+        AgentTaskService::new(&paths)
+            .create_draft("task-resume", "project-agent-resume", "original goal", 2)
+            .unwrap();
+        let task_before = AgentTaskService::new(&paths)
+            .load("task-resume")
+            .unwrap()
+            .unwrap();
+        let parsed = AgentResumeArgs {
+            base: Some(paths.base().to_path_buf()),
+            socket: Some(paths.base().join("missing.sock")),
+            agent_task_id: "task-resume".into(),
+            session_id: "session-agent-resume".into(),
+            workspace_id: "workspace-agent-resume".into(),
+            cwd: CwdMode::Scratch,
+            cols: 80,
+            rows: 24,
+            argv: vec!["/bin/sh".into()],
+        };
+
+        let error = run_agent_resume(&parsed).unwrap_err();
+        assert_eq!(error.kind, "daemon");
+        assert!(error.message.contains("exact task/session cancellation"));
+        assert!(error.message.contains("fresh scratch cleanup: Removed"));
+        assert_eq!(
+            AgentTaskService::new(&paths)
+                .load("task-resume")
+                .unwrap()
+                .unwrap(),
+            task_before,
+        );
+        assert_record_absent::<maestro_shell::SessionRecord>(
+            &paths,
+            RecordKind::Session,
+            "session-agent-resume",
+        );
+        assert!(!paths.scratch_base().join("session-agent-resume").exists());
+    }
+
     fn load_workspace(paths: &AppPaths, id: &str) -> Workspace {
         match load_one::<Workspace>(paths, RecordKind::Workspace, id)
             .expect("load")
@@ -2797,20 +3292,22 @@ mod tests {
             argv: vec!["/bin/sh".into()],
         };
 
-        let cwd = resolve_cwd(
+        let prepared = prepare_cli_workspace(
             &paths,
             &parsed.workspace_id,
             &parsed.session_id,
             &parsed.cwd,
             7,
+            None,
         )
         .unwrap();
+        let cwd = prepared.prepared.cwd.to_string_lossy().into_owned();
         let expected = paths.worktree_base().join("ws1").join("sess1");
         assert_eq!(PathBuf::from(&cwd), expected);
         assert!(expected.join("seed.txt").is_file(), "real checkout");
 
         // Exactly this prepared cwd lands in StartParams.
-        let params = StartParams::adhoc(
+        let params = maestro_shell::StartParams::adhoc(
             parsed.session_id.clone(),
             parsed.workspace_id.clone(),
             parsed.kind,
@@ -2933,14 +3430,16 @@ mod tests {
             argv: vec!["/bin/sh".into()],
         };
 
-        let cwd = resolve_cwd(
+        let prepared = prepare_cli_workspace(
             &paths,
             &parsed.workspace_id,
             &parsed.session_id,
             &parsed.cwd,
             7,
+            None,
         )
         .unwrap();
+        let cwd = prepared.prepared.cwd.to_string_lossy().into_owned();
         assert_eq!(cwd, root_str, "session cwd must be exactly the repo root");
         // Nothing was created in the root or under app-support scratch/worktrees.
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
@@ -2948,7 +3447,7 @@ mod tests {
         assert!(!paths.worktree_base().exists());
 
         // Exactly this prepared cwd lands in StartParams.
-        let params = StartParams::adhoc(
+        let params = maestro_shell::StartParams::adhoc(
             parsed.session_id.clone(),
             parsed.workspace_id.clone(),
             parsed.kind,
@@ -3021,10 +3520,10 @@ mod tests {
 
     #[test]
     fn start_success_json_has_required_fields() {
-        let outcome = StartSessionOutcome {
-            socket_path: PathBuf::from("/run/d.sock"),
-            record: record(SessionStatus::Live, Some("gen-7")),
-        };
+        let outcome = StartSessionOutcome::new(
+            PathBuf::from("/run/d.sock"),
+            record(SessionStatus::Live, Some("gen-7")),
+        );
         let v = start_success_json(&outcome);
         assert_eq!(v["ok"], json!(true));
         assert_eq!(v["socket_path"], json!("/run/d.sock"));
@@ -3035,10 +3534,10 @@ mod tests {
 
     #[test]
     fn start_success_json_generation_null_when_absent() {
-        let outcome = StartSessionOutcome {
-            socket_path: PathBuf::from("/s.sock"),
-            record: record(SessionStatus::Unknown, None),
-        };
+        let outcome = StartSessionOutcome::new(
+            PathBuf::from("/s.sock"),
+            record(SessionStatus::Unknown, None),
+        );
         let v = start_success_json(&outcome);
         assert_eq!(v["status"], json!("unknown"));
         assert_eq!(v["generation"], serde_json::Value::Null);
@@ -3064,6 +3563,10 @@ mod tests {
                 recovered_sessions: vec![maestro_shell::RecoveredSession {
                     session_id: "orphan".into(),
                 }],
+                // Mutation-authority targets are intentionally opaque and are not part of this
+                // read-only JSON projection fixture.
+                recovered_session_targets: vec![],
+                live_session_release_targets: vec![],
                 skipped_future_version: vec![PathBuf::from("/x/future.json")],
             },
         };
@@ -4424,21 +4927,64 @@ mod tests {
         use std::os::unix::net::UnixListener;
         use std::path::PathBuf;
 
-        /// A loopback stub daemon: bind `path`, accept one connection, read the single
-        /// `ListSessions` request line, then answer `{"ev":"sessions","ids":[...]}`. Mirrors the
-        /// reconcile wire flow used by `ShellRuntime::reconcile_sessions`. The join handle is kept
-        /// so the test waits for the thread to finish.
+        /// A loopback protocol-v3 stub daemon: answer the read-only capability probe and then one
+        /// complete, generation-bearing `ListSessions` snapshot. This mirrors the strict reconcile
+        /// flow used by `ShellRuntime::reconcile_sessions`; no mutation request is accepted.
         fn spawn_sessions_stub(path: PathBuf, ids: Vec<String>) -> std::thread::JoinHandle<()> {
             let listener = UnixListener::bind(&path).unwrap();
             std::thread::spawn(move || {
                 if let Ok((mut stream, _)) = listener.accept() {
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
                     let mut line = String::new();
-                    let _ = reader.read_line(&mut line); // ListSessions
-                    let ids_json = serde_json::to_string(&ids).unwrap();
-                    let resp = format!("{{\"ev\":\"sessions\",\"ids\":{ids_json}}}\n");
-                    stream.write_all(resp.as_bytes()).unwrap();
+                    reader.read_line(&mut line).unwrap();
+                    assert_eq!(line.trim(), r#"{"op":"daemon_info"}"#);
+                    writeln!(
+                        stream,
+                        "{}",
+                        serde_json::json!({
+                            "ev": "daemon_info",
+                            "protocol_version": maestro_protocol::DAEMON_PROTOCOL_VERSION,
+                            "build_version": "smoke-dashboard-stub",
+                            "daemon_instance_id": "22222222222242228222222222222222",
+                            "output_generation_echo": true,
+                            "child_environment": true,
+                            "generation_conditional_mutations": true,
+                            "attachment_aware_conditional_kill": true,
+                            "generation_conditional_start": true,
+                            "start_operation_ledger": true,
+                            "generation_conditional_attach": true,
+                        })
+                    )
+                    .unwrap();
                     stream.flush().unwrap();
+
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    assert_eq!(line.trim(), r#"{"op":"list_sessions"}"#);
+                    let sessions = ids
+                        .iter()
+                        .map(|id| {
+                            serde_json::json!({
+                                "id": id,
+                                "generation": "smoke-dashboard-generation",
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    writeln!(
+                        stream,
+                        "{}",
+                        serde_json::json!({
+                            "ev": "sessions",
+                            "ids": ids,
+                            "sessions": sessions,
+                        })
+                    )
+                    .unwrap();
+                    stream.flush().unwrap();
+                    // Keep the peer alive while the client restores its scoped socket timeouts;
+                    // the runtime drops the connection before `run_dashboard` returns.
+                    line.clear();
+                    let _ = reader.read_line(&mut line);
                 }
             })
         }
@@ -4532,8 +5078,12 @@ mod tests {
             let (_tmp, paths) = temp_paths();
             write_project(&paths, &project("p1", "One", 100));
             write_workspace(&paths, &workspace("ws1", "p1"));
-            // Two sessions on the same project; daemon reports only s_live alive.
-            write_session(&paths, &session("s_live", "ws1", SessionStatus::Unknown));
+            // Two sessions on the same project; daemon reports only the exact durable generation
+            // of s_live alive. Presence without generation identity is deliberately not enough to
+            // promote an Unknown durable row to Live.
+            let mut live = session("s_live", "ws1", SessionStatus::Unknown);
+            live.last_known_generation = Some("smoke-dashboard-generation".into());
+            write_session(&paths, &live);
             write_session(&paths, &session("s_dead", "ws1", SessionStatus::Unknown));
             write_window(
                 &paths,

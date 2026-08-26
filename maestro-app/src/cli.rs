@@ -83,7 +83,9 @@ pub enum Command {
     /// Manage named workspace layout presets. Daemon-free: `save` reads a
     /// persisted `WindowLayout` and writes a `LayoutPreset`; `list`/`delete` operate on the preset
     /// store; `restore-plan` prints the non-executing restore plan (which slots reattach vs. launch
-    /// fresh) as JSON. See [`LayoutPresetCommand`] and `maestro_shell::LayoutPresetService`.
+    /// fresh) as JSON. Executing a non-empty restore is temporarily fail-closed until exact topology
+    /// and renderer-publication authority can be coordinated. See [`LayoutPresetCommand`] and
+    /// `maestro_shell::LayoutPresetService`.
     LayoutPreset(LayoutPresetCommand),
     /// Project management over `maestro_shell::ProjectService`. Create/update/reorder are local
     /// record writes and list is read-only; delete additionally contacts the retained PTY daemon so
@@ -181,9 +183,10 @@ pub enum LayoutPresetCommand {
     /// `layout-preset restore-plan --preset-id <id> [--base <dir>]`: print the non-executing restore
     /// plan for a preset (each slot marked reattach-live vs. launch-fresh) as JSON.
     RestorePlan(LayoutPresetRefArgs),
-    /// `layout-preset restore --preset-id <id> --window-id <id> [--base <dir>]`: EXECUTE a restore —
-    /// walk the plan and, per slot, reattach the still-live hinted session or launch a fresh one,
-    /// appending the rebuilt tabs/splits into `window-id`'s layout. Prints the per-slot outcomes.
+    /// `layout-preset restore --preset-id <id> --window-id <id> [--base <dir>]`: derive and
+    /// preflight an executing restore. Empty presets succeed as effect-free no-ops; non-empty plans
+    /// currently fail closed before touching the target/daemon until exact topology coordination is
+    /// available.
     Restore(LayoutPresetRestoreArgs),
 }
 
@@ -217,10 +220,10 @@ pub struct LayoutPresetRefArgs {
 }
 
 /// Parsed `layout-preset restore` arguments. `preset_id` (the preset to restore) and `window_id`
-/// (the target window the rebuilt tabs are appended into) are both required + safe-id-validated;
-/// `base` selects the records base. `socket`/`daemon`/`log_dir` mirror `launch`: a LaunchFresh slot
-/// starts a real session, so the executor must reach (and may spawn) a daemon. The executing
-/// counterpart to `restore-plan`.
+/// (the future target window) are both required + safe-id-validated; `base` selects the records
+/// base. `socket`/`daemon`/`log_dir` are reserved for the future exact executor. Today a non-empty
+/// plan is refused before those paths are inspected or any target is created; an empty plan is a
+/// side-effect-free success.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LayoutPresetRestoreArgs {
     pub preset_id: Option<String>,
@@ -909,6 +912,10 @@ pub fn usage() -> &'static str {
      \x20\x20maestro-app layout-preset restore-plan --preset-id <id> [--base <dir>]\n\
      \x20\x20maestro-app layout-preset restore --preset-id <id> --window-id <id> [--base <dir>] [--socket <path>] [--daemon <path>] [--log-dir <dir>]\n\
      \n\
+     Non-empty 'layout-preset restore' plans are currently unavailable: they fail closed before\n\
+     target-window, daemon, renderer, or log effects until exact topology restore is implemented.\n\
+     An empty preset is accepted as an effect-free no-op.\n\
+     \n\
      The 'settings show' command prints the app's effective settings (foreground chrome defaults,\n\
      workspace consent policy, local safety policy, and appearance) as one structured JSON value and\n\
      exits 0, merging any persisted appearance and chrome overrides. The 'settings set' command\n\
@@ -988,12 +995,12 @@ pub fn usage() -> &'static str {
      refusing to clobber an existing preset id; running-session identity is kept separate from layout\n\
      position so a restore never relabels or restarts the wrong pane. 'list' prints saved presets\n\
      newest-first (optionally scoped to a --project-id); 'delete' removes one preset; 'restore-plan'\n\
-     prints the NON-EXECUTING restore plan — each captured slot marked reattach (its hinted session is\n\
-     still live) or launch_fresh — derived from the fresh set of non-exited session records. 'restore'\n\
-     EXECUTES that plan into --window-id's layout: it walks the slots in order, reattaching a live\n\
-     hinted session (no relaunch) or launching a fresh one through the ordinary new-tab pipeline,\n\
-     minting fresh tab ids and rebuilding splits inside one top-level tab list. Each command prints\n\
-     exactly one structured JSON value; --base resolves the records base.\n\
+     prints the NON-EXECUTING candidate plan — each captured slot marked reattach (its hinted session\n\
+     is still live) or launch_fresh — derived from the fresh set of non-exited session records.\n\
+     'restore' currently preflights that plan only: an empty preset succeeds without side effects,\n\
+     while every non-empty plan fails closed before target-window, daemon, renderer, log, or id\n\
+     effects until exact topology + renderer-publication coordination is implemented. Each command\n\
+     prints exactly one structured JSON value; --base resolves the records base.\n\
      \n\
      FLAGS (attach-tab):\n\
      \x20\x20--window-id <id>     persisted window layout to open from (required)\n\

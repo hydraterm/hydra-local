@@ -902,7 +902,7 @@ fn provider_session_id_from_launch(launch: &LaunchSpec) -> Option<String> {
             launch_spec_id,
             params,
         } => {
-            if launch_spec_id == "devin" || launch_spec_id == "droid" {
+            if matches!(launch_spec_id.as_str(), "claude" | "devin" | "droid") {
                 return opaque_resume_id_from_params(params);
             }
             provider_session_id_from_tokens(
@@ -987,15 +987,7 @@ fn provider_session_id_from_flat_tokens(tokens: &[&str], allow_cursor: bool) -> 
                 }
             }
         } else if leaf == "gemini" {
-            for offset in 1..4 {
-                if tokens.get(idx + offset).copied() == Some("--session-file") {
-                    return tokens
-                        .get(idx + offset + 1)
-                        .and_then(|path| Path::new(path).file_stem())
-                        .and_then(|stem| stem.to_str())
-                        .map(str::to_string);
-                }
-            }
+            return gemini_session_id_from_flat_tokens(tokens, idx + 1);
         } else if leaf == "opencode" {
             for offset in 1..4 {
                 if tokens.get(idx + offset).copied() == Some("--session") {
@@ -1073,6 +1065,38 @@ fn provider_session_id_from_flat_tokens(tokens: &[&str], allow_cursor: bool) -> 
         }
     }
     None
+}
+
+fn gemini_session_id_from_flat_tokens(tokens: &[&str], mut idx: usize) -> Option<String> {
+    let mut identity = None;
+    while idx < tokens.len() {
+        let candidate = match tokens[idx] {
+            "--resume" | "--session-id" => {
+                let value = *tokens.get(idx + 1)?;
+                let canonical = clean_uuid(value)?;
+                if canonical != value {
+                    return None;
+                }
+                idx += 2;
+                canonical
+            }
+            "--session-file" => {
+                let path = *tokens.get(idx + 1)?;
+                let stem = Path::new(path).file_stem()?.to_str()?;
+                let stem = clean_opaque_session_id(stem)?;
+                idx += 2;
+                stem
+            }
+            _ => {
+                idx += 1;
+                continue;
+            }
+        };
+        if identity.replace(candidate).is_some() {
+            return None;
+        }
+    }
+    identity
 }
 
 fn clean_uuid(candidate: &str) -> Option<String> {
@@ -1210,6 +1234,21 @@ mod tests {
             Some("10000000-0000-4000-8000-000000000001")
         );
 
+        let claude_with_launch_flags = LaunchSpec::KnownSafe {
+            launch_spec_id: "claude".into(),
+            params: vec![
+                "--model".into(),
+                "opus".into(),
+                "--dangerously-skip-permissions".into(),
+                "--resume".into(),
+                "10000000-0000-4000-8000-000000000002".into(),
+            ],
+        };
+        assert_eq!(
+            provider_session_id_from_launch(&claude_with_launch_flags).as_deref(),
+            Some("10000000-0000-4000-8000-000000000002")
+        );
+
         let shell_wrapped = LaunchSpec::AdHocRedacted {
             argv: vec![
                 "/bin/zsh".into(),
@@ -1247,6 +1286,42 @@ mod tests {
             provider_session_id_from_launch(&gemini).as_deref(),
             Some("gemini-session")
         );
+
+        let gemini_id = "40000000-0000-4000-8000-000000000001";
+        let exact_gemini = LaunchSpec::KnownSafe {
+            launch_spec_id: "gemini".into(),
+            params: vec!["--resume".into(), gemini_id.into()],
+        };
+        assert_eq!(
+            provider_session_id_from_launch(&exact_gemini).as_deref(),
+            Some(gemini_id)
+        );
+        for params in [
+            vec!["--resume".into(), "latest".into()],
+            vec!["--resume".into(), "5".into()],
+            vec!["--resume".into(), format!(" {gemini_id} ")],
+            vec![
+                "--resume".into(),
+                gemini_id.into(),
+                "--resume".into(),
+                gemini_id.into(),
+            ],
+            vec![
+                "--resume".into(),
+                gemini_id.into(),
+                "--session-file".into(),
+                "/tmp/gemini-session.jsonl".into(),
+            ],
+        ] {
+            assert_eq!(
+                provider_session_id_from_launch(&LaunchSpec::KnownSafe {
+                    launch_spec_id: "gemini".into(),
+                    params,
+                }),
+                None,
+                "non-exact or conflicting Gemini selector must not claim pane ownership"
+            );
+        }
 
         let copilot_id = "20000000-0000-4000-8000-000000000001";
         let copilot = LaunchSpec::KnownSafe {

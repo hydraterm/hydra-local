@@ -47,13 +47,69 @@ use super::sidebar_layout::SidebarLayout;
 use super::wake::{
     FlushWake, HostEventSender, LinuxLoopEvent, LinuxUserEventSender, RendererRedrawWake,
 };
+use crate::file_drop::{MAX_DROPPED_PATHS, MAX_DROPPED_URI_BYTES};
 use crate::host_services::{ChromeHostServices, HostServices, TerminalClipboardHostServices};
 use crate::linux_host::chrome_services::LinuxChromeServices;
 use crate::linux_host::host_services::LinuxHostServices;
-use crate::{RendererEvent, UserEvent};
+use crate::{RendererEvent, UserEvent, ViewportEventSink};
 
 /// Default sidebar width in logical pixels when the caller supplies no React chrome width.
 const DEFAULT_SIDEBAR_WIDTH: i32 = 420;
+const TERMINAL_FILE_DROP_TARGET_INFO: u32 = 1;
+
+/// Decode only bounded local `file:` URIs from a GTK `text/uri-list`. A URI is transport, not a
+/// terminal payload: non-file schemes and remote hosts are rejected, and App independently rechecks
+/// absolute/UTF-8/control/insert-size policy before retaining any path.
+fn local_file_paths_from_uris<'a>(
+    uris: impl IntoIterator<Item = &'a str>,
+) -> Vec<std::path::PathBuf> {
+    uris.into_iter()
+        .take(MAX_DROPPED_PATHS)
+        .filter(|uri| uri.len() <= MAX_DROPPED_URI_BYTES)
+        .filter_map(|uri| glib::filename_from_uri(uri).ok())
+        .filter(|(_, hostname)| {
+            hostname.as_ref().is_none_or(|host| {
+                host.as_str().is_empty() || host.as_str().eq_ignore_ascii_case("localhost")
+            })
+        })
+        .map(|(path, _)| path)
+        .collect()
+}
+
+#[cfg(test)]
+mod file_drop_uri_tests {
+    use super::{local_file_paths_from_uris, MAX_DROPPED_PATHS, MAX_DROPPED_URI_BYTES};
+
+    #[test]
+    fn uri_list_decodes_only_bounded_local_files() {
+        let oversized = format!("file:///{}", "x".repeat(MAX_DROPPED_URI_BYTES));
+        let uris = [
+            "file:///tmp/a%20b",
+            "https://example.invalid/not-a-path",
+            "file://remote.invalid/tmp/not-local",
+            "file://localhost/tmp/local",
+            oversized.as_str(),
+        ];
+        assert_eq!(
+            local_file_paths_from_uris(uris),
+            vec![
+                std::path::PathBuf::from("/tmp/a b"),
+                std::path::PathBuf::from("/tmp/local"),
+            ]
+        );
+    }
+
+    #[test]
+    fn uri_list_path_count_is_bounded_before_decode() {
+        let uris = (0..MAX_DROPPED_PATHS + 5)
+            .map(|index| format!("file:///tmp/{index}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            local_file_paths_from_uris(uris.iter().map(String::as_str)).len(),
+            MAX_DROPPED_PATHS
+        );
+    }
+}
 
 /// Errors constructing or running the Linux dashboard host.
 #[derive(Debug)]
@@ -298,7 +354,7 @@ impl LinuxDashboardHost {
     pub fn new(
         window_title: &str,
         react_chrome: Option<crate::RendererReactChrome>,
-        events: Option<std::sync::mpsc::Sender<RendererEvent>>,
+        events: Option<ViewportEventSink>,
     ) -> Result<Self, LinuxHostError> {
         // MUST precede gtk::init: GTK opens the GDK Xlib connection, which is later
         // shared with WGPU/Vulkan on X11.
@@ -427,6 +483,18 @@ impl LinuxDashboardHost {
                 | gtk::gdk::EventMask::KEY_RELEASE_MASK
                 | gtk::gdk::EventMask::FOCUS_CHANGE_MASK
                 | gtk::gdk::EventMask::LEAVE_NOTIFY_MASK,
+        );
+        // Register ONLY the native terminal slot as a file destination. Sidebar/topbar WebViews and
+        // every other chrome widget keep their existing drag behavior and can never emit a terminal
+        // path insertion through this signal.
+        terminal_slot.drag_dest_set(
+            gtk::DestDefaults::ALL,
+            &[gtk::TargetEntry::new(
+                "text/uri-list",
+                gtk::TargetFlags::empty(),
+                TERMINAL_FILE_DROP_TARGET_INFO,
+            )],
+            gtk::gdk::DragAction::COPY,
         );
 
         // --- Slot background painting: avoid a white PARENT flash during a resize ---
@@ -910,6 +978,30 @@ impl LinuxDashboardHost {
         // paste shortcuts can consume repeats without issuing repeated clipboard reads/writes.
         let pressed_keys = Rc::new(RefCell::new(std::collections::HashSet::<u16>::new()));
 
+        // --- native file drop: one bounded URI-list batch → one neutral DroppedFiles event ---
+        {
+            let sink = sink.clone();
+            terminal_slot.connect_drag_data_received(
+                move |widget, context, x, y, selection, info, time| {
+                    let paths = if info == TERMINAL_FILE_DROP_TARGET_INFO {
+                        let uris = selection.uris();
+                        local_file_paths_from_uris(uris.iter().map(|uri| uri.as_str()))
+                    } else {
+                        Vec::new()
+                    };
+                    let accepted = !paths.is_empty();
+                    if accepted {
+                        let scale = widget.scale_factor().max(1) as f64;
+                        (sink.borrow_mut())(HostEvent::DroppedFiles {
+                            paths,
+                            position: Some((x as f64 * scale, y as f64 * scale)),
+                        });
+                    }
+                    context.drop_finish(accepted, time);
+                },
+            );
+        }
+
         // GTK does not clear an X11 urgency hint automatically when the window is activated. Clear it at the
         // top-level focus boundary so a bell raised while Hydra is in the background is acknowledged whether
         // focus returns through the terminal slot or through the dashboard WebView. This deliberately emits no
@@ -1227,7 +1319,11 @@ impl LinuxDashboardHost {
                 }
                 Event::UserEvent(LinuxLoopEvent::TerminalRevealReady { generation }) => {
                     if let Some(resume) = self.present_target.complete_reveal(generation) {
-                        app.resume_linux_terminal_presentation(resume);
+                        if app.resume_linux_terminal_presentation(resume)
+                            == crate::HostControl::Exit
+                        {
+                            *control_flow = ControlFlow::Exit;
+                        }
                     }
                 }
                 Event::RedrawRequested(_) => {

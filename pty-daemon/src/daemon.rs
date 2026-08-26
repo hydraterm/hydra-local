@@ -6,8 +6,22 @@
 use crate::channel::Channel;
 use crate::ids::{ChannelId, SessionId};
 use crate::protocol::{now_millis, ChannelEvent, ChannelEventKind, SessionInfo};
-use crate::session::Session;
+use crate::revision::SessionGeneration;
+use crate::session::{AttachmentGuard, Session};
+#[cfg(test)]
+use crate::session::{MAX_ATTACHMENT_HANDOFF_TOKENS, MAX_RETIRED_ATTACHMENT_HANDOFF_TOKENS};
 use anyhow::{anyhow, Result};
+use maestro_protocol::request::{
+    AttachmentHandoff, AttachmentHandoffToken, ConditionalSessionStart, DaemonInstanceId,
+    SessionStartOperationToken, SessionStartPrecondition,
+};
+use maestro_protocol::{
+    ConditionalSessionStartOutcome, ConditionalSessionStartRefusal, SessionAttachRefusal,
+    SessionStartOperationLifecycle, SessionStartOperationReserveOutcome,
+    SessionStartOperationReserveRefusal, SessionStartOperationRetireExpectation,
+    SessionStartOperationRetireOutcome, SessionStartOperationStatus,
+    MAX_START_OPERATION_SESSION_ID_BYTES,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -21,11 +35,67 @@ const MAX_SESSIONS: usize = 64;
 /// ceiling rather than inheriting the session limit accidentally.
 const MAX_CHANNELS: usize = 64;
 const MAX_CHANNEL_ID_BYTES: usize = 512;
+/// Operation entries have no TTL/LRU and are removed only by exact CAS retirement. Once this cap
+/// is full, only a brand-new reservation is refused; lookup, exact Start replay, and retirement of
+/// existing entries remain admitted so callers can safely recover capacity.
+pub(crate) const MAX_START_OPERATION_LEDGER_ENTRIES: usize = 4096;
 
-#[derive(Default)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum StartOperationLedgerEntry {
+    Reserved {
+        id: SessionId,
+    },
+    Applied {
+        id: SessionId,
+        generation: String,
+    },
+    Refused {
+        id: SessionId,
+        reason: ConditionalSessionStartRefusal,
+    },
+}
+
+impl StartOperationLedgerEntry {
+    fn id(&self) -> &SessionId {
+        match self {
+            Self::Reserved { id } | Self::Applied { id, .. } | Self::Refused { id, .. } => id,
+        }
+    }
+}
+
 pub struct Daemon {
     sessions: HashMap<SessionId, Session>,
     channels: HashMap<ChannelId, Channel>,
+    /// Content-blind process-lifetime start ledger. Values contain only opaque ids, opaque tokens,
+    /// generation identities, and enum state—never cwd, argv, environment, grid, or output.
+    start_operations: HashMap<SessionStartOperationToken, StartOperationLedgerEntry>,
+    instance_id: DaemonInstanceId,
+    #[cfg(test)]
+    force_next_conditional_generation_collision: bool,
+}
+
+#[derive(Debug)]
+pub enum SessionAttachmentAcquireError {
+    Refused(SessionAttachRefusal),
+    Invalid(anyhow::Error),
+}
+
+impl Default for Daemon {
+    fn default() -> Self {
+        let instance_id = uuid::Uuid::new_v4()
+            .simple()
+            .to_string()
+            .parse()
+            .expect("Uuid::new_v4 simple encoding is a valid DaemonInstanceId");
+        Self {
+            sessions: HashMap::new(),
+            channels: HashMap::new(),
+            start_operations: HashMap::new(),
+            instance_id,
+            #[cfg(test)]
+            force_next_conditional_generation_collision: false,
+        }
+    }
 }
 
 /// Outcome of `Daemon::shutdown`: how many owned children were confirmed reaped
@@ -52,9 +122,24 @@ impl ShutdownReport {
 
 pub type SharedDaemon = Arc<Mutex<Daemon>>;
 
+/// Result of atomically comparing a caller's lifetime proof with the current id mapping and, on
+/// an exact match, removing that one Session from the map. The caller kills the returned Session
+/// after releasing the daemon mutex, so a blocking child operation cannot stall unrelated ids and
+/// can never retarget a replacement inserted after removal.
+pub enum ConditionalSessionTake {
+    Absent,
+    GenerationMismatch,
+    AttachmentInUse,
+    Taken(Session),
+}
+
 impl Daemon {
     pub fn shared() -> SharedDaemon {
         Arc::new(Mutex::new(Daemon::default()))
+    }
+
+    pub fn instance_id(&self) -> &DaemonInstanceId {
+        &self.instance_id
     }
 
     #[expect(
@@ -150,6 +235,11 @@ impl Daemon {
                     "session {id} has exited and is retained; explicit restart authority is required"
                 ));
             }
+            Some(existing) if existing.attachment_in_use() => {
+                return Err(anyhow!(
+                    "session {id} has an active attachment or pending attachment handoff"
+                ));
+            }
             Some(_) => true,
             None => false,
         };
@@ -192,7 +282,7 @@ impl Daemon {
             && !self
                 .sessions
                 .values()
-                .any(|session| session.exit_state().is_some())
+                .any(|session| session.exit_state().is_some() && !session.attachment_in_use())
         {
             return Err(anyhow!(
                 "session limit reached ({MAX_SESSIONS}); kill a session before starting another"
@@ -217,9 +307,7 @@ impl Daemon {
                 .sessions
                 .iter()
                 .find_map(|(candidate_id, candidate)| {
-                    candidate
-                        .exit_state()
-                        .is_some()
+                    (candidate.exit_state().is_some() && !candidate.attachment_in_use())
                         .then(|| candidate_id.clone())
                 })
                 .expect("capacity eviction candidate remains installed under daemon lock");
@@ -232,12 +320,401 @@ impl Daemon {
         Ok(())
     }
 
+    /// Atomically compare one exact daemon-map precondition and, only on a match, create a fresh
+    /// Session and publish its generation into the reserved ledger entry. The global daemon mutex
+    /// is held by the caller across this entire method, so no Attach/Kill/other Start can interleave
+    /// between the predicate, Session insertion, and Reserved-to-Applied transition.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_session_conditionally(
+        &mut self,
+        id: SessionId,
+        cwd: &str,
+        command: &str,
+        args: &[String],
+        child_environment: Option<&maestro_protocol::ChildEnvironment>,
+        cols: u16,
+        rows: u16,
+        conditional: &ConditionalSessionStart,
+    ) -> ConditionalSessionStartOutcome {
+        // Conditional Start is legal only for the exact, previously reserved content-blind tuple.
+        // Applied and Refused are idempotent replay answers even after the Session map removes or
+        // replaces the resulting generation, until an explicit exact retirement removes them.
+        match self.start_operations.get(&conditional.operation_token) {
+            Some(StartOperationLedgerEntry::Reserved { id: reserved_id }) if reserved_id == &id => {
+            }
+            Some(StartOperationLedgerEntry::Applied {
+                id: applied_id,
+                generation,
+            }) if applied_id == &id => {
+                return ConditionalSessionStartOutcome::AlreadyApplied {
+                    generation: generation.clone(),
+                }
+            }
+            Some(StartOperationLedgerEntry::Refused {
+                id: refused_id,
+                reason,
+            }) if refused_id == &id => {
+                return ConditionalSessionStartOutcome::Refused { reason: *reason }
+            }
+            Some(_) | None => {
+                return ConditionalSessionStartOutcome::Refused {
+                    reason: ConditionalSessionStartRefusal::PreconditionFailed,
+                }
+            }
+        }
+
+        let restart_exited = match &conditional.precondition {
+            SessionStartPrecondition::Absent {
+                excluded_generation,
+            } => {
+                if excluded_generation
+                    .as_ref()
+                    .is_some_and(|generation| generation.is_empty() || generation.len() > 128)
+                {
+                    return self.refuse_reserved_start(
+                        &id,
+                        &conditional.operation_token,
+                        ConditionalSessionStartRefusal::PreconditionFailed,
+                    );
+                }
+                if self.sessions.contains_key(&id) {
+                    return self.refuse_reserved_start(
+                        &id,
+                        &conditional.operation_token,
+                        ConditionalSessionStartRefusal::PreconditionFailed,
+                    );
+                }
+                false
+            }
+            SessionStartPrecondition::ExitedGeneration {
+                expected_generation,
+            } => {
+                if expected_generation.is_empty() || expected_generation.len() > 128 {
+                    return self.refuse_reserved_start(
+                        &id,
+                        &conditional.operation_token,
+                        ConditionalSessionStartRefusal::PreconditionFailed,
+                    );
+                }
+                let Some(existing) = self.sessions.get(&id) else {
+                    return self.refuse_reserved_start(
+                        &id,
+                        &conditional.operation_token,
+                        ConditionalSessionStartRefusal::PreconditionFailed,
+                    );
+                };
+                if existing.generation() != *expected_generation || existing.exit_state().is_none()
+                {
+                    return self.refuse_reserved_start(
+                        &id,
+                        &conditional.operation_token,
+                        ConditionalSessionStartRefusal::PreconditionFailed,
+                    );
+                }
+                if existing.attachment_in_use() {
+                    return self.refuse_reserved_start(
+                        &id,
+                        &conditional.operation_token,
+                        ConditionalSessionStartRefusal::AttachmentInUse,
+                    );
+                }
+                true
+            }
+        };
+
+        // Conditional start never reaps an unrelated retained snapshot to make room: its authority
+        // is one exact id predicate, not a global capacity mutation. Same-id replacement reuses its
+        // slot; an Absent start at capacity fails without touching any existing mapping.
+        if !restart_exited && self.sessions.len() >= MAX_SESSIONS {
+            return self.refuse_reserved_start(
+                &id,
+                &conditional.operation_token,
+                ConditionalSessionStartRefusal::SpawnFailed,
+            );
+        }
+
+        // Validate every spawn input before creating a candidate. The old exact Session remains
+        // mapped throughout validation and spawn, so any failure preserves its exit latch, grid,
+        // attachments, and operation token byte-for-byte.
+        if command.is_empty()
+            || command.contains('\0')
+            || args.iter().any(|argument| argument.contains('\0'))
+            || validate_child_environment(child_environment).is_err()
+            || (!cwd.is_empty() && !std::path::Path::new(cwd).is_dir())
+        {
+            return self.refuse_reserved_start(
+                &id,
+                &conditional.operation_token,
+                ConditionalSessionStartRefusal::SpawnFailed,
+            );
+        }
+        let (normalized_cols, normalized_rows) = crate::grid::normalize_dims(cols, rows);
+        if !crate::grid::fits_snapshot_budget(normalized_cols, normalized_rows) {
+            return self.refuse_reserved_start(
+                &id,
+                &conditional.operation_token,
+                ConditionalSessionStartRefusal::SpawnFailed,
+            );
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut self.force_next_conditional_generation_collision) {
+            // Deterministic proof seam: collision refusal occurs before PTY creation/exec, so the
+            // test command cannot leave even an external side effect marker.
+            return self.refuse_reserved_start(
+                &id,
+                &conditional.operation_token,
+                ConditionalSessionStartRefusal::SpawnFailed,
+            );
+        }
+        let candidate_generation = match &conditional.precondition {
+            SessionStartPrecondition::Absent {
+                excluded_generation,
+            } => excluded_generation
+                .as_deref()
+                .map_or_else(SessionGeneration::new, SessionGeneration::new_excluding),
+            SessionStartPrecondition::ExitedGeneration {
+                expected_generation,
+            } => SessionGeneration::new_excluding(expected_generation),
+        };
+        let generation = candidate_generation.to_string();
+        let candidate = match Session::spawn_with_generation(
+            id.clone(),
+            cwd,
+            command,
+            args,
+            child_environment,
+            cols,
+            rows,
+            candidate_generation,
+        ) {
+            Ok(candidate) => candidate,
+            Err(_) => {
+                return self.refuse_reserved_start(
+                    &id,
+                    &conditional.operation_token,
+                    ConditionalSessionStartRefusal::SpawnFailed,
+                )
+            }
+        };
+        debug_assert_eq!(candidate.generation(), generation);
+        // This is the sole destructive map publication. Candidate validation, generation proof,
+        // and ledger reservation proof all completed first, so inserting can no longer fail.
+        self.sessions.insert(id.clone(), candidate);
+        let entry = self
+            .start_operations
+            .get_mut(&conditional.operation_token)
+            .expect("exact reserved operation remains present under daemon lock");
+        debug_assert!(matches!(
+            entry,
+            StartOperationLedgerEntry::Reserved { id: reserved_id } if reserved_id == &id
+        ));
+        *entry = StartOperationLedgerEntry::Applied {
+            id,
+            generation: generation.clone(),
+        };
+        ConditionalSessionStartOutcome::Applied { generation }
+    }
+
+    fn refuse_reserved_start(
+        &mut self,
+        id: &SessionId,
+        operation_token: &SessionStartOperationToken,
+        reason: ConditionalSessionStartRefusal,
+    ) -> ConditionalSessionStartOutcome {
+        let entry = self
+            .start_operations
+            .get_mut(operation_token)
+            .expect("conditional Start reached validation only with a reserved operation");
+        debug_assert!(matches!(
+            entry,
+            StartOperationLedgerEntry::Reserved { id: reserved_id } if reserved_id == id
+        ));
+        *entry = StartOperationLedgerEntry::Refused {
+            id: id.clone(),
+            reason,
+        };
+        ConditionalSessionStartOutcome::Refused { reason }
+    }
+
+    /// Reserve one content-blind tuple retained until exact retirement. Existing entries are
+    /// always handled before the cap check, so replay/recovery remains available even after new
+    /// reservations are exhausted.
+    pub fn reserve_start_operation(
+        &mut self,
+        id: SessionId,
+        operation_token: SessionStartOperationToken,
+    ) -> SessionStartOperationReserveOutcome {
+        if id.0.is_empty()
+            || id.0.len() > MAX_START_OPERATION_SESSION_ID_BYTES
+            || id.0.chars().any(char::is_control)
+        {
+            return SessionStartOperationReserveOutcome::Refused {
+                reason: SessionStartOperationReserveRefusal::InvalidSessionId,
+            };
+        }
+        if let Some(existing) = self.start_operations.get(&operation_token) {
+            return match existing {
+                StartOperationLedgerEntry::Reserved { id: reserved_id } if reserved_id == &id => {
+                    SessionStartOperationReserveOutcome::AlreadyReserved
+                }
+                StartOperationLedgerEntry::Applied { id: applied_id, .. }
+                | StartOperationLedgerEntry::Refused { id: applied_id, .. }
+                    if applied_id == &id =>
+                {
+                    SessionStartOperationReserveOutcome::Refused {
+                        reason: SessionStartOperationReserveRefusal::AlreadyTerminal,
+                    }
+                }
+                _ => SessionStartOperationReserveOutcome::Refused {
+                    reason: SessionStartOperationReserveRefusal::TokenInUse,
+                },
+            };
+        }
+        if self.start_operations.len() >= MAX_START_OPERATION_LEDGER_ENTRIES {
+            return SessionStartOperationReserveOutcome::Refused {
+                reason: SessionStartOperationReserveRefusal::LedgerFull,
+            };
+        }
+        self.start_operations
+            .insert(operation_token, StartOperationLedgerEntry::Reserved { id });
+        SessionStartOperationReserveOutcome::Reserved
+    }
+
+    /// Read-only recovery for a conditional start whose acknowledgement was ambiguous. An exact
+    /// tuple reports its retained operation state even after Session removal/replacement.
+    pub fn lookup_start_operation(
+        &self,
+        id: &SessionId,
+        operation_token: &SessionStartOperationToken,
+    ) -> SessionStartOperationStatus {
+        match self.start_operations.get(operation_token) {
+            Some(StartOperationLedgerEntry::Reserved { id: reserved_id }) if reserved_id == id => {
+                SessionStartOperationStatus::Reserved
+            }
+            Some(StartOperationLedgerEntry::Refused { id: refused_id, .. }) if refused_id == id => {
+                SessionStartOperationStatus::Refused
+            }
+            Some(StartOperationLedgerEntry::Applied {
+                id: applied_id,
+                generation,
+            }) if applied_id == id => {
+                let lifecycle = match self.sessions.get(id) {
+                    Some(session) if session.generation() == *generation => {
+                        if session.exit_state().is_some() {
+                            SessionStartOperationLifecycle::Exited
+                        } else {
+                            SessionStartOperationLifecycle::Live
+                        }
+                    }
+                    Some(_) | None => SessionStartOperationLifecycle::Removed,
+                };
+                SessionStartOperationStatus::Applied {
+                    generation: generation.clone(),
+                    lifecycle,
+                }
+            }
+            Some(_) | None => SessionStartOperationStatus::Unknown,
+        }
+    }
+
+    /// Exact CAS retirement. The daemon mutex held by the caller makes removal a barrier with
+    /// Start: either Start observes Reserved first and publishes Applied(G), or the later Start
+    /// observes Missing and refuses without spawning.
+    pub fn retire_start_operation(
+        &mut self,
+        id: &SessionId,
+        operation_token: &SessionStartOperationToken,
+        expected: &SessionStartOperationRetireExpectation,
+    ) -> SessionStartOperationRetireOutcome {
+        let current = self.lookup_start_operation(id, operation_token);
+        let may_retire = match (expected, &current) {
+            (
+                SessionStartOperationRetireExpectation::Unapplied,
+                SessionStartOperationStatus::Reserved | SessionStartOperationStatus::Refused,
+            ) => true,
+            (
+                SessionStartOperationRetireExpectation::Applied {
+                    generation: expected_generation,
+                },
+                SessionStartOperationStatus::Applied { generation, .. },
+            ) => expected_generation == generation,
+            _ => false,
+        };
+        if may_retire {
+            let entry = self
+                .start_operations
+                .get(operation_token)
+                .expect("retirable exact operation remains present under daemon lock");
+            debug_assert_eq!(entry.id(), id);
+            self.start_operations.remove(operation_token);
+            return SessionStartOperationRetireOutcome::Retired;
+        }
+        if current == SessionStartOperationStatus::Unknown {
+            return SessionStartOperationRetireOutcome::AlreadyRetired;
+        }
+        SessionStartOperationRetireOutcome::Conflict { current }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)] // Reserved fault-injection seam for conditional-start collision tests.
+    pub fn force_next_conditional_generation_collision_for_test(&mut self) {
+        self.force_next_conditional_generation_collision = true;
+    }
+
     pub fn session(&self, id: &SessionId) -> Result<&Session> {
         self.sessions
             .get(id)
             .ok_or_else(|| anyhow!("no such session: {id}"))
     }
 
+    /// Acquire a non-cloneable owner guard on the current exact Session object. Callers invoke this
+    /// while holding the daemon mutex, so it linearizes with conditional Kill and same-id restart.
+    pub fn acquire_session_attachment(
+        &self,
+        id: &SessionId,
+        handoff: Option<&AttachmentHandoff>,
+        owner_nonce: u64,
+    ) -> Result<AttachmentGuard> {
+        self.session(id)?.acquire_attachment(handoff, owner_nonce)
+    }
+
+    /// Generation-conditional attachment linearizes the lifetime comparison and guard acquisition
+    /// under the daemon map lock held by the caller. A refusal therefore exposes no Grid and cannot
+    /// suffer a list/probe-to-Attach ABA window.
+    pub fn acquire_session_attachment_if_generation(
+        &self,
+        id: &SessionId,
+        expected_generation: &str,
+        handoff: Option<&AttachmentHandoff>,
+        owner_nonce: u64,
+    ) -> std::result::Result<AttachmentGuard, SessionAttachmentAcquireError> {
+        let session = self
+            .sessions
+            .get(id)
+            .ok_or(SessionAttachmentAcquireError::Refused(
+                SessionAttachRefusal::Missing,
+            ))?;
+        if session.generation() != expected_generation {
+            return Err(SessionAttachmentAcquireError::Refused(
+                SessionAttachRefusal::GenerationMismatch,
+            ));
+        }
+        session
+            .acquire_attachment(handoff, owner_nonce)
+            .map_err(SessionAttachmentAcquireError::Invalid)
+    }
+
+    pub fn cancel_session_attachment_handoff(
+        &self,
+        id: &SessionId,
+        token: &AttachmentHandoffToken,
+    ) {
+        if let Some(session) = self.sessions.get(id) {
+            session.cancel_attachment_handoff(token);
+        }
+    }
+
+    #[cfg(test)]
     pub fn kill_session(&mut self, id: &SessionId) {
         // Terminate the child explicitly first — dropping the Session closes the
         // PTY, but a child sitting in its own read loop may not exit on PTY
@@ -246,6 +723,27 @@ impl Daemon {
             s.kill_child();
         }
         self.sessions.remove(id);
+    }
+
+    pub fn take_session_if_generation(
+        &mut self,
+        id: &SessionId,
+        expected_generation: &str,
+    ) -> ConditionalSessionTake {
+        let Some(session) = self.sessions.get(id) else {
+            return ConditionalSessionTake::Absent;
+        };
+        if session.generation() != expected_generation {
+            return ConditionalSessionTake::GenerationMismatch;
+        }
+        if session.attachment_in_use() {
+            return ConditionalSessionTake::AttachmentInUse;
+        }
+        ConditionalSessionTake::Taken(
+            self.sessions
+                .remove(id)
+                .expect("generation-matched session remains mapped under daemon lock"),
+        )
     }
 
     #[cfg(test)]
@@ -281,7 +779,8 @@ impl Daemon {
     /// and frees its grid/scrollback buffers.
     #[cfg(test)]
     pub fn reap_exited_sessions(&mut self) {
-        self.sessions.retain(|_, s| s.exit_state().is_none());
+        self.sessions
+            .retain(|_, s| s.exit_state().is_none() || s.attachment_in_use());
     }
 
     /// Terminate and reap every owned child, then drop all sessions. Without
@@ -489,6 +988,989 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("session {id} did not record an exit within the timeout");
+    }
+
+    fn token(value: &str) -> AttachmentHandoffToken {
+        value.parse().expect("test token is fixed lowercase hex")
+    }
+
+    fn start_token(index: usize) -> SessionStartOperationToken {
+        let mut value = format!("{index:032x}");
+        value.replace_range(12..13, "4");
+        value.replace_range(16..17, "8");
+        value.parse().expect("forced UUIDv4 token is valid")
+    }
+
+    fn absent_start(token: SessionStartOperationToken) -> ConditionalSessionStart {
+        ConditionalSessionStart {
+            operation_token: token,
+            precondition: SessionStartPrecondition::Absent {
+                excluded_generation: None,
+            },
+        }
+    }
+
+    #[test]
+    fn conditional_start_requires_exact_prior_reservation() {
+        let mut daemon = Daemon::default();
+        let id = sid("reserve-required");
+        let operation = absent_start(start_token(1));
+
+        assert_eq!(
+            daemon.start_session_conditionally(
+                id.clone(),
+                ".",
+                "sleep",
+                &["30".into()],
+                None,
+                80,
+                24,
+                &operation,
+            ),
+            ConditionalSessionStartOutcome::Refused {
+                reason: ConditionalSessionStartRefusal::PreconditionFailed,
+            }
+        );
+        assert!(daemon.session(&id).is_err());
+        assert_eq!(
+            daemon.lookup_start_operation(&id, &operation.operation_token),
+            SessionStartOperationStatus::Unknown,
+            "an unreserved Start refusal must not consume ledger capacity"
+        );
+    }
+
+    #[test]
+    fn applied_operation_survives_exit_removal_and_replays_idempotently() {
+        let mut daemon = Daemon::default();
+        let id = sid("operation-lifecycle");
+        let operation = absent_start(start_token(2));
+        assert_eq!(
+            daemon.reserve_start_operation(id.clone(), operation.operation_token.clone()),
+            SessionStartOperationReserveOutcome::Reserved
+        );
+        assert_eq!(
+            daemon.reserve_start_operation(id.clone(), operation.operation_token.clone()),
+            SessionStartOperationReserveOutcome::AlreadyReserved
+        );
+        let applied = daemon.start_session_conditionally(
+            id.clone(),
+            ".",
+            "true",
+            &[],
+            None,
+            80,
+            24,
+            &operation,
+        );
+        let generation = match applied {
+            ConditionalSessionStartOutcome::Applied { generation } => generation,
+            other => panic!("reserved operation should apply, got {other:?}"),
+        };
+        wait_for_exit(&daemon, &id);
+        assert_eq!(
+            daemon.lookup_start_operation(&id, &operation.operation_token),
+            SessionStartOperationStatus::Applied {
+                generation: generation.clone(),
+                lifecycle: SessionStartOperationLifecycle::Exited,
+            }
+        );
+
+        daemon.reap_exited_sessions();
+        assert_eq!(
+            daemon.lookup_start_operation(&id, &operation.operation_token),
+            SessionStartOperationStatus::Applied {
+                generation: generation.clone(),
+                lifecycle: SessionStartOperationLifecycle::Removed,
+            }
+        );
+        assert_eq!(
+            daemon.start_session_conditionally(
+                id.clone(),
+                ".",
+                "sleep",
+                &["30".into()],
+                None,
+                80,
+                24,
+                &operation,
+            ),
+            ConditionalSessionStartOutcome::AlreadyApplied {
+                generation: generation.clone(),
+            },
+            "same-token replay must not respawn after map removal"
+        );
+        assert!(daemon.session(&id).is_err());
+    }
+
+    #[test]
+    fn applied_lookup_distinguishes_live_from_same_id_replacement() {
+        let mut daemon = Daemon::default();
+        let id = sid("operation-replacement");
+        let operation = absent_start(start_token(20_002));
+        assert_eq!(
+            daemon.reserve_start_operation(id.clone(), operation.operation_token.clone()),
+            SessionStartOperationReserveOutcome::Reserved
+        );
+        let generation = match daemon.start_session_conditionally(
+            id.clone(),
+            ".",
+            "sleep",
+            &["30".into()],
+            None,
+            80,
+            24,
+            &operation,
+        ) {
+            ConditionalSessionStartOutcome::Applied { generation } => generation,
+            other => panic!("reserved operation should apply, got {other:?}"),
+        };
+        assert_eq!(
+            daemon.lookup_start_operation(&id, &operation.operation_token),
+            SessionStartOperationStatus::Applied {
+                generation: generation.clone(),
+                lifecycle: SessionStartOperationLifecycle::Live,
+            }
+        );
+
+        daemon.kill_session(&id);
+        daemon
+            .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+            .unwrap();
+        let replacement_generation = daemon.session(&id).unwrap().generation();
+        assert_ne!(replacement_generation, generation);
+        assert_eq!(
+            daemon.lookup_start_operation(&id, &operation.operation_token),
+            SessionStartOperationStatus::Applied {
+                generation: generation.clone(),
+                lifecycle: SessionStartOperationLifecycle::Removed,
+            }
+        );
+        assert_eq!(
+            daemon.start_session_conditionally(
+                id.clone(),
+                ".",
+                "sleep",
+                &["30".into()],
+                None,
+                80,
+                24,
+                &operation,
+            ),
+            ConditionalSessionStartOutcome::AlreadyApplied {
+                generation: generation.clone(),
+            },
+            "same-token replay must not disturb a later same-id generation"
+        );
+        assert_eq!(
+            daemon.session(&id).unwrap().generation(),
+            replacement_generation
+        );
+        daemon.kill_session(&id);
+    }
+
+    #[test]
+    fn retire_is_a_start_barrier_and_wrong_tuple_never_removes_authority() {
+        let mut daemon = Daemon::default();
+        let id = sid("retire-before-start");
+        let wrong_id = sid("foreign-id");
+        let operation = absent_start(start_token(3));
+        daemon.reserve_start_operation(id.clone(), operation.operation_token.clone());
+
+        assert_eq!(
+            daemon.retire_start_operation(
+                &wrong_id,
+                &operation.operation_token,
+                &SessionStartOperationRetireExpectation::Unapplied,
+            ),
+            SessionStartOperationRetireOutcome::AlreadyRetired,
+            "wrong tuple is content-blind Unknown, but must not mutate the real entry"
+        );
+        assert_eq!(
+            daemon.lookup_start_operation(&id, &operation.operation_token),
+            SessionStartOperationStatus::Reserved
+        );
+        assert_eq!(
+            daemon.retire_start_operation(
+                &id,
+                &operation.operation_token,
+                &SessionStartOperationRetireExpectation::Unapplied,
+            ),
+            SessionStartOperationRetireOutcome::Retired
+        );
+        assert_eq!(
+            daemon.start_session_conditionally(
+                id.clone(),
+                ".",
+                "sleep",
+                &["30".into()],
+                None,
+                80,
+                24,
+                &operation,
+            ),
+            ConditionalSessionStartOutcome::Refused {
+                reason: ConditionalSessionStartRefusal::PreconditionFailed,
+            },
+            "a delayed Start after the retire barrier sees Missing and cannot spawn"
+        );
+        assert!(daemon.session(&id).is_err());
+    }
+
+    #[test]
+    fn concurrent_start_and_retire_linearize_to_exactly_one_safe_winner() {
+        let shared = Daemon::shared();
+        let id = sid("start-retire-race");
+        let operation = absent_start(start_token(30_000));
+        let setup = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        setup.block_on(async {
+            assert_eq!(
+                shared
+                    .lock()
+                    .await
+                    .reserve_start_operation(id.clone(), operation.operation_token.clone()),
+                SessionStartOperationReserveOutcome::Reserved
+            );
+        });
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let start_shared = shared.clone();
+        let start_id = id.clone();
+        let start_operation = operation.clone();
+        let start_barrier = barrier.clone();
+        let starter = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            start_barrier.wait();
+            runtime.block_on(async {
+                start_shared.lock().await.start_session_conditionally(
+                    start_id,
+                    ".",
+                    "sleep",
+                    &["30".into()],
+                    None,
+                    80,
+                    24,
+                    &start_operation,
+                )
+            })
+        });
+        let retire_shared = shared.clone();
+        let retire_id = id.clone();
+        let retire_token = operation.operation_token.clone();
+        let retire_barrier = barrier.clone();
+        let retirer = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            retire_barrier.wait();
+            runtime.block_on(async {
+                retire_shared.lock().await.retire_start_operation(
+                    &retire_id,
+                    &retire_token,
+                    &SessionStartOperationRetireExpectation::Unapplied,
+                )
+            })
+        });
+        barrier.wait();
+        let start_outcome = starter.join().unwrap();
+        let retire_outcome = retirer.join().unwrap();
+
+        setup.block_on(async {
+            let mut daemon = shared.lock().await;
+            match (start_outcome, retire_outcome) {
+                (
+                    ConditionalSessionStartOutcome::Applied { generation },
+                    SessionStartOperationRetireOutcome::Conflict {
+                        current:
+                            SessionStartOperationStatus::Applied {
+                                generation: conflict_generation,
+                                ..
+                            },
+                    },
+                ) => {
+                    assert_eq!(generation, conflict_generation);
+                    assert_eq!(daemon.session(&id).unwrap().generation(), generation);
+                    daemon.kill_session(&id);
+                }
+                (
+                    ConditionalSessionStartOutcome::Refused {
+                        reason: ConditionalSessionStartRefusal::PreconditionFailed,
+                    },
+                    SessionStartOperationRetireOutcome::Retired,
+                ) => assert!(daemon.session(&id).is_err()),
+                unexpected => panic!("unsafe Start/Retire race outcome: {unexpected:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn applied_retirement_is_generation_cas() {
+        let mut daemon = Daemon::default();
+        let id = sid("retire-applied");
+        let operation = absent_start(start_token(4));
+        daemon.reserve_start_operation(id.clone(), operation.operation_token.clone());
+        let generation = match daemon.start_session_conditionally(
+            id.clone(),
+            ".",
+            "sleep",
+            &["30".into()],
+            None,
+            80,
+            24,
+            &operation,
+        ) {
+            ConditionalSessionStartOutcome::Applied { generation } => generation,
+            other => panic!("reserved operation should apply, got {other:?}"),
+        };
+
+        assert!(matches!(
+            daemon.retire_start_operation(
+                &id,
+                &operation.operation_token,
+                &SessionStartOperationRetireExpectation::Unapplied,
+            ),
+            SessionStartOperationRetireOutcome::Conflict {
+                current: SessionStartOperationStatus::Applied { .. }
+            }
+        ));
+        assert!(matches!(
+            daemon.retire_start_operation(
+                &id,
+                &operation.operation_token,
+                &SessionStartOperationRetireExpectation::Applied {
+                    generation: "wrong-generation".into(),
+                },
+            ),
+            SessionStartOperationRetireOutcome::Conflict {
+                current: SessionStartOperationStatus::Applied { .. }
+            }
+        ));
+        assert_eq!(
+            daemon.retire_start_operation(
+                &id,
+                &operation.operation_token,
+                &SessionStartOperationRetireExpectation::Applied {
+                    generation: generation.clone(),
+                },
+            ),
+            SessionStartOperationRetireOutcome::Retired
+        );
+        assert_eq!(
+            daemon.lookup_start_operation(&id, &operation.operation_token),
+            SessionStartOperationStatus::Unknown
+        );
+        daemon.kill_session(&id);
+    }
+
+    #[test]
+    fn operation_cap_blocks_only_new_reservations_and_exact_retire_recovers_capacity() {
+        let mut daemon = Daemon::default();
+        let id = sid("ledger-cap");
+        for index in 0..MAX_START_OPERATION_LEDGER_ENTRIES {
+            assert_eq!(
+                daemon.reserve_start_operation(id.clone(), start_token(index + 10)),
+                SessionStartOperationReserveOutcome::Reserved
+            );
+        }
+        let existing = start_token(10);
+        assert_eq!(
+            daemon.reserve_start_operation(id.clone(), existing.clone()),
+            SessionStartOperationReserveOutcome::AlreadyReserved
+        );
+        assert_eq!(
+            daemon.lookup_start_operation(&id, &existing),
+            SessionStartOperationStatus::Reserved
+        );
+
+        let overflow = start_token(MAX_START_OPERATION_LEDGER_ENTRIES + 20);
+        assert_eq!(
+            daemon.reserve_start_operation(id.clone(), overflow.clone()),
+            SessionStartOperationReserveOutcome::Refused {
+                reason: SessionStartOperationReserveRefusal::LedgerFull,
+            }
+        );
+
+        // Start and replay remain admitted at cap. A deterministic input refusal is retained and
+        // replayed without a spawn or a new entry.
+        let existing_operation = absent_start(existing.clone());
+        let refused = daemon.start_session_conditionally(
+            id.clone(),
+            ".",
+            "",
+            &[],
+            None,
+            80,
+            24,
+            &existing_operation,
+        );
+        assert_eq!(
+            refused,
+            ConditionalSessionStartOutcome::Refused {
+                reason: ConditionalSessionStartRefusal::SpawnFailed,
+            }
+        );
+        assert_eq!(
+            daemon.lookup_start_operation(&id, &existing),
+            SessionStartOperationStatus::Refused
+        );
+        assert_eq!(
+            daemon.start_session_conditionally(
+                id.clone(),
+                ".",
+                "sleep",
+                &["30".into()],
+                None,
+                80,
+                24,
+                &existing_operation,
+            ),
+            refused,
+            "terminal replay remains admitted at the cap"
+        );
+        assert_eq!(
+            daemon.retire_start_operation(
+                &id,
+                &existing,
+                &SessionStartOperationRetireExpectation::Unapplied,
+            ),
+            SessionStartOperationRetireOutcome::Retired
+        );
+        assert_eq!(
+            daemon.reserve_start_operation(id, overflow),
+            SessionStartOperationReserveOutcome::Reserved,
+            "only an explicit exact retire frees one ledger slot"
+        );
+    }
+
+    #[test]
+    fn reservation_rejects_unbounded_or_control_bearing_ids_without_retention() {
+        let mut daemon = Daemon::default();
+        for (index, id) in [
+            sid(""),
+            sid("bad\nidentity"),
+            sid(&"x".repeat(MAX_START_OPERATION_SESSION_ID_BYTES + 1)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let token = start_token(index + 5000);
+            assert_eq!(
+                daemon.reserve_start_operation(id.clone(), token.clone()),
+                SessionStartOperationReserveOutcome::Refused {
+                    reason: SessionStartOperationReserveRefusal::InvalidSessionId,
+                }
+            );
+            assert_eq!(
+                daemon.lookup_start_operation(&id, &token),
+                SessionStartOperationStatus::Unknown
+            );
+        }
+        assert!(daemon.start_operations.is_empty());
+    }
+
+    #[test]
+    fn exact_attachment_guards_block_kill_until_the_last_owner_detaches() {
+        let mut daemon = Daemon::default();
+        let id = sid("attachment-owners");
+        daemon
+            .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+            .unwrap();
+        let generation = daemon.session(&id).unwrap().generation();
+
+        let first = daemon.acquire_session_attachment(&id, None, 1).unwrap();
+        let second = daemon.acquire_session_attachment(&id, None, 2).unwrap();
+        assert!(matches!(
+            daemon.take_session_if_generation(&id, &generation),
+            ConditionalSessionTake::AttachmentInUse
+        ));
+
+        first.detach();
+        assert_eq!(
+            daemon.session(&id).unwrap().attachment_fence_counts(),
+            (1, 0),
+            "one detach must not erase the other exact owner"
+        );
+        assert!(matches!(
+            daemon.take_session_if_generation(&id, &generation),
+            ConditionalSessionTake::AttachmentInUse
+        ));
+
+        second.detach();
+        let ConditionalSessionTake::Taken(session) =
+            daemon.take_session_if_generation(&id, &generation)
+        else {
+            panic!("last detach must make the exact lifetime conditionally removable");
+        };
+        session.kill_child();
+    }
+
+    #[test]
+    fn raw_guard_drop_preserves_pending_offer_for_same_client_replacement() {
+        let mut daemon = Daemon::default();
+        let id = sid("handoff-starter-first");
+        daemon
+            .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+            .unwrap();
+        let exact = token("00000000000000000000000000000001");
+        let wrong = token("00000000000000000000000000000002");
+        let offer = AttachmentHandoff::Offer {
+            token: exact.clone(),
+        };
+        let starter = daemon
+            .acquire_session_attachment(&id, Some(&offer), 10)
+            .unwrap();
+        assert!(
+            daemon
+                .acquire_session_attachment(&id, Some(&offer), 11)
+                .is_err(),
+            "another client cannot share a duplicate offer"
+        );
+        // Raw guard Drop is deliberately non-retiring. The connection owner (`ClientState`) uses
+        // explicit detach on EOF; keeping this lower-level behavior is what lets same-client
+        // replacement acquire a new guard before releasing the old one.
+        drop(starter);
+        assert_eq!(
+            daemon.session(&id).unwrap().attachment_fence_counts(),
+            (0, 1)
+        );
+
+        let wrong_claim = AttachmentHandoff::Claim { token: wrong };
+        assert!(daemon
+            .acquire_session_attachment(&id, Some(&wrong_claim), 20)
+            .is_err());
+        assert_eq!(
+            daemon.session(&id).unwrap().attachment_fence_counts(),
+            (0, 1),
+            "wrong claim must not steal or consume the pending token"
+        );
+
+        let exact_claim = AttachmentHandoff::Claim {
+            token: exact.clone(),
+        };
+        let renderer = daemon
+            .acquire_session_attachment(&id, Some(&exact_claim), 20)
+            .unwrap();
+        assert_eq!(
+            daemon.session(&id).unwrap().attachment_fence_counts(),
+            (1, 0),
+            "claim atomically replaces Pending with an ordinary active owner"
+        );
+        assert!(
+            daemon
+                .acquire_session_attachment(&id, Some(&exact_claim), 20)
+                .is_err(),
+            "one-shot claim cannot be replayed"
+        );
+        assert!(
+            daemon
+                .acquire_session_attachment(&id, Some(&offer), 10)
+                .is_err(),
+            "a claimed one-shot token cannot be re-offered"
+        );
+        drop(renderer); // one-shot correction: no automatic re-pend
+        assert_eq!(
+            daemon.session(&id).unwrap().attachment_fence_counts(),
+            (0, 0)
+        );
+        daemon.kill_session(&id);
+    }
+
+    #[test]
+    fn generation_conditional_attach_refuses_missing_and_mismatch_before_guard() {
+        let mut daemon = Daemon::default();
+        let id = sid("conditional-attach-core");
+        assert!(matches!(
+            daemon.acquire_session_attachment_if_generation(&id, "generation-a", None, 1),
+            Err(SessionAttachmentAcquireError::Refused(
+                SessionAttachRefusal::Missing
+            ))
+        ));
+
+        daemon
+            .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+            .unwrap();
+        let actual = daemon.session(&id).unwrap().generation();
+        assert_ne!(actual, "generation-a");
+        assert!(matches!(
+            daemon.acquire_session_attachment_if_generation(&id, "generation-a", None, 2),
+            Err(SessionAttachmentAcquireError::Refused(
+                SessionAttachRefusal::GenerationMismatch
+            ))
+        ));
+        assert_eq!(
+            daemon.session(&id).unwrap().attachment_fence_counts(),
+            (0, 0)
+        );
+        let guard = daemon
+            .acquire_session_attachment_if_generation(&id, &actual, None, 3)
+            .unwrap();
+        assert_eq!(
+            daemon.session(&id).unwrap().attachment_fence_counts(),
+            (1, 0)
+        );
+        guard.detach();
+        daemon.kill_session(&id);
+    }
+
+    #[test]
+    fn renderer_claim_before_starter_eof_has_no_ownerless_interval() {
+        let mut daemon = Daemon::default();
+        let id = sid("handoff-renderer-first");
+        daemon
+            .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+            .unwrap();
+        let value = token("00000000000000000000000000000003");
+        let offer = AttachmentHandoff::Offer {
+            token: value.clone(),
+        };
+        let claim = AttachmentHandoff::Claim { token: value };
+        let starter = daemon
+            .acquire_session_attachment(&id, Some(&offer), 30)
+            .unwrap();
+        let renderer = daemon
+            .acquire_session_attachment(&id, Some(&claim), 31)
+            .unwrap();
+        assert_eq!(
+            daemon.session(&id).unwrap().attachment_fence_counts(),
+            (2, 0)
+        );
+        drop(starter);
+        assert_eq!(
+            daemon.session(&id).unwrap().attachment_fence_counts(),
+            (1, 0),
+            "starter EOF cannot erase the already-installed renderer owner"
+        );
+        let generation = daemon.session(&id).unwrap().generation();
+        assert!(matches!(
+            daemon.take_session_if_generation(&id, &generation),
+            ConditionalSessionTake::AttachmentInUse
+        ));
+        drop(renderer);
+        daemon.kill_session(&id);
+    }
+
+    #[test]
+    fn exact_cancel_releases_pending_fence_but_wrong_cancel_does_not() {
+        let mut daemon = Daemon::default();
+        let id = sid("handoff-cancel");
+        daemon
+            .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+            .unwrap();
+        let exact = token("00000000000000000000000000000004");
+        let wrong = token("00000000000000000000000000000005");
+        let offer = AttachmentHandoff::Offer {
+            token: exact.clone(),
+        };
+        drop(
+            daemon
+                .acquire_session_attachment(&id, Some(&offer), 40)
+                .unwrap(),
+        );
+        daemon.cancel_session_attachment_handoff(&id, &wrong);
+        assert!(daemon.session(&id).unwrap().attachment_in_use());
+        daemon.cancel_session_attachment_handoff(&id, &exact);
+        assert!(!daemon.session(&id).unwrap().attachment_in_use());
+        assert!(
+            daemon
+                .acquire_session_attachment(&id, Some(&offer), 40)
+                .is_err(),
+            "a cancelled one-shot token cannot be re-offered"
+        );
+        daemon.kill_session(&id);
+    }
+
+    #[test]
+    fn pending_handoff_tokens_are_bounded_and_claims_release_capacity() {
+        let mut daemon = Daemon::default();
+        let id = sid("handoff-bound");
+        daemon
+            .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+            .unwrap();
+        let mut tokens = Vec::new();
+        for index in 0..MAX_ATTACHMENT_HANDOFF_TOKENS {
+            let value = token(&format!("{index:032x}"));
+            let offer = AttachmentHandoff::Offer {
+                token: value.clone(),
+            };
+            drop(
+                daemon
+                    .acquire_session_attachment(&id, Some(&offer), index as u64 + 1)
+                    .unwrap(),
+            );
+            tokens.push(value);
+        }
+        assert_eq!(
+            daemon.session(&id).unwrap().attachment_fence_counts(),
+            (0, MAX_ATTACHMENT_HANDOFF_TOKENS)
+        );
+        let overflow = token("ffffffffffffffffffffffffffffffff");
+        assert!(daemon
+            .acquire_session_attachment(
+                &id,
+                Some(&AttachmentHandoff::Offer {
+                    token: overflow.clone(),
+                }),
+                999,
+            )
+            .is_err());
+
+        let claimed = daemon
+            .acquire_session_attachment(
+                &id,
+                Some(&AttachmentHandoff::Claim {
+                    token: tokens[0].clone(),
+                }),
+                1000,
+            )
+            .unwrap();
+        drop(claimed);
+        drop(
+            daemon
+                .acquire_session_attachment(
+                    &id,
+                    Some(&AttachmentHandoff::Offer {
+                        token: overflow.clone(),
+                    }),
+                    999,
+                )
+                .expect("consuming one pending token frees one bounded slot"),
+        );
+        for value in tokens.into_iter().skip(1).chain(std::iter::once(overflow)) {
+            daemon.cancel_session_attachment_handoff(&id, &value);
+        }
+        assert!(!daemon.session(&id).unwrap().attachment_in_use());
+        daemon.kill_session(&id);
+    }
+
+    #[test]
+    fn retired_handoff_replay_cache_is_bounded_without_exhausting_new_offers() {
+        let mut daemon = Daemon::default();
+        let id = sid("handoff-retired-bound");
+        daemon
+            .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+            .unwrap();
+
+        for index in 0..(MAX_RETIRED_ATTACHMENT_HANDOFF_TOKENS + 32) {
+            let value = token(&format!("{index:032x}"));
+            let guard = daemon
+                .acquire_session_attachment(
+                    &id,
+                    Some(&AttachmentHandoff::Offer { token: value }),
+                    index as u64 + 1,
+                )
+                .expect("a fresh token must not consume the pending budget permanently");
+            guard.detach();
+        }
+        assert_eq!(
+            daemon
+                .session(&id)
+                .unwrap()
+                .retired_attachment_handoff_count(),
+            MAX_RETIRED_ATTACHMENT_HANDOFF_TOKENS
+        );
+        assert_eq!(
+            daemon.session(&id).unwrap().attachment_fence_counts(),
+            (0, 0)
+        );
+
+        let recent = token(&format!(
+            "{:032x}",
+            MAX_RETIRED_ATTACHMENT_HANDOFF_TOKENS + 31
+        ));
+        assert!(
+            daemon
+                .acquire_session_attachment(
+                    &id,
+                    Some(&AttachmentHandoff::Offer { token: recent }),
+                    999,
+                )
+                .is_err(),
+            "a recent retired token is replay-protected"
+        );
+        let fresh = token("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+        let guard = daemon
+            .acquire_session_attachment(
+                &id,
+                Some(&AttachmentHandoff::Offer {
+                    token: fresh.clone(),
+                }),
+                1000,
+            )
+            .expect("bounded retired cache must not exhaust future fresh offers");
+        drop(guard);
+        daemon.cancel_session_attachment_handoff(&id, &fresh);
+
+        // Once the bounded LRU evicts its oldest value, caller-side cryptographic uniqueness is the
+        // remaining replay defense. Even if a violating caller reuses that value, it can pin only
+        // this exact Session A: the pending fence is still visible to conditional Kill and is
+        // removed only by exact cancel/detach.
+        let evicted_oldest = token("00000000000000000000000000000000");
+        let generation_a = daemon.session(&id).unwrap().generation();
+        drop(
+            daemon
+                .acquire_session_attachment(
+                    &id,
+                    Some(&AttachmentHandoff::Offer {
+                        token: evicted_oldest.clone(),
+                    }),
+                    2000,
+                )
+                .expect("the bounded LRU has evicted the oldest retired value"),
+        );
+        assert!(matches!(
+            daemon.take_session_if_generation(&id, &generation_a),
+            ConditionalSessionTake::AttachmentInUse
+        ));
+        daemon.cancel_session_attachment_handoff(&id, &evicted_oldest);
+        let ConditionalSessionTake::Taken(session_a) =
+            daemon.take_session_if_generation(&id, &generation_a)
+        else {
+            panic!("exact cancel must reopen conditional Kill for A");
+        };
+        session_a.kill_child();
+
+        daemon
+            .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+            .unwrap();
+        let generation_b = daemon.session(&id).unwrap().generation();
+        assert_ne!(generation_a, generation_b);
+        assert!(
+            daemon
+                .acquire_session_attachment(
+                    &id,
+                    Some(&AttachmentHandoff::Claim {
+                        token: evicted_oldest,
+                    }),
+                    2001,
+                )
+                .is_err(),
+            "A's pending token never transfers to same-id replacement B"
+        );
+        let ConditionalSessionTake::Taken(session_b) =
+            daemon.take_session_if_generation(&id, &generation_b)
+        else {
+            panic!("unrelated replacement B must remain conditionally killable");
+        };
+        session_b.kill_child();
+    }
+
+    #[test]
+    fn protected_exited_a_cannot_be_restarted_reaped_or_claimed_as_b() {
+        let mut daemon = Daemon::default();
+        let id = sid("handoff-generation-a");
+        daemon
+            .start_session(id.clone(), ".", "true", &[], 80, 24)
+            .unwrap();
+        wait_for_exit(&daemon, &id);
+        let generation_a = daemon.session(&id).unwrap().generation();
+        let value = token("00000000000000000000000000000006");
+        let offer = AttachmentHandoff::Offer {
+            token: value.clone(),
+        };
+        drop(
+            daemon
+                .acquire_session_attachment(&id, Some(&offer), 50)
+                .unwrap(),
+        );
+
+        daemon.reap_exited_sessions();
+        assert!(
+            daemon.session(&id).is_ok(),
+            "pending exited A is not evictable"
+        );
+        assert!(
+            daemon
+                .start_session_with_restart(id.clone(), ".", "sleep", &["30".into()], 80, 24, true,)
+                .is_err(),
+            "pending exited A cannot be bypassed by explicit restart"
+        );
+        assert_eq!(daemon.session(&id).unwrap().generation(), generation_a);
+
+        daemon.cancel_session_attachment_handoff(&id, &value);
+        daemon
+            .start_session_with_restart(id.clone(), ".", "sleep", &["30".into()], 80, 24, true)
+            .unwrap();
+        assert_ne!(daemon.session(&id).unwrap().generation(), generation_a);
+        let stale_claim = AttachmentHandoff::Claim { token: value };
+        assert!(
+            daemon
+                .acquire_session_attachment(&id, Some(&stale_claim), 51)
+                .is_err(),
+            "A's token must not protect or attach to replacement B"
+        );
+        daemon.kill_session(&id);
+    }
+
+    #[test]
+    fn capacity_refuses_when_every_exited_candidate_is_active_or_pending() {
+        let mut daemon = Daemon::default();
+        let mut active_guards = Vec::new();
+        let mut pending = Vec::new();
+
+        for index in 0..MAX_SESSIONS {
+            let id = sid(&format!("protected-capacity-{index}"));
+            daemon
+                .start_session(id.clone(), ".", "true", &[], 80, 24)
+                .unwrap();
+            wait_for_exit(&daemon, &id);
+            if index % 2 == 0 {
+                active_guards.push(
+                    daemon
+                        .acquire_session_attachment(&id, None, index as u64 + 1)
+                        .unwrap(),
+                );
+            } else {
+                let value = token(&format!("{:032x}", index + 10_000));
+                drop(
+                    daemon
+                        .acquire_session_attachment(
+                            &id,
+                            Some(&AttachmentHandoff::Offer {
+                                token: value.clone(),
+                            }),
+                            index as u64 + 1,
+                        )
+                        .unwrap(),
+                );
+                pending.push((id, value));
+            }
+        }
+        assert_eq!(daemon.sessions.len(), MAX_SESSIONS);
+        let before: std::collections::HashSet<_> = daemon.sessions.keys().cloned().collect();
+        let error = daemon
+            .start_session(
+                sid("must-not-evict-protected"),
+                ".",
+                "sleep",
+                &["30".into()],
+                80,
+                24,
+            )
+            .expect_err("no protected exited snapshot is a capacity eviction candidate");
+        assert!(error.to_string().contains("session limit reached"));
+        assert_eq!(daemon.sessions.len(), MAX_SESSIONS);
+        assert_eq!(
+            daemon
+                .sessions
+                .keys()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>(),
+            before,
+            "capacity refusal must not evict any protected exited Session"
+        );
+
+        drop(active_guards);
+        for (id, value) in pending {
+            daemon.cancel_session_attachment_handoff(&id, &value);
+        }
+        daemon.reap_exited_sessions();
+        assert!(daemon.sessions.is_empty());
     }
 
     /// An in-flight PTY write for one session must NOT hold

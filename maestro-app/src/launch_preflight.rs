@@ -15,6 +15,10 @@
 //! changing into that directory. The actual argv wins over the selected provider, so a custom wrapper
 //! is checked as itself rather than spuriously requiring the provider CLI it may eventually invoke.
 
+// This file is compiled into both the library and binary targets. The binary owns the complete
+// preflight surface while the library intentionally consumes only the prepared-argv reprobe.
+#![allow(dead_code)]
+
 use std::ffi::CString;
 use std::fmt;
 use std::os::unix::ffi::OsStrExt;
@@ -820,6 +824,40 @@ pub(crate) fn prepare(
         Some(ProbeTarget::LoginShell(_)) | None => {}
     }
     Ok(Some(argv))
+}
+
+/// Re-probe one already-materialized source argv at the exact cwd that will be sealed into a
+/// prepared Session. The vector is read-only: absolute custom commands and preassigned provider
+/// identities (notably Copilot's UUID) remain byte-identical to the first preflight.
+pub(crate) fn reprobe_prepared_argv(
+    argv: &[String],
+    selected_agent: Option<&str>,
+    cwd: &Path,
+) -> Result<(), LaunchPreflightError> {
+    if argv.first().is_none_or(|command| command.trim().is_empty()) {
+        return Err(LaunchPreflightError::MalformedCommand);
+    }
+    // Preserve the initial unknown-provider refusal even though the already-materialized argv is
+    // otherwise authoritative for executable selection.
+    let _ = selected_agent_target(selected_agent)?;
+    let probe = LoginShellAgentProbe::from_process_env();
+    let cwd = validated_cwd(cwd, probe.home.as_deref())?;
+    let cursor_provenance = selected_agent
+        .is_some_and(|agent| agent.trim().eq_ignore_ascii_case("cursor"))
+        && is_canonical_cursor_argv(argv);
+    let target = classify_target(argv, &cwd, cursor_provenance)?
+        .ok_or(LaunchPreflightError::MalformedCommand)?;
+    let agent = match &target {
+        ProbeTarget::LoginShell(agent) | ProbeTarget::DirectPath { agent, .. } => Some(*agent),
+        ProbeTarget::ProcessPathCommand(_) | ProbeTarget::DirectCommandPath(_) => None,
+    };
+    match probe.probe(&target, &cwd)? {
+        true => Ok(()),
+        false => Err(match agent {
+            Some(agent) => LaunchPreflightError::Missing(agent),
+            None => LaunchPreflightError::MissingCommand,
+        }),
+    }
 }
 
 #[cfg(test)]

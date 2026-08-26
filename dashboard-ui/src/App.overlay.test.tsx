@@ -1463,6 +1463,9 @@ describe('lazy native overlay model delivery', () => {
 
   it('preflights new-window and split launches before either mutation', async () => {
     const initialModel = structuredClone(mockDashboardModel)
+    initialModel.details.sample_workspace.windows
+      .find((window) => window.window_id === 'w-main')!
+      .tabs.find((tab) => tab.tab_id === 'tab-claude')!.cwd = '/Projects/Hydra'
     const intents: Array<Record<string, unknown>> = []
     const browserWindow = Object.assign(new EventTarget(), {
       location: {
@@ -1547,6 +1550,16 @@ describe('lazy native overlay model delivery', () => {
         cwd: '/Projects/Hydra',
       }),
     )
+    expect(launchIntents[3]).toEqual(
+      expect.objectContaining({
+        type: 'splitPane',
+        project_id: 'sample_workspace',
+        window_id: 'w-main',
+        tab_id: 'tab-claude',
+        dir: 'h',
+      }),
+    )
+    expect(launchIntents[3]).not.toHaveProperty('cwd')
   })
 
   it('omits the empty launch command when creating a Terminal project', async () => {

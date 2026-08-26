@@ -57,7 +57,13 @@ fn snapshot_and_output_carry_generation_and_monotonic_revision() {
     // revision is strictly greater than the snapshot's, with a matching gen.
     send(
         &mut stream,
-        &format!(r#"{{"op":"write","id":"{id}","data":"hello-rev\n"}}"#),
+        &serde_json::json!({
+            "op": "write",
+            "id": id,
+            "data": "hello-rev\n",
+            "expected_generation": gen0.as_str().expect("snapshot generation string")
+        })
+        .to_string(),
     );
     let out = grid_event(&read_until(&mut reader, "\"ev\":\"output\"", WITHIN));
     let out_gen = out["generation"].clone();
@@ -98,7 +104,15 @@ fn reattach_keeps_generation_respawn_changes_it() {
     );
 
     // Respawn: kill, then start the same id again → a fresh grid → new gen.
-    send(&mut stream, &format!(r#"{{"op":"kill","id":"{id}"}}"#));
+    send(
+        &mut stream,
+        &serde_json::json!({
+            "op": "kill",
+            "id": id,
+            "expected_generation": gen_a.as_str().expect("generation string")
+        })
+        .to_string(),
+    );
     read_until(&mut reader, "\"ev\":\"session_exited\"", WITHIN);
     start_cat(&mut stream, id);
     send(&mut stream, &format!(r#"{{"op":"attach","id":"{id}"}}"#));
@@ -128,8 +142,18 @@ fn kill_always_delivers_session_exited() {
         start_cat(&mut stream, &id);
         send(&mut stream, &format!(r#"{{"op":"attach","id":"{id}"}}"#));
         // Drain the restore Grid so the next read targets the exit event.
-        read_until(&mut reader, "\"ev\":\"grid\"", WITHIN);
-        send(&mut stream, &format!(r#"{{"op":"kill","id":"{id}"}}"#));
+        let baseline = grid_event(&read_until(&mut reader, "\"ev\":\"grid\"", WITHIN));
+        send(
+            &mut stream,
+            &serde_json::json!({
+                "op": "kill",
+                "id": id,
+                "expected_generation": baseline["grid"]["generation"]
+                    .as_str()
+                    .expect("generation string")
+            })
+            .to_string(),
+        );
         // The hard WITHIN deadline turns the old indefinite hang into a fast,
         // unambiguous failure if SessionExited is ever dropped.
         read_until(&mut reader, "\"ev\":\"session_exited\"", WITHIN);
@@ -195,17 +219,26 @@ fn final_output_and_notifications_precede_exactly_one_exit() {
 
         // Consume this session's restore baseline before releasing the child.
         let baseline_deadline = Instant::now() + WITHIN;
-        loop {
+        let generation = loop {
             let line = next_wire_line(&mut reader, &mut partial_line, baseline_deadline)
                 .expect("restore Grid before deadline");
             let event: Value = serde_json::from_str(line.trim()).expect("wire event JSON");
             if event["ev"] == "grid" && event["id"] == id {
-                break;
+                break event["grid"]["generation"]
+                    .as_str()
+                    .expect("grid generation")
+                    .to_string();
             }
-        }
+        };
         send(
             &mut stream,
-            &serde_json::json!({"op": "write", "id": id, "data": "go\n"}).to_string(),
+            &serde_json::json!({
+                "op": "write",
+                "id": id,
+                "data": "go\n",
+                "expected_generation": generation
+            })
+            .to_string(),
         );
 
         let deadline = Instant::now() + WITHIN;

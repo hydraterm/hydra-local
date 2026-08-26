@@ -21,7 +21,7 @@ pub const DB_FILENAME: &str = "maestro.db";
 
 /// The DB schema version this binary understands. Bumped when the relational schema changes; a DB stamped HIGHER than
 /// this was written by a newer build → we refuse to mutate it (the DB-level analog of the old per-record FutureVersion).
-pub const DB_SCHEMA_VERSION: i64 = 1;
+pub const DB_SCHEMA_VERSION: i64 = 3;
 
 /// Every schema-aware process keeps a shared lock on this file for as long as it has a cached
 /// connection. A binary that needs to initialize or migrate the schema must first acquire the same
@@ -64,6 +64,9 @@ pub enum DbError {
     Authority(String),
     /// Could not create the base directory for the DB file.
     Io(std::io::Error),
+    /// The no-schema-change WindowLayout mutation clock is corrupt or cannot advance. Continuing
+    /// would make an exact delete/recreate (ABA) indistinguishable from the snapshot it replaced.
+    WindowMutationEpochExhausted { value: i64 },
 }
 
 impl std::fmt::Display for DbError {
@@ -81,6 +84,10 @@ impl std::fmt::Display for DbError {
             ),
             DbError::Authority(error) => write!(f, "local data authority is unresolved: {error}"),
             DbError::Io(e) => write!(f, "db io error: {e}"),
+            DbError::WindowMutationEpochExhausted { value } => write!(
+                f,
+                "window mutation epoch is invalid or exhausted at {value}; refusing an ABA-unsafe write"
+            ),
         }
     }
 }
@@ -125,11 +132,11 @@ pub fn conn_for(base: &Path) -> Result<Arc<Mutex<Connection>>, DbError> {
 pub(crate) fn conn_for_migration(base: &Path) -> Result<Arc<Mutex<Connection>>, DbError> {
     let map = CONNS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = map.lock().unwrap();
-    #[cfg(test)]
-    prune_deleted_test_bases(&mut guard);
     if let Some(existing) = guard.get(base).cloned() {
         return Ok(existing);
     }
+    #[cfg(any(test, feature = "test-connection-cache-pruning"))]
+    prune_idle_test_connections(&mut guard);
     // Keep this lock through opening so two threads in one process cannot both attempt to upgrade
     // the flock from shared to exclusive. Cross-process initialization is serialized by the lease.
     let (conn, lease) = open_conn(base)?;
@@ -143,37 +150,41 @@ pub(crate) fn conn_for_migration(base: &Path) -> Result<Arc<Mutex<Connection>>, 
     Ok(arc)
 }
 
-/// Unit tests create hundreds of distinct temporary app-support bases in one process. The
-/// production cache intentionally keeps its one real base open for the process lifetime, but that
-/// policy would otherwise retain every deleted test database and schema-lease descriptor until the
-/// test binary exits. Reclaim only bases that have disappeared and whose connection has no owner
-/// outside the cache. Keeping the lease while an external `Arc` exists preserves the same schema
-/// generation invariant that production relies on.
-#[cfg(test)]
-fn prune_deleted_test_bases(conns: &mut HashMap<PathBuf, Arc<Mutex<Connection>>>) {
-    let stale = conns
+/// App unit-test binaries intentionally exercise many isolated support bases in one process. The
+/// production cache is process-lifetime because a real process has one (occasionally a handful of)
+/// bases, but retaining every temp base exhausts macOS's default 256-descriptor limit and can make a
+/// passing test wait forever on a daemon stub whose socket could not be opened.
+///
+/// This is compiled for this crate's own unit-test binary and through the App's dev-dependency
+/// feature. An entry is eligible only when the cache owns the sole `Arc` *and* its temporary base
+/// directory no longer exists. The filesystem
+/// condition matters for parallel tests: an existing base can rely on connection-local
+/// `data_version` continuity between operations even while no caller happens to retain an `Arc`.
+/// An active transaction, caller, or worker also necessarily retains another clone and is never
+/// disturbed. Dropping the parallel schema lease and authority bit with the vanished-base
+/// connection makes an unlikely later path reuse take the complete migration/open path again.
+#[cfg(any(test, feature = "test-connection-cache-pruning"))]
+fn prune_idle_test_connections(connections: &mut HashMap<PathBuf, Arc<Mutex<Connection>>>) {
+    let idle: Vec<PathBuf> = connections
         .iter()
-        .filter(|(base, conn)| !base.exists() && Arc::strong_count(conn) == 1)
+        .filter(|(base, connection)| Arc::strong_count(connection) == 1 && !base.exists())
         .map(|(base, _)| base.clone())
-        .collect::<Vec<_>>();
-
-    if stale.is_empty() {
+        .collect();
+    if idle.is_empty() {
         return;
     }
-
-    // Close SQLite before releasing its matching schema lease.
-    for base in &stale {
-        conns.remove(base);
+    for base in &idle {
+        connections.remove(base);
     }
     if let Some(leases) = SCHEMA_LEASES.get() {
         let mut leases = leases.lock().unwrap();
-        for base in &stale {
+        for base in &idle {
             leases.remove(base);
         }
     }
     if let Some(ready) = AUTHORITY_READY.get() {
         let mut ready = ready.lock().unwrap();
-        for base in &stale {
+        for base in &idle {
             ready.remove(base);
         }
     }
@@ -437,6 +448,58 @@ pub fn data_version(conn: &Connection) -> Result<i64, DbError> {
     Ok(v)
 }
 
+/// Persistent generation for the complete WindowLayout/owner namespace.
+///
+/// Slice B deliberately cannot change the relational schema, so the otherwise-unused SQLite
+/// `user_version` header is the single authority for this clock (schema compatibility remains
+/// exclusively in `schema_meta.version`). Every production transaction that creates, updates, or
+/// deletes a window layout/owner advances this value in the SAME transaction. Deleting a Project
+/// identity also advances it even when that project is currently empty: a pending window-restore
+/// receipt may still name the old Project incarnation. Project creation alone remains quiet because
+/// its required preceding deletion is the ABA fence. Actual Workspace and Session identity
+/// deletions also advance it: all three owner/child ids can be part of an outstanding window cleanup
+/// or restore proof. Their creation and ordinary metadata/heartbeat/generation updates remain quiet
+/// because a same-id recreation necessarily crosses the preceding delete fence. Snapshots carry the
+/// observed value, keeping byte-identical ABA distinguishable across app/agent processes without
+/// treating high-frequency session/task commits as window changes.
+///
+/// This is a GLOBAL window clock rather than a per-window revision: an unrelated window mutation
+/// conservatively invalidates a prepared snapshot. That false-stale result is safe and retryable.
+pub(crate) fn window_mutation_epoch(conn: &Connection) -> Result<u32, DbError> {
+    let value: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if !(0..=i64::from(i32::MAX)).contains(&value) {
+        return Err(DbError::WindowMutationEpochExhausted { value });
+    }
+    Ok(value as u32)
+}
+
+/// Advance [`window_mutation_epoch`] exactly once inside the caller's SQLite transaction.
+/// Exhaustion fails closed; wrapping could make a new window incarnation equal an old snapshot.
+pub(crate) fn bump_window_mutation_epoch(conn: &Connection) -> Result<u32, DbError> {
+    let current = window_mutation_epoch(conn)?;
+    if current == i32::MAX as u32 {
+        return Err(DbError::WindowMutationEpochExhausted {
+            value: i64::from(current),
+        });
+    }
+    let next = current + 1;
+    conn.pragma_update(None, "user_version", next)?;
+    Ok(next)
+}
+
+/// Prove that a later bump in the same writer transaction can succeed, without changing bytes.
+/// Callers that must perform an irreversible external effect before their SQLite mutation use
+/// this to ensure epoch exhaustion cannot strand the external world ahead of a rolled-back DB.
+pub(crate) fn preflight_window_mutation_epoch_bump(conn: &Connection) -> Result<(), DbError> {
+    let current = window_mutation_epoch(conn)?;
+    if current == i32::MAX as u32 {
+        return Err(DbError::WindowMutationEpochExhausted {
+            value: i64::from(current),
+        });
+    }
+    Ok(())
+}
+
 /// [`data_version`] read on the process's CACHED connection for `base` — the long-lived handle the
 /// baseline rule above requires, without the caller naming rusqlite types. `None` when the store
 /// can't be opened (dev/no DB) or the lock is poisoned; callers treat that as "no signal" and fall
@@ -636,7 +699,7 @@ mod data_version_tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(tables, 0, "no v1 DDL may run before the future guard");
+        assert_eq!(tables, 0, "no schema DDL may run before the future guard");
     }
 
     #[cfg(unix)]

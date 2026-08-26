@@ -154,6 +154,7 @@ pub enum DamageOutcome {
 /// The renderer's view, bound to one session. Tracks the current generation +
 /// revision baseline, the set of retired generations, the explicit phase, and
 /// whether a coalescing snapshot request is in flight.
+#[derive(Clone)]
 pub struct SyncState {
     /// The only session whose events we honor.
     session_id: String,
@@ -534,6 +535,40 @@ impl SyncState {
             .map(|(generation, _)| generation.0.as_str())
     }
 
+    /// Roll back only the "request admitted" bit when the renderer's fail-fast outbound queue
+    /// refused a Snapshot. Keep `highest_seen`: a later Grid/Damage can either catch up naturally or
+    /// ask again, while clearing the bit prevents permanent coalescing behind a request that never
+    /// entered the FIFO.
+    pub fn snapshot_request_not_admitted(&mut self) {
+        self.request_in_flight = false;
+    }
+
+    /// Immutable preflight for a locally requested recovery Snapshot. The reader thread is the sole
+    /// SyncState owner, so `can_request_local_resync -> fail-fast queue admission ->
+    /// local_resync_request_admitted` is one stable transaction. Wrong-session/exited states and a
+    /// request already in flight enqueue nothing; failed admission mutates nothing.
+    pub fn can_request_local_resync(&self, id: &str) -> bool {
+        id == self.session_id && self.phase != SyncPhase::Exited && !self.request_in_flight
+    }
+
+    /// Commit a successfully admitted renderer-originated recovery Snapshot. Unlike daemon
+    /// `ResyncRequired`, this keeps the in-flight bit raised until a Grid settles it, coalescing a
+    /// burst of malformed/gapped Damage into exactly one request.
+    pub fn local_resync_request_admitted(&mut self, id: &str) -> Result<Action, Reject> {
+        if id != self.session_id {
+            return Err(Reject::WrongSession);
+        }
+        if self.phase == SyncPhase::Exited {
+            return Err(Reject::SessionEnded);
+        }
+        if self.request_in_flight {
+            return Ok(Action::None);
+        }
+        self.phase = SyncPhase::AwaitingResync;
+        self.request_in_flight = true;
+        Ok(Action::None)
+    }
+
     #[cfg(test)]
     fn note_highest(&mut self, generation: Option<&SessionGeneration>, revision: Revision) {
         // We can only meaningfully order revisions within a known generation; use
@@ -577,6 +612,11 @@ fn validate_dimensions(snap: &GridSnapshot) -> Result<(), Reject> {
     if snap.rows_cells.iter().any(|r| r.len() != snap.cols) {
         return Err(Reject::InvalidDimensions {
             reason: "a row's cell count != cols",
+        });
+    }
+    if !crate::wire::terminal_link_cells_within_cap(&snap.rows_cells) {
+        return Err(Reject::InvalidDimensions {
+            reason: "terminal hyperlink cell cap exceeded",
         });
     }
     Ok(())
@@ -641,6 +681,9 @@ fn apply_ops(grid: &mut GridSnapshot, ops: &[DamageOp]) -> Result<(), &'static s
                 )?;
             }
         }
+    }
+    if !crate::wire::terminal_link_cells_within_cap(&grid.rows_cells) {
+        return Err("terminal hyperlink cell cap exceeded after damage");
     }
     Ok(())
 }
@@ -729,6 +772,7 @@ mod tests {
             strikeout: false,
             dim: false,
             hidden: false,
+            hyperlink: None,
             width,
         }
     }
@@ -1099,6 +1143,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_grid_over_terminal_hyperlink_cell_cap() {
+        let mut linked = cell(1, "x");
+        linked.hyperlink = Some("https://grid-cap.example.test".to_owned());
+        let row = vec![linked; maestro_protocol::MAX_TERMINAL_LINK_CELLS_PER_FRAME + 1];
+        let mut s = st();
+        assert_eq!(
+            s.on_grid(SESSION, &snap("gen-a", 1, vec![row])),
+            Err(Reject::InvalidDimensions {
+                reason: "terminal hyperlink cell cap exceeded"
+            })
+        );
+    }
+
+    #[test]
     fn accepts_valid_wide_pair() {
         let mut s = st();
         let row = vec![cell(2, "界"), cell(0, ""), cell(1, "x")];
@@ -1226,6 +1284,27 @@ mod tests {
             }
             other => panic!("expected Applied, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn post_damage_grid_over_terminal_hyperlink_cell_cap_is_discarded() {
+        let mut linked = cell(1, "x");
+        linked.hyperlink = Some("https://damage-cap.example.test".to_owned());
+        let mut row = vec![linked.clone(); maestro_protocol::MAX_TERMINAL_LINK_CELLS_PER_FRAME];
+        row.push(cell(1, " "));
+        let mut grid = snap("gen-a", 10, vec![row]);
+
+        assert_eq!(
+            apply_ops(
+                &mut grid,
+                &[DamageOp::RowSpan {
+                    row: 0,
+                    start: maestro_protocol::MAX_TERMINAL_LINK_CELLS_PER_FRAME as u16,
+                    cells: vec![linked],
+                }],
+            ),
+            Err("terminal hyperlink cell cap exceeded after damage")
+        );
     }
 
     #[test]

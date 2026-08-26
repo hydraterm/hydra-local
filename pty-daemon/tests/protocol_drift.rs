@@ -16,9 +16,9 @@
 
 mod common;
 
-use common::{connect, read_until, send, socket_path, start_daemon_on, Killer};
+use common::{connect, read_until, send, socket_path, start_daemon_on, unique, Killer};
 use serde_json::Value;
-use std::io::BufReader;
+use std::io::{BufRead, BufReader};
 use std::time::Duration;
 
 const WITHIN: Duration = Duration::from_secs(5);
@@ -52,53 +52,219 @@ fn grid_text(grid: &Value) -> String {
     out
 }
 
-/// Malformed and hostile client lines must not crash or wedge the daemon. A peer can
-/// send: non-JSON garbage, a valid JSON object with an unknown `op`, a known op with a
-/// missing required field, and a known op with a wrong-typed field. After all of that
-/// on the SAME connection, a well-formed request must still be served — proving the
-/// daemon skips bad lines rather than tearing down the connection or the process.
+#[test]
+fn start_operation_ledger_wire_is_typed_content_blind_and_lifecycle_stable() {
+    let sock = std::path::PathBuf::from("/tmp").join(format!("h-ol-{}.sock", unique()));
+    let _killer = Killer(start_daemon_on(&sock));
+    let mut stream = connect(&sock);
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let id = "ledger-wire";
+    let token = "11111111111141118111111111111111";
+
+    send(&mut stream, r#"{"op":"daemon_info"}"#);
+    let info = ev(&read_until(&mut reader, "\"ev\":\"daemon_info\"", WITHIN));
+    assert_eq!(info["start_operation_ledger"], Value::Bool(true));
+
+    send(
+        &mut stream,
+        &format!(r#"{{"op":"reserve_start_operation","id":"{id}","operation_token":"{token}"}}"#),
+    );
+    let reserved = ev(&read_until(
+        &mut reader,
+        "\"ev\":\"start_operation_reserved\"",
+        WITHIN,
+    ));
+    assert_eq!(reserved["outcome"]["status"], "reserved");
+    let keys: std::collections::BTreeSet<_> = reserved
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "daemon_instance_id",
+            "ev",
+            "id",
+            "operation_token",
+            "outcome",
+        ]
+        .into_iter()
+        .collect(),
+        "reservation metadata must remain content-blind"
+    );
+
+    send(
+        &mut stream,
+        &format!(
+            r#"{{"op":"start_session","id":"{id}","cwd":".","command":"sh","args":["-c","sleep 0.2"],"cols":80,"rows":24,"conditional_start":{{"operation_token":"{token}","precondition":{{"kind":"absent"}}}}}}"#
+        ),
+    );
+    let started = ev(&read_until(
+        &mut reader,
+        "\"ev\":\"conditional_session_start\"",
+        WITHIN,
+    ));
+    assert_eq!(started["outcome"]["status"], "applied");
+    let generation = started["outcome"]["generation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let mut exited = None;
+    for _ in 0..100 {
+        send(
+            &mut stream,
+            &format!(
+                r#"{{"op":"lookup_start_operation","id":"{id}","operation_token":"{token}"}}"#
+            ),
+        );
+        let status = ev(&read_until(
+            &mut reader,
+            "\"ev\":\"start_operation_status\"",
+            WITHIN,
+        ));
+        assert_eq!(status["status"]["generation"], generation);
+        if status["status"]["lifecycle"] == "exited" {
+            exited = Some(status);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        exited.is_some(),
+        "natural exit must become ledger Exited(G)"
+    );
+
+    send(
+        &mut stream,
+        &format!(r#"{{"op":"kill","id":"{id}","expected_generation":"{generation}"}}"#),
+    );
+    send(
+        &mut stream,
+        &format!(r#"{{"op":"lookup_start_operation","id":"{id}","operation_token":"{token}"}}"#),
+    );
+    let removed = ev(&read_until(
+        &mut reader,
+        "\"ev\":\"start_operation_status\"",
+        WITHIN,
+    ));
+    assert_eq!(removed["status"]["generation"], generation);
+    assert_eq!(removed["status"]["lifecycle"], "removed");
+
+    send(
+        &mut stream,
+        &format!(
+            r#"{{"op":"retire_start_operation","id":"{id}","operation_token":"{token}","expected":{{"state":"applied","generation":"{generation}"}}}}"#
+        ),
+    );
+    let retired = ev(&read_until(
+        &mut reader,
+        "\"ev\":\"start_operation_retired\"",
+        WITHIN,
+    ));
+    assert_eq!(retired["outcome"]["status"], "retired");
+
+    send(
+        &mut stream,
+        &format!(r#"{{"op":"lookup_start_operation","id":"{id}","operation_token":"{token}"}}"#),
+    );
+    let unknown = ev(&read_until(
+        &mut reader,
+        "\"ev\":\"start_operation_status\"",
+        WITHIN,
+    ));
+    assert_eq!(unknown["status"]["status"], "unknown");
+}
+
+#[test]
+fn refused_start_replays_typed_outcome_on_the_same_connection() {
+    let sock = std::path::PathBuf::from("/tmp").join(format!("h-or-{}.sock", unique()));
+    let _killer = Killer(start_daemon_on(&sock));
+    let mut stream = connect(&sock);
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let id = "refused-replay";
+    let token = "33333333333343338333333333333333";
+
+    send(
+        &mut stream,
+        &format!(r#"{{"op":"reserve_start_operation","id":"{id}","operation_token":"{token}"}}"#),
+    );
+    let reserved = ev(&read_until(
+        &mut reader,
+        "\"ev\":\"start_operation_reserved\"",
+        WITHIN,
+    ));
+    assert_eq!(reserved["outcome"]["status"], "reserved");
+
+    let start = format!(
+        r#"{{"op":"start_session","id":"{id}","cwd":".","command":"","args":[],"cols":80,"rows":24,"conditional_start":{{"operation_token":"{token}","precondition":{{"kind":"absent"}}}}}}"#
+    );
+    for attempt in 0..2 {
+        send(&mut stream, &start);
+        let refused = ev(&read_until(
+            &mut reader,
+            "\"ev\":\"conditional_session_start\"",
+            WITHIN,
+        ));
+        assert_eq!(refused["outcome"]["status"], "refused", "attempt {attempt}");
+        assert_eq!(
+            refused["outcome"]["reason"], "spawn_failed",
+            "attempt {attempt} must replay the original terminal reason"
+        );
+    }
+
+    send(
+        &mut stream,
+        &format!(
+            r#"{{"op":"retire_start_operation","id":"{id}","operation_token":"{token}","expected":{{"state":"unapplied"}}}}"#
+        ),
+    );
+    let retired = ev(&read_until(
+        &mut reader,
+        "\"ev\":\"start_operation_retired\"",
+        WITHIN,
+    ));
+    assert_eq!(retired["outcome"]["status"], "retired");
+}
+
+/// Malformed framing closes only the offending client and must not crash or wedge the daemon.
+/// A fresh client must still be served after the fail-closed boundary rejects the bad peer.
 #[test]
 fn malformed_requests_do_not_wedge_the_daemon() {
     let sock = socket_path("drift-malformed");
     let _killer = Killer(start_daemon_on(&sock));
 
-    let id = "malformed-sess";
     let mut stream = connect(&sock);
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let read_clone = stream.try_clone().unwrap();
+    read_clone
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut reader = BufReader::new(read_clone);
 
-    // A spray of bad lines, each on its own newline-framed line.
+    // Unparseable request framing is terminal for this client: the daemon cannot prove that an
+    // undecodable line is mutation-free, so it emits no unscoped Error and closes the peer.
     send(&mut stream, "this is not json at all");
-    send(&mut stream, "{ broken json ");
-    send(&mut stream, r#"{"op":"totally_unknown_op","id":"x"}"#);
-    // start_session missing the required `command` field.
-    send(
-        &mut stream,
-        r#"{"op":"start_session","id":"x","cwd":".","args":[],"cols":80,"rows":24}"#,
-    );
-    // attach with a wrong-typed id (number, not string).
-    send(&mut stream, r#"{"op":"attach","id":12345}"#);
-    // A bare empty line.
-    send(&mut stream, "");
-
-    // The daemon must still be alive and serving on this very connection.
-    start_cat(&mut stream, id);
-    send(&mut stream, &format!(r#"{{"op":"attach","id":"{id}"}}"#));
-    let snap = ev(&read_until(&mut reader, "\"ev\":\"grid\"", WITHIN));
+    let mut line = String::new();
     assert_eq!(
-        snap["grid"]["cols"].as_u64(),
-        Some(80),
-        "daemon still serves a well-formed attach after a malformed-input spray"
+        reader
+            .read_line(&mut line)
+            .expect("read malformed peer EOF"),
+        0
     );
 
-    // And a brand-new connection must also be accepted (the listener survived).
+    // A brand-new connection is accepted: only the malformed client was closed.
+    let id = "malformed-sess";
     let mut s2 = connect(&sock);
     let mut r2 = BufReader::new(s2.try_clone().unwrap());
+    start_cat(&mut s2, id);
     send(&mut s2, &format!(r#"{{"op":"attach","id":"{id}"}}"#));
     let snap2 = ev(&read_until(&mut r2, "\"ev\":\"grid\"", WITHIN));
     assert_eq!(
         snap2["grid"]["cols"].as_u64(),
         Some(80),
-        "a fresh connection is accepted after malformed input on another connection"
+        "a fresh connection is accepted after malformed framing closed another client"
     );
 }
 
@@ -124,20 +290,27 @@ fn resize_storm_settles_on_final_geometry_via_grid_resync() {
         Some(80),
         "started at 80 cols"
     );
+    let generation = snap["grid"]["generation"]
+        .as_str()
+        .expect("baseline generation");
 
     // Fire a burst of distinct geometries with no reads in between. The final one is the
     // truth the client must converge to.
     for (cols, rows) in [(90, 26), (110, 32), (70, 20), (100, 30), (120, 40)] {
         send(
             &mut stream,
-            &format!(r#"{{"op":"resize","id":"{id}","cols":{cols},"rows":{rows}}}"#),
+            &format!(
+                r#"{{"op":"resize","id":"{id}","cols":{cols},"rows":{rows},"expected_generation":"{generation}"}}"#
+            ),
         );
     }
     std::thread::sleep(Duration::from_millis(250));
     // One write wakes the forwarder so it diffs the new geometry against its baseline.
     send(
         &mut stream,
-        &format!(r#"{{"op":"write","id":"{id}","data":"settled\n"}}"#),
+        &format!(
+            r#"{{"op":"write","id":"{id}","data":"settled\n","expected_generation":"{generation}"}}"#
+        ),
     );
 
     // The geometry change surfaces as ResyncRequired + a full Grid. Drain grids until the
@@ -216,6 +389,7 @@ fn damage_chain_has_no_revision_gap_across_session_life() {
     );
     let snap = ev(&read_until(&mut reader, "\"ev\":\"grid\"", WITHIN));
     let gen = snap["grid"]["generation"].clone();
+    let generation = gen.as_str().expect("baseline generation");
     let mut held_rev = snap["grid"]["revision"]
         .as_u64()
         .expect("baseline revision");
@@ -225,7 +399,10 @@ fn damage_chain_has_no_revision_gap_across_session_life() {
     for w in writes {
         send(
             &mut stream,
-            &format!(r#"{{"op":"write","id":"{id}","data":"{}"}}"#, w.trim_end()),
+            &format!(
+                r#"{{"op":"write","id":"{id}","data":"{}","expected_generation":"{generation}"}}"#,
+                w.trim_end()
+            ),
         );
     }
 

@@ -9,12 +9,14 @@
 //! which is forbidden. The no-second-parser rule is about the OUTPUT path; input
 //! encoding only PRODUCES bytes and is unaffected.
 //!
-//! It also supports scrollback: the mouse wheel and PageUp/PageDown/Home/End
-//! scroll a renderer-owned VIEW into the daemon's history (a read-only `Scrollback`
-//! query answered with historical rows we paint through the SAME path as live rows).
-//! Scrolling is a view action, never PTY input. The daemon's live grid stays pinned at
-//! the bottom — we keep consuming live Damage while scrolled so returning to the bottom
-//! is instant. Alt-screen and resize force the view back to live.
+//! It also supports scrollback: on the primary screen, the mouse wheel and
+//! PageUp/PageDown/Home/End scroll a renderer-owned VIEW into the daemon's history (a
+//! read-only `Scrollback` query answered with historical rows we paint through the SAME
+//! path as live rows). Alternate-screen wheel input stays application-owned: negotiated
+//! mouse reporting wins, otherwise bounded Up/Down key input is synthesized. The daemon's
+//! live grid stays pinned at the bottom — we keep consuming live Damage while scrolled so
+//! returning to the bottom is instant. Alt-screen transitions and resize force the view
+//! back to live.
 //!
 //! ## Library entrypoint
 //!
@@ -46,6 +48,7 @@ mod client;
 // `file:///...` bundle URL does not. Keep the serving/path policy in one cross-platform boundary.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod dashboard_protocol;
+mod file_drop;
 // Platform-neutral windowing event model the App consumes. Both platforms translate native events into it via
 // a small adapter (winit on macOS, Tao/GTK on Linux) so no toolkit type reaches App. See host_event.rs.
 mod host_event;
@@ -71,10 +74,13 @@ mod linux_host;
 mod render;
 mod scene;
 mod sync;
+mod terminal_links;
 mod theme;
 mod wire;
 
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
@@ -97,19 +103,20 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::window::Window;
 use winit::window::WindowId;
 
-#[cfg(target_os = "linux")]
 use client::encode_paste;
 use client::{
     command_palette_escape_dismisses, command_palette_nav, compute_dims_with_chrome_rows,
-    encode_focus, encode_key, encode_mouse, extract_selection, next_view_offset,
-    pixel_to_cell_with_top_offset, plan_attach_switch, reset_session_state, scroll_key_action_for,
-    wheel_route, CellPos, CommandPaletteNavKey, MouseButton as MouseBtn, MouseEvent as MouseEv,
-    ResizeCoalescer, ScrollAction, ScrollKey, Shared, TermModes, WheelAccumulator, WheelRoute,
+    encode_focus, encode_key, encode_mouse, extract_selection, pixel_to_cell_with_top_offset,
+    scroll_key_action_for, wheel_input_action_for, CellPos, CommandPaletteNavKey,
+    DesiredPaneBinding, DesiredViewportBinding, MouseButton as MouseBtn, MouseEvent as MouseEv,
+    PreparedScrollAction, ResizeCoalescer, ScrollAction, ScrollKey, ScrollRequestIntent, Shared,
+    TermModes, WheelAccumulator, WheelDirection, WheelInputAction, OUTBOUND_CAP_BYTES,
 };
 #[cfg(not(target_os = "linux"))]
 use client::{paste_payload, Clipboard, SystemClipboard};
-use render::{ExtraPanePaint, Renderer, SiblingPaneStatus};
-use wire::ClientRequest;
+pub use client::{PaneKind, ViewportBindingToken};
+use render::{ExtraPanePaint, FrameOutcome, Renderer, SiblingPaneStatus, TerminalLinkHighlight};
+use wire::{ClientRequest, SessionGeneration};
 
 /// Project one absolute window-grid selection onto exactly its owning split pane. The renderer
 /// translates the range to pane-local content coordinates at paint time. Keeping this policy pure
@@ -149,6 +156,42 @@ fn global_cursor_position_px() -> Option<(f32, f32)> {
     let event = CGEvent::new(source).ok()?;
     let location = event.location();
     Some((location.x as f32, location.y as f32))
+}
+
+#[cfg(target_os = "macos")]
+fn global_logical_to_window_physical(
+    global_logical: (f32, f32),
+    window_inner_physical: (i32, i32),
+    scale: f32,
+) -> Option<(f32, f32)> {
+    if !global_logical.0.is_finite()
+        || !global_logical.1.is_finite()
+        || !scale.is_finite()
+        || scale <= 0.0
+    {
+        return None;
+    }
+    Some((
+        global_logical.0 * scale - window_inner_physical.0 as f32,
+        global_logical.1 * scale - window_inner_physical.1 as f32,
+    ))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod mac_cursor_coordinate_tests {
+    use super::global_logical_to_window_physical;
+
+    #[test]
+    fn retina_global_logical_point_maps_to_window_physical_pixels() {
+        assert_eq!(
+            global_logical_to_window_physical((500.0, 300.0), (800, 400), 2.0),
+            Some((200.0, 200.0))
+        );
+        assert_eq!(
+            global_logical_to_window_physical((1.0, 1.0), (0, 0), 0.0),
+            None
+        );
+    }
 }
 const RESIZE_REFIT_SETTLE_INTERVAL: Duration = Duration::from_millis(90);
 
@@ -221,6 +264,461 @@ mod external_viewport_session_tests {
     }
 }
 
+static NEXT_ATTACHMENT_HANDOFF_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_EXACT_VIEWPORT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Opaque correlation identity for one ordinary exact viewport publication request.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RendererExactViewportRequestId(u64);
+
+impl RendererExactViewportRequestId {
+    pub fn new() -> Self {
+        let id = NEXT_EXACT_VIEWPORT_REQUEST_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("renderer exact viewport request-id namespace exhausted");
+        Self(id)
+    }
+}
+
+impl Default for RendererExactViewportRequestId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for RendererExactViewportRequestId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RendererExactViewportRequestId(<redacted>)")
+    }
+}
+
+#[derive(Clone)]
+pub struct RendererExactViewportRequest {
+    core: Arc<RendererExactViewportRequestCore>,
+}
+
+struct RendererExactViewportRequestCore {
+    request_id: RendererExactViewportRequestId,
+    session_id: String,
+    exact_viewport: RendererExactViewport,
+    tab_strip: RendererTabStrip,
+    dispositions: std::sync::mpsc::Sender<RendererEvent>,
+    state: AtomicU8,
+}
+
+const EXACT_VIEWPORT_REQUEST_FRESH: u8 = 0;
+const EXACT_VIEWPORT_REQUEST_DELIVERED: u8 = 1;
+const EXACT_VIEWPORT_REQUEST_SETTLED: u8 = 2;
+
+impl RendererExactViewportRequest {
+    pub fn new(
+        session_id: String,
+        exact_viewport: RendererExactViewport,
+        tab_strip: RendererTabStrip,
+        dispositions: std::sync::mpsc::Sender<RendererEvent>,
+    ) -> Result<Self, RendererExactViewportError> {
+        if exact_viewport.primary().session_id() != session_id
+            || !exact_viewport.matches_projection(&tab_strip)
+        {
+            return Err(RendererExactViewportError::CohortMismatch);
+        }
+        Ok(Self {
+            core: Arc::new(RendererExactViewportRequestCore {
+                request_id: RendererExactViewportRequestId::new(),
+                session_id,
+                exact_viewport,
+                tab_strip,
+                dispositions,
+                state: AtomicU8::new(EXACT_VIEWPORT_REQUEST_FRESH),
+            }),
+        })
+    }
+
+    pub fn request_id(&self) -> RendererExactViewportRequestId {
+        self.core.request_id
+    }
+
+    fn session_id(&self) -> &str {
+        &self.core.session_id
+    }
+
+    fn exact_viewport(&self) -> &RendererExactViewport {
+        &self.core.exact_viewport
+    }
+
+    fn tab_strip(&self) -> &RendererTabStrip {
+        &self.core.tab_strip
+    }
+
+    /// Linearize owner-loop receipt exactly once. A duplicate wrapper delivery, including a replay
+    /// after terminal settlement, is a no-op and can never serialize a second Attach cohort.
+    fn begin_delivery(&self) -> bool {
+        self.core
+            .state
+            .compare_exchange(
+                EXACT_VIEWPORT_REQUEST_FRESH,
+                EXACT_VIEWPORT_REQUEST_DELIVERED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn settle(
+        &self,
+        outcome: RendererExactViewportOutcome,
+        daemon_instance_id: Option<maestro_shell::DaemonInstanceId>,
+    ) {
+        if self
+            .core
+            .state
+            .swap(EXACT_VIEWPORT_REQUEST_SETTLED, Ordering::AcqRel)
+            == EXACT_VIEWPORT_REQUEST_SETTLED
+        {
+            return;
+        }
+        let _ = self
+            .core
+            .dispositions
+            .send(RendererEvent::ExactViewportDisposition(
+                RendererExactViewportDisposition {
+                    request_id: self.core.request_id,
+                    session_id: self.core.session_id.clone(),
+                    generation: self.core.exact_viewport.primary().generation().to_string(),
+                    daemon_instance_id,
+                    outcome,
+                },
+            ));
+    }
+}
+
+impl PartialEq for RendererExactViewportRequest {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.core, &other.core)
+    }
+}
+
+impl Eq for RendererExactViewportRequest {}
+
+impl std::fmt::Debug for RendererExactViewportRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RendererExactViewportRequest(<redacted>)")
+    }
+}
+
+impl Drop for RendererExactViewportRequestCore {
+    fn drop(&mut self) {
+        if self
+            .state
+            .swap(EXACT_VIEWPORT_REQUEST_SETTLED, Ordering::AcqRel)
+            != EXACT_VIEWPORT_REQUEST_SETTLED
+        {
+            let _ = self
+                .dispositions
+                .send(RendererEvent::ExactViewportDisposition(
+                    RendererExactViewportDisposition {
+                        request_id: self.request_id,
+                        session_id: self.session_id.clone(),
+                        generation: self.exact_viewport.primary().generation().to_string(),
+                        daemon_instance_id: None,
+                        outcome: RendererExactViewportOutcome::Unavailable,
+                    },
+                ));
+        }
+    }
+}
+
+/// Opaque process-local correlation identity for one exact renderer handoff attempt. It is neither
+/// a daemon token nor mutation authority; app code keeps it solely to match a later disposition to
+/// the command it sent. Debug deliberately reveals no nonce value.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RendererAttachmentHandoffRequestId(u64);
+
+impl RendererAttachmentHandoffRequestId {
+    pub fn new() -> Self {
+        let id = NEXT_ATTACHMENT_HANDOFF_REQUEST_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("renderer attachment handoff request-id namespace exhausted");
+        Self(id)
+    }
+}
+
+impl Default for RendererAttachmentHandoffRequestId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for RendererAttachmentHandoffRequestId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RendererAttachmentHandoffRequestId(<redacted>)")
+    }
+}
+
+/// In-process renderer ownership for one exact shell-reviewed handoff. The shell authority keeps
+/// the original Offer connection alive; cloning this value never reconstructs ownership from a
+/// token or socket path.
+#[derive(Clone)]
+pub struct RendererAttachmentHandoff {
+    request_id: RendererAttachmentHandoffRequestId,
+    core: Arc<RendererAttachmentHandoffCore>,
+}
+
+struct RendererAttachmentHandoffCore {
+    authority: maestro_shell::AttachmentHandoffAuthority,
+    settled: std::sync::atomic::AtomicBool,
+    attempt_facts: Mutex<Option<RendererAttachmentHandoffAttemptFacts>>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct RendererAttachmentHandoffAttemptFacts {
+    session_id: String,
+    tab_strip: Option<RendererTabStrip>,
+    exact_viewport: Option<RendererExactViewport>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RendererAttachmentHandoffAttemptRegistration {
+    New,
+    Duplicate,
+    Conflict,
+}
+
+impl RendererAttachmentHandoff {
+    pub fn new(authority: maestro_shell::AttachmentHandoffAuthority) -> Self {
+        Self {
+            request_id: RendererAttachmentHandoffRequestId::new(),
+            core: Arc::new(RendererAttachmentHandoffCore {
+                authority,
+                settled: std::sync::atomic::AtomicBool::new(false),
+                attempt_facts: Mutex::new(None),
+            }),
+        }
+    }
+
+    pub fn request_id(&self) -> RendererAttachmentHandoffRequestId {
+        self.request_id
+    }
+
+    pub fn authority(&self) -> &maestro_shell::AttachmentHandoffAuthority {
+        &self.core.authority
+    }
+
+    fn mark_settled(&self) {
+        self.core.settled.store(true, Ordering::Release);
+    }
+
+    fn register_attempt(
+        &self,
+        session_id: &str,
+        tab_strip: Option<&RendererTabStrip>,
+        exact_viewport: Option<&RendererExactViewport>,
+    ) -> RendererAttachmentHandoffAttemptRegistration {
+        let proposed = RendererAttachmentHandoffAttemptFacts {
+            session_id: session_id.to_string(),
+            tab_strip: tab_strip.cloned(),
+            exact_viewport: exact_viewport.cloned(),
+        };
+        let mut facts = self
+            .core
+            .attempt_facts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match facts.as_ref() {
+            Some(existing) if existing == &proposed => {
+                RendererAttachmentHandoffAttemptRegistration::Duplicate
+            }
+            Some(_) => RendererAttachmentHandoffAttemptRegistration::Conflict,
+            None => {
+                *facts = Some(proposed);
+                RendererAttachmentHandoffAttemptRegistration::New
+            }
+        }
+    }
+}
+
+impl PartialEq for RendererAttachmentHandoff {
+    fn eq(&self, other: &Self) -> bool {
+        self.request_id == other.request_id && Arc::ptr_eq(&self.core, &other.core)
+    }
+}
+
+impl Eq for RendererAttachmentHandoff {}
+
+impl Drop for RendererAttachmentHandoffCore {
+    fn drop(&mut self) {
+        // Covers command-channel queue destruction and proxy-send failure before the owner loop can
+        // arm its explicit guard. Shell state makes a post-proof/post-cancel repeat harmless.
+        if !self.settled.load(Ordering::Acquire) {
+            spawn_detached_authority_cancel(self.authority.clone());
+        }
+    }
+}
+
+impl std::fmt::Debug for RendererAttachmentHandoff {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RendererAttachmentHandoff(<redacted>)")
+    }
+}
+
+/// Typed, explicitly *unowned* Claim material reserved for a future detached parent/child ACK
+/// pipe. A raw environment token is not this value: construction requires every exact proof fact
+/// the parent obtained while it continues retaining the real [`AttachmentHandoffAuthority`]. This
+/// slice intentionally does not route the descriptor through the detached binary yet.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RendererDetachedAttachmentHandoffClaim {
+    request_id: RendererAttachmentHandoffRequestId,
+    session_id: String,
+    token: maestro_shell::AttachmentHandoffToken,
+    expected_daemon_instance: maestro_shell::DaemonInstanceId,
+    expected_server_pid: Option<u32>,
+    expected_generation: String,
+}
+
+impl RendererDetachedAttachmentHandoffClaim {
+    pub fn from_parent_authority(handoff: &RendererAttachmentHandoff) -> Self {
+        let authority = handoff.authority();
+        Self {
+            request_id: handoff.request_id(),
+            session_id: authority.session_id().to_string(),
+            token: authority.token().clone(),
+            expected_daemon_instance: authority.expected_daemon_instance().clone(),
+            expected_server_pid: authority.expected_server_pid(),
+            expected_generation: authority.expected_generation().to_string(),
+        }
+    }
+}
+
+impl std::fmt::Debug for RendererDetachedAttachmentHandoffClaim {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RendererDetachedAttachmentHandoffClaim(<redacted>)")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RendererAttachmentHandoffOutcome {
+    Claimed,
+    /// The primary exact Grid proved and consumed the shell Claim, but another exact viewport role
+    /// failed before the complete viewport could be published. The renderer is neutral and the
+    /// outcome is compensation-unsafe; no cancellation or retry authority exists.
+    ClaimedViewportUnavailable,
+    /// Exact cancellation was acknowledged before any Claim entered the renderer writer FIFO.
+    CancelledBeforeClaimAdmission,
+    /// Pre-admission cancellation failed; the returned authority is the only retry capability.
+    CancellationUnresolvedBeforeClaimAdmission,
+    /// A Claim entered the FIFO but exact Grid proof never completed. Even a later Cancel ACK does
+    /// not prove that Claim was unpublished, so callers must treat durable compensation as unsafe.
+    ClaimPossiblyApplied,
+}
+
+/// Final renderer disposition for one correlated handoff attempt. Queue/command admission emits
+/// nothing: `Claimed` exists only after exact route+generation+peer proof; `Cancelled` only after
+/// the original Offer connection acknowledged cancellation. `Unresolved` returns a cloned owned
+/// authority so the App can retain/retry it. Debug redacts every correlation and proof value.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RendererAttachmentHandoffDisposition {
+    request_id: RendererAttachmentHandoffRequestId,
+    session_id: String,
+    outcome: RendererAttachmentHandoffOutcome,
+    daemon_instance_id: Option<maestro_shell::DaemonInstanceId>,
+    generation: Option<String>,
+    retry_authority: Option<maestro_shell::AttachmentHandoffAuthority>,
+}
+
+impl RendererAttachmentHandoffDisposition {
+    pub fn request_id(&self) -> RendererAttachmentHandoffRequestId {
+        self.request_id
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn outcome(&self) -> RendererAttachmentHandoffOutcome {
+        self.outcome
+    }
+
+    pub fn daemon_instance_id(&self) -> Option<&maestro_shell::DaemonInstanceId> {
+        self.daemon_instance_id.as_ref()
+    }
+
+    pub fn generation(&self) -> Option<&str> {
+        self.generation.as_deref()
+    }
+
+    pub fn retry_authority(&self) -> Option<&maestro_shell::AttachmentHandoffAuthority> {
+        self.retry_authority.as_ref()
+    }
+
+    pub fn into_retry_authority(self) -> Option<maestro_shell::AttachmentHandoffAuthority> {
+        self.retry_authority
+    }
+}
+
+impl std::fmt::Debug for RendererAttachmentHandoffDisposition {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RendererAttachmentHandoffDisposition")
+            .field("outcome", &self.outcome)
+            .field("exact_identity", &"<redacted>")
+            .field("retry_authority", &self.retry_authority.is_some())
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RendererExactViewportOutcome {
+    Published,
+    Unavailable,
+}
+
+/// Exactly-once ordinary viewport publication result. It carries no daemon capability; App keeps
+/// the opaque id solely to correlate a pending UI transition and adopts only `Published`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RendererExactViewportDisposition {
+    request_id: RendererExactViewportRequestId,
+    session_id: String,
+    generation: String,
+    daemon_instance_id: Option<maestro_shell::DaemonInstanceId>,
+    outcome: RendererExactViewportOutcome,
+}
+
+impl RendererExactViewportDisposition {
+    pub fn request_id(&self) -> RendererExactViewportRequestId {
+        self.request_id
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn generation(&self) -> &str {
+        &self.generation
+    }
+
+    pub fn daemon_instance_id(&self) -> Option<&maestro_shell::DaemonInstanceId> {
+        self.daemon_instance_id.as_ref()
+    }
+
+    pub fn outcome(&self) -> RendererExactViewportOutcome {
+        self.outcome
+    }
+}
+
+impl std::fmt::Debug for RendererExactViewportDisposition {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RendererExactViewportDisposition")
+            .field("outcome", &self.outcome)
+            .field("exact_identity", &"<redacted>")
+            .finish()
+    }
+}
+
 /// What [`run_renderer`] needs to attach to one daemon session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RendererLaunch {
@@ -228,6 +726,12 @@ pub struct RendererLaunch {
     pub socket_path: String,
     /// The session id to attach and render.
     pub session_id: String,
+    /// Owned in-process startup-to-renderer authority. Detached launchers require a future typed
+    /// parent/child ACK pipe and must not reconstruct this authority from an environment token.
+    pub attachment_handoff: Option<RendererAttachmentHandoff>,
+    /// Immutable all-pane lifetime authority. A display strip can describe labels and geometry but
+    /// can never authorize Attach membership; launches without this exact cohort remain neutral.
+    pub exact_viewport: Option<RendererExactViewport>,
     /// The native window title. `None` keeps the historical [`DEFAULT_WINDOW_TITLE`]; an app-shell
     /// caller (`maestro-app`) supplies an app-owned identity here.
     pub window_title: Option<String>,
@@ -276,6 +780,194 @@ pub struct RendererLaunch {
     pub theme: Option<RendererTheme>,
     /// Optional app-owned React chrome hosted as a native child WebView in the left sidebar band.
     pub react_chrome: Option<RendererReactChrome>,
+}
+
+/// Legacy child-only carrier name. The detached binary now rejects a value here because a token by
+/// itself cannot carry owned cancellation authority or return an exact Claim/Grid acknowledgement.
+pub const ATTACHMENT_HANDOFF_ENV: &str = "MAESTRO_ATTACHMENT_HANDOFF_TOKEN";
+
+/// Runtime command ownership for one exact offered handoff. Unlike launch-time setup, the owner
+/// loop can discard or replace a command while its Claim is still queued/backpressured. Keep the
+/// cancellation capability armed across that whole interval and bind it to the exact
+/// connection-local output generation once the aggregate Attach transaction is admitted.
+struct RuntimeAttachmentHandoffCancelGuard {
+    handoff: RendererAttachmentHandoff,
+    claim_binding: Option<client::ViewportBindingSet>,
+    cancel_in_flight: bool,
+}
+
+enum RuntimeAttachmentHandoffProof {
+    Pending,
+    Proven(RendererAttachmentHandoffDisposition),
+    ClaimedViewportUnavailable(RendererAttachmentHandoffDisposition),
+    Contradicted,
+}
+
+impl std::fmt::Debug for RuntimeAttachmentHandoffCancelGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeAttachmentHandoffCancelGuard")
+            .field("handoff", &"<redacted>")
+            .field("claim_binding", &self.claim_binding)
+            .field("cancel_in_flight", &self.cancel_in_flight)
+            .finish()
+    }
+}
+
+impl RuntimeAttachmentHandoffCancelGuard {
+    fn new(handoff: RendererAttachmentHandoff) -> Self {
+        Self {
+            handoff,
+            claim_binding: None,
+            cancel_in_flight: false,
+        }
+    }
+
+    fn request_id(&self) -> RendererAttachmentHandoffRequestId {
+        self.handoff.request_id()
+    }
+
+    fn session_id(&self) -> &str {
+        self.handoff.authority().session_id().0.as_str()
+    }
+
+    fn claim(&self) -> client::AttachmentHandoffClaim {
+        let authority = self.handoff.authority();
+        client::AttachmentHandoffClaim {
+            authority: authority.clone(),
+            session_id: authority.session_id().to_string(),
+            token: authority.token().clone(),
+            expected_daemon_instance: authority.expected_daemon_instance().clone(),
+            expected_server_pid: authority.expected_server_pid(),
+            expected_generation: authority.expected_generation().to_string(),
+        }
+    }
+
+    fn mark_claim_admitted(&mut self, binding: client::ViewportBindingSet) {
+        self.claim_binding = Some(binding);
+    }
+
+    /// Only an accepted Grid stored under the exact binding created for this Claim can retire the
+    /// cancellation capability. `try_bind_viewport` clears the former grid before publishing this
+    /// binding, so `Some(generation)` here is also exact PTY-lifetime baseline proof.
+    fn claim_if_exact_grid_proven(
+        &mut self,
+        shared: &Shared,
+        operationally_available: bool,
+    ) -> RuntimeAttachmentHandoffProof {
+        let Some(binding) = self.claim_binding.as_ref() else {
+            return RuntimeAttachmentHandoffProof::Pending;
+        };
+        let claim = self.claim();
+        let authority_session_id = self.handoff.authority().session_id().to_string();
+        let authority_daemon_instance = self.handoff.authority().expected_daemon_instance().clone();
+        let primary = binding.primary();
+        if primary.session_id != claim.session_id {
+            return RuntimeAttachmentHandoffProof::Contradicted;
+        }
+        match binding.status() {
+            client::ExactViewportAdmissionStatus::Pending => {
+                if operationally_available {
+                    RuntimeAttachmentHandoffProof::Pending
+                } else {
+                    RuntimeAttachmentHandoffProof::Contradicted
+                }
+            }
+            client::ExactViewportAdmissionStatus::FailedBeforePrimaryProof => {
+                RuntimeAttachmentHandoffProof::Contradicted
+            }
+            client::ExactViewportAdmissionStatus::Complete => {
+                if operationally_available && !shared.operational_handoff_peer_matches(&claim) {
+                    return RuntimeAttachmentHandoffProof::Contradicted;
+                }
+                self.handoff.mark_settled();
+                self.claim_binding = None;
+                let disposition = RendererAttachmentHandoffDisposition {
+                    request_id: self.request_id(),
+                    session_id: authority_session_id,
+                    outcome: if operationally_available {
+                        RendererAttachmentHandoffOutcome::Claimed
+                    } else {
+                        RendererAttachmentHandoffOutcome::ClaimedViewportUnavailable
+                    },
+                    daemon_instance_id: Some(authority_daemon_instance),
+                    generation: Some(claim.expected_generation),
+                    retry_authority: None,
+                };
+                if operationally_available {
+                    RuntimeAttachmentHandoffProof::Proven(disposition)
+                } else {
+                    RuntimeAttachmentHandoffProof::ClaimedViewportUnavailable(disposition)
+                }
+            }
+            client::ExactViewportAdmissionStatus::FailedAfterPrimaryProof => {
+                self.handoff.mark_settled();
+                self.claim_binding = None;
+                RuntimeAttachmentHandoffProof::ClaimedViewportUnavailable(
+                    RendererAttachmentHandoffDisposition {
+                        request_id: self.request_id(),
+                        session_id: authority_session_id,
+                        outcome: RendererAttachmentHandoffOutcome::ClaimedViewportUnavailable,
+                        daemon_instance_id: Some(authority_daemon_instance),
+                        generation: Some(claim.expected_generation),
+                        retry_authority: None,
+                    },
+                )
+            }
+        }
+    }
+}
+
+fn claimed_viewport_unavailable_disposition(
+    handoff: &RendererAttachmentHandoff,
+    binding: Option<&client::ViewportBindingSet>,
+) -> Option<RendererAttachmentHandoffDisposition> {
+    let status = binding.map(client::ViewportBindingSet::status)?;
+    if !matches!(
+        status,
+        client::ExactViewportAdmissionStatus::Complete
+            | client::ExactViewportAdmissionStatus::FailedAfterPrimaryProof
+    ) {
+        return None;
+    }
+    let authority = handoff.authority();
+    Some(RendererAttachmentHandoffDisposition {
+        request_id: handoff.request_id(),
+        session_id: authority.session_id().to_string(),
+        outcome: RendererAttachmentHandoffOutcome::ClaimedViewportUnavailable,
+        daemon_instance_id: Some(authority.expected_daemon_instance().clone()),
+        generation: Some(authority.expected_generation().to_string()),
+        retry_authority: None,
+    })
+}
+
+fn spawn_detached_authority_cancel(authority: maestro_shell::AttachmentHandoffAuthority) {
+    let worker_authority = authority.clone();
+    if std::thread::Builder::new()
+        .name("renderer-handoff-cancel".to_string())
+        .spawn(move || {
+            if worker_authority.cancel().is_err() {
+                // No owner loop remains to receive a retry authority. Deliberately leak this final
+                // clone rather than silently destroying the only exact cancellation connection.
+                std::mem::forget(worker_authority);
+            }
+        })
+        .is_err()
+    {
+        std::mem::forget(authority);
+    }
+}
+
+fn claim_for_handoff(handoff: &RendererAttachmentHandoff) -> client::AttachmentHandoffClaim {
+    let authority = handoff.authority();
+    client::AttachmentHandoffClaim {
+        authority: authority.clone(),
+        session_id: authority.session_id().to_string(),
+        token: authority.token().clone(),
+        expected_daemon_instance: authority.expected_daemon_instance().clone(),
+        expected_server_pid: authority.expected_server_pid(),
+        expected_generation: authority.expected_generation().to_string(),
+    }
 }
 
 /// Optional app-owned React chrome hosted as a native child WebView.
@@ -615,7 +1307,7 @@ fn forward_mac_dashboard_ipc(
     request_uri: &str,
     canonical_url: &str,
     body: &str,
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
 ) -> bool {
     if !mac_dashboard_document_is_trusted(request_uri, canonical_url) {
         eprintln!(
@@ -712,7 +1404,7 @@ fn build_mac_dashboard_webview(
     bounds: wry::Rect,
     background: (u8, u8, u8, u8),
     host_script: &str,
-    events: Option<std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<ViewportEventSink>,
     page_load_proxy: Option<EventLoopProxy<UserEvent>>,
 ) -> Result<wry::WebView, wry::Error> {
     let serve_url = serving.url.clone();
@@ -790,7 +1482,9 @@ fn build_mac_dashboard_webview(
                 &request_uri,
                 &trusted_ipc_url,
                 request.body(),
-                events.as_ref(),
+                events
+                    .as_ref()
+                    .map(|events| events as &dyn RendererEventOutput),
             );
         })
         .with_bounds(bounds)
@@ -2670,6 +3364,530 @@ pub struct RendererTabStrip {
     pub tabs: Vec<RendererTab>,
 }
 
+/// One daemon PTY lifetime named by an immutable renderer viewport authority. The fields are
+/// intentionally private: textual session ids and durable generation strings must not be mixed by
+/// callers after the Shell loaded them in one database snapshot.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RendererExactSessionTarget {
+    session_id: String,
+    generation: String,
+}
+
+impl RendererExactSessionTarget {
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn generation(&self) -> &str {
+        &self.generation
+    }
+}
+
+impl std::fmt::Debug for RendererExactSessionTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RendererExactSessionTarget(<redacted>)")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct RendererExactViewportRole {
+    tab_id: String,
+    target: RendererExactSessionTarget,
+}
+
+/// Immutable all-pane lifetime authority for one renderer viewport. Presentation data such as
+/// labels, attention and split chrome remains in [`RendererTabStrip`]; this value alone authorizes
+/// membership Attach frames. It can only be built from Shell's opaque one-snapshot cohort.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RendererExactViewport {
+    window_id: String,
+    primary_tab_id: String,
+    primary: RendererExactSessionTarget,
+    roles: Vec<RendererExactViewportRole>,
+    unique_targets: Vec<RendererExactSessionTarget>,
+}
+
+impl RendererExactViewport {
+    pub fn from_window_snapshot(
+        snapshot: &maestro_shell::WindowViewportSnapshot,
+        primary_tab_id: &str,
+    ) -> Result<Self, RendererExactViewportError> {
+        let layout = &snapshot.window().layout;
+        if layout.window_id.is_empty() {
+            return Err(RendererExactViewportError::InvalidWindow);
+        }
+        let visible: Vec<_> = layout.tabs.iter().filter(|tab| !tab.stashed).collect();
+        if visible.is_empty() || visible.len() != snapshot.panes().len() {
+            return Err(RendererExactViewportError::CohortMismatch);
+        }
+
+        let mut tab_ids = BTreeSet::new();
+        let mut unique = BTreeMap::<String, (String, Option<(u16, u16, u16, u16)>)>::new();
+        let mut roles = Vec::with_capacity(visible.len());
+        for tab in visible {
+            if !tab_ids.insert(tab.tab_id.clone()) {
+                return Err(RendererExactViewportError::DuplicateTab);
+            }
+            let pane = snapshot
+                .pane_for_tab(&tab.tab_id)
+                .ok_or(RendererExactViewportError::CohortMismatch)?;
+            if pane.tab_id() != tab.tab_id || pane.session_id() != tab.session_id {
+                return Err(RendererExactViewportError::CohortMismatch);
+            }
+            let generation = pane.generation();
+            if generation.is_empty() || generation.len() > 128 {
+                return Err(RendererExactViewportError::InvalidGeneration);
+            }
+            let geometry = tab.pane_rect.map(|rect| (rect.x, rect.y, rect.w, rect.h));
+            match unique.get(pane.session_id()) {
+                Some((existing_generation, _)) if existing_generation != generation => {
+                    return Err(RendererExactViewportError::ConflictingSessionLifetime)
+                }
+                Some((_, existing_geometry)) if existing_geometry != &geometry => {
+                    return Err(RendererExactViewportError::ConflictingSessionGeometry)
+                }
+                _ => {
+                    unique
+                        .entry(pane.session_id().to_string())
+                        .or_insert_with(|| (generation.to_string(), geometry));
+                }
+            }
+            roles.push(RendererExactViewportRole {
+                tab_id: tab.tab_id.clone(),
+                target: RendererExactSessionTarget {
+                    session_id: pane.session_id().to_string(),
+                    generation: generation.to_string(),
+                },
+            });
+        }
+
+        let primary = roles
+            .iter()
+            .find(|role| role.tab_id == primary_tab_id)
+            .map(|role| role.target.clone())
+            .ok_or(RendererExactViewportError::PrimaryMissing)?;
+        let unique_targets = unique
+            .into_iter()
+            .map(|(session_id, (generation, _))| RendererExactSessionTarget {
+                session_id,
+                generation,
+            })
+            .collect();
+        Ok(Self {
+            window_id: layout.window_id.clone(),
+            primary_tab_id: primary_tab_id.to_string(),
+            primary,
+            roles,
+            unique_targets,
+        })
+    }
+
+    pub fn window_id(&self) -> &str {
+        &self.window_id
+    }
+
+    pub fn primary_tab_id(&self) -> &str {
+        &self.primary_tab_id
+    }
+
+    pub fn primary(&self) -> &RendererExactSessionTarget {
+        &self.primary
+    }
+
+    pub fn targets(&self) -> impl ExactSizeIterator<Item = &RendererExactSessionTarget> {
+        self.unique_targets.iter()
+    }
+
+    fn target_for_tab(&self, tab_id: &str) -> Option<&RendererExactSessionTarget> {
+        self.roles
+            .iter()
+            .find(|role| role.tab_id == tab_id)
+            .map(|role| &role.target)
+    }
+
+    /// Presentation may refresh labels/attention/geometry, but it must name the same window,
+    /// exact tab/session cohort and primary role. It can never add or switch an Attach target.
+    fn matches_projection(&self, strip: &RendererTabStrip) -> bool {
+        if strip.window_id != self.window_id || strip.tabs.len() != self.roles.len() {
+            return false;
+        }
+        let mut seen_tabs = BTreeSet::new();
+        let mut geometry_by_session = BTreeMap::new();
+        let mut active = None;
+        for tab in &strip.tabs {
+            if !seen_tabs.insert(tab.tab_id.as_str()) {
+                return false;
+            }
+            let Some(target) = self.target_for_tab(&tab.tab_id) else {
+                return false;
+            };
+            if target.session_id != tab.session_id {
+                return false;
+            }
+            let geometry = tab.pane_rect.map(|rect| (rect.x, rect.y, rect.w, rect.h));
+            if geometry_by_session
+                .insert(tab.session_id.as_str(), geometry)
+                .is_some_and(|existing| existing != geometry)
+            {
+                return false;
+            }
+            if tab.active && active.replace(tab.tab_id.as_str()).is_some() {
+                return false;
+            }
+        }
+        active == Some(self.primary_tab_id.as_str())
+    }
+}
+
+impl std::fmt::Debug for RendererExactViewport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RendererExactViewport")
+            .field("role_count", &self.roles.len())
+            .field("unique_target_count", &self.unique_targets.len())
+            .field("exact_identity", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RendererExactViewportError {
+    InvalidWindow,
+    CohortMismatch,
+    DuplicateTab,
+    PrimaryMissing,
+    InvalidGeneration,
+    ConflictingSessionLifetime,
+    ConflictingSessionGeometry,
+}
+
+impl std::fmt::Display for RendererExactViewportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidWindow => "renderer viewport window identity is invalid",
+            Self::CohortMismatch => "renderer viewport layout/session cohort does not match",
+            Self::DuplicateTab => "renderer viewport contains a duplicate tab identity",
+            Self::PrimaryMissing => "renderer viewport primary tab is absent",
+            Self::InvalidGeneration => "renderer viewport PTY generation is invalid",
+            Self::ConflictingSessionLifetime => {
+                "renderer viewport aliases one session with conflicting PTY lifetimes"
+            }
+            Self::ConflictingSessionGeometry => {
+                "renderer viewport aliases one session with conflicting pane geometry"
+            }
+        })
+    }
+}
+
+impl std::error::Error for RendererExactViewportError {}
+
+#[cfg(test)]
+mod exact_viewport_authority_tests {
+    use super::{
+        RendererExactSessionTarget, RendererExactViewport, RendererExactViewportError,
+        RendererExactViewportRequest, RendererExactViewportRole, RendererPaneRect, RendererTab,
+        RendererTabSplitAxis, RendererTabStrip,
+    };
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
+
+    static NEXT_STORE: AtomicU64 = AtomicU64::new(1);
+
+    struct ViewportStore(PathBuf);
+
+    impl Drop for ViewportStore {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn viewport_store() -> (ViewportStore, maestro_shell::AppPaths) {
+        let base = std::env::temp_dir().join(format!(
+            "maestro-renderer-exact-viewport-{}-{}",
+            std::process::id(),
+            NEXT_STORE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let paths = maestro_shell::AppPaths::with_base(base.clone());
+        maestro_shell::ProjectService::new(&paths)
+            .create(
+                "viewport-project",
+                "Viewport",
+                base.to_string_lossy(),
+                maestro_shell::NewProject::default(),
+                1,
+            )
+            .unwrap();
+        maestro_shell::write_record(
+            &paths,
+            maestro_shell::RecordKind::Workspace,
+            "viewport-workspace",
+            1,
+            &maestro_shell::Workspace {
+                workspace_id: "viewport-workspace".to_string(),
+                project_id: "viewport-project".to_string(),
+                root: base.to_string_lossy().into_owned(),
+                policy: maestro_shell::WorkspacePolicy::ScratchCwd,
+                consent: maestro_shell::WorkspaceConsent::default(),
+            },
+        )
+        .unwrap();
+        (ViewportStore(base), paths)
+    }
+
+    fn seed_session(paths: &maestro_shell::AppPaths, id: &str, generation: &str) {
+        maestro_shell::write_record(
+            paths,
+            maestro_shell::RecordKind::Session,
+            id,
+            1,
+            &maestro_shell::SessionRecord {
+                session_id: id.to_string(),
+                workspace_id: "viewport-workspace".to_string(),
+                kind: maestro_shell::SessionKind::Shell,
+                launch: maestro_shell::LaunchSpec::OptOut,
+                cwd_resolved: "/tmp".to_string(),
+                agent_task_id: None,
+                created_at_ms: 1,
+                last_attached_at_ms: 1,
+                last_known_generation: Some(generation.to_string()),
+                status: maestro_shell::SessionStatus::Live,
+            },
+        )
+        .unwrap();
+    }
+
+    fn presentation_from_snapshot(
+        snapshot: &maestro_shell::WindowViewportSnapshot,
+        primary_tab_id: &str,
+    ) -> RendererTabStrip {
+        RendererTabStrip {
+            window_id: snapshot.window().layout.window_id.clone(),
+            tabs: snapshot
+                .window()
+                .layout
+                .tabs
+                .iter()
+                .filter(|tab| !tab.stashed)
+                .map(|tab| RendererTab {
+                    tab_id: tab.tab_id.clone(),
+                    session_id: tab.session_id.clone(),
+                    title: tab.title.clone(),
+                    active: tab.tab_id == primary_tab_id,
+                    pinned: tab.pinned,
+                    needs_attention: false,
+                    attention: None,
+                    split: tab.split_from.as_ref().map(|split| match split.axis {
+                        maestro_shell::SplitAxis::Right => RendererTabSplitAxis::Right,
+                        maestro_shell::SplitAxis::Down => RendererTabSplitAxis::Down,
+                    }),
+                    split_from_tab_id: tab.split_from.as_ref().map(|split| split.tab_id.clone()),
+                    split_ratio_per_mille: tab
+                        .split_from
+                        .as_ref()
+                        .and_then(|split| split.ratio_per_mille),
+                    pane_rect: tab.pane_rect.map(|rect| RendererPaneRect {
+                        x: rect.x,
+                        y: rect.y,
+                        w: rect.w,
+                        h: rect.h,
+                    }),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn shell_snapshot_builds_one_exact_visible_cohort_and_request_rejects_projection_drift() {
+        let (_store, paths) = viewport_store();
+        seed_session(&paths, "viewport-a", "generation-a");
+        seed_session(&paths, "viewport-b", "generation-b");
+        let layouts = maestro_shell::WindowLayoutService::new(&paths);
+        layouts.create_empty("viewport-window", 1).unwrap();
+        layouts
+            .open_tab(
+                "viewport-window",
+                "tab-a",
+                "viewport-a",
+                "A",
+                false,
+                maestro_shell::AttentionState::default(),
+                2,
+            )
+            .unwrap();
+        layouts
+            .split_tab(
+                "viewport-window",
+                "tab-a",
+                "tab-b",
+                "viewport-b",
+                "B",
+                maestro_shell::SplitAxis::Right,
+                3,
+            )
+            .unwrap();
+        layouts
+            .open_tab(
+                "viewport-window",
+                "tab-stashed",
+                "unresolved-stashed",
+                "Stashed",
+                false,
+                maestro_shell::AttentionState::default(),
+                4,
+            )
+            .unwrap();
+        layouts
+            .set_tab_stashed("viewport-window", "tab-stashed", true, 5)
+            .unwrap();
+
+        let snapshot = layouts.load_viewport_snapshot("viewport-window").unwrap();
+        let exact = RendererExactViewport::from_window_snapshot(&snapshot, "tab-b").unwrap();
+        assert_eq!(exact.window_id(), "viewport-window");
+        assert_eq!(exact.primary_tab_id(), "tab-b");
+        assert_eq!(exact.primary().session_id(), "viewport-b");
+        assert_eq!(exact.primary().generation(), "generation-b");
+        assert_eq!(
+            exact
+                .targets()
+                .map(|target| (target.session_id(), target.generation()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("viewport-a", "generation-a"),
+                ("viewport-b", "generation-b")
+            ]
+        );
+        let strip = presentation_from_snapshot(&snapshot, "tab-b");
+        assert!(exact.matches_projection(&strip));
+
+        let mut wrong_window = strip.clone();
+        wrong_window.window_id = "foreign-window".to_string();
+        assert!(!exact.matches_projection(&wrong_window));
+        let mut wrong_session = strip.clone();
+        wrong_session.tabs[0].session_id = "foreign-session".to_string();
+        assert!(!exact.matches_projection(&wrong_session));
+        let mut wrong_primary = strip.clone();
+        for tab in &mut wrong_primary.tabs {
+            tab.active = tab.tab_id == "tab-a";
+        }
+        assert!(!exact.matches_projection(&wrong_primary));
+        let mut extra = strip.clone();
+        extra.tabs.push(extra.tabs[0].clone());
+        assert!(!exact.matches_projection(&extra));
+
+        let (dispositions, _received) = mpsc::channel();
+        assert_eq!(
+            RendererExactViewportRequest::new("viewport-a".to_string(), exact, strip, dispositions,),
+            Err(RendererExactViewportError::CohortMismatch)
+        );
+    }
+
+    #[test]
+    fn duplicate_session_roles_with_different_geometry_fail_closed() {
+        let (_store, paths) = viewport_store();
+        seed_session(&paths, "viewport-shared", "generation-shared");
+        let layouts = maestro_shell::WindowLayoutService::new(&paths);
+        layouts.create_empty("viewport-window", 1).unwrap();
+        layouts
+            .open_tab(
+                "viewport-window",
+                "tab-a",
+                "viewport-shared",
+                "A",
+                false,
+                maestro_shell::AttentionState::default(),
+                2,
+            )
+            .unwrap();
+        layouts
+            .split_tab(
+                "viewport-window",
+                "tab-a",
+                "tab-b",
+                "viewport-shared",
+                "B",
+                maestro_shell::SplitAxis::Right,
+                3,
+            )
+            .unwrap();
+        let snapshot = layouts.load_viewport_snapshot("viewport-window").unwrap();
+        assert_eq!(
+            RendererExactViewport::from_window_snapshot(&snapshot, "tab-a"),
+            Err(RendererExactViewportError::ConflictingSessionGeometry)
+        );
+    }
+
+    #[test]
+    fn projection_refresh_rechecks_equal_geometry_for_same_lifetime_aliases() {
+        let target = RendererExactSessionTarget {
+            session_id: "shared".to_string(),
+            generation: "generation-shared".to_string(),
+        };
+        let exact = RendererExactViewport {
+            window_id: "window".to_string(),
+            primary_tab_id: "a".to_string(),
+            primary: target.clone(),
+            roles: vec![
+                RendererExactViewportRole {
+                    tab_id: "a".to_string(),
+                    target: target.clone(),
+                },
+                RendererExactViewportRole {
+                    tab_id: "b".to_string(),
+                    target: target.clone(),
+                },
+            ],
+            unique_targets: vec![target],
+        };
+        let alias = |tab_id: &str, active: bool, x: u16| RendererTab {
+            tab_id: tab_id.to_string(),
+            session_id: "shared".to_string(),
+            title: tab_id.to_string(),
+            active,
+            pinned: false,
+            needs_attention: false,
+            attention: None,
+            split: None,
+            split_from_tab_id: None,
+            split_ratio_per_mille: None,
+            pane_rect: Some(RendererPaneRect {
+                x,
+                y: 0,
+                w: 500,
+                h: 1000,
+            }),
+        };
+        let compatible = RendererTabStrip {
+            window_id: "window".to_string(),
+            tabs: vec![alias("a", true, 0), alias("b", false, 0)],
+        };
+        assert!(exact.matches_projection(&compatible));
+        let conflicting = RendererTabStrip {
+            window_id: "window".to_string(),
+            tabs: vec![alias("a", true, 0), alias("b", false, 500)],
+        };
+        assert!(!exact.matches_projection(&conflicting));
+    }
+}
+
+/// A handoff projection is either intentionally strip-less, or names exactly one active tab whose
+/// session is the indivisible authority's session. Apply the same predicate at startup and runtime
+/// so an inconsistent strip can never be published after a successful Claim.
+fn handoff_projection_matches_session(
+    tab_strip: Option<&RendererTabStrip>,
+    session_id: &str,
+) -> bool {
+    let Some(tab_strip) = tab_strip else {
+        return true;
+    };
+    let mut active_tabs = tab_strip.tabs.iter().filter(|tab| tab.active);
+    active_tabs
+        .next()
+        .is_some_and(|tab| tab.session_id == session_id)
+        && active_tabs.next().is_none()
+}
+
 /// Max characters of a single tab title shown in the strip before it is truncated with `..`. Keeps one
 /// pathological title from making the overlay unusable.
 const TAB_TITLE_MAX: usize = 16;
@@ -3075,6 +4293,49 @@ pub(crate) fn host_mods(control: bool, alt: bool, shift: bool, super_key: bool) 
         alt,
         shift,
         super_key,
+    }
+}
+
+/// Exact terminal-link gesture: Command-click on macOS, Ctrl-click elsewhere.
+/// Shift/Alt and the other platform modifier are forbidden so selection overrides
+/// and multi-modifier TUI gestures retain their existing behavior.
+fn terminal_link_modifier_matches(mods: HostModifiers, macos: bool) -> bool {
+    if mods.alt || mods.shift {
+        return false;
+    }
+    if macos {
+        mods.super_key && !mods.control
+    } else {
+        mods.control && !mods.super_key
+    }
+}
+
+#[cfg(test)]
+mod terminal_link_modifier_tests {
+    use super::{terminal_link_modifier_matches, HostModifiers};
+
+    #[test]
+    fn modifier_click_is_exact_per_platform() {
+        let command = HostModifiers {
+            super_key: true,
+            ..HostModifiers::default()
+        };
+        let control = HostModifiers {
+            control: true,
+            ..HostModifiers::default()
+        };
+        assert!(terminal_link_modifier_matches(command, true));
+        assert!(!terminal_link_modifier_matches(control, true));
+        assert!(terminal_link_modifier_matches(control, false));
+        assert!(!terminal_link_modifier_matches(command, false));
+        assert!(!terminal_link_modifier_matches(
+            HostModifiers {
+                control: true,
+                shift: true,
+                ..HostModifiers::default()
+            },
+            false
+        ));
     }
 }
 
@@ -3486,6 +4747,7 @@ fn pane_cycle_target<'a>(
 /// the daemon's grid (which would feed the shrunk size back into the split-frame computation and
 /// oscillate). `window_dims` is the renderer's authoritative full grid; the no-split path returns it
 /// unchanged so the single-pane resize is byte-identical.
+#[cfg(test)]
 fn active_resize_dims(window_dims: (u16, u16), frame: Option<&RendererSplitFrame>) -> (u16, u16) {
     match frame {
         Some(f) => {
@@ -5798,6 +7060,25 @@ fn rect_split_layout(
     rows: u16,
 ) -> Option<RendererSplitLayout> {
     let members = active_split_set(&strip.tabs, root);
+    // A committed close/stash can leave the sole surviving durable row carrying its former half/quarter
+    // rect until a later canonicalization write. One live pane always owns the whole terminal viewport;
+    // never preserve a black/stale hole merely because that row still has split-era coordinates.
+    if let [member] = members.as_slice() {
+        return Some(RendererSplitLayout {
+            panes: vec![RendererLayoutPane {
+                tab_id: member.tab_id.clone(),
+                session_id: member.session_id.clone(),
+                region: RendererPaneRegion {
+                    col: 0,
+                    row: 0,
+                    cols,
+                    rows,
+                },
+                active: member.tab_id == active.tab_id,
+            }],
+            dividers: Vec::new(),
+        });
+    }
     // Every live pane must carry a rect; otherwise the geometry is not fully described and we defer to
     // the chain path.
     let rects: Vec<(String, [f32; 4])> = members
@@ -6533,6 +7814,15 @@ fn focused_terminal_cell_in_layout(
         .find(|pane| pane.session_id == focused_session_id)?;
     let content = pane_content_region_for_layout(pane.region, layout.panes.len());
     cell_in_region(cell.col, cell.row, content).then_some(cell)
+}
+
+/// Resolve the pane whose terminal CONTENT owns one absolute window-grid cell. Unlike keyboard/mouse
+/// routing this deliberately ignores prior focus: a file drop targets the pane under the pointer.
+/// Headers, dividers, and cells outside every pane resolve to `None`.
+fn file_drop_target_session_at_cell(layout: &RendererSplitLayout, cell: CellPos) -> Option<&str> {
+    let pane = layout_pane_at_cell(layout, cell.col, cell.row)?;
+    let content = pane_content_region_for_layout(pane.region, layout.panes.len());
+    cell_in_region(cell.col, cell.row, content).then_some(pane.session_id.as_str())
 }
 
 /// Production pointer-to-terminal planner shared by macOS and Linux. A split is mapped against the
@@ -7774,6 +9064,11 @@ pub fn retain_hover_in_strip(
 pub enum RendererRunError {
     /// The winit event loop could not be created.
     EventLoop(winit::error::EventLoopError),
+    /// An owned handoff could not be installed on its exact reviewed operational peer.
+    AttachmentHandoffUnavailable(RendererAttachmentHandoffDisposition),
+    /// No immutable all-pane lifetime cohort was supplied, or the supplied cohort contradicted the
+    /// presentation/primary. The renderer never sends an Attach and remains neutral.
+    ViewportAuthorityUnavailable,
     /// The Linux Tao/GTK DashboardHost failed to build or run (Linux only). Carries the host error text.
     #[cfg(target_os = "linux")]
     LinuxHost(String),
@@ -7783,6 +9078,12 @@ impl std::fmt::Display for RendererRunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RendererRunError::EventLoop(e) => write!(f, "renderer event loop error: {e}"),
+            RendererRunError::AttachmentHandoffUnavailable(_) => {
+                f.write_str("renderer attachment handoff was not accepted by its exact peer")
+            }
+            RendererRunError::ViewportAuthorityUnavailable => {
+                f.write_str("renderer exact viewport authority is unavailable")
+            }
             #[cfg(target_os = "linux")]
             RendererRunError::LinuxHost(e) => write!(f, "linux dashboard host error: {e}"),
         }
@@ -7793,6 +9094,8 @@ impl std::error::Error for RendererRunError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             RendererRunError::EventLoop(e) => Some(e),
+            RendererRunError::AttachmentHandoffUnavailable(_) => None,
+            RendererRunError::ViewportAuthorityUnavailable => None,
             #[cfg(target_os = "linux")]
             RendererRunError::LinuxHost(_) => None,
         }
@@ -7803,6 +9106,67 @@ impl From<winit::error::EventLoopError> for RendererRunError {
     fn from(e: winit::error::EventLoopError) -> Self {
         RendererRunError::EventLoop(e)
     }
+}
+
+fn unavailable_handoff_error(handoff: &RendererAttachmentHandoff) -> RendererRunError {
+    handoff.mark_settled();
+    RendererRunError::AttachmentHandoffUnavailable(RendererAttachmentHandoffDisposition {
+        request_id: handoff.request_id(),
+        session_id: handoff.authority().session_id().to_string(),
+        outcome: if handoff.authority().claim_status()
+            == maestro_shell::daemon_client::AttachmentHandoffClaimStatus::PossiblyApplied
+        {
+            RendererAttachmentHandoffOutcome::ClaimPossiblyApplied
+        } else {
+            RendererAttachmentHandoffOutcome::CancellationUnresolvedBeforeClaimAdmission
+        },
+        daemon_instance_id: None,
+        generation: None,
+        retry_authority: Some(handoff.authority().clone()),
+    })
+}
+
+fn unavailable_startup_handoff_error(
+    handoff: &RendererAttachmentHandoff,
+    binding: Option<&client::ViewportBindingSet>,
+) -> RendererRunError {
+    if let Some(disposition) = claimed_viewport_unavailable_disposition(handoff, binding) {
+        handoff.mark_settled();
+        RendererRunError::AttachmentHandoffUnavailable(disposition)
+    } else {
+        unavailable_handoff_error(handoff)
+    }
+}
+
+fn desired_viewport_for_launch(
+    session_id: &str,
+    exact: &RendererExactViewport,
+    strip: Option<&RendererTabStrip>,
+) -> Option<DesiredViewportBinding> {
+    if exact.primary().session_id() != session_id {
+        return None;
+    }
+    match strip {
+        Some(strip) if !exact.matches_projection(strip) => return None,
+        None if exact.roles.len() != 1 => return None,
+        _ => {}
+    }
+    let mut panes = exact
+        .targets()
+        .filter(|target| target.session_id() != session_id)
+        .map(|target| DesiredPaneBinding {
+            session_id: target.session_id().to_string(),
+            expected_generation: SessionGeneration(target.generation().to_string()),
+            dims: None,
+        })
+        .collect::<Vec<_>>();
+    panes.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+    Some(DesiredViewportBinding {
+        primary_session_id: session_id.to_string(),
+        primary_expected_generation: SessionGeneration(exact.primary().generation().to_string()),
+        primary_dims: None,
+        panes,
+    })
 }
 
 /// Host-owned purpose of a script evaluated in the React dashboard realms. This classification is
@@ -7836,6 +9200,12 @@ impl ReactChromeScriptKind {
 pub enum UserEvent {
     /// A new validated grid is ready; repaint once.
     Redraw,
+    /// The bounded outbound queue became eligible for a retained nonblocking retry.
+    OutboundWritable,
+    /// The socket reader/writer terminated. Shared authority is already revoked; the owner clears
+    /// every App projection and requests one blank frame. Writer/reader duplicate observations are
+    /// coalesced at the connection boundary.
+    ConnectionClosed,
     /// A daemon exit accepted by the active/sibling/extra-pane sync gate. The generation is the
     /// most recent authoritative grid generation observed for that exact binding; `None` means the
     /// exit arrived before a baseline and must not be used to rewrite generation-guarded records.
@@ -7844,13 +9214,20 @@ pub enum UserEvent {
         code: Option<i32>,
         observed_generation: Option<String>,
     },
-    TerminalBell,
+    TerminalBell {
+        binding: ViewportBindingToken,
+    },
     TerminalTitle {
+        binding: ViewportBindingToken,
         title: Option<String>,
     },
     TerminalClipboardStore {
+        binding: ViewportBindingToken,
         text: String,
     },
+    /// Revoke the entire terminal viewport locally without contacting the daemon. This is the
+    /// fail-closed state used when no live pane owns the window.
+    ClearViewport,
     /// Rebind the single renderer to a different daemon session (the future tab-switch
     /// primitive). Posted through the loop's `EventLoopProxy` by any caller that wants
     /// the one active terminal viewport to point at `session_id`. A same-id request is
@@ -7859,6 +9236,25 @@ pub enum UserEvent {
     /// tabs — there is still exactly one active session at a time.
     AttachSession {
         session_id: String,
+    },
+    /// Atomically rebind using an immutable all-pane lifetime cohort. Unlike SetTabStrip, this is
+    /// membership authority and remains neutral until every unique exact route proves a baseline.
+    AttachExactViewport {
+        request: RendererExactViewportRequest,
+    },
+    AttachSessionWithHandoff {
+        session_id: String,
+        handoff: RendererAttachmentHandoff,
+        tab_strip: RendererTabStrip,
+        exact_viewport: RendererExactViewport,
+    },
+    /// Result of one bounded cancellation worker. Internal-only: the owner loop retains the exact
+    /// authority until this arrives, then emits the public correlated disposition.
+    AttachmentHandoffCancellationFinished {
+        request_id: RendererAttachmentHandoffRequestId,
+        authority: maestro_shell::AttachmentHandoffAuthority,
+        claim_status: maestro_shell::daemon_client::AttachmentHandoffClaimStatus,
+        cancelled: bool,
     },
     /// Replace or clear the read-only tab-strip overlay. `Some(strip)` recomposes the displayed
     /// structured line via [`compose_tab_strip_line`]; `None` clears it. Renderer-local display
@@ -8047,9 +9443,25 @@ pub enum UserEvent {
 /// commands today drive the one-viewport rebind primitive and the read-only strip display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RendererCommand {
+    /// Atomically neutralize the renderer viewport and its grid-facing UI caches. This command is
+    /// local/nonblocking and deliberately emits no synchronous Detach request.
+    ClearViewport,
     /// Rebind the single renderer viewport to a different daemon session (the future
     /// tab-switch primitive). Translated to [`UserEvent::AttachSession`] with the same id.
     AttachSession { session_id: String },
+    /// Rebind through one immutable all-pane lifetime cohort. The strip supplies presentation and
+    /// geometry only for that same cohort; it cannot authorize additional membership.
+    AttachExactViewport {
+        request: RendererExactViewportRequest,
+    },
+    /// Rebind to a freshly started lifetime while atomically claiming its daemon-side one-shot
+    /// startup ownership token. The token remains redacted in Debug output.
+    AttachSessionWithHandoff {
+        session_id: String,
+        handoff: RendererAttachmentHandoff,
+        tab_strip: RendererTabStrip,
+        exact_viewport: RendererExactViewport,
+    },
     /// Replace (`Some`) or clear (`None`) the read-only tab-strip overlay. Translated to
     /// [`UserEvent::SetTabStrip`]. Updating the displayed strip and switching the active
     /// session are deliberately separate operations: this never rebinds the viewport.
@@ -8184,7 +9596,22 @@ pub enum RendererCommand {
 /// understands. Pure (no proxy, no thread) so command mapping is unit-testable without a GUI.
 pub fn user_event_for_command(command: RendererCommand) -> UserEvent {
     match command {
+        RendererCommand::ClearViewport => UserEvent::ClearViewport,
         RendererCommand::AttachSession { session_id } => UserEvent::AttachSession { session_id },
+        RendererCommand::AttachExactViewport { request } => {
+            UserEvent::AttachExactViewport { request }
+        }
+        RendererCommand::AttachSessionWithHandoff {
+            session_id,
+            handoff,
+            tab_strip,
+            exact_viewport,
+        } => UserEvent::AttachSessionWithHandoff {
+            session_id,
+            handoff,
+            tab_strip,
+            exact_viewport,
+        },
         RendererCommand::SetTabStrip { tab_strip } => UserEvent::SetTabStrip { tab_strip },
         RendererCommand::SetPickerOverlay { picker } => UserEvent::SetPickerOverlay { picker },
         RendererCommand::SetStatusLabel { status_label } => {
@@ -8276,6 +9703,150 @@ pub trait UserEventSender: Send {
     fn clone_sender(&self) -> Box<dyn UserEventSender>;
 }
 
+/// Pre-window wake adapter used only during exact startup proof. Client workers can begin consuming
+/// the daemon before any native/React surface exists; until activation, events merely wake the
+/// synchronous proof waiter and carry no UI side effect. After every baseline proves, the same
+/// shared adapter forwards future events to the real owner-loop sender.
+#[derive(Clone)]
+struct StartupEventSender {
+    state: Arc<Mutex<StartupEventSenderState>>,
+    proof_wake: std::sync::mpsc::Sender<()>,
+}
+
+struct StartupEventSenderState {
+    forward: Option<Box<dyn UserEventSender>>,
+    buffered_lifecycle: Vec<UserEvent>,
+    overflowed: bool,
+}
+
+const MAX_STARTUP_BUFFERED_LIFECYCLE_EVENTS: usize = 4096;
+
+impl StartupEventSender {
+    fn new(proof_wake: std::sync::mpsc::Sender<()>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(StartupEventSenderState {
+                forward: None,
+                buffered_lifecycle: Vec::new(),
+                overflowed: false,
+            })),
+            proof_wake,
+        }
+    }
+
+    fn activate(&self, sender: Box<dyn UserEventSender>) -> bool {
+        let (forward, buffered, overflowed) = {
+            let mut state = self.state.lock().unwrap();
+            state.forward = Some(sender);
+            (
+                state
+                    .forward
+                    .as_ref()
+                    .expect("startup forward installed")
+                    .clone_sender(),
+                std::mem::take(&mut state.buffered_lifecycle),
+                state.overflowed,
+            )
+        };
+        if overflowed {
+            return false;
+        }
+        for event in buffered {
+            if forward.send(event).is_err() {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl UserEventSender for StartupEventSender {
+    fn send(&self, event: UserEvent) -> Result<(), UserEvent> {
+        let mut state = self.state.lock().unwrap();
+        let forward = state.forward.as_ref().map(|sender| sender.clone_sender());
+        if let Some(forward) = forward {
+            drop(state);
+            return forward.send(event);
+        }
+        if matches!(
+            &event,
+            UserEvent::SessionExited { .. } | UserEvent::ConnectionClosed
+        ) {
+            if state.buffered_lifecycle.len() < MAX_STARTUP_BUFFERED_LIFECYCLE_EVENTS {
+                state.buffered_lifecycle.push(event.clone());
+            } else {
+                state.overflowed = true;
+            }
+        }
+        drop(state);
+        self.proof_wake.send(()).map_err(|_| event)
+    }
+
+    fn clone_sender(&self) -> Box<dyn UserEventSender> {
+        Box::new(self.clone())
+    }
+}
+
+const STARTUP_EXACT_VIEWPORT_PROOF_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn wait_for_startup_exact_viewport(
+    shared: &Shared,
+    binding: &client::ViewportBindingSet,
+    wake: &std::sync::mpsc::Receiver<()>,
+) -> bool {
+    let deadline = Instant::now() + STARTUP_EXACT_VIEWPORT_PROOF_TIMEOUT;
+    loop {
+        match binding.status() {
+            client::ExactViewportAdmissionStatus::Complete => {
+                return !shared.connection_is_closed();
+            }
+            client::ExactViewportAdmissionStatus::FailedBeforePrimaryProof
+            | client::ExactViewportAdmissionStatus::FailedAfterPrimaryProof => return false,
+            client::ExactViewportAdmissionStatus::Pending => {}
+        }
+        if shared.connection_is_closed() {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        match wake.recv_timeout(remaining.min(Duration::from_millis(100))) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+}
+
+fn wait_for_startup_legacy_binding(
+    shared: &Shared,
+    binding: &client::ActiveBindingToken,
+    wake: &std::sync::mpsc::Receiver<()>,
+) -> bool {
+    let deadline = Instant::now() + STARTUP_EXACT_VIEWPORT_PROOF_TIMEOUT;
+    loop {
+        if shared.connection_is_closed() || !shared.active_token_is_current(binding) {
+            return false;
+        }
+        if shared
+            .pane_paint(&binding.session_id, &binding.session_id)
+            .live
+            .is_some()
+        {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        match wake.recv_timeout(remaining.min(Duration::from_millis(100))) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+}
+
 /// The winit owner-loop sender (macOS path, and the demo/stress probes on every platform).
 /// Exactly the `proxy.send_event` calls the client used before, behind the neutral trait.
 impl UserEventSender for EventLoopProxy<UserEvent> {
@@ -8301,9 +9872,38 @@ pub fn bridge_commands<F>(commands: std::sync::mpsc::Receiver<RendererCommand>, 
 where
     F: FnMut(UserEvent) -> Result<(), ()>,
 {
-    for command in commands {
+    while let Ok(command) = commands.recv() {
+        let undelivered_handoff = match &command {
+            RendererCommand::AttachSessionWithHandoff { handoff, .. } => Some(handoff.clone()),
+            _ => None,
+        };
+        let undelivered_viewport = match &command {
+            RendererCommand::AttachExactViewport { request } => Some(request.clone()),
+            _ => None,
+        };
         if send(user_event_for_command(command)).is_err() {
-            // The event loop is gone; no point reading further commands.
+            // The event loop is gone. Settle the failed event and every still-queued handoff on
+            // their exact original Offer connections; dropping the receiver alone is insufficient
+            // when App retains another clone of the wrapper while awaiting disposition.
+            if let Some(handoff) = undelivered_handoff {
+                handoff.mark_settled();
+                spawn_detached_authority_cancel(handoff.authority().clone());
+            }
+            if let Some(request) = undelivered_viewport {
+                request.settle(RendererExactViewportOutcome::Unavailable, None);
+            }
+            while let Ok(queued) = commands.try_recv() {
+                match queued {
+                    RendererCommand::AttachSessionWithHandoff { handoff, .. } => {
+                        handoff.mark_settled();
+                        spawn_detached_authority_cancel(handoff.authority().clone());
+                    }
+                    RendererCommand::AttachExactViewport { request } => {
+                        request.settle(RendererExactViewportOutcome::Unavailable, None);
+                    }
+                    _ => {}
+                }
+            }
             break;
         }
     }
@@ -8313,13 +9913,21 @@ where
 /// [`RendererCommand`]. The renderer can identify which tab a future click lands on (via the
 /// retained [`RendererTabStripLine`] hit targets), but it MUST NOT resolve a `tab_id` to a
 /// `session_id` or rebind the viewport itself: `maestro-app` owns the persisted `WindowLayout`
-/// and the `tab_id -> session_id` lookup (`TabSwitchController`). So the renderer reports only
-/// the activation *intent* by `tab_id`; the app decides whether to send back a
-/// [`RendererCommand::AttachSession`].
+/// and the `tab_id -> session_id` lookup (`TabSwitchController`). So the renderer reports the
+/// activation *intent* by `tab_id` plus the exact strip `window_id` that emitted it; the app decides
+/// whether the still-current binding authorizes a [`RendererCommand::AttachSession`]. Every native
+/// window/tab/pane mutation intent follows that projection-window rule so a queued event cannot be
+/// reinterpreted after another window with legal duplicate tab ids is projected.
 ///
 /// Events carry intent or observations only; the app remains the authority for switching and mutation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RendererEvent {
+    /// Exact terminal disposition for one owned attachment-handoff request. Merely admitting the
+    /// command/Claim queue entry never emits this event.
+    AttachmentHandoffDisposition(RendererAttachmentHandoffDisposition),
+    /// Exactly-once result for an ordinary exact viewport request. Command-channel admission is
+    /// never success; App adopts its pending active projection only on correlated `Published`.
+    ExactViewportDisposition(RendererExactViewportDisposition),
     /// A retained daemon session ended. This is an observation, not lifecycle authority: the
     /// renderer neither mutates durable records nor removes/kills the daemon session. App/domain
     /// code may use `observed_generation` for a conservative targeted status update; `None` cannot
@@ -8329,37 +9937,37 @@ pub enum RendererEvent {
         code: Option<i32>,
         observed_generation: Option<String>,
     },
-    /// A tab in the read-only strip was activated (a future click target). Carries the `tab_id`
-    /// only; the app resolves it inside the active window layout.
-    TabStripActivated { tab_id: String },
+    /// A tab in the read-only strip was activated (a future click target). Carries the emitting
+    /// strip's `window_id` and the `tab_id`; the app resolves it only inside that exact window.
+    TabStripActivated { window_id: String, tab_id: String },
     /// A click landed on a tab's drawn close affordance (`x`). This is INTENT ONLY: the renderer
     /// reports the `tab_id` whose close marker was pressed and does nothing else. It does not resolve
     /// `tab_id -> session_id`, mutate any persisted layout/session/task/window record, or
     /// stop/kill/detach a daemon session. The app is the sole authority for what (if anything) a close
     /// intent does.
-    TabCloseRequested { tab_id: String },
+    TabCloseRequested { window_id: String, tab_id: String },
     /// A click landed on a split pane's drawn close affordance (`x`, upper-right corner of the pane).
     /// This is INTENT ONLY: the renderer reports the `tab_id` whose pane close marker was pressed and
     /// does nothing else. It does not resolve `tab_id -> session_id`, mutate any persisted
     /// layout/session/task/window record, or stop/kill/detach a daemon session. The app is the sole
     /// authority for what a pane-close intent does (it stashes the pane and re-snaps survivors).
-    PaneCloseRequested { tab_id: String },
+    PaneCloseRequested { window_id: String, tab_id: String },
     /// The focused split pane changed. The renderer owns mouse/grid hit testing, so it reports the
     /// resolved tab id to the app chrome; React controls must not guess split sources from dashboard
     /// ordering.
-    PaneFocused { tab_id: String },
-    /// A click landed on the top tab bar's drawn new-tab control (`+`). This is INTENT ONLY and
-    /// carries NO payload: the renderer reports that a new tab was requested and does nothing else. It
-    /// does not create a session, mutate any persisted layout/session/task/window record, or contact a
-    /// daemon. The app is the sole authority for what (if anything) a new-tab intent does.
-    NewTabRequested,
+    PaneFocused { window_id: String, tab_id: String },
+    /// A click landed on the top tab bar's drawn new-tab control (`+`). This is INTENT ONLY: it
+    /// carries the exact emitting strip `window_id`, but no requested tab/session identity. The
+    /// renderer does not create a session, mutate any persisted layout/session/task/window record, or
+    /// contact a daemon. The app is the sole authority for what (if anything) a new-tab intent does.
+    NewTabRequested { window_id: String },
     /// A click landed on a tab's visible attention marker glyph. This is INTENT ONLY: the renderer
     /// reports the `tab_id` whose attention marker was pressed and does nothing else. It does not
     /// resolve `tab_id -> session_id`, mutate any persisted attention/layout/session/task/window
     /// record, or contact a daemon. The app is the sole authority for clearing persisted attention
     /// (via `clear_tab_attention_and_refresh_strip`). Emitted only when the click lands on a visible
     /// marker; it takes precedence over plain tab activation but never over close or new-tab controls.
-    TabAttentionClearRequested { tab_id: String },
+    TabAttentionClearRequested { window_id: String, tab_id: String },
     /// A selectable row in the read-only picker overlay was activated (a click or key). This is INTENT
     /// ONLY: the renderer reports which project (and, for a workspace row, which workspace) was
     /// activated and does nothing else. It does NOT grant consent, resolve a workspace to a session,
@@ -8551,6 +10159,7 @@ pub enum RendererEvent {
     /// the active tab. `None` only when the strip has no resolvable tab at all; the app then declines
     /// exactly like the no-active-tab case.
     SplitRequested {
+        window_id: String,
         axis: RendererTabSplitAxis,
         from_tab_id: Option<String>,
     },
@@ -8561,7 +10170,11 @@ pub enum RendererEvent {
     /// both ids so the app does not re-derive the pair; they are always distinct (the two sides of one
     /// split). Emitted only when the active tab participates in a split — otherwise the press is a
     /// consumed no-op and no event fires.
-    SwapRequested { tab_id_a: String, tab_id_b: String },
+    SwapRequested {
+        window_id: String,
+        tab_id_a: String,
+        tab_id_b: String,
+    },
     /// A press on the drawn remote-access toggle requested flipping remote access on/off. INTENT ONLY: the renderer
     /// reports the DESIRED new state (`open`) and does nothing else — maestro-app owns writing the flag file (which
     /// the agent enforces) and pushing the new state back via `Renderer::set_remote_open`. `open` = the state to
@@ -8583,7 +10196,11 @@ pub enum RendererEvent {
     /// (`WindowLayoutService::swap_tab_positions`, the SAME record path the swap control uses) and the
     /// reprojection, so preview and commit share one transition. The two ids are always distinct (a
     /// drop onto the dragged pane itself is a no-op and emits nothing).
-    PaneSwapRequested { tab_id_a: String, tab_id_b: String },
+    PaneSwapRequested {
+        window_id: String,
+        tab_id_a: String,
+        tab_id_b: String,
+    },
     /// A pane drag was released over a target pane's EDGE (not its center), requesting the dragged pane
     /// dock beside the target on that side. INTENT ONLY, exactly like [`RendererEvent::PaneSwapRequested`]:
     /// the renderer reports the dragged pane's tab id (`source_tab_id`), the target pane's tab id
@@ -8593,6 +10210,7 @@ pub enum RendererEvent {
     /// commit share one transition. A center drop emits `PaneSwapRequested` instead; a drop onto the
     /// dragged pane itself or outside every pane emits nothing.
     PaneEdgeDockRequested {
+        window_id: String,
         source_tab_id: String,
         target_tab_id: String,
         edge: PaneDockEdge,
@@ -8602,8 +10220,10 @@ pub enum RendererEvent {
     /// the edge. The app owns revive + layout insertion + strip reprojection. Center drops are invalid
     /// for stashed panes and emit nothing.
     StashedPaneDropRequested {
-        window_id: String,
-        tab_id: String,
+        source_window_id: String,
+        source_tab_id: String,
+        source_session_id: String,
+        target_window_id: String,
         target_tab_id: String,
         edge: PaneDockEdge,
     },
@@ -8614,11 +10234,12 @@ pub enum RendererEvent {
     /// and contacts no daemon. The app owns the swallow (`WindowLayoutService::swallow_split`) and the
     /// reprojection. Emitted only when the active tab participates in a split — otherwise the press is a
     /// consumed no-op and no event fires.
-    SwallowRequested { tab_id: String },
+    SwallowRequested { window_id: String, tab_id: String },
     /// A press on a pane header's directional swallow arrow (`⇤ ⤓ ⤒ ⇥`) requested the pane re-snap
     /// through the canonical swallow table in that exact direction. INTENT ONLY: the renderer reports
     /// the pane tab id and direction, and the app owns the record mutation/reprojection.
     PaneSwallowRequested {
+        window_id: String,
         tab_id: String,
         direction: PaneSwallowDirection,
     },
@@ -8633,7 +10254,10 @@ pub enum RendererEvent {
     ///
     /// `tab_id` names the focused pane's tab — the focused pane's tab when a pane focus is set, otherwise
     /// the active tab. `None` only when the strip has no resolvable tab at all; the app then refuses.
-    CloseFocusedPaneRequested { tab_id: Option<String> },
+    CloseFocusedPaneRequested {
+        window_id: String,
+        tab_id: Option<String>,
+    },
     /// A split divider drag has SETTLED (pointer release): the renderer reports the dragged child's
     /// `child_tab_id` and the FINAL parent-side share as integer per-mille (`0..=1000`, `500` == even).
     /// This is the one moment a live divider position becomes durable: the app persists it onto that
@@ -8642,6 +10266,7 @@ pub enum RendererEvent {
     /// the settled value to the record layer and triggers no renderer command back. Emitted exactly
     /// once per drag, on release — never per intermediate pointer move.
     DividerRatioPersisted {
+        window_id: String,
         child_tab_id: String,
         ratio_per_mille: u16,
     },
@@ -8653,6 +10278,7 @@ pub enum RendererEvent {
     /// this event only hands the settled rects to the record layer. Emitted exactly once per drag, on
     /// release — never per intermediate pointer move.
     PaneRectsResized {
+        window_id: String,
         rects: Vec<(String, RendererPaneRect)>,
     },
     /// A JSON intent emitted by the embedded React chrome WebView. INTENT ONLY: the renderer does not
@@ -8661,19 +10287,288 @@ pub enum RendererEvent {
     ReactChromeIntent { json: String },
 }
 
+/// Durable lifecycle/disposition observations remain deliverable while the terminal viewport is
+/// neutral. Every app/chrome intent requires an all-baseline published viewport, so a WebView or
+/// retained native hit target cannot mutate App state during an exact rebind.
+fn renderer_event_is_allowed_while_viewport_neutral(event: &RendererEvent) -> bool {
+    matches!(
+        event,
+        RendererEvent::SessionExited { .. }
+            | RendererEvent::AttachmentHandoffDisposition(_)
+            | RendererEvent::ExactViewportDisposition(_)
+    )
+}
+
+/// Minimal send surface shared by raw public event channels and the renderer's epoch-gated
+/// producer sink. Public pure helpers stay usable with an ordinary `mpsc::Sender`; live renderer
+/// producers receive only the gated implementation.
+#[allow(clippy::result_large_err)] // SendError must return ownership of the unsent event.
+pub trait RendererEventOutput {
+    fn send(&self, event: RendererEvent) -> Result<(), std::sync::mpsc::SendError<RendererEvent>>;
+}
+
+#[allow(clippy::result_large_err)]
+impl RendererEventOutput for std::sync::mpsc::Sender<RendererEvent> {
+    fn send(&self, event: RendererEvent) -> Result<(), std::sync::mpsc::SendError<RendererEvent>> {
+        std::sync::mpsc::Sender::send(self, event)
+    }
+}
+
+#[derive(Debug)]
+struct ViewportEventGateState {
+    epoch: u64,
+    published: bool,
+    exhausted: bool,
+}
+
+#[derive(Debug)]
+struct ViewportEventGate {
+    state: Mutex<ViewportEventGateState>,
+}
+
+impl ViewportEventGate {
+    fn new(published: bool) -> Self {
+        Self {
+            state: Mutex::new(ViewportEventGateState {
+                epoch: 1,
+                published,
+                exhausted: false,
+            }),
+        }
+    }
+
+    /// Revoke intent publication at the same mutex linearization point used by every producer.
+    /// Repeated neutralization is idempotent; only a published→neutral transition advances epoch.
+    fn neutralize(&self) -> u64 {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.published {
+            match state.epoch.checked_add(1) {
+                Some(next) => state.epoch = next,
+                None => state.exhausted = true,
+            }
+            state.published = false;
+        }
+        state.epoch
+    }
+
+    /// Mint the publication epoch for one newly accepted exact-viewport attempt and close intent
+    /// delivery in the same critical section. Unlike idempotent cleanup neutralization, every
+    /// accepted attempt advances the epoch even when the renderer was already neutral, so a late
+    /// aggregate completion from an earlier neutral-era attempt can never publish its successor.
+    fn begin_attempt(&self) -> Option<u64> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.published = false;
+        if state.exhausted {
+            return None;
+        }
+        let Some(next) = state.epoch.checked_add(1) else {
+            state.exhausted = true;
+            return None;
+        };
+        state.epoch = next;
+        Some(next)
+    }
+
+    fn epoch(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .epoch
+    }
+
+    /// Publish only the exact pending epoch captured after neutralization. A stale completion can
+    /// never reopen a later viewport; exhaustion is terminal-neutral rather than wrapping.
+    fn publish(&self, expected_epoch: u64) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.exhausted || state.epoch != expected_epoch {
+            return false;
+        }
+        state.published = true;
+        true
+    }
+
+    #[cfg(test)]
+    fn is_published(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .published
+    }
+}
+
+/// Cloneable producer-time publication gate. The gate mutex is held through the downstream
+/// unbounded-channel enqueue, so Clear is ordered either wholly before an intent (which is dropped)
+/// or wholly after it (the intent belongs to the prior published viewport). There is no asynchronous
+/// untagged queue in which a neutral-era intent could be resurrected by a later publish.
+#[derive(Clone, Debug)]
+pub(crate) struct ViewportEventSink {
+    events: std::sync::mpsc::Sender<RendererEvent>,
+    gate: Arc<ViewportEventGate>,
+}
+
+#[allow(clippy::result_large_err)]
+impl RendererEventOutput for ViewportEventSink {
+    fn send(&self, event: RendererEvent) -> Result<(), std::sync::mpsc::SendError<RendererEvent>> {
+        let state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.published && !renderer_event_is_allowed_while_viewport_neutral(&event) {
+            return Ok(());
+        }
+        self.events.send(event)
+    }
+}
+
+impl ViewportEventSink {
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn send(
+        &self,
+        event: RendererEvent,
+    ) -> Result<(), std::sync::mpsc::SendError<RendererEvent>> {
+        RendererEventOutput::send(self, event)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct AppRendererEvents(Option<ViewportEventSink>);
+
+impl AppRendererEvents {
+    fn as_ref(&self) -> Option<&dyn RendererEventOutput> {
+        self.0
+            .as_ref()
+            .map(|events| events as &dyn RendererEventOutput)
+    }
+
+    fn clone_sink(&self) -> Option<ViewportEventSink> {
+        self.0.clone()
+    }
+}
+
+fn viewport_gated_renderer_events(
+    events: Option<std::sync::mpsc::Sender<RendererEvent>>,
+    gate: Arc<ViewportEventGate>,
+) -> Option<ViewportEventSink> {
+    events.map(|events| ViewportEventSink { events, gate })
+}
+
+#[cfg(test)]
+mod viewport_event_gate_tests {
+    use super::{viewport_gated_renderer_events, RendererEvent, ViewportEventGate};
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    #[test]
+    fn producer_gate_drops_neutral_and_aba_intents_but_keeps_lifecycle_observations() {
+        let gate = Arc::new(ViewportEventGate::new(true));
+        let (external, received) = mpsc::channel();
+        let gated = viewport_gated_renderer_events(Some(external), Arc::clone(&gate))
+            .expect("gated sender");
+
+        let neutral_epoch = gate.neutralize();
+        assert!(!gate.is_published());
+        gated
+            .send(RendererEvent::ReactChromeIntent {
+                json: "{\"type\":\"newTab\"}".to_string(),
+            })
+            .unwrap();
+        gated
+            .send(RendererEvent::SessionExited {
+                session_id: "sid-A".to_string(),
+                code: Some(0),
+                observed_generation: Some("gen-A".to_string()),
+            })
+            .unwrap();
+        assert!(matches!(
+            received.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RendererEvent::SessionExited { .. }
+        ));
+        assert!(received.try_recv().is_err());
+
+        assert!(gate.publish(neutral_epoch));
+        gated
+            .send(RendererEvent::ReactChromeIntent {
+                json: "{\"type\":\"newTab\"}".to_string(),
+            })
+            .unwrap();
+        assert!(matches!(
+            received.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RendererEvent::ReactChromeIntent { .. }
+        ));
+
+        let next_epoch = gate.neutralize();
+        gated
+            .send(RendererEvent::ReactChromeIntent {
+                json: "{\"type\":\"mustNeverResurrect\"}".to_string(),
+            })
+            .unwrap();
+        assert!(gate.publish(next_epoch));
+        assert!(received.try_recv().is_err());
+
+        let final_epoch = gate.neutralize();
+        assert_ne!(final_epoch, neutral_epoch);
+        assert!(
+            !gate.publish(neutral_epoch),
+            "a stale completion cannot reopen a later neutral epoch"
+        );
+        assert!(!gate.is_published());
+    }
+
+    #[test]
+    fn each_neutral_attempt_gets_a_fresh_epoch_and_close_orders_cross_thread_sends() {
+        let gate = Arc::new(ViewportEventGate::new(true));
+        let (external, received) = mpsc::channel();
+        let gated = viewport_gated_renderer_events(Some(external), Arc::clone(&gate))
+            .expect("gated sender");
+
+        let attempt_a = gate.begin_attempt().expect("attempt A epoch");
+        assert_eq!(gate.neutralize(), attempt_a, "cleanup is idempotent");
+        let attempt_b = gate.begin_attempt().expect("attempt B epoch");
+        assert_ne!(attempt_a, attempt_b);
+        assert!(!gate.publish(attempt_a), "stale A cannot publish B");
+        assert!(gate.publish(attempt_b));
+
+        let (send_after_close, close_observed) = mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            close_observed.recv().unwrap();
+            gated
+                .send(RendererEvent::ReactChromeIntent {
+                    json: "{\"type\":\"afterCloseReturned\"}".to_string(),
+                })
+                .unwrap();
+        });
+        gate.neutralize();
+        send_after_close.send(()).unwrap();
+        producer.join().unwrap();
+        assert!(received.try_recv().is_err());
+    }
+}
+
 /// Emit a [`RendererEvent::TabStripActivated`] for `tab_id` through the optional outbound
 /// `events` sender. Pure and GUI-free so the send behavior is unit-testable.
 ///
 /// Returns `true` if the event was sent; `false` if there is no sender or the receiver has been
 /// dropped. Never panics (a closed channel is a normal, non-fatal outcome — app chrome may have
-/// gone away). Only the `tab_id` is cloned for the event.
+/// gone away). The projection `window_id` and `tab_id` are cloned for the event.
 pub fn emit_tab_strip_activation(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
+    window_id: &str,
     tab_id: &str,
 ) -> bool {
     match events {
         Some(sender) => sender
             .send(RendererEvent::TabStripActivated {
+                window_id: window_id.to_string(),
                 tab_id: tab_id.to_string(),
             })
             .is_ok(),
@@ -8683,18 +10578,20 @@ pub fn emit_tab_strip_activation(
 
 /// Emit a [`RendererEvent::TabCloseRequested`] for `tab_id` through the optional outbound `events`
 /// sender. Mirrors [`emit_tab_strip_activation`]: pure, GUI-free, and unit-testable. This is the
-/// intent-only close signal — it carries the `tab_id` and nothing more; the renderer never resolves a
-/// session, mutates a record, or touches daemon lifecycle.
+/// intent-only close signal — it carries the emitting projection's `window_id` and the `tab_id`, but
+/// never resolves a session, mutates a record, or touches daemon lifecycle.
 ///
 /// Returns `true` if the event was sent; `false` if there is no sender or the receiver has been
 /// dropped. Never panics (a closed channel is a normal, non-fatal outcome).
 pub fn emit_tab_close_requested(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
+    window_id: &str,
     tab_id: &str,
 ) -> bool {
     match events {
         Some(sender) => sender
             .send(RendererEvent::TabCloseRequested {
+                window_id: window_id.to_string(),
                 tab_id: tab_id.to_string(),
             })
             .is_ok(),
@@ -8704,14 +10601,18 @@ pub fn emit_tab_close_requested(
 
 /// Emit a [`RendererEvent::NewTabRequested`] through the optional outbound `events` sender. Mirrors
 /// [`emit_tab_close_requested`]: pure, GUI-free, and unit-testable. This is the intent-only new-tab
-/// signal — it carries NO payload; the renderer never creates a session, mutates a record, or touches
-/// daemon lifecycle.
+/// signal — it carries the emitting projection's `window_id`, but no requested tab/session identity;
+/// the renderer never creates a session, mutates a record, or touches daemon lifecycle.
 ///
 /// Returns `true` if the event was sent; `false` if there is no sender or the receiver has been
 /// dropped. Never panics (a closed channel is a normal, non-fatal outcome).
-pub fn emit_new_tab_requested(events: Option<&std::sync::mpsc::Sender<RendererEvent>>) -> bool {
+pub fn emit_new_tab_requested(events: Option<&dyn RendererEventOutput>, window_id: &str) -> bool {
     match events {
-        Some(sender) => sender.send(RendererEvent::NewTabRequested).is_ok(),
+        Some(sender) => sender
+            .send(RendererEvent::NewTabRequested {
+                window_id: window_id.to_string(),
+            })
+            .is_ok(),
         None => false,
     }
 }
@@ -8726,7 +10627,7 @@ pub fn emit_new_tab_requested(events: Option<&std::sync::mpsc::Sender<RendererEv
 /// dropped. Never panics (a closed channel is a normal, non-fatal outcome). Only the `action_id` is
 /// cloned for the event.
 pub fn emit_command_palette_action_activated(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
     action_id: &str,
 ) -> bool {
     match events {
@@ -8799,13 +10700,18 @@ pub fn split_shortcut_matches(
 /// Returns `true` if the event was sent; `false` if there is no sender or the receiver has been
 /// dropped. Never panics (a closed channel is a normal, non-fatal outcome).
 pub fn emit_split_requested(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
+    window_id: &str,
     axis: RendererTabSplitAxis,
     from_tab_id: Option<String>,
 ) -> bool {
     match events {
         Some(sender) => sender
-            .send(RendererEvent::SplitRequested { axis, from_tab_id })
+            .send(RendererEvent::SplitRequested {
+                window_id: window_id.to_string(),
+                axis,
+                from_tab_id,
+            })
             .is_ok(),
         None => false,
     }
@@ -8820,7 +10726,8 @@ pub fn emit_split_requested(
 /// Returns `true` if the event was sent; `false` if there is no sender or the receiver has been
 /// dropped. Never panics (a closed channel is a normal, non-fatal outcome).
 pub fn emit_pane_edge_dock_requested(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
+    window_id: &str,
     source_tab_id: &str,
     target_tab_id: &str,
     edge: PaneDockEdge,
@@ -8828,6 +10735,7 @@ pub fn emit_pane_edge_dock_requested(
     match events {
         Some(sender) => sender
             .send(RendererEvent::PaneEdgeDockRequested {
+                window_id: window_id.to_string(),
                 source_tab_id: source_tab_id.to_string(),
                 target_tab_id: target_tab_id.to_string(),
                 edge,
@@ -8846,13 +10754,15 @@ pub fn emit_pane_edge_dock_requested(
 /// Returns `true` if the event was sent; `false` if there is no sender or the receiver has been
 /// dropped. Never panics (a closed channel is a normal, non-fatal outcome).
 pub fn emit_swap_requested(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
+    window_id: &str,
     tab_id_a: &str,
     tab_id_b: &str,
 ) -> bool {
     match events {
         Some(sender) => sender
             .send(RendererEvent::SwapRequested {
+                window_id: window_id.to_string(),
                 tab_id_a: tab_id_a.to_string(),
                 tab_id_b: tab_id_b.to_string(),
             })
@@ -8864,7 +10774,7 @@ pub fn emit_swap_requested(
 /// Emit a [`RendererEvent::RemoteAccessToggleRequested`] carrying the DESIRED new state. Mirrors
 /// [`emit_swap_requested`]: pure, GUI-free, unit-testable, non-panicking.
 pub fn emit_remote_access_toggle_requested(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
     open: bool,
 ) -> bool {
     match events {
@@ -8878,7 +10788,7 @@ pub fn emit_remote_access_toggle_requested(
 /// Emit a [`RendererEvent::WinsizeOwnerToggleRequested`] carrying the DESIRED new owner. Mirrors
 /// [`emit_remote_access_toggle_requested`]: pure, GUI-free, unit-testable, non-panicking.
 pub fn emit_winsize_owner_toggle_requested(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
     remote: bool,
 ) -> bool {
     match events {
@@ -8890,7 +10800,7 @@ pub fn emit_winsize_owner_toggle_requested(
 }
 
 pub fn emit_viewport_reclaim_requested(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
     session_id: &str,
 ) -> bool {
     match events {
@@ -8913,13 +10823,15 @@ pub fn emit_viewport_reclaim_requested(
 /// Returns `true` if the event was sent; `false` if there is no sender or the receiver has been
 /// dropped. Never panics (a closed channel is a normal, non-fatal outcome).
 pub fn emit_pane_swap_requested(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
+    window_id: &str,
     tab_id_a: &str,
     tab_id_b: &str,
 ) -> bool {
     match events {
         Some(sender) => sender
             .send(RendererEvent::PaneSwapRequested {
+                window_id: window_id.to_string(),
                 tab_id_a: tab_id_a.to_string(),
                 tab_id_b: tab_id_b.to_string(),
             })
@@ -8937,12 +10849,14 @@ pub fn emit_pane_swap_requested(
 /// Returns `true` if the event was sent; `false` if there is no sender or the receiver has been
 /// dropped. Never panics (a closed channel is a normal, non-fatal outcome).
 pub fn emit_swallow_requested(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
+    window_id: &str,
     tab_id: &str,
 ) -> bool {
     match events {
         Some(sender) => sender
             .send(RendererEvent::SwallowRequested {
+                window_id: window_id.to_string(),
                 tab_id: tab_id.to_string(),
             })
             .is_ok(),
@@ -8953,13 +10867,15 @@ pub fn emit_swallow_requested(
 /// Emit a [`RendererEvent::PaneSwallowRequested`] for a pane-header directional swallow arrow.
 /// Intent-only and non-fatal when the event channel is absent/closed.
 pub fn emit_pane_swallow_requested(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
+    window_id: &str,
     tab_id: &str,
     direction: PaneSwallowDirection,
 ) -> bool {
     match events {
         Some(sender) => sender
             .send(RendererEvent::PaneSwallowRequested {
+                window_id: window_id.to_string(),
                 tab_id: tab_id.to_string(),
                 direction,
             })
@@ -8972,7 +10888,8 @@ pub fn emit_pane_swallow_requested(
 /// Returns whether the event was sent (false when there is no event channel). Intent only — the renderer
 /// mutates no record; the app stashes the pane and re-snaps survivors.
 pub fn emit_pane_close_requested(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
+    window_id: &str,
     tab_id: &str,
 ) -> bool {
     match events {
@@ -8980,6 +10897,7 @@ pub fn emit_pane_close_requested(
             eprintln!("hydra-renderer: pane close requested tab_id={tab_id:?}");
             sender
                 .send(RendererEvent::PaneCloseRequested {
+                    window_id: window_id.to_string(),
                     tab_id: tab_id.to_string(),
                 })
                 .is_ok()
@@ -9015,12 +10933,16 @@ pub fn close_focused_pane_shortcut_matches(logical_key: &HostKey, mods: &HostMod
 /// Returns `true` if the event was sent; `false` if there is no sender or the receiver has been
 /// dropped. Never panics (a closed channel is a normal, non-fatal outcome).
 pub fn emit_close_focused_pane_requested(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
+    window_id: &str,
     tab_id: Option<String>,
 ) -> bool {
     match events {
         Some(sender) => sender
-            .send(RendererEvent::CloseFocusedPaneRequested { tab_id })
+            .send(RendererEvent::CloseFocusedPaneRequested {
+                window_id: window_id.to_string(),
+                tab_id,
+            })
             .is_ok(),
         None => false,
     }
@@ -9033,13 +10955,15 @@ pub fn emit_close_focused_pane_requested(
 /// to `0..=1000` (the shell clamps again defensively). Returns `true` if sent; `false` when there is no
 /// sender or the receiver was dropped. Never panics.
 pub fn emit_divider_ratio_persisted(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
+    window_id: &str,
     child_tab_id: String,
     ratio_per_mille: u16,
 ) -> bool {
     match events {
         Some(sender) => sender
             .send(RendererEvent::DividerRatioPersisted {
+                window_id: window_id.to_string(),
                 child_tab_id,
                 ratio_per_mille,
             })
@@ -9056,9 +10980,7 @@ pub fn emit_divider_ratio_persisted(
 ///
 /// Returns `true` if the event was sent; `false` if there is no sender or the receiver has been
 /// dropped. Never panics (a closed channel is a normal, non-fatal outcome).
-pub fn emit_command_palette_open_requested(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
-) -> bool {
+pub fn emit_command_palette_open_requested(events: Option<&dyn RendererEventOutput>) -> bool {
     match events {
         Some(sender) => sender
             .send(RendererEvent::CommandPaletteOpenRequested)
@@ -9175,9 +11097,7 @@ pub fn settings_panel_shortcut_intent(
 ///
 /// Returns `true` if the event was sent; `false` if there is no sender or the receiver has been
 /// dropped. Never panics (a closed channel is a normal, non-fatal outcome).
-pub fn emit_settings_panel_open_requested(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
-) -> bool {
+pub fn emit_settings_panel_open_requested(events: Option<&dyn RendererEventOutput>) -> bool {
     match events {
         Some(sender) => sender
             .send(RendererEvent::SettingsPanelOpenRequested)
@@ -9194,9 +11114,7 @@ pub fn emit_settings_panel_open_requested(
 ///
 /// Returns `true` if the event was sent; `false` if there is no sender or the receiver has been
 /// dropped. Never panics (a closed channel is a normal, non-fatal outcome).
-pub fn emit_settings_panel_close_requested(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
-) -> bool {
+pub fn emit_settings_panel_close_requested(events: Option<&dyn RendererEventOutput>) -> bool {
     match events {
         Some(sender) => sender
             .send(RendererEvent::SettingsPanelCloseRequested)
@@ -9216,7 +11134,7 @@ pub fn emit_settings_panel_close_requested(
 /// Returns `true` if the event was sent; `false` if there is no sender or the receiver has been
 /// dropped. Never panics (a closed channel is a normal, non-fatal outcome).
 pub fn emit_settings_panel_row_selected(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
     row_index: usize,
     row: &RendererSettingsPanelRow,
 ) -> bool {
@@ -9244,7 +11162,7 @@ pub fn emit_settings_panel_row_selected(
 /// Returns `true` if the event was sent; `false` if there is no sender or the receiver has been
 /// dropped. Never panics (a closed channel is a normal, non-fatal outcome).
 pub fn emit_settings_panel_row_activated(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
     row_index: usize,
     row: &RendererSettingsPanelRow,
 ) -> bool {
@@ -9272,7 +11190,7 @@ pub fn emit_settings_panel_row_activated(
 /// Returns `true` if the event was sent; `false` if there is no sender, the row is unfocusable, or the
 /// receiver has been dropped. Never panics (a closed channel is a normal, non-fatal outcome).
 pub fn emit_dashboard_row_activated(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
     row: &RendererDashboardRow,
 ) -> bool {
     let Some(tab_id) = row.focus_tab_id.clone() else {
@@ -9294,7 +11212,7 @@ pub fn emit_dashboard_row_activated(
 /// `revive_tab_id` target, and the renderer mutates nothing. A row without a `revive_tab_id` is not a
 /// revive candidate and is silently ignored. Returns `true` only if the event was sent.
 pub fn emit_dashboard_row_revive_requested(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
     row: &RendererDashboardRow,
 ) -> bool {
     let Some(tab_id) = row.revive_tab_id.clone() else {
@@ -9316,7 +11234,7 @@ pub fn emit_dashboard_row_revive_requested(
 /// the renderer mutates nothing. A row without a `select_project_id` is not a project row and is
 /// silently ignored. Returns `true` only if the event was sent.
 pub fn emit_dashboard_project_selected(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
     row: &RendererDashboardRow,
 ) -> bool {
     let Some(project_id) = row.select_project_id.clone() else {
@@ -9342,7 +11260,7 @@ pub fn emit_dashboard_project_selected(
 /// Returns `true` if the event was sent; `false` if there is no sender or the receiver has been
 /// dropped. Never panics (a closed channel is a normal, non-fatal outcome).
 pub fn emit_settings_panel_edit_draft_submitted(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
     row_id: &str,
     setting_key: &str,
     value: &str,
@@ -9367,7 +11285,7 @@ pub fn emit_settings_panel_edit_draft_submitted(
 /// normal, non-fatal outcome). The caller invokes this ONLY when the prompt is open, Enter was
 /// pressed, and the path is non-empty.
 pub fn emit_file_preview_path_submitted(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
     path: &str,
 ) -> bool {
     match events {
@@ -9389,12 +11307,14 @@ pub fn emit_file_preview_path_submitted(
 /// Returns `true` if the event was sent; `false` if there is no sender or the receiver has been
 /// dropped. Never panics (a closed channel is a normal, non-fatal outcome).
 pub fn emit_tab_attention_clear_requested(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
+    window_id: &str,
     tab_id: &str,
 ) -> bool {
     match events {
         Some(sender) => sender
             .send(RendererEvent::TabAttentionClearRequested {
+                window_id: window_id.to_string(),
                 tab_id: tab_id.to_string(),
             })
             .is_ok(),
@@ -9410,7 +11330,7 @@ pub fn emit_tab_attention_clear_requested(
 /// Returns `true` if the event was sent; `false` if there is no sender or the receiver has been
 /// dropped. Never panics (a closed channel is a normal, non-fatal outcome).
 pub fn emit_picker_row_activated(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
     project_id: &str,
     workspace_id: Option<&str>,
 ) -> bool {
@@ -9434,7 +11354,7 @@ pub fn emit_picker_row_activated(
 /// Returns `true` if the event was sent; `false` if there is no sender or the receiver has been
 /// dropped. Never panics (a closed channel is a normal, non-fatal outcome).
 pub fn emit_picker_consent_grant_requested(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
     project_id: &str,
     workspace_id: &str,
 ) -> bool {
@@ -9458,7 +11378,7 @@ pub fn emit_picker_consent_grant_requested(
 /// Returns `true` if the event was sent; `false` if there is no sender or the receiver has been
 /// dropped. Never panics (a closed channel is a normal, non-fatal outcome).
 pub fn emit_picker_consent_grant_confirmed(
-    events: Option<&std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<&dyn RendererEventOutput>,
     project_id: &str,
     workspace_id: &str,
 ) -> bool {
@@ -9474,12 +11394,12 @@ pub fn emit_picker_consent_grant_confirmed(
 }
 
 /// Emit a [`RendererEvent::PickerDismissed`] through the optional outbound `events` sender. Mirrors
-/// [`emit_new_tab_requested`]: pure, GUI-free, payload-free, and unit-testable. The renderer reports
+/// [`emit_new_tab_requested`]: pure, GUI-free, window-bound, and unit-testable. The renderer reports
 /// only that the overlay should hide; the app responds with `SetPickerOverlay(None)`.
 ///
 /// Returns `true` if the event was sent; `false` if there is no sender or the receiver has been
 /// dropped. Never panics (a closed channel is a normal, non-fatal outcome).
-pub fn emit_picker_dismissed(events: Option<&std::sync::mpsc::Sender<RendererEvent>>) -> bool {
+pub fn emit_picker_dismissed(events: Option<&dyn RendererEventOutput>) -> bool {
     match events {
         Some(sender) => sender.send(RendererEvent::PickerDismissed).is_ok(),
         None => false,
@@ -9526,7 +11446,7 @@ struct PaneDrag {
 struct StashedPaneDrag {
     window_id: String,
     tab_id: String,
-    _session_id: String,
+    session_id: String,
 }
 
 impl From<RendererStashedPaneDrag> for StashedPaneDrag {
@@ -9534,7 +11454,7 @@ impl From<RendererStashedPaneDrag> for StashedPaneDrag {
         Self {
             window_id: value.window_id,
             tab_id: value.tab_id,
-            _session_id: value.session_id,
+            session_id: value.session_id,
         }
     }
 }
@@ -9553,6 +11473,20 @@ struct PendingPaste {
     request_id: u64,
     target_session_id: String,
     target_generation: String,
+    binding: ViewportBindingToken,
+}
+
+/// One native file drop, coalesced until the owner loop reaches its idle tail. winit emits one
+/// `DroppedFile` per path, while GTK supplies one URI-list batch; both therefore become exactly one
+/// bounded PTY Write. The target binding + PTY generation are captured before deferral so a rebind or
+/// same-id restart drops the insertion instead of retargeting it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingFileDrop {
+    target_session_id: String,
+    target_generation: SessionGeneration,
+    binding: ViewportBindingToken,
+    payload: String,
+    path_count: usize,
 }
 
 /// Linux right-button ownership at press time. Pure policy keeps TUI mouse isolation testable:
@@ -9564,6 +11498,62 @@ enum LinuxRightClickAction {
     ContextMenu,
     ReportToPty,
     Ignore,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameRecoveryAction {
+    None,
+    RequestRedraw,
+    Exit,
+}
+
+/// Host-neutral bounded retry policy for frame failures. Only the first degraded
+/// outcome in one recovery epoch schedules another redraw. The resulting redraw
+/// cannot replenish its own budget; progress from a complete present or an
+/// independently delivered app/window event can.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FrameRecoveryState {
+    retry_available: bool,
+}
+
+impl Default for FrameRecoveryState {
+    fn default() -> Self {
+        Self {
+            retry_available: true,
+        }
+    }
+}
+
+impl FrameRecoveryState {
+    fn observe(&mut self, outcome: FrameOutcome) -> FrameRecoveryAction {
+        match outcome {
+            FrameOutcome::Presented => {
+                self.retry_available = true;
+                FrameRecoveryAction::None
+            }
+            FrameOutcome::PresentedWithoutText | FrameOutcome::SurfaceUnavailable
+                if self.retry_available =>
+            {
+                self.retry_available = false;
+                FrameRecoveryAction::RequestRedraw
+            }
+            FrameOutcome::PresentedWithoutText | FrameOutcome::SurfaceUnavailable => {
+                FrameRecoveryAction::None
+            }
+            FrameOutcome::FatalSurface => {
+                self.retry_available = false;
+                FrameRecoveryAction::Exit
+            }
+        }
+    }
+
+    fn rearm_from_external_event(&mut self) {
+        self.retry_available = true;
+    }
+
+    fn continuous_redraw_allowed(self) -> bool {
+        self.retry_available
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -9578,6 +11568,115 @@ fn linux_right_click_action(
     } else {
         LinuxRightClickAction::ContextMenu
     }
+}
+
+#[derive(Clone, Debug)]
+struct PendingActiveAttach {
+    session_id: String,
+    handoff_request_id: Option<RendererAttachmentHandoffRequestId>,
+    viewport_request: Option<RendererExactViewportRequest>,
+    exact_viewport: Option<RendererExactViewport>,
+    /// Publication epoch captured after the prior viewport was synchronously neutralized. Only
+    /// this exact epoch may reopen native/WebView intent delivery after aggregate proof.
+    event_gate_epoch: u64,
+    window_dims: Option<(u16, u16)>,
+    /// Distinguishes an Attach waiting for its projection from a delivered `SetTabStrip(None)`,
+    /// which is a legitimate primary-only topology.
+    projection_received: bool,
+    tab_strip_line: Option<RendererTabStripLine>,
+    tab_strip_source: Option<RendererTabStrip>,
+    split_ratios: SplitRatios,
+}
+
+#[derive(Clone, Debug)]
+struct PendingOwnerBatch {
+    /// Exact renderer incarnation that authorized every request in this batch. Clear, role change,
+    /// or same-id revive makes it stale, so a retry can never cross a Detach→Attach generation
+    /// barrier merely because the textual session id is unchanged.
+    binding: ViewportBindingToken,
+    /// PTY lifetime observed when the owner intent was created. Queue pressure may delay admission,
+    /// but a same-binding Grid rollover must discard the old Write/Resize/query rather than replay it
+    /// into the new lifetime.
+    expected_generation: SessionGeneration,
+    requests: Vec<ClientRequest>,
+    framed_bytes: usize,
+    scroll_intent: Option<ScrollRequestIntent>,
+}
+
+/// Owner-loop intent before a PTY lifetime has been bound to its wire bytes. This private type
+/// makes it impossible to construct an id-only Write/Resize: conversion happens exactly once, from
+/// the generation proof captured for the PendingOwnerBatch, and the Shared admission gate verifies
+/// the resulting wire stamp still equals that proof at every retry.
+#[derive(Clone, Debug)]
+enum OwnerRequest {
+    Write {
+        id: String,
+        data: String,
+    },
+    Resize {
+        id: String,
+        cols: u16,
+        rows: u16,
+    },
+    Snapshot {
+        id: String,
+    },
+    Scrollback {
+        id: String,
+        offset_from_top: u32,
+        count: u16,
+    },
+}
+
+impl OwnerRequest {
+    fn is_mutation(&self) -> bool {
+        matches!(self, Self::Write { .. } | Self::Resize { .. })
+    }
+
+    fn bind_generation(self, generation: &SessionGeneration) -> ClientRequest {
+        match self {
+            Self::Write { id, data } => ClientRequest::Write {
+                id,
+                expected_generation: generation.clone(),
+                data,
+            },
+            Self::Resize { id, cols, rows } => ClientRequest::Resize {
+                id,
+                expected_generation: generation.clone(),
+                cols,
+                rows,
+            },
+            Self::Snapshot { id } => ClientRequest::Snapshot { id },
+            Self::Scrollback {
+                id,
+                offset_from_top,
+                count,
+            } => ClientRequest::Scrollback {
+                id,
+                offset_from_top,
+                count,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnerBatchAdmission {
+    Admitted,
+    Retained,
+    Rejected,
+}
+
+impl OwnerBatchAdmission {
+    fn accepted(self) -> bool {
+        matches!(self, Self::Admitted | Self::Retained)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HoveredTerminalLink {
+    url: String,
+    highlight: TerminalLinkHighlight,
 }
 
 struct App {
@@ -9618,6 +11717,52 @@ struct App {
     /// only on an actual size change. Empty for the two-pane case (the lone inactive pane is the
     /// sibling). The cache drives attachment and resize reconciliation for those painted panes.
     pane_cache_dims: std::collections::HashMap<String, (u16, u16)>,
+    /// Every daemon subscription revoked locally before its Detach transaction is admitted.
+    /// ClearViewport moves primary+sibling+all pane ids here, then owner-loop retries either one
+    /// neutral Detach-only batch or a complete cleanup-prefix→bind batch. The set clears only after
+    /// all-or-none admission, so backpressure cannot forget a hidden forwarder.
+    pending_detach_sessions: std::collections::BTreeSet<String>,
+    /// A controller-delivered Attach whose all-or-none daemon transaction was temporarily refused.
+    /// The viewport stays neutral and owner wakes retry this intent; no new session/dims authority is
+    /// claimed until the full cleanup→Attach→Resize→Snapshot batch is admitted.
+    pending_active_attach: Option<PendingActiveAttach>,
+    /// Projection admitted beside a Claim but kept entirely off the visible/interactive App state
+    /// until the exact expected Grid proves transfer.
+    pending_handoff_projection: Option<PendingActiveAttach>,
+    /// Immutable aggregate route receipt retained across reader/owner races. Projection remains
+    /// neutral until this receipt proves every unique exact baseline.
+    pending_viewport_binding: Option<client::ViewportBindingSet>,
+    /// Exact lifetime cohort backing the currently published viewport. Display-only strip updates
+    /// must match this same cohort and primary role; they never change Attach membership.
+    exact_viewport: Option<RendererExactViewport>,
+    /// One runtime handoff command from owner-loop receipt through exact Claim/Grid proof. The
+    /// guard is neither UI state nor daemon attachment authority: it solely guarantees that every
+    /// pre-proof discard publishes (or safely attempts) the exact token cancellation.
+    runtime_attachment_handoff: Option<RuntimeAttachmentHandoffCancelGuard>,
+    /// Cancellations refused only by transient FIFO pressure. They retry ahead of any later
+    /// topology transaction so Claim/Cancel order stays on the one operational connection.
+    pending_attachment_handoff_cancels: Vec<RuntimeAttachmentHandoffCancelGuard>,
+    /// Cross-thread wake path for bounded authority cancellation completion.
+    handoff_event_sender: Option<Box<dyn UserEventSender>>,
+    /// Exact set of daemon forwarders whose Attach transactions were admitted on this connection.
+    /// Updated only after an all-or-none topology admission; Clear moves it into pending cleanup.
+    attached_sessions: std::collections::BTreeSet<String>,
+    /// Ordered owner-loop requests refused by the bounded daemon queue. Writes remain byte-ordered;
+    /// geometry/snapshot/scrollback requests coalesce by session. The whole retained suffix is
+    /// retried all-or-none so a later request never overtakes an earlier keystroke.
+    pending_owner_requests: std::collections::VecDeque<PendingOwnerBatch>,
+    pending_owner_request_bytes: usize,
+    outbound_stalled: bool,
+    /// A retained suffix exceeded its local bound or one framed batch exceeded the daemon queue cap.
+    /// Refuse every later owner request until an explicit clear/rebind resets the incarnation, so a
+    /// small Write can never silently overtake the rejected bytes.
+    outbound_hard_refusal: bool,
+    /// The retained daemon did not prove protocol-v3 generation-conditional mutation support.
+    /// This is deliberately narrower than `outbound_hard_refusal`: Write/Resize are refused
+    /// locally, while Attach/Snapshot/Scrollback and the reader remain live for legacy read-only
+    /// observation. Once latched for this connection it also prevents automatic resize retries.
+    mutation_read_only: bool,
+    connection_alive: bool,
     /// Session ids whose viewport geometry is currently leased to a negotiated optional extension.
     /// This is an in-memory projection supplied through [`RendererCommand::SetRemoteExtensionState`];
     /// the public renderer never reads a private-agent directory or shared authority file.
@@ -9781,7 +11926,11 @@ struct App {
     /// command-only entrypoint. Renderer chrome uses this for top-level actions (tab activation,
     /// split/swap/swallow, picker/settings requests). Split-pane focus stays renderer-local: a pane
     /// click must not run the app's tab-switch attach/detach path.
-    events: Option<std::sync::mpsc::Sender<RendererEvent>>,
+    events: AppRendererEvents,
+    /// Cross-thread publication gate shared with every native/WebView event producer. Exact
+    /// rebind receipt closes it before old viewport authority is revoked; aggregate commit reopens
+    /// it only after every unique route proves its durable generation.
+    viewport_event_gate: Arc<ViewportEventGate>,
     /// Optional wake path back into the winit app from platform callbacks owned by child surfaces such
     /// as the embedded WebView. Tests and command-only fixtures can leave it absent.
     #[cfg(target_os = "macos")]
@@ -9805,6 +11954,7 @@ struct App {
     next_paste_request_id: u64,
     #[cfg(target_os = "linux")]
     pending_paste: Option<PendingPaste>,
+    pending_file_drop: Option<PendingFileDrop>,
     // Text selection (drag-select). `anchor` is set on left-button press; `focus`
     // tracks the cursor while the button is held. `selecting` is true between
     // press and release. A finalized selection keeps `anchor`/`focus` (so Cmd-C
@@ -9813,8 +11963,17 @@ struct App {
     sel_anchor: Option<CellPos>,
     sel_focus: Option<CellPos>,
     selecting: bool,
-    // Last cursor position (physical pixels) for hit-testing on press/move.
+    // Last cursor position (physical pixels) for hit-testing on press/move. macOS file drops do
+    // not trust this cache: child WebViews can own drag motion, so they query the global pointer
+    // at delivery time.
     cursor_px: (f32, f32),
+    /// One safe link currently under the real pointer, projected to absolute
+    /// window-grid geometry.  Display-only until an exact platform modifier-click
+    /// re-resolves the same target through the native opener boundary.
+    hovered_terminal_link: Option<HoveredTerminalLink>,
+    /// Consumes the release half of an exact modifier press so neither a proven
+    /// link nor an outside-link no-op can leak to PTY mouse reporting or selection.
+    terminal_link_click_in_progress: bool,
     // Mouse reporting (TUI): the button currently held for drag tracking, and the last
     // cell we reported, so motion reports fire only when the pointer crosses a cell
     // boundary (not on every sub-cell pixel move).
@@ -9868,6 +12027,10 @@ struct App {
     // FPS tracking.
     frame_times: Vec<Instant>,
     fps: f32,
+    /// One-shot recovery budget for a degraded frame or unavailable surface.
+    /// A successful frame or a later external event re-arms it; the redraw it
+    /// schedules does not, so a persistently unavailable surface cannot busy-loop.
+    frame_recovery: FrameRecoveryState,
     /// Launch-time initial glyph point size resolved by the app-shell caller. `None` keeps the
     /// historical renderer default; `Some(px)` drives `Renderer::new`'s initial font metrics.
     font_size_px: Option<u32>,
@@ -9891,10 +12054,13 @@ impl App {
         picker: Option<RendererPickerModel>,
         command_palette: Option<RendererCommandPaletteModel>,
         events: Option<std::sync::mpsc::Sender<RendererEvent>>,
+        handoff_event_sender: Option<Box<dyn UserEventSender>>,
         _event_proxy: Option<EventLoopProxy<UserEvent>>,
         font_size_px: Option<u32>,
         theme: Option<RendererTheme>,
     ) -> Self {
+        let initially_attached_session = session_id.clone();
+        let connection_alive = !shared.connection_is_closed();
         let last_expanded_react_chrome_width_logical_px = react_chrome
             .as_ref()
             .map(|chrome| {
@@ -9905,6 +12071,8 @@ impl App {
                 }
             })
             .unwrap_or(460);
+        let viewport_event_gate = Arc::new(ViewportEventGate::new(true));
+        let events = viewport_gated_renderer_events(events, Arc::clone(&viewport_event_gate));
         App {
             shared,
             session_id,
@@ -9916,6 +12084,24 @@ impl App {
             sibling_id: None,
             sibling_dims: None,
             pane_cache_dims: std::collections::HashMap::new(),
+            pending_detach_sessions: std::collections::BTreeSet::new(),
+            pending_active_attach: None,
+            pending_handoff_projection: None,
+            pending_viewport_binding: None,
+            exact_viewport: None,
+            runtime_attachment_handoff: None,
+            pending_attachment_handoff_cancels: Vec::new(),
+            handoff_event_sender,
+            attached_sessions: (!initially_attached_session.is_empty())
+                .then_some(initially_attached_session)
+                .into_iter()
+                .collect(),
+            pending_owner_requests: std::collections::VecDeque::new(),
+            pending_owner_request_bytes: 0,
+            outbound_stalled: false,
+            outbound_hard_refusal: false,
+            mutation_read_only: false,
+            connection_alive,
             external_winsize_sessions: std::collections::HashSet::new(),
             primary_pane_dims: None,
             focused_pane_session: None,
@@ -9951,7 +12137,8 @@ impl App {
             command_palette_result: None,
             shortcut_hint_lines: None,
             picker_click_in_progress: false,
-            events,
+            events: AppRendererEvents(events),
+            viewport_event_gate,
             #[cfg(target_os = "macos")]
             event_proxy: _event_proxy,
             #[cfg(not(target_os = "linux"))]
@@ -9967,10 +12154,13 @@ impl App {
             next_paste_request_id: 1,
             #[cfg(target_os = "linux")]
             pending_paste: None,
+            pending_file_drop: None,
             sel_anchor: None,
             sel_focus: None,
             selecting: false,
             cursor_px: (0.0, 0.0),
+            hovered_terminal_link: None,
+            terminal_link_click_in_progress: false,
             mouse_held: None,
             last_reported_cell: None,
             #[cfg(target_os = "linux")]
@@ -9988,6 +12178,7 @@ impl App {
             wheel: WheelAccumulator::default(),
             frame_times: Vec::new(),
             fps: 0.0,
+            frame_recovery: FrameRecoveryState::default(),
             font_size_px,
             theme,
         }
@@ -10134,7 +12325,7 @@ impl App {
             bounds,
             (7, 8, 11, 255),
             &chrome.initialization_script,
-            self.events.clone(),
+            self.events.clone_sink(),
             self.event_proxy.clone(),
         );
 
@@ -10170,7 +12361,7 @@ impl App {
             top_bounds,
             (7, 8, 11, 255),
             &chrome.initialization_script,
-            self.events.clone(),
+            self.events.clone_sink(),
             self.event_proxy.clone(),
         );
 
@@ -10203,7 +12394,7 @@ impl App {
             overlay_bounds,
             (0, 0, 0, 0),
             &chrome.initialization_script,
-            self.events.clone(),
+            self.events.clone_sink(),
             self.event_proxy.clone(),
         );
 
@@ -10308,52 +12499,61 @@ impl App {
             .map(|g| (g.alt_screen, g.rows))
     }
 
+    /// Resolve one accumulated wheel gesture against the pane focus that now owns input.
+    /// The pure policy owns precedence; this adapter only supplies live focused-pane state.
+    fn wheel_input_action(&self, lines: i64) -> WheelInputAction {
+        let alt_screen = self
+            .live_view_geometry()
+            .map(|(alt_screen, _)| alt_screen)
+            .unwrap_or(false);
+        wheel_input_action_for(lines, self.mouse_reporting_active(), alt_screen)
+    }
+
+    /// Emit the conventional alternate-scroll cursor key as one bounded atomic PTY write.
+    /// These are synthetic wheel fallback keys, so held host modifiers do not transform them;
+    /// the focused TUI's DECCKM/application-cursor mode still selects CSI vs SS3 encoding.
+    fn write_alternate_scroll_keys(&mut self, direction: WheelDirection, steps: u8) {
+        let named = match direction {
+            WheelDirection::Up => HostNamedKey::ArrowUp,
+            WheelDirection::Down => HostNamedKey::ArrowDown,
+        };
+        let Some(sequence) = encode_key(
+            &HostKey::Named(named),
+            None,
+            None,
+            &HostModifiers::default(),
+            self.current_modes(),
+        ) else {
+            return;
+        };
+        self.write_to_pty(sequence.repeat(usize::from(steps)));
+    }
+
     /// Apply a viewport scroll action (wheel / PageUp / PageDown / Home / End). This is
     /// a VIEW action, never PTY input. Scrollback is disabled on the alternate screen
     /// (full-screen apps own their own scrolling), so any action there snaps back to live.
     /// Returns `true` if the event was consumed as a scroll action (so the caller does
     /// not also encode it as a keystroke).
     fn apply_scroll(&mut self, action: ScrollAction) -> bool {
-        let Some((alt_screen, rows)) = self.live_view_geometry() else {
+        if !self.viewport_is_bound() {
             return false;
-        };
-        // The wheel acts on the focused pane's own scrollback (the primary's dedicated field when
-        // focus is on the active pane / unsplit — byte-identical; the focused pane's `PaneStore`
-        // scrollback otherwise). All edits run inside `with_pane_scrollback`, which holds the short lock
-        // only for the closure and never across the redraw or request below.
+        }
         let focus_id = self.focused_session_id();
         let primary = self.session_id.clone();
-
-        // Alt-screen forbids scrollback: force live and consume nothing further.
-        if alt_screen {
-            self.shared
-                .with_pane_scrollback(&focus_id, &primary, |sb| sb.reset_to_live());
-            return false;
-        }
-
-        // Compute the next offset for the focused pane under a short lock, then decide outside it.
-        enum Step {
-            NoMove,
-            ToLive,
-            Moved(u32),
-        }
-        let step = self.shared.with_pane_scrollback(&focus_id, &primary, |sb| {
-            let new_offset = next_view_offset(sb.view_offset, sb.history_len, rows as u32, action);
-            if new_offset == sb.view_offset {
-                Step::NoMove
-            } else if new_offset == 0 {
-                sb.reset_to_live();
-                Step::ToLive
-            } else {
-                sb.view_offset = new_offset;
-                Step::Moved(new_offset)
+        let prepared = self
+            .shared
+            .prepare_scroll_action(&focus_id, &primary, action);
+        let (binding, request, count) = match prepared {
+            PreparedScrollAction::Unavailable => return false,
+            PreparedScrollAction::AlternateScreen => {
+                self.cancel_pending_scrollback(&focus_id);
+                return false;
             }
-        });
-        let new_offset = match step {
             // No movement (already at the requested bound). Still consume so the key
             // (e.g. Home/End/PageUp) is not forwarded to the PTY.
-            Step::NoMove => return true,
-            Step::ToLive => {
+            PreparedScrollAction::NoMove => return true,
+            PreparedScrollAction::ToLive => {
+                self.cancel_pending_scrollback(&focus_id);
                 // Returned to the live bottom: the historical window is dropped so `draw` paints the
                 // focused pane's live grid, which live Damage has kept current. The painted rows change
                 // under the same generation, so a selection cut for the old viewport no longer maps to
@@ -10362,7 +12562,11 @@ impl App {
                 self.request_redraw();
                 return true;
             }
-            Step::Moved(n) => n,
+            PreparedScrollAction::Moved {
+                binding,
+                request,
+                count,
+            } => (binding, request, count),
         };
         // Viewport moved: invalidate any selection (its cell coords now cover
         // different content). Mirrors the resize/scale/generation clears.
@@ -10372,11 +12576,16 @@ impl App {
         // session so a scroll gesture pages the pane the user is interacting with across an N-pane
         // layout (active id when unsplit or focus is on the active pane — byte-identical to the
         // pre-split path; a removed focused pane falls back to active).
-        self.shared.send_request(&ClientRequest::Scrollback {
-            id: focus_id,
-            offset_from_top: new_offset,
-            count: rows.min(u16::MAX as usize) as u16,
-        });
+        self.admit_or_retain_owner_batch_with_proof(
+            binding,
+            vec![OwnerRequest::Scrollback {
+                id: focus_id,
+                offset_from_top: request.requested_offset,
+                count,
+            }],
+            request.expected_generation.clone(),
+            Some(request),
+        );
         true
     }
 
@@ -10384,6 +12593,15 @@ impl App {
         if let Some(h) = self.host.as_ref() {
             h.request_redraw();
         }
+    }
+
+    /// The UI may retain the last exact session id for the next ordered cleanup plan; only Shared's
+    /// Option binding authorizes terminal paint/input/geometry in the meantime.
+    fn viewport_is_bound(&self) -> bool {
+        self.pending_handoff_projection.is_none()
+            && self.pending_viewport_binding.is_none()
+            && self.exact_viewport.is_some()
+            && self.shared.active_snapshot().id.as_deref() == Some(self.session_id.as_str())
     }
 
     /// Handle an already-resolved pane-local size-glyph click. This path is deliberately intent
@@ -10405,20 +12623,26 @@ impl App {
     }
 
     #[cfg(target_os = "macos")]
-    fn refresh_cursor_from_global_mouse(&mut self) -> bool {
-        let Some(window) = self.window.as_ref() else {
-            return false;
-        };
+    fn global_cursor_in_window_px(&self) -> Option<(f32, f32)> {
+        let window = self.window.as_ref()?;
         let Ok(inner_position) = window.inner_position() else {
+            return None;
+        };
+        let (global_x, global_y) = global_cursor_position_px()?;
+        // CoreGraphics reports global logical points while winit exposes the window origin in
+        // physical pixels. Convert with the window's current backing scale before subtracting.
+        global_logical_to_window_physical(
+            (global_x, global_y),
+            (inner_position.x, inner_position.y),
+            window.scale_factor() as f32,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn refresh_cursor_from_global_mouse(&mut self) -> bool {
+        let Some(next) = self.global_cursor_in_window_px() else {
             return false;
         };
-        let Some((global_x, global_y)) = global_cursor_position_px() else {
-            return false;
-        };
-        let next = (
-            global_x - inner_position.x as f32,
-            global_y - inner_position.y as f32,
-        );
         if (self.cursor_px.0 - next.0).abs() < 0.5 && (self.cursor_px.1 - next.1).abs() < 0.5 {
             return false;
         }
@@ -10430,6 +12654,10 @@ impl App {
         let Some(drag) = self.stashed_pane_drag.take() else {
             return false;
         };
+        let target_window_id = self
+            .tab_strip_source
+            .as_ref()
+            .map(|strip| strip.window_id.clone());
         // Prefer the LIVE-tracked cursor (kept current by `dragover` → moveStashedPaneDrag) over the drop
         // event's own coords, which some browsers report stale/elsewhere than the last dragover — that
         // mismatch made the drop land on a different pane than the highlighted one. Only fall back to the
@@ -10448,10 +12676,14 @@ impl App {
                 if let Some(edge) =
                     pane_drop_zone_in_region(target.region, cell.col, cell.row).dock_edge()
                 {
-                    if let Some(sender) = self.events.as_ref() {
+                    if let (Some(sender), Some(target_window_id)) =
+                        (self.events.as_ref(), target_window_id)
+                    {
                         let _ = sender.send(RendererEvent::StashedPaneDropRequested {
-                            window_id: drag.window_id,
-                            tab_id: drag.tab_id,
+                            source_window_id: drag.window_id,
+                            source_tab_id: drag.tab_id,
+                            source_session_id: drag.session_id,
+                            target_window_id,
                             target_tab_id: target.tab_id.clone(),
                             edge,
                         });
@@ -10535,7 +12767,7 @@ impl App {
     }
 
     /// Forward raw bytes to the PTY as one atomic Write (single serialized writer).
-    fn write_to_pty(&self, data: String) {
+    fn write_to_pty(&mut self, data: String) {
         if data.is_empty() {
             return;
         }
@@ -10576,14 +12808,187 @@ impl App {
 
     /// Write one already-routed payload to an explicit session. Async clipboard completion uses
     /// this instead of re-resolving focus, so a delayed reply can never land in a different pane.
-    fn write_to_session(&self, id: &str, data: String) {
-        if data.is_empty() {
+    fn write_to_session(&mut self, id: &str, data: String) {
+        if data.is_empty() || !self.viewport_is_bound() {
             return;
         }
-        self.shared.send_request(&ClientRequest::Write {
-            id: id.to_string(),
-            data,
+        let Some(binding) = self.shared.binding_token_for_session(id) else {
+            return;
+        };
+        self.admit_or_retain_owner_batch(
+            binding,
+            vec![OwnerRequest::Write {
+                id: id.to_string(),
+                data,
+            }],
+        );
+    }
+
+    /// Resolve one physical drop point to terminal CONTENT and capture its exact live mutation
+    /// authority. Pane headers, dividers, dashboard/tab/sidebar chrome, and points outside the grid
+    /// resolve to `None`; a split target is selected by the pointer, never by prior keyboard focus.
+    fn file_drop_target_at(
+        &self,
+        cursor_px: (f32, f32),
+    ) -> Option<(String, ViewportBindingToken, SessionGeneration)> {
+        if !self.viewport_is_bound() {
+            return None;
+        }
+        let target_session_id = if let Some(layout) = self.current_split_layout() {
+            let cell = self.hit_test_window_grid(cursor_px)?;
+            file_drop_target_session_at_cell(&layout, cell)?.to_string()
+        } else {
+            self.hit_test(cursor_px)?;
+            self.focused_session_id()
+        };
+        let binding = self.shared.binding_token_for_session(&target_session_id)?;
+        let paint = self.shared.pane_paint(&target_session_id, &self.session_id);
+        if paint.exited.is_some() {
+            return None;
+        }
+        let generation = paint.live.as_ref()?.generation.clone();
+        Some((target_session_id, binding, generation))
+    }
+
+    /// Queue one native drop delivery. Consecutive winit single-file events coalesce into the same
+    /// pending payload; GTK's URI-list delivery enters as one batch. No file is opened or resolved.
+    fn queue_dropped_files(
+        &mut self,
+        paths: Vec<std::path::PathBuf>,
+        position: Option<(f64, f64)>,
+    ) {
+        if paths.is_empty()
+            || self.picker_shown()
+            || self.command_palette_shown()
+            || self.file_path_input_shown()
+            || self.settings_edit_draft_shown()
+            || self.react_overlay_visible
+            || self.divider_drag.is_some()
+            || self.rect_divider_drag.is_some()
+            || self.pane_drag.is_some()
+            || self.stashed_pane_drag.is_some()
+            || self.react_chrome_resize_drag.is_some()
+        {
+            return;
+        }
+        let cursor_px = match position {
+            Some((x, y)) if x.is_finite() && y.is_finite() && x >= 0.0 && y >= 0.0 => {
+                let cursor = (x as f32, y as f32);
+                self.cursor_px = cursor;
+                cursor
+            }
+            Some(_) => return,
+            // macOS/winit provides no coordinates with DroppedFile. Query the live global
+            // pointer at delivery time because child WKWebViews can own drag motion over the
+            // sidebar/top bar, leaving the parent's cached CursorMoved position stale. The
+            // ordinary terminal hit test below rejects chrome and out-of-window coordinates.
+            None => {
+                #[cfg(target_os = "macos")]
+                {
+                    let Some(cursor) = self.global_cursor_in_window_px() else {
+                        return;
+                    };
+                    self.cursor_px = cursor;
+                    cursor
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    return;
+                }
+            }
+        };
+        let Some((target_session_id, binding, target_generation)) =
+            self.file_drop_target_at(cursor_px)
+        else {
+            return;
+        };
+
+        let target_changed = self.pending_file_drop.as_ref().is_some_and(|pending| {
+            pending.target_session_id != target_session_id
+                || pending.binding != binding
+                || pending.target_generation != target_generation
         });
+        if target_changed {
+            self.flush_pending_file_drop();
+        }
+        if self.pending_file_drop.is_none() {
+            self.pending_file_drop = Some(PendingFileDrop {
+                target_session_id: target_session_id.clone(),
+                target_generation,
+                binding,
+                payload: String::new(),
+                path_count: 0,
+            });
+        }
+        let added = self.pending_file_drop.as_mut().map_or(0, |pending| {
+            file_drop::append_quoted_paths(&mut pending.payload, &mut pending.path_count, paths)
+        });
+        if added == 0 {
+            if self
+                .pending_file_drop
+                .as_ref()
+                .is_some_and(|pending| pending.path_count == 0)
+            {
+                self.pending_file_drop = None;
+            }
+            return;
+        }
+
+        // A drop is direct pane input. Move renderer-local focus to that live pane so subsequent
+        // typing follows the same target; the pending Write still uses its captured explicit target.
+        let target_is_split_pane = self.current_split_layout().is_some_and(|layout| {
+            layout.panes.len() >= 2
+                && layout
+                    .panes
+                    .iter()
+                    .any(|pane| pane.session_id == target_session_id)
+        });
+        let next_focus = Some(target_session_id);
+        if target_is_split_pane && self.focused_pane_session != next_focus {
+            self.focused_pane_session = next_focus;
+            self.clear_selection();
+            self.emit_focused_pane_event();
+            self.request_redraw();
+        }
+    }
+
+    /// Emit one coalesced file drop as one generation-conditional Write. Live mode is re-read for the
+    /// captured target so bracketed paste follows the receiving program at flush time. A stale binding,
+    /// exited/restarted PTY, or cleared viewport drops the payload without retargeting it.
+    fn flush_pending_file_drop(&mut self) {
+        let Some(pending) = self.pending_file_drop.take() else {
+            return;
+        };
+        if pending.payload.is_empty()
+            || !self.shared.viewport_token_is_current(&pending.binding)
+            || !self.viewport_is_bound()
+        {
+            return;
+        }
+        let paint = self
+            .shared
+            .pane_paint(&pending.target_session_id, &self.session_id);
+        if paint.exited.is_some() {
+            return;
+        }
+        let Some(live) = paint.live.as_ref() else {
+            return;
+        };
+        if live.generation != pending.target_generation {
+            return;
+        }
+        let Some(data) = encode_paste(&pending.payload, live.bracketed_paste) else {
+            return;
+        };
+        self.admit_or_retain_owner_batch_with_proof(
+            pending.binding,
+            vec![OwnerRequest::Write {
+                id: pending.target_session_id,
+                data,
+            }],
+            pending.target_generation,
+            None,
+        );
     }
 
     /// Copy text through the native platform clipboard. macOS retains the existing arboard path;
@@ -10616,6 +13021,9 @@ impl App {
                 return;
             };
             let target_session_id = self.focused_session_id();
+            let Some(binding) = self.shared.binding_token_for_session(&target_session_id) else {
+                return;
+            };
             let paint = self.shared.pane_paint(&target_session_id, &self.session_id);
             let Some(live) = paint.live.as_ref() else {
                 return;
@@ -10624,11 +13032,18 @@ impl App {
                 return;
             }
             let request_id = self.next_paste_request_id;
-            self.next_paste_request_id = self.next_paste_request_id.wrapping_add(1).max(1);
+            let Some(next_request_id) = request_id.checked_add(1) else {
+                self.outbound_stalled = true;
+                self.outbound_hard_refusal = true;
+                self.request_redraw();
+                return;
+            };
+            self.next_paste_request_id = next_request_id;
             self.pending_paste = Some(PendingPaste {
                 request_id,
                 target_session_id,
                 target_generation: live.generation.0.clone(),
+                binding,
             });
             host.request_text(request_id);
             let _ = modes;
@@ -10656,6 +13071,9 @@ impl App {
             .pending_paste
             .take()
             .expect("matching pending paste exists");
+        if !self.shared.viewport_token_is_current(&pending.binding) {
+            return;
+        }
         if self.focused_session_id() != pending.target_session_id {
             return;
         }
@@ -10677,7 +13095,17 @@ impl App {
         let Some(payload) = encode_paste(&raw, live.bracketed_paste) else {
             return;
         };
-        self.write_to_session(&pending.target_session_id, payload);
+        // Exact-token validation and queue admission are one authority→nonblocking-queue critical
+        // section, so clear/same-id revive cannot linearize between this callback and its Write.
+        self.admit_or_retain_owner_batch_with_proof(
+            pending.binding,
+            vec![OwnerRequest::Write {
+                id: pending.target_session_id,
+                data: payload,
+            }],
+            SessionGeneration(pending.target_generation),
+            None,
+        );
     }
 
     /// Recompute the current one-pair split frame outside `draw` so the input path can resolve which
@@ -10836,6 +13264,7 @@ impl App {
         else {
             return false;
         };
+        let window_id = strip.window_id.clone();
         let child = child.to_string();
         let before = self.split_ratios.first_share(&child);
         self.split_ratios
@@ -10846,6 +13275,7 @@ impl App {
         self.clear_selection();
         emit_divider_ratio_persisted(
             self.events.as_ref(),
+            &window_id,
             child,
             first_share_to_per_mille(DEFAULT_SPLIT_RATIO),
         );
@@ -10872,6 +13302,7 @@ impl App {
         else {
             return false;
         };
+        let window_id = strip.window_id.clone();
         let Some(axis) = strip
             .tabs
             .iter()
@@ -10891,7 +13322,12 @@ impl App {
             return false;
         }
         self.clear_selection();
-        emit_divider_ratio_persisted(self.events.as_ref(), child, first_share_to_per_mille(after));
+        emit_divider_ratio_persisted(
+            self.events.as_ref(),
+            &window_id,
+            child,
+            first_share_to_per_mille(after),
+        );
         self.schedule_resize();
         self.request_redraw();
         true
@@ -11165,8 +13601,11 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
-        if let Some(tx) = self.events.as_ref() {
-            let _ = tx.send(RendererEvent::PaneRectsResized { rects });
+        if let (Some(tx), Some(strip)) = (self.events.as_ref(), self.tab_strip_source.as_ref()) {
+            let _ = tx.send(RendererEvent::PaneRectsResized {
+                window_id: strip.window_id.clone(),
+                rects,
+            });
         }
         true
     }
@@ -11217,6 +13656,7 @@ impl App {
             return;
         };
         let _ = tx.send(RendererEvent::PaneFocused {
+            window_id: strip.window_id.clone(),
             tab_id: tab_id.to_string(),
         });
     }
@@ -11309,11 +13749,17 @@ impl App {
     }
 
     fn clear_chrome_drag_state(&mut self) -> bool {
-        let had_drag = self.react_chrome_resize_drag.take().is_some()
-            || self.divider_drag.take().is_some()
-            || self.rect_divider_drag.take().is_some()
-            || self.pane_drag.take().is_some()
-            || self.stashed_pane_drag.take().is_some();
+        // `||` directly between `.take()` calls would short-circuit after the first true value and
+        // leave the other gesture owners armed. Take every owner eagerly, then combine the booleans.
+        let had_react_resize = self.react_chrome_resize_drag.take().is_some();
+        let had_divider = self.divider_drag.take().is_some();
+        let had_rect_divider = self.rect_divider_drag.take().is_some();
+        let had_pane = self.pane_drag.take().is_some();
+        let had_stashed_pane = self.stashed_pane_drag.take().is_some();
+        let had_drag =
+            had_react_resize || had_divider || had_rect_divider || had_pane || had_stashed_pane;
+        self.hovered_terminal_link = None;
+        self.terminal_link_click_in_progress = false;
         self.mouse_held = None;
         self.last_reported_cell = None;
         self.reset_cursor_icon();
@@ -11330,7 +13776,15 @@ impl App {
         if let Some(drag) = self.divider_drag.take() {
             let ratio_per_mille =
                 first_share_to_per_mille(self.split_ratios.first_share(&drag.child_tab_id));
-            emit_divider_ratio_persisted(self.events.as_ref(), drag.child_tab_id, ratio_per_mille);
+            emit_divider_ratio_persisted(
+                self.events.as_ref(),
+                self.tab_strip_source
+                    .as_ref()
+                    .map(|strip| strip.window_id.as_str())
+                    .unwrap_or_default(),
+                drag.child_tab_id,
+                ratio_per_mille,
+            );
             self.reset_cursor_icon();
             self.request_redraw();
             return true;
@@ -11345,6 +13799,10 @@ impl App {
             return true;
         }
         if let Some(drag) = self.pane_drag.take() {
+            let projection_window_id = self
+                .tab_strip_source
+                .as_ref()
+                .map(|strip| strip.window_id.clone());
             if let (Some(layout), Some(cell)) = (
                 self.current_split_layout(),
                 self.hit_test_window_grid(self.cursor_px),
@@ -11354,16 +13812,20 @@ impl App {
                 {
                     match pane_drop_zone_in_region(target.region, cell.col, cell.row) {
                         PaneDropZone::Center => {
-                            emit_pane_swap_requested(
-                                self.events.as_ref(),
-                                &drag.source_tab_id,
-                                &target.tab_id,
-                            );
+                            if let Some(window_id) = projection_window_id.as_deref() {
+                                emit_pane_swap_requested(
+                                    self.events.as_ref(),
+                                    window_id,
+                                    &drag.source_tab_id,
+                                    &target.tab_id,
+                                );
+                            }
                         }
                         zone => {
                             if let Some(edge) = zone.dock_edge() {
                                 emit_pane_edge_dock_requested(
                                     self.events.as_ref(),
+                                    projection_window_id.as_deref().unwrap_or_default(),
                                     &drag.source_tab_id,
                                     &target.tab_id,
                                     edge,
@@ -12256,6 +14718,10 @@ impl App {
     /// Record the window's current geometry; the coalescer decides whether to send
     /// now (latest-wins, throttled) or hold it for a trailing flush.
     fn schedule_resize(&mut self) {
+        if !self.viewport_is_bound() || self.mutation_read_only {
+            self.resize = ResizeCoalescer::default();
+            return;
+        }
         let Some(dims) = self.window_dims() else {
             return;
         };
@@ -12263,23 +14729,39 @@ impl App {
             .resize
             .record(dims, Instant::now(), RESIZE_MIN_INTERVAL)
         {
-            self.send_resize(d);
+            if !self.send_resize(d) {
+                self.resize.request_not_admitted(d);
+            }
         }
     }
 
     /// Flush any geometry held back during a burst so the daemon ends at the true
     /// settled size. Called from the idle path.
     fn flush_resize_if_due(&mut self) {
+        if !self.viewport_is_bound() || self.mutation_read_only {
+            self.resize = ResizeCoalescer::default();
+            return;
+        }
         if let Some(d) = self.resize.flush(Instant::now(), RESIZE_MIN_INTERVAL) {
-            self.send_resize(d);
+            if !self.send_resize(d) {
+                self.resize.request_not_admitted(d);
+            }
         }
     }
 
     fn schedule_resize_refit(&mut self) {
+        if !self.viewport_is_bound() {
+            self.pending_resize_refit_at = None;
+            return;
+        }
         self.pending_resize_refit_at = Some(Instant::now() + RESIZE_REFIT_SETTLE_INTERVAL);
     }
 
     fn flush_resize_refit_if_due(&mut self) -> bool {
+        if !self.viewport_is_bound() {
+            self.pending_resize_refit_at = None;
+            return false;
+        }
         let Some(due_at) = self.pending_resize_refit_at else {
             return false;
         };
@@ -12296,10 +14778,13 @@ impl App {
             self.send_resize_refit_nudge(self.session_id.clone(), primary_dims);
         } else if let Some(dims) = self.primary_pane_dims {
             self.send_resize_refit_nudge(self.session_id.clone(), dims);
-        } else {
-            self.shared.send_request(&ClientRequest::Snapshot {
-                id: self.session_id.clone(),
-            });
+        } else if let Some(binding) = self.shared.binding_token_for_session(&self.session_id) {
+            self.admit_or_retain_owner_batch(
+                binding,
+                vec![OwnerRequest::Snapshot {
+                    id: self.session_id.clone(),
+                }],
+            );
         }
         for (id, dims) in self.pane_cache_dims.clone() {
             self.send_resize_refit_nudge(id, dims);
@@ -12321,6 +14806,8 @@ impl App {
     // `about_to_wait` body untouched.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn flush_deferred_and_next_deadline(&mut self) -> Option<Instant> {
+        // GTK supplies one complete URI list; the owner-loop tail is its deterministic batch boundary.
+        self.flush_pending_file_drop();
         self.flush_resize_if_due();
         self.flush_resize_refit_if_due();
         if self.resize.has_pending() {
@@ -12331,7 +14818,10 @@ impl App {
         self.pending_resize_refit_at
     }
 
-    fn send_resize_refit_nudge(&self, id: String, dims: (u16, u16)) {
+    fn send_resize_refit_nudge(&mut self, id: String, dims: (u16, u16)) {
+        if !self.viewport_is_bound() || self.mutation_read_only {
+            return;
+        }
         // Only skip when a negotiated optional extension currently owns THIS pane's viewport.
         if self.external_winsize_sessions.contains(&id) {
             return;
@@ -12339,20 +14829,28 @@ impl App {
         self.send_resize_refit_nudge_unchecked(id, dims);
     }
 
-    fn send_resize_refit_nudge_unchecked(&self, id: String, dims: (u16, u16)) {
+    fn send_resize_refit_nudge_unchecked(&mut self, id: String, dims: (u16, u16)) {
+        if !self.viewport_is_bound() || self.mutation_read_only {
+            return;
+        }
+        let Some(binding) = self.shared.binding_token_for_session(&id) else {
+            return;
+        };
+        let mut requests = Vec::with_capacity(3);
         if let Some(nudged) = resize_refit_nudge_dims(dims) {
-            self.shared.send_request(&ClientRequest::Resize {
+            requests.push(OwnerRequest::Resize {
                 id: id.clone(),
                 cols: nudged.0,
                 rows: nudged.1,
             });
         }
-        self.shared.send_request(&ClientRequest::Resize {
+        requests.push(OwnerRequest::Resize {
             id: id.clone(),
             cols: dims.0,
             rows: dims.1,
         });
-        self.shared.send_request(&ClientRequest::Snapshot { id });
+        requests.push(OwnerRequest::Snapshot { id });
+        self.admit_or_retain_owner_batch(binding, requests);
     }
 
     /// Send the active session's resize. The coalescer keys on the full WINDOW geometry (so a window
@@ -12360,9 +14858,12 @@ impl App {
     /// pane region when a split frame exists — `active_resize_dims` maps the window dims to the active
     /// pane size, or passes them through unchanged when unsplit (byte-identical single-pane path). The
     /// sibling session is resized separately in `sync_sibling_session`.
-    fn send_resize(&mut self, window_dims: (u16, u16)) {
-        if self.external_winsize_sessions.contains(&self.session_id) {
-            return;
+    fn send_resize(&mut self, window_dims: (u16, u16)) -> bool {
+        if !self.viewport_is_bound()
+            || self.mutation_read_only
+            || self.external_winsize_sessions.contains(&self.session_id)
+        {
+            return false;
         }
         // The primary PTY (`self.session_id`) is sized to its own pane region, not the
         // layout-ACTIVE region. After a split `self.session_id` is the SOURCE while the active pane is
@@ -12371,7 +14872,6 @@ impl App {
         // primary's own region from the layout; fall back to the active-frame dims when the primary is
         // not found, and to the full window when unsplit (byte-identical single-pane path).
         let (cols, rows) = self.primary_resize_dims(window_dims);
-        self.primary_pane_dims = Some((cols, rows));
         #[cfg(target_os = "linux")]
         if std::env::var("HYDRA_LINUX_GEOMETRY_TRACE").as_deref() == Ok("1") {
             eprintln!(
@@ -12379,25 +14879,51 @@ impl App {
                 self.session_id
             );
         }
-        self.shared.send_request(&ClientRequest::Resize {
-            id: self.session_id.clone(),
-            cols,
-            rows,
-        });
+        let Some(binding) = self.shared.binding_token_for_session(&self.session_id) else {
+            return false;
+        };
+        self.admit_or_retain_owner_batch(
+            binding,
+            vec![OwnerRequest::Resize {
+                id: self.session_id.clone(),
+                cols,
+                rows,
+            }],
+        )
+        .accepted()
     }
 
     /// The dims the PRIMARY session (`self.session_id`) should be resized to: its own region in the
     /// current split layout, or the whole window when unsplit. Mirrors `sync_pane_cache`'s per-region
     /// sizing of the OTHER panes so every visible pane is sized to the region it paints into.
     fn primary_resize_dims(&self, window_dims: (u16, u16)) -> (u16, u16) {
-        if let (Some((cols, rows)), Some(strip)) =
-            (self.split_frame_dims(), self.tab_strip_source.as_ref())
-        {
+        self.primary_resize_dims_for(&self.session_id, window_dims)
+    }
+
+    fn primary_resize_dims_for(
+        &self,
+        primary_session_id: &str,
+        window_dims: (u16, u16),
+    ) -> (u16, u16) {
+        self.primary_resize_dims_for_strip(
+            primary_session_id,
+            window_dims,
+            self.tab_strip_source.as_ref(),
+        )
+    }
+
+    fn primary_resize_dims_for_strip(
+        &self,
+        primary_session_id: &str,
+        window_dims: (u16, u16),
+        strip: Option<&RendererTabStrip>,
+    ) -> (u16, u16) {
+        if let (Some((cols, rows)), Some(strip)) = (Some(window_dims), strip) {
             if let Some(layout) = compute_split_layout_with(strip, cols, rows, &self.split_ratios) {
                 if let Some(region) = layout
                     .panes
                     .iter()
-                    .find(|p| p.session_id == self.session_id)
+                    .find(|p| p.session_id == primary_session_id)
                     .map(|p| p.region)
                 {
                     // Reserve header rows only for a REAL split. A one-pane layout draws no header, so
@@ -12407,8 +14933,72 @@ impl App {
                 }
             }
         }
-        // No split (or primary not in the layout): full window — the unsplit path is unchanged.
-        active_resize_dims(window_dims, self.current_split_frame().as_ref())
+        // No supplied split (or primary not in it) means the DESIRED topology is full-window.
+        // Never consult the current/old strip here: SetTabStrip(None) removes that split geometry.
+        window_dims
+    }
+
+    fn desired_viewport_binding(
+        &self,
+        pending: &PendingActiveAttach,
+    ) -> Option<DesiredViewportBinding> {
+        let exact = pending.exact_viewport.as_ref()?;
+        if exact.primary().session_id() != pending.session_id {
+            return None;
+        }
+        let strip = pending.tab_strip_source.as_ref();
+        match strip {
+            Some(strip) if !exact.matches_projection(strip) => return None,
+            None if exact.roles.len() != 1 => return None,
+            _ => {}
+        }
+        let primary_dims = pending
+            .window_dims
+            .filter(|_| !self.external_winsize_sessions.contains(&pending.session_id))
+            .map(|dims| self.primary_resize_dims_for_strip(&pending.session_id, dims, strip));
+        let mut dims_by_session = BTreeMap::new();
+        if let Some(strip) = strip {
+            // Topology exists before the first native Resized event. Use generous synthetic geometry
+            // only to enumerate the active split set; actual Resize frames remain absent until real
+            // window dimensions arrive.
+            let (layout_cols, layout_rows) = pending.window_dims.unwrap_or((1000, 1000));
+            if let Some(layout) =
+                compute_split_layout_with(strip, layout_cols, layout_rows, &pending.split_ratios)
+            {
+                let pane_count = layout.panes.len();
+                if pane_count >= 2 {
+                    for pane in layout.panes {
+                        if pane.session_id == pending.session_id {
+                            continue;
+                        }
+                        let dims = pending.window_dims.and_then(|_| {
+                            let content = pane_content_region_for_layout(pane.region, pane_count);
+                            (!self.external_winsize_sessions.contains(&pane.session_id))
+                                .then_some((content.cols, content.rows))
+                        });
+                        dims_by_session.insert(pane.session_id, dims);
+                    }
+                }
+            }
+        }
+        let mut panes = exact
+            .targets()
+            .filter(|target| target.session_id() != exact.primary().session_id())
+            .map(|target| DesiredPaneBinding {
+                session_id: target.session_id().to_string(),
+                expected_generation: SessionGeneration(target.generation().to_string()),
+                dims: dims_by_session.get(target.session_id()).copied().flatten(),
+            })
+            .collect::<Vec<_>>();
+        panes.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        Some(DesiredViewportBinding {
+            primary_session_id: pending.session_id.clone(),
+            primary_expected_generation: SessionGeneration(
+                exact.primary().generation().to_string(),
+            ),
+            primary_dims,
+            panes,
+        })
     }
 
     /// Rebind the single renderer to `new_id` (the future tab-switch primitive). This
@@ -12483,7 +15073,10 @@ impl App {
     /// pane whose grid lives in `shared.grid` rather than the stores map. Idempotent: a no-change region
     /// sends nothing, so it does not spam Resize on every draw.
     fn sync_primary_resize(&mut self) {
-        if self.external_winsize_sessions.contains(&self.session_id) {
+        if !self.viewport_is_bound()
+            || self.mutation_read_only
+            || self.external_winsize_sessions.contains(&self.session_id)
+        {
             return;
         }
         let Some(window_dims) = self.split_frame_dims() else {
@@ -12499,141 +15092,78 @@ impl App {
                 self.session_id, window_dims, dims, self.primary_pane_dims,
             );
         }
-        self.primary_pane_dims = Some(dims);
-        self.shared.send_request(&ClientRequest::Resize {
-            id: self.session_id.clone(),
-            cols: dims.0,
-            rows: dims.1,
-        });
-    }
-
-    /// Whether `id` still owns a renderer role outside the non-primary pane cache. The daemon has
-    /// one forwarder per `(client, session_id)`, not one per renderer role, so dropping a stale
-    /// `Pane` role must never emit `Detach` after that same id has become the primary or sibling.
-    fn pane_cache_detach_would_drop_live_role(&self, id: &str) -> bool {
-        id == self.session_id || self.sibling_id.as_deref() == Some(id)
+        let Some(binding) = self.shared.binding_token_for_session(&self.session_id) else {
+            return;
+        };
+        self.admit_or_retain_owner_batch(
+            binding,
+            vec![OwnerRequest::Resize {
+                id: self.session_id.clone(),
+                cols: dims.0,
+                rows: dims.1,
+            }],
+        );
     }
 
     fn sync_pane_cache(&mut self) {
-        // The extra non-primary panes (id -> region dims), excluding only the primary storage pane and
-        // the pane the sibling path already owns. The renderer now paints every visible pane through
-        // `current_pane_paints`, so an active split child that is not `self.session_id` still needs a
-        // cache entry; filtering by `pane.active` leaves that pane pending/blank and breaks focus.
-        let mut wanted: Vec<(String, (u16, u16))> = Vec::new();
-        if let (Some((cols, rows)), Some(strip)) =
-            (self.split_frame_dims(), self.tab_strip_source.as_ref())
-        {
-            // While a NON-active pane is zoomed it fills the whole window, so it must be cached at the
-            // FULL window size, not its split-region size — through this same Attach/Resize path. The
-            // active-pane zoom case resolves to `None` and leaves region sizing unchanged.
-            let zoom_full_window =
-                zoom_paint_session(self.zoomed_pane_session.as_deref(), &self.session_id);
-            if let Some(layout) = compute_split_layout_with(strip, cols, rows, &self.split_ratios) {
-                // A one-pane strip has no secondary renderer role. This guard is load-bearing for
-                // attach-first product transitions (React split and stash/revive): while
-                // `AttachSession(new)` is in flight, the renderer can still hold the OLD one-pane
-                // strip. Treating that sole old session as a cache pane queues Attach(old), then the
-                // active-switch plan queues Detach(old); `pane_cache_dims` nevertheless remembers it
-                // as attached, so the following `SetTabStrip(A|B)` emits only Resize(old) and leaves
-                // its daemon forwarder permanently closed. Wait for the real 2+-pane strip instead;
-                // it will attach every non-primary pane with its final region dimensions.
-                if layout.panes.len() >= 2 {
-                    for pane in &layout.panes {
-                        if pane.session_id == self.session_id {
-                            continue; // primary lives in `shared.grid`, not in the pane cache.
-                        }
-                        let dims = if zoom_full_window == Some(pane.session_id.as_str()) {
-                            (cols, rows)
-                        } else {
-                            // Reserve the header row: the cached pane's PTY is sized to its CONTENT
-                            // sub-region so its grid matches where it paints (below the header band).
-                            let content =
-                                pane_content_region_for_layout(pane.region, layout.panes.len());
-                            (content.cols, content.rows)
-                        };
-                        wanted.push((pane.session_id.clone(), dims));
-                    }
-                }
-            }
+        if !self.viewport_is_bound() {
+            return;
         }
-
-        // Fast path: nothing bound and nothing wanted — leave the cache (and its generation) alone.
-        if wanted.is_empty() && self.pane_cache_dims.is_empty() {
+        let Some(exact_viewport) = self.exact_viewport.clone() else {
+            return;
+        };
+        let pending = PendingActiveAttach {
+            session_id: self.session_id.clone(),
+            handoff_request_id: None,
+            viewport_request: None,
+            exact_viewport: Some(exact_viewport),
+            event_gate_epoch: self.viewport_event_gate.epoch(),
+            window_dims: self.split_frame_dims(),
+            projection_received: true,
+            tab_strip_line: self.tab_strip_line.clone(),
+            tab_strip_source: self.tab_strip_source.clone(),
+            split_ratios: self.split_ratios.clone(),
+        };
+        let Some(desired) = self.desired_viewport_binding(&pending) else {
+            self.shared.abort_connection();
+            self.connection_closed();
+            return;
+        };
+        let desired_sessions: std::collections::BTreeSet<String> =
+            std::iter::once(desired.primary_session_id.clone())
+                .chain(desired.panes.iter().map(|pane| pane.session_id.clone()))
+                .collect();
+        if desired_sessions != self.attached_sessions {
+            // Display-only refreshes never authorize membership. Any divergence from the immutable
+            // exact viewport is a local integrity failure, not an excuse for an id-only rebind.
+            self.shared.abort_connection();
+            self.connection_closed();
             return;
         }
 
-        // Teardown: the layout collapsed back to two-or-fewer panes — detach every bound extra pane
-        // and clear the cache in one shot (the reader drops all per-pane SyncStates).
-        if wanted.is_empty() {
-            for id in self.pane_cache_dims.keys() {
-                if !self.pane_cache_detach_would_drop_live_role(id) {
-                    self.shared
-                        .send_request(&ClientRequest::Detach { id: id.clone() });
-                }
+        // Existing roles need only exact-token Resize transactions. Unknown geometry at initial
+        // attach is filled here on the first real native size; mirrors advance only after admission.
+        for pane in desired.panes {
+            let Some((cols, rows)) = pane.dims else {
+                continue;
+            };
+            if self.pane_cache_dims.get(&pane.session_id) == Some(&(cols, rows)) {
+                continue;
             }
-            self.pane_cache_dims.clear();
-            self.shared.clear_pane_sessions();
-            return;
-        }
-
-        // Reconcile membership FIRST so the reader's generation/epoch gate is live before any frame
-        // a fresh Attach triggers can arrive.
-        let ids: Vec<&str> = wanted.iter().map(|(id, _)| id.as_str()).collect();
-        self.shared.set_pane_sessions(&ids);
-
-        // Detach panes that left the layout.
-        let gone: Vec<String> = self
-            .pane_cache_dims
-            .keys()
-            .filter(|id| !wanted.iter().any(|(w, _)| w == *id))
-            .cloned()
-            .collect();
-        for id in &gone {
-            if !self.pane_cache_detach_would_drop_live_role(id) {
-                self.shared
-                    .send_request(&ClientRequest::Detach { id: id.clone() });
+            if self.mutation_read_only {
+                continue;
             }
-            self.pane_cache_dims.remove(id);
-        }
-
-        // Attach new panes and resize any whose region changed. Suppression is per session —
-        // only the pane(s) the REMOTE owns skip the local Resize; every other pane resizes to its region.
-        let remote_owned = &self.external_winsize_sessions;
-        for (id, dims) in &wanted {
-            let suppress_resize = remote_owned.contains(id);
-            match self.pane_cache_dims.get(id) {
-                Some(prev) if prev == dims => {} // unchanged — no request.
-                Some(_) => {
-                    if !suppress_resize {
-                        self.shared.send_request(&ClientRequest::Resize {
-                            id: id.clone(),
-                            cols: dims.0,
-                            rows: dims.1,
-                        });
-                    }
-                }
-                None => {
-                    // Subscribe first so a SIGWINCH-triggered bell/title/OSC notification cannot
-                    // fall into a pre-attachment gap. Attach's first baseline may still carry the
-                    // retained session's old geometry, so a locally-owned binding follows with
-                    // Resize + Snapshot: resize advances the grid revision and the deterministic
-                    // second baseline paints the pane-local size even when the shell is idle.
-                    self.shared.send_request(&ClientRequest::Attach {
-                        id: id.clone(),
-                        want_raw_output: false,
-                    });
-                    if !suppress_resize {
-                        self.shared.send_request(&ClientRequest::Resize {
-                            id: id.clone(),
-                            cols: dims.0,
-                            rows: dims.1,
-                        });
-                        self.shared
-                            .send_request(&ClientRequest::Snapshot { id: id.clone() });
-                    }
-                }
-            }
-            self.pane_cache_dims.insert(id.clone(), *dims);
+            let Some(binding) = self.shared.binding_token_for_session(&pane.session_id) else {
+                continue;
+            };
+            self.admit_or_retain_owner_batch(
+                binding,
+                vec![OwnerRequest::Resize {
+                    id: pane.session_id,
+                    cols,
+                    rows,
+                }],
+            );
         }
     }
 
@@ -12769,76 +15299,1196 @@ impl App {
         (panes, dividers)
     }
 
+    /// Enter the no-owner viewport state at one local linearization point. This path remains
+    /// nonblocking under daemon backpressure: it first revokes Shared authority and clears every
+    /// renderer/UI projection, then makes a separate fail-fast Detach-only cleanup attempt. While
+    /// neutral, no Write/Resize/Snapshot/Attach is admissible; a refused Detach set stays retained for
+    /// OutboundWritable/redraw retry or for the cleanup prefix of the next complete bind.
+    fn emit_handoff_disposition(&self, disposition: RendererAttachmentHandoffDisposition) {
+        if let Some(events) = self.events.as_ref() {
+            if let Err(std::sync::mpsc::SendError(RendererEvent::AttachmentHandoffDisposition(
+                disposition,
+            ))) = events.send(RendererEvent::AttachmentHandoffDisposition(disposition))
+            {
+                if let Some(authority) = disposition.into_retry_authority() {
+                    std::mem::forget(authority);
+                }
+            }
+        } else if let Some(authority) = disposition.into_retry_authority() {
+            std::mem::forget(authority);
+        }
+    }
+
+    fn emit_exact_viewport_disposition(
+        &self,
+        request: &RendererExactViewportRequest,
+        outcome: RendererExactViewportOutcome,
+    ) {
+        let daemon_instance_id = (outcome == RendererExactViewportOutcome::Published)
+            .then(|| self.shared.operational_daemon_instance())
+            .flatten();
+        request.settle(outcome, daemon_instance_id);
+    }
+
+    fn settle_pending_ordinary_viewport_unavailable(&self) {
+        // App may clear its own pending gate as soon as it observes this disposition. Close native
+        // and WebView intent publication before that event can cross the process boundary.
+        self.viewport_event_gate.neutralize();
+        let pending = self
+            .pending_handoff_projection
+            .as_ref()
+            .or(self.pending_active_attach.as_ref());
+        if let Some(request) = pending.and_then(|pending| pending.viewport_request.as_ref()) {
+            self.emit_exact_viewport_disposition(
+                request,
+                RendererExactViewportOutcome::Unavailable,
+            );
+        }
+    }
+
+    fn unresolved_handoff_disposition(
+        guard: &RuntimeAttachmentHandoffCancelGuard,
+    ) -> RendererAttachmentHandoffDisposition {
+        if let Some(disposition) =
+            claimed_viewport_unavailable_disposition(&guard.handoff, guard.claim_binding.as_ref())
+        {
+            return disposition;
+        }
+        let claim_possibly_applied = guard.handoff.authority().claim_status()
+            == maestro_shell::daemon_client::AttachmentHandoffClaimStatus::PossiblyApplied;
+        RendererAttachmentHandoffDisposition {
+            request_id: guard.request_id(),
+            session_id: guard.session_id().to_string(),
+            outcome: if claim_possibly_applied {
+                RendererAttachmentHandoffOutcome::ClaimPossiblyApplied
+            } else {
+                RendererAttachmentHandoffOutcome::CancellationUnresolvedBeforeClaimAdmission
+            },
+            daemon_instance_id: None,
+            generation: None,
+            retry_authority: Some(guard.handoff.authority().clone()),
+        }
+    }
+
+    fn start_pending_attachment_handoff_cancels(&mut self) {
+        let Some(owner_sender) = self.handoff_event_sender.as_ref() else {
+            return;
+        };
+        let mut spawn_failures = Vec::new();
+        let mut failed_request_ids = Vec::new();
+        for guard in &mut self.pending_attachment_handoff_cancels {
+            if guard.cancel_in_flight {
+                continue;
+            }
+            guard.cancel_in_flight = true;
+            let request_id = guard.request_id();
+            let handoff = guard.handoff.clone();
+            let claim_binding = guard.claim_binding.clone();
+            let authority = guard.handoff.authority().clone();
+            let sender = owner_sender.clone_sender();
+            let external_events = self.events.clone_sink();
+            if std::thread::Builder::new()
+                .name("renderer-handoff-cancel".to_string())
+                .spawn(move || {
+                    let (cancelled, claim_status) = match authority.cancel() {
+                        Ok(claim_status) => (true, claim_status),
+                        Err(error) => (false, error.claim_status()),
+                    };
+                    let completion = UserEvent::AttachmentHandoffCancellationFinished {
+                        request_id,
+                        authority,
+                        claim_status,
+                        cancelled,
+                    };
+                    if let Err(UserEvent::AttachmentHandoffCancellationFinished {
+                        request_id,
+                        authority,
+                        claim_status,
+                        cancelled,
+                    }) = sender.send(completion)
+                    {
+                        if let Some(disposition) = claimed_viewport_unavailable_disposition(
+                            &handoff,
+                            claim_binding.as_ref(),
+                        ) {
+                            handoff.mark_settled();
+                            if let Some(events) = external_events.as_ref() {
+                                let _ = events.send(RendererEvent::AttachmentHandoffDisposition(
+                                    disposition,
+                                ));
+                            }
+                            return;
+                        }
+                        let claim_possibly_applied = claim_status
+                            == maestro_shell::daemon_client::AttachmentHandoffClaimStatus::PossiblyApplied;
+                        let disposition = RendererAttachmentHandoffDisposition {
+                            request_id,
+                            session_id: authority.session_id().to_string(),
+                            outcome: if claim_possibly_applied {
+                                RendererAttachmentHandoffOutcome::ClaimPossiblyApplied
+                            } else if cancelled {
+                                RendererAttachmentHandoffOutcome::CancelledBeforeClaimAdmission
+                            } else {
+                                RendererAttachmentHandoffOutcome::CancellationUnresolvedBeforeClaimAdmission
+                            },
+                            daemon_instance_id: None,
+                            generation: None,
+                            retry_authority: (!cancelled).then_some(authority.clone()),
+                        };
+                        if external_events
+                            .as_ref()
+                            .is_none_or(|events| {
+                                events
+                                    .send(RendererEvent::AttachmentHandoffDisposition(disposition))
+                                    .is_err()
+                            })
+                            && !cancelled
+                        {
+                            // The loop and public receiver are both gone. Retain the only exact
+                            // retry connection rather than silently dropping unresolved authority.
+                            std::mem::forget(authority);
+                        }
+                    }
+                })
+                .is_err()
+            {
+                guard.cancel_in_flight = false;
+                guard.handoff.mark_settled();
+                failed_request_ids.push(guard.request_id());
+                spawn_failures.push(Self::unresolved_handoff_disposition(guard));
+            }
+        }
+        self.pending_attachment_handoff_cancels
+            .retain(|guard| !failed_request_ids.contains(&guard.request_id()));
+        for disposition in spawn_failures {
+            self.emit_handoff_disposition(disposition);
+        }
+    }
+
+    fn retain_or_cancel_attachment_handoff(&mut self, guard: RuntimeAttachmentHandoffCancelGuard) {
+        self.pending_attachment_handoff_cancels.push(guard);
+        self.start_pending_attachment_handoff_cancels();
+    }
+
+    fn queue_runtime_attachment_handoff_for_cancel(&mut self) {
+        if let Some(guard) = self.runtime_attachment_handoff.take() {
+            self.pending_handoff_projection = None;
+            self.pending_attachment_handoff_cancels.push(guard);
+        }
+    }
+
+    fn retire_runtime_attachment_handoff(&mut self) {
+        self.queue_runtime_attachment_handoff_for_cancel();
+        self.start_pending_attachment_handoff_cancels();
+    }
+
+    fn cancel_all_attachment_handoffs_in_background(&mut self) {
+        self.queue_runtime_attachment_handoff_for_cancel();
+        self.start_pending_attachment_handoff_cancels();
+    }
+
+    fn retry_pending_attachment_handoff_cancels(&mut self) {
+        self.start_pending_attachment_handoff_cancels();
+    }
+
+    fn settle_pending_exact_viewport(&mut self, operationally_available: bool) {
+        let Some(status) = self
+            .pending_viewport_binding
+            .as_ref()
+            .map(client::ViewportBindingSet::status)
+        else {
+            return;
+        };
+        if operationally_available && status == client::ExactViewportAdmissionStatus::Pending {
+            return;
+        }
+        if !(operationally_available && status == client::ExactViewportAdmissionStatus::Complete) {
+            self.viewport_event_gate.neutralize();
+        }
+
+        if self.runtime_attachment_handoff.is_none() {
+            if operationally_available && status == client::ExactViewportAdmissionStatus::Complete {
+                self.commit_proven_handoff_projection();
+                return;
+            }
+            self.settle_pending_ordinary_viewport_unavailable();
+            self.pending_handoff_projection = None;
+            self.pending_viewport_binding = None;
+            self.pending_active_attach = None;
+            self.retain_attached_sessions_for_cleanup();
+            self.shared.abort_connection();
+            self.clear_viewport_projections();
+            self.connection_alive = false;
+            return;
+        }
+
+        let proof = self
+            .runtime_attachment_handoff
+            .as_mut()
+            .map_or(RuntimeAttachmentHandoffProof::Pending, |guard| {
+                guard.claim_if_exact_grid_proven(&self.shared, operationally_available)
+            });
+        match proof {
+            RuntimeAttachmentHandoffProof::Pending => {}
+            RuntimeAttachmentHandoffProof::Proven(mut disposition) => {
+                if !self.commit_proven_handoff_projection() {
+                    disposition.outcome =
+                        RendererAttachmentHandoffOutcome::ClaimedViewportUnavailable;
+                }
+                self.runtime_attachment_handoff = None;
+                self.emit_handoff_disposition(disposition);
+            }
+            RuntimeAttachmentHandoffProof::ClaimedViewportUnavailable(disposition) => {
+                self.pending_handoff_projection = None;
+                self.pending_viewport_binding = None;
+                self.pending_active_attach = None;
+                self.retain_attached_sessions_for_cleanup();
+                self.shared.abort_connection();
+                self.clear_viewport_projections();
+                self.connection_alive = false;
+                self.runtime_attachment_handoff = None;
+                self.emit_handoff_disposition(disposition);
+            }
+            RuntimeAttachmentHandoffProof::Contradicted => {
+                self.pending_handoff_projection = None;
+                self.pending_viewport_binding = None;
+                self.pending_active_attach = None;
+                self.retain_attached_sessions_for_cleanup();
+                self.shared.abort_connection();
+                self.clear_viewport_projections();
+                self.connection_alive = false;
+                self.queue_runtime_attachment_handoff_for_cancel();
+                self.start_pending_attachment_handoff_cancels();
+            }
+        }
+    }
+
+    /// Finalize a pending exact viewport only after local projection authority has been revoked and
+    /// either its Detach cleanup entered the operational FIFO or the transport was closed. A sticky
+    /// primary Grid always wins over a racing Cancel/EOF and therefore yields the forward-only
+    /// `ClaimedViewportUnavailable` disposition instead of a cancellation classification.
+    fn settle_neutralized_exact_viewport(&mut self) {
+        self.viewport_event_gate.neutralize();
+        self.settle_pending_ordinary_viewport_unavailable();
+        self.pending_handoff_projection = None;
+        self.pending_viewport_binding = None;
+        self.pending_active_attach = None;
+
+        let Some(guard) = self.runtime_attachment_handoff.take() else {
+            return;
+        };
+        // The App-global pending receipt can belong to a superseded request while a replacement
+        // guard is still pre-admission. Classify only from the receipt stored on this exact guard;
+        // a foreign old proof must never settle or discard a new authority.
+        match guard
+            .claim_binding
+            .as_ref()
+            .map(client::ViewportBindingSet::status)
+        {
+            Some(
+                client::ExactViewportAdmissionStatus::Complete
+                | client::ExactViewportAdmissionStatus::FailedAfterPrimaryProof,
+            ) => {
+                guard.handoff.mark_settled();
+                if let Some(disposition) = claimed_viewport_unavailable_disposition(
+                    &guard.handoff,
+                    guard.claim_binding.as_ref(),
+                ) {
+                    self.emit_handoff_disposition(disposition);
+                }
+            }
+            Some(
+                client::ExactViewportAdmissionStatus::Pending
+                | client::ExactViewportAdmissionStatus::FailedBeforePrimaryProof,
+            )
+            | None => {
+                self.pending_attachment_handoff_cancels.push(guard);
+            }
+        }
+    }
+
+    fn finish_attachment_handoff_cancellation(
+        &mut self,
+        request_id: RendererAttachmentHandoffRequestId,
+        authority: maestro_shell::AttachmentHandoffAuthority,
+        claim_status: maestro_shell::daemon_client::AttachmentHandoffClaimStatus,
+        cancelled: bool,
+    ) {
+        let claim_possibly_applied = claim_status
+            == maestro_shell::daemon_client::AttachmentHandoffClaimStatus::PossiblyApplied;
+        let Some(index) = self
+            .pending_attachment_handoff_cancels
+            .iter()
+            .position(|guard| {
+                guard.request_id() == request_id && guard.handoff.authority() == &authority
+            })
+        else {
+            // The correlated guard was already terminally settled. A late worker completion is an
+            // idempotent no-op; emitting here would create a second final disposition.
+            return;
+        };
+        if let Some(disposition) = claimed_viewport_unavailable_disposition(
+            &self.pending_attachment_handoff_cancels[index].handoff,
+            self.pending_attachment_handoff_cancels[index]
+                .claim_binding
+                .as_ref(),
+        ) {
+            let guard = self.pending_attachment_handoff_cancels.remove(index);
+            guard.handoff.mark_settled();
+            self.emit_handoff_disposition(disposition);
+            if self.pending_attachment_handoff_cancels.is_empty() {
+                self.try_admit_pending_active_attach();
+            }
+            return;
+        }
+        if cancelled {
+            let guard = self.pending_attachment_handoff_cancels.remove(index);
+            guard.handoff.mark_settled();
+            self.emit_handoff_disposition(RendererAttachmentHandoffDisposition {
+                request_id,
+                session_id: guard.session_id().to_string(),
+                outcome: if claim_possibly_applied {
+                    RendererAttachmentHandoffOutcome::ClaimPossiblyApplied
+                } else {
+                    RendererAttachmentHandoffOutcome::CancelledBeforeClaimAdmission
+                },
+                daemon_instance_id: None,
+                generation: None,
+                retry_authority: None,
+            });
+            // An exact old cancellation must resolve before a staged replacement Claim can enter
+            // the operational writer FIFO.
+            if self.pending_attachment_handoff_cancels.is_empty() {
+                self.try_admit_pending_active_attach();
+            }
+        } else {
+            // Finalize this renderer request exactly once and transfer retry ownership to App.
+            // A later retry must use that returned authority under a new correlated request.
+            let guard = self.pending_attachment_handoff_cancels.remove(index);
+            guard.handoff.mark_settled();
+            let disposition = Self::unresolved_handoff_disposition(&guard);
+            self.emit_handoff_disposition(disposition);
+            if self.pending_attachment_handoff_cancels.is_empty() {
+                self.try_admit_pending_active_attach();
+            }
+        }
+    }
+
+    fn clear_viewport(&mut self) {
+        // This is the owner-receipt linearization point. No terminal disposition or cleanup fact
+        // may reach App while stale native/WebView intents are still publishable.
+        self.viewport_event_gate.neutralize();
+        self.retain_attached_sessions_for_cleanup();
+        self.settle_pending_ordinary_viewport_unavailable();
+        self.pending_active_attach = None;
+        self.shared.clear_viewport();
+        self.clear_viewport_projections();
+        // Local pixels/input are already neutral above. Daemon forwarder teardown is a separate
+        // all-or-none, fail-fast transaction whose tombstone survives backpressure.
+        self.try_admit_pending_detach_cleanup();
+        if self.pending_detach_sessions.is_empty() || !self.connection_alive {
+            self.settle_neutralized_exact_viewport();
+        }
+        self.start_pending_attachment_handoff_cancels();
+    }
+
+    fn retain_attached_sessions_for_cleanup(&mut self) {
+        // `attached_sessions` is the sole admitted-forwarder inventory. Never reconstruct it from
+        // stale App mirrors after a Detach-only batch has already been admitted: doing so would put
+        // an id-only Detach behind that cleanup and potentially cut a later same-id revival.
+        self.pending_detach_sessions.extend(
+            self.attached_sessions
+                .iter()
+                .filter(|id| !id.is_empty())
+                .cloned(),
+        );
+        self.attached_sessions.clear();
+    }
+
+    /// Revoke terminal authority after a transient bind-admission refusal while retaining the
+    /// desired strip off the terminal data path. The strip describes the pending target and is
+    /// needed to compute its pane geometry once capacity returns; Shared neutrality hard-gates all
+    /// paint/input/resize in the interim.
+    fn neutralize_for_pending_attach(&mut self) {
+        self.clear_viewport_projections();
+    }
+
+    fn connection_closed(&mut self) {
+        self.viewport_event_gate.neutralize();
+        self.connection_alive = false;
+        self.pending_detach_sessions.clear();
+        self.attached_sessions.clear();
+        self.pending_owner_requests.clear();
+        self.pending_owner_request_bytes = 0;
+        self.outbound_stalled = false;
+        self.outbound_hard_refusal = false;
+        self.shared.clear_viewport();
+        self.clear_viewport_projections();
+        self.settle_neutralized_exact_viewport();
+        self.start_pending_attachment_handoff_cancels();
+    }
+
+    /// Latch legacy read-only mode without revoking viewport authority. Geometry mirrors remain
+    /// unchanged because the refused mutation was never admitted; clearing resize timers prevents
+    /// draw/idle from repeatedly retrying a mutation the negotiated daemon cannot accept.
+    fn enter_mutation_read_only(&mut self) {
+        self.mutation_read_only = true;
+        self.resize = ResizeCoalescer::default();
+        self.pending_resize_refit_at = None;
+    }
+
+    fn owner_batch_framed_bytes(requests: &[ClientRequest]) -> Option<usize> {
+        requests.iter().try_fold(0usize, |total, request| {
+            let len = serde_json::to_vec(request).ok()?.len().checked_add(1)?;
+            total.checked_add(len)
+        })
+    }
+
+    fn cancel_pending_scrollback(&mut self, session_id: &str) {
+        let mut removed_bytes = 0usize;
+        self.pending_owner_requests.retain(|batch| {
+            let remove = batch.requests.len() == 1
+                && matches!(
+                    &batch.requests[0],
+                    ClientRequest::Scrollback { id, .. } if id == session_id
+                );
+            if remove {
+                removed_bytes = removed_bytes.saturating_add(batch.framed_bytes);
+            }
+            !remove
+        });
+        self.pending_owner_request_bytes = self
+            .pending_owner_request_bytes
+            .saturating_sub(removed_bytes);
+        if self.pending_owner_requests.is_empty() && !self.outbound_hard_refusal {
+            self.outbound_stalled = false;
+        }
+    }
+
+    /// Apply mirrors only after the batch has entered the writer FIFO. This keeps a refused Resize
+    /// retryable instead of teaching later draws that daemon geometry already advanced; Scrollback
+    /// likewise changes the painted view only after its exact query was admitted.
+    fn commit_admitted_owner_batch(&mut self, batch: &PendingOwnerBatch) {
+        for request in &batch.requests {
+            match request {
+                ClientRequest::Resize { id, cols, rows, .. } => {
+                    if id == &self.session_id {
+                        self.primary_pane_dims = Some((*cols, *rows));
+                    } else if let Some(dims) = self.pane_cache_dims.get_mut(id) {
+                        *dims = (*cols, *rows);
+                    } else if self.shared.binding_token_for_session(id).is_some() {
+                        self.pane_cache_dims.insert(id.clone(), (*cols, *rows));
+                    }
+                }
+                ClientRequest::Scrollback { .. } => {
+                    // Correlation is registered under the exact Shared authority before the frame
+                    // becomes writer-visible; post-enqueue registration has a fast-reply race.
+                }
+                ClientRequest::DaemonInfo
+                | ClientRequest::Attach { .. }
+                | ClientRequest::CancelAttachmentHandoff { .. }
+                | ClientRequest::Detach { .. }
+                | ClientRequest::Snapshot { .. }
+                | ClientRequest::Write { .. } => {}
+            }
+        }
+    }
+
+    fn retain_owner_batch(&mut self, batch: PendingOwnerBatch) -> bool {
+        let coalesces_last = self.pending_owner_requests.back().is_some_and(|last| {
+            if last.binding != batch.binding
+                || last.requests.len() != 1
+                || batch.requests.len() != 1
+            {
+                return false;
+            }
+            match (&last.requests[0], &batch.requests[0]) {
+                (ClientRequest::Resize { id: old, .. }, ClientRequest::Resize { id: new, .. }) => {
+                    old == new
+                }
+                (
+                    ClientRequest::Scrollback { id: old, .. },
+                    ClientRequest::Scrollback { id: new, .. },
+                ) => old == new,
+                _ => false,
+            }
+        });
+        if coalesces_last {
+            let old_bytes = self
+                .pending_owner_requests
+                .back()
+                .map(|last| last.framed_bytes)
+                .unwrap_or(0);
+            let next_bytes = self
+                .pending_owner_request_bytes
+                .saturating_sub(old_bytes)
+                .saturating_add(batch.framed_bytes);
+            if next_bytes <= OUTBOUND_CAP_BYTES {
+                self.pending_owner_request_bytes = next_bytes;
+                if let Some(last) = self.pending_owner_requests.back_mut() {
+                    *last = batch;
+                }
+                self.outbound_stalled = true;
+                return true;
+            }
+        }
+        if batch.framed_bytes > OUTBOUND_CAP_BYTES
+            || self
+                .pending_owner_request_bytes
+                .saturating_add(batch.framed_bytes)
+                > OUTBOUND_CAP_BYTES
+        {
+            // Bound local retention independently of the daemon queue. Input is refused visibly,
+            // never accumulated without limit or silently reordered around later geometry.
+            self.outbound_stalled = true;
+            self.outbound_hard_refusal = true;
+            self.request_redraw();
+            return false;
+        }
+        self.pending_owner_request_bytes += batch.framed_bytes;
+        self.pending_owner_requests.push_back(batch);
+        self.outbound_stalled = true;
+        true
+    }
+
+    /// Nonblocking owner-loop admission with exact incarnation retention. A pending suffix is kept
+    /// in arrival order and retried from OutboundWritable/redraw; a later Resize or scroll query can
+    /// never overtake an earlier Write. Terminal transport failures synchronously blank the App.
+    fn admit_or_retain_owner_batch(
+        &mut self,
+        binding: ViewportBindingToken,
+        requests: Vec<OwnerRequest>,
+    ) -> OwnerBatchAdmission {
+        let Some(expected_generation) = self.shared.live_generation_for_binding(&binding) else {
+            return OwnerBatchAdmission::Rejected;
+        };
+        self.admit_or_retain_owner_batch_with_proof(binding, requests, expected_generation, None)
+    }
+
+    /// Variant for operations (scroll and asynchronous paste) that captured their PTY generation
+    /// before returning to the owner loop. The supplied proof is retained byte-for-byte across
+    /// queue pressure and revalidated inside the authority→queue admission transaction.
+    fn admit_or_retain_owner_batch_with_proof(
+        &mut self,
+        binding: ViewportBindingToken,
+        requests: Vec<OwnerRequest>,
+        expected_generation: SessionGeneration,
+        scroll_intent: Option<ScrollRequestIntent>,
+    ) -> OwnerBatchAdmission {
+        let contains_mutation = requests.iter().any(OwnerRequest::is_mutation);
+        if !self.connection_alive
+            || self.outbound_hard_refusal
+            || (self.mutation_read_only && contains_mutation)
+            || requests.is_empty()
+            || !self.shared.viewport_token_is_current(&binding)
+        {
+            return OwnerBatchAdmission::Rejected;
+        }
+        let requests: Vec<ClientRequest> = requests
+            .into_iter()
+            .map(|request| request.bind_generation(&expected_generation))
+            .collect();
+        let Some(framed_bytes) = Self::owner_batch_framed_bytes(&requests) else {
+            self.shared.abort_connection();
+            self.connection_closed();
+            return OwnerBatchAdmission::Rejected;
+        };
+        let batch = PendingOwnerBatch {
+            binding,
+            expected_generation,
+            requests,
+            framed_bytes,
+            scroll_intent,
+        };
+        if !self.pending_owner_requests.is_empty() {
+            return if self.retain_owner_batch(batch) {
+                OwnerBatchAdmission::Retained
+            } else {
+                OwnerBatchAdmission::Rejected
+            };
+        }
+        match self.shared.send_request_batch_for_binding(
+            &batch.binding,
+            &batch.requests,
+            &batch.expected_generation,
+            batch.scroll_intent.as_ref(),
+        ) {
+            None => OwnerBatchAdmission::Rejected,
+            Some(admission) if admission.is_admitted() => {
+                self.commit_admitted_owner_batch(&batch);
+                self.outbound_stalled = false;
+                OwnerBatchAdmission::Admitted
+            }
+            Some(admission) if admission.is_retryable() => {
+                let retained = self.retain_owner_batch(batch);
+                if admission.wake_now() {
+                    self.request_redraw();
+                }
+                if retained {
+                    OwnerBatchAdmission::Retained
+                } else {
+                    OwnerBatchAdmission::Rejected
+                }
+            }
+            Some(admission) if admission.is_connection_terminal() => {
+                self.shared.abort_connection();
+                self.connection_closed();
+                OwnerBatchAdmission::Rejected
+            }
+            Some(admission) if admission.is_mutation_unsupported() => {
+                self.enter_mutation_read_only();
+                OwnerBatchAdmission::Rejected
+            }
+            Some(_) => {
+                // TooLarge is a bounded, user-visible refusal, not evidence the socket died.
+                self.outbound_stalled = true;
+                self.outbound_hard_refusal = true;
+                self.request_redraw();
+                OwnerBatchAdmission::Rejected
+            }
+        }
+    }
+
+    fn retry_pending_owner_requests(&mut self) {
+        while let Some(batch) = self.pending_owner_requests.front().cloned() {
+            if !self.shared.viewport_token_is_current(&batch.binding) {
+                self.pending_owner_requests.pop_front();
+                self.pending_owner_request_bytes = self
+                    .pending_owner_request_bytes
+                    .saturating_sub(batch.framed_bytes);
+                continue;
+            }
+            match self.shared.send_request_batch_for_binding(
+                &batch.binding,
+                &batch.requests,
+                &batch.expected_generation,
+                batch.scroll_intent.as_ref(),
+            ) {
+                None => {
+                    self.pending_owner_requests.pop_front();
+                    self.pending_owner_request_bytes = self
+                        .pending_owner_request_bytes
+                        .saturating_sub(batch.framed_bytes);
+                }
+                Some(admission) if admission.is_admitted() => {
+                    self.pending_owner_requests.pop_front();
+                    self.pending_owner_request_bytes = self
+                        .pending_owner_request_bytes
+                        .saturating_sub(batch.framed_bytes);
+                    self.commit_admitted_owner_batch(&batch);
+                }
+                Some(admission) if admission.is_retryable() => {
+                    self.outbound_stalled = true;
+                    if admission.wake_now() {
+                        self.request_redraw();
+                    }
+                    break;
+                }
+                Some(admission) if admission.is_connection_terminal() => {
+                    self.shared.abort_connection();
+                    self.connection_closed();
+                    return;
+                }
+                Some(admission) if admission.is_mutation_unsupported() => {
+                    self.pending_owner_requests.pop_front();
+                    self.pending_owner_request_bytes = self
+                        .pending_owner_request_bytes
+                        .saturating_sub(batch.framed_bytes);
+                    self.enter_mutation_read_only();
+                }
+                Some(_) => {
+                    self.pending_owner_requests.pop_front();
+                    self.pending_owner_request_bytes = self
+                        .pending_owner_request_bytes
+                        .saturating_sub(batch.framed_bytes);
+                    self.outbound_stalled = true;
+                    self.outbound_hard_refusal = true;
+                    self.request_redraw();
+                }
+            }
+        }
+        if self.pending_owner_requests.is_empty() && !self.outbound_hard_refusal {
+            self.outbound_stalled = false;
+        }
+    }
+
+    fn retry_pending_outbound(&mut self) {
+        // Token retirement is lifecycle authority, so it gets the first writable slot. A retained
+        // Cancel always stays on the same FIFO as its earlier Claim and cannot be overtaken by a
+        // replacement topology transaction.
+        self.retry_pending_attachment_handoff_cancels();
+        let recovery = self.shared.retry_pending_recoveries();
+        if recovery.terminal {
+            self.shared.abort_connection();
+            self.connection_closed();
+            return;
+        }
+        if recovery.wake_now {
+            self.request_redraw();
+        }
+        self.retry_pending_owner_requests();
+        // A complete projected bind owns the tombstones and must win over a standalone cleanup;
+        // otherwise the old id-only Detach could land after a same-id revival.
+        self.try_admit_pending_active_attach();
+        self.try_admit_pending_detach_cleanup();
+    }
+
+    fn try_admit_pending_detach_cleanup(&mut self) {
+        if !self.connection_alive || self.pending_detach_sessions.is_empty() {
+            return;
+        }
+        if self
+            .pending_active_attach
+            .as_ref()
+            .is_some_and(|pending| pending.projection_received)
+        {
+            return;
+        }
+        let ids: Vec<String> = self.pending_detach_sessions.iter().cloned().collect();
+        match self.shared.try_detach_while_neutral(&ids) {
+            Some(admission) if admission.is_admitted() => {
+                self.pending_detach_sessions.clear();
+                self.settle_neutralized_exact_viewport();
+                self.start_pending_attachment_handoff_cancels();
+            }
+            Some(admission) if admission.is_connection_terminal() => {
+                self.shared.abort_connection();
+                self.connection_closed();
+            }
+            Some(admission) if admission.is_retryable() => {
+                if admission.wake_now() {
+                    self.request_redraw();
+                }
+            }
+            Some(_) => {
+                // A Detach-only batch that cannot ever fit/serialize has no safe bounded retry.
+                // Shutdown makes the daemon drop every forwarder for this client connection.
+                self.shared.abort_connection();
+                self.connection_closed();
+            }
+            None => {
+                // Another owner action already published a viewport. Its aggregate bind either
+                // consumed this set or remains responsible for it; never enqueue a late cleanup.
+            }
+        }
+    }
+
+    fn try_admit_pending_active_attach(&mut self) {
+        let Some(pending) = self.pending_active_attach.clone() else {
+            return;
+        };
+        if !self.connection_alive
+            || !pending.projection_received
+            || !self.pending_attachment_handoff_cancels.is_empty()
+        {
+            return;
+        }
+        let handoff_claim = match pending.handoff_request_id {
+            Some(request_id) => match self.runtime_attachment_handoff.as_ref() {
+                Some(guard) if guard.request_id() == request_id => Some(guard.claim()),
+                _ => {
+                    self.pending_active_attach = None;
+                    self.cancel_all_attachment_handoffs_in_background();
+                    return;
+                }
+            },
+            None => None,
+        };
+        let Some(desired) = self.desired_viewport_binding(&pending) else {
+            self.queue_runtime_attachment_handoff_for_cancel();
+            self.shared.abort_connection();
+            self.connection_closed();
+            return;
+        };
+        let mut detach_ids = self.pending_detach_sessions.clone();
+        detach_ids.extend(self.attached_sessions.iter().cloned());
+        let detach_ids: Vec<String> = detach_ids.into_iter().collect();
+        match self
+            .shared
+            .try_bind_viewport(&desired, &detach_ids, handoff_claim.as_ref())
+        {
+            Ok(binding) => {
+                if pending.handoff_request_id.is_some() {
+                    if let Some(guard) = self.runtime_attachment_handoff.as_mut() {
+                        guard.mark_claim_admitted(binding.clone());
+                    }
+                } else {
+                    // Any ordinary rebind supersedes a still-unproven runtime handoff. This is
+                    // normally retired at staging time; keep the admission boundary fail-safe too.
+                    self.retire_runtime_attachment_handoff();
+                }
+                // Only the all-or-none queue admission may advance App mirrors. Retained cleanup is
+                // now in the writer FIFO before Attach, so it can be forgotten locally.
+                self.pending_detach_sessions.clear();
+                self.pending_active_attach = None;
+                // Attach/Snapshot is read-only and deliberately carries no pre-baseline Resize.
+                // Leave geometry mirrors empty so the first exact Grid-triggered reconciliation
+                // emits generation-conditional Resize for every pane.
+                self.primary_pane_dims = None;
+                self.sibling_id = None;
+                self.sibling_dims = None;
+                self.pane_cache_dims.clear();
+                self.attached_sessions = std::iter::once(desired.primary_session_id.clone())
+                    .chain(desired.panes.iter().map(|pane| pane.session_id.clone()))
+                    .filter(|id| !id.is_empty())
+                    .collect();
+                // Queue admission is never viewport success. Handoff and ordinary exact binds use
+                // the same all-route baseline gate; only the handoff additionally emits a public
+                // disposition after proof.
+                self.pending_handoff_projection = Some(pending);
+                self.pending_viewport_binding = Some(binding);
+                self.request_redraw();
+            }
+            Err(crate::client::ActiveBindFailure::Admission(admission)) => {
+                // First refusal revokes every old local role immediately. The exact desired attach
+                // remains pending and retries on the queue's capacity/contended wake.
+                if self.shared.active_snapshot().id.is_some() {
+                    self.retain_attached_sessions_for_cleanup();
+                    self.shared.clear_viewport();
+                    self.neutralize_for_pending_attach();
+                }
+                if admission.is_connection_terminal() {
+                    self.queue_runtime_attachment_handoff_for_cancel();
+                    self.shared.abort_connection();
+                    self.connection_closed();
+                } else if admission.wake_now() {
+                    self.request_redraw();
+                } else if !admission.is_retryable() {
+                    self.queue_runtime_attachment_handoff_for_cancel();
+                    self.shared.abort_connection();
+                    self.connection_closed();
+                }
+            }
+            Err(
+                crate::client::ActiveBindFailure::AuthorityExhausted
+                | crate::client::ActiveBindFailure::HandoffPeerMismatch,
+            ) => {
+                self.retain_attached_sessions_for_cleanup();
+                self.queue_runtime_attachment_handoff_for_cancel();
+                self.shared.abort_connection();
+                self.connection_closed();
+            }
+        }
+    }
+
+    fn publish_admitted_projection(
+        &mut self,
+        pending: PendingActiveAttach,
+        primary_session_id: String,
+    ) -> bool {
+        let event_gate_epoch = pending.event_gate_epoch;
+        self.session_id = primary_session_id;
+        self.exact_viewport = pending.exact_viewport;
+        self.tab_strip_line = pending.tab_strip_line;
+        self.tab_strip_source = pending.tab_strip_source;
+        self.split_ratios = pending.split_ratios;
+        self.clear_selection();
+        self.clear_chrome_drag_state();
+        self.force_live_view();
+        self.wheel = WheelAccumulator::default();
+        self.resize = ResizeCoalescer::default();
+        self.pending_resize_refit_at = None;
+        self.focused_pane_session = None;
+        self.zoomed_pane_session = None;
+        self.shortcut_hint_lines = None;
+        self.mouse_held = None;
+        self.last_reported_cell = None;
+        self.pending_file_drop = None;
+        #[cfg(target_os = "linux")]
+        {
+            self.pending_paste = None;
+            self.context_menu_click_in_progress = false;
+        }
+        self.hover_tab_id = None;
+        self.pane_header_action_hover_tab_id = None;
+        // Publish the complete local projection before allowing any native/WebView intent to leave
+        // the renderer. The mutex-linearized exact epoch prevents a stale aggregate completion from
+        // reopening a later neutral viewport.
+        if !self.viewport_event_gate.publish(event_gate_epoch) {
+            self.shared.abort_connection();
+            self.connection_alive = false;
+            self.clear_viewport_projections();
+            return false;
+        }
+        self.request_redraw();
+        true
+    }
+
+    fn commit_proven_handoff_projection(&mut self) -> bool {
+        let Some(pending) = self.pending_handoff_projection.take() else {
+            return false;
+        };
+        let ordinary_disposition = pending.viewport_request.clone();
+        let session_id = pending.session_id.clone();
+        let published = self.publish_admitted_projection(pending, session_id);
+        self.pending_viewport_binding = None;
+        if let Some(request) = ordinary_disposition {
+            self.emit_exact_viewport_disposition(
+                &request,
+                if published {
+                    RendererExactViewportOutcome::Published
+                } else {
+                    RendererExactViewportOutcome::Unavailable
+                },
+            );
+        }
+        published
+    }
+
+    /// Clear every App-owned projection after Shared authority has already been revoked (for
+    /// example an exhausted bind allocator). Keeping this separate avoids a second epoch bump while
+    /// still guaranteeing the same blank UI/input/geometry postcondition as explicit ClearViewport.
+    fn clear_viewport_projections(&mut self) {
+        // Close the cross-thread intent boundary before touching any retained chrome/model state.
+        // Producers take the same mutex through downstream enqueue, so a callback is wholly before
+        // this revoke or observes the neutral epoch and is dropped; later publication cannot revive it.
+        self.viewport_event_gate.neutralize();
+        // The retained suffix is exact-incarnation authority. Clearing it wholesale is required on
+        // every revoke, including same-id revive, so no Write/Resize/scroll query can cross the next
+        // Detach→Attach fence.
+        self.pending_owner_requests.clear();
+        self.pending_owner_request_bytes = 0;
+        self.outbound_stalled = false;
+        self.outbound_hard_refusal = false;
+
+        // Projection/paint sources.
+        self.tab_strip_line = None;
+        self.tab_strip_source = None;
+        self.exact_viewport = None;
+        self.sibling_id = None;
+        self.sibling_dims = None;
+        self.pane_cache_dims.clear();
+        self.primary_pane_dims = None;
+        self.focused_pane_session = None;
+        self.zoomed_pane_session = None;
+        self.split_ratios = SplitRatios::default();
+        self.shortcut_hint_lines = None;
+        self.hover_tab_id = None;
+        self.pane_header_action_hover_tab_id = None;
+        self.external_winsize_sessions.clear();
+
+        // Neutral draw suppresses every interactive terminal-adjacent surface. Erase the backing
+        // models at the same linearization point so an invisible picker/palette/settings/file/dock
+        // target cannot still consume a click or Enter before (or after) the blank frame presents.
+        self.picker_rows = None;
+        self.command_palette_lines = None;
+        self.command_palette_model = None;
+        self.command_palette_query.clear();
+        self.command_palette_result = None;
+        self.dashboard_panel = None;
+        self.selected_settings_panel_row = None;
+        self.settings_edit_draft = None;
+        self.file_preview = None;
+        self.file_path_input = None;
+        self.dock = None;
+        self.react_overlay_visible = false;
+        self.latest_react_chrome_model_json = None;
+        // The overlay is a native child surface and can remain physically stacked above WGPU even
+        // after its Rust model is cleared. Hide it at the same local revoke point: macOS owns the
+        // child WebView directly, while Linux delegates native stacking to ChromeHostServices.
+        self.resize_react_chrome_webview();
+        #[cfg(not(target_os = "macos"))]
+        if let Some(chrome_host) = self.chrome_host.as_ref() {
+            chrome_host.set_overlay_visible(false);
+        }
+
+        // Every in-flight grid gesture belongs to the revoked coordinates/binding.
+        self.clear_selection();
+        self.clear_chrome_drag_state();
+        self.picker_click_in_progress = false;
+        self.tab_strip_click_in_progress = false;
+        self.top_bar_click_in_progress = false;
+        self.dashboard_panel_click_in_progress = false;
+        self.dock_click_in_progress = false;
+        self.pending_file_drop = None;
+        #[cfg(target_os = "linux")]
+        {
+            self.context_menu_click_in_progress = false;
+            self.pending_paste = None;
+        }
+        self.mouse_held = None;
+        self.last_reported_cell = None;
+        // `cursor_px` and `modifiers` are passive host mirrors, not terminal authority. Preserve keys
+        // held continuously across Clear (the host may emit no new ModifiersChanged before rebind),
+        // while the neutral host gate prevents either mirror from activating a hidden target.
+
+        // Geometry derived under the old owner must not flush after clear.
+        self.resize = ResizeCoalescer::default();
+        self.pending_resize_refit_at = None;
+        self.wheel = WheelAccumulator::default();
+
+        if let Some(host) = self.host.as_ref() {
+            host.set_title(&self.window_title);
+            host.request_redraw();
+        }
+    }
+
     fn attach_session(&mut self, new_id: String) {
         let window_dims = self.window_dims();
         self.attach_session_with_window_dims(new_id, window_dims);
+    }
+
+    fn attach_session_with_handoff(
+        &mut self,
+        new_id: String,
+        handoff: RendererAttachmentHandoff,
+        tab_strip: RendererTabStrip,
+        exact_viewport: RendererExactViewport,
+    ) {
+        match handoff.register_attempt(&new_id, Some(&tab_strip), Some(&exact_viewport)) {
+            RendererAttachmentHandoffAttemptRegistration::Duplicate => {
+                // Includes retry after a terminal disposition: the shared wrapper remembers its
+                // immutable first projection facts and a retired token is never re-Claimed.
+                return;
+            }
+            RendererAttachmentHandoffAttemptRegistration::Conflict => {
+                // Reusing one correlated authority with different projection facts is a local
+                // integrity failure. Revoke the operational connection before any disposition.
+                self.shared.abort_connection();
+                self.connection_closed();
+                return;
+            }
+            RendererAttachmentHandoffAttemptRegistration::New => {}
+        }
+        // Arm owned cancellation at owner-loop receipt, before any validation can discard the
+        // command. Session identity is part of the shell authority, never supplied independently.
+        let request_id = handoff.request_id();
+        let guard = RuntimeAttachmentHandoffCancelGuard::new(handoff);
+        if self.pending_active_attach.is_some()
+            || self.pending_viewport_binding.is_some()
+            || self.runtime_attachment_handoff.is_some()
+            || !self.pending_attachment_handoff_cancels.is_empty()
+        {
+            // App serializes exact viewport intents. Reject a concurrent handoff on its own
+            // authority rather than mixing its guard with another request's aggregate receipt.
+            self.retain_or_cancel_attachment_handoff(guard);
+            return;
+        }
+        let Some(event_gate_epoch) = self.viewport_event_gate.begin_attempt() else {
+            // Epoch exhaustion is terminal-neutral. Revoke A before returning B's exact authority
+            // to cancellation; wrapping would let an ancient completion republish a new viewport.
+            self.clear_viewport();
+            self.retain_or_cancel_attachment_handoff(guard);
+            return;
+        };
+        // App has already entered Pending B when this command is delivered. Revoke A immediately,
+        // before validating any B fact, so malformed/refused B cannot leave A paint/input/OSC live.
+        self.clear_viewport();
+        if !self.connection_alive
+            || self.shared.connection_is_closed()
+            || guard.session_id() != new_id
+            || !handoff_projection_matches_session(Some(&tab_strip), &new_id)
+            || exact_viewport.primary().session_id() != new_id
+            || exact_viewport.primary().generation()
+                != guard.handoff.authority().expected_generation()
+            || !exact_viewport.matches_projection(&tab_strip)
+        {
+            self.retain_or_cancel_attachment_handoff(guard);
+            return;
+        }
+        self.runtime_attachment_handoff = Some(guard);
+        let window_dims = self.window_dims();
+        let line = apply_set_tab_strip(Some(&tab_strip));
+        let mut split_ratios = SplitRatios::default();
+        hydrate_split_ratios(&mut split_ratios, &tab_strip, None);
+        self.pending_active_attach = Some(PendingActiveAttach {
+            session_id: new_id,
+            handoff_request_id: Some(request_id),
+            viewport_request: None,
+            exact_viewport: Some(exact_viewport),
+            event_gate_epoch,
+            window_dims,
+            projection_received: true,
+            tab_strip_line: line,
+            tab_strip_source: Some(tab_strip),
+            split_ratios,
+        });
+        self.retain_attached_sessions_for_cleanup();
+        self.shared.clear_viewport();
+        self.neutralize_for_pending_attach();
+        self.start_pending_attachment_handoff_cancels();
+        self.try_admit_pending_active_attach();
+    }
+
+    fn attach_exact_viewport(&mut self, request: RendererExactViewportRequest) {
+        if !request.begin_delivery() {
+            return;
+        }
+        let new_id = request.session_id().to_string();
+        let exact_viewport = request.exact_viewport().clone();
+        let tab_strip = request.tab_strip().clone();
+        if self.pending_active_attach.is_some()
+            || self.pending_viewport_binding.is_some()
+            || self.runtime_attachment_handoff.is_some()
+            || !self.pending_attachment_handoff_cancels.is_empty()
+        {
+            self.emit_exact_viewport_disposition(
+                &request,
+                RendererExactViewportOutcome::Unavailable,
+            );
+            return;
+        }
+        let Some(event_gate_epoch) = self.viewport_event_gate.begin_attempt() else {
+            self.clear_viewport();
+            self.emit_exact_viewport_disposition(
+                &request,
+                RendererExactViewportOutcome::Unavailable,
+            );
+            return;
+        };
+        self.clear_viewport();
+        if !self.connection_alive
+            || self.shared.connection_is_closed()
+            || exact_viewport.primary().session_id() != new_id
+            || !exact_viewport.matches_projection(&tab_strip)
+        {
+            self.emit_exact_viewport_disposition(
+                &request,
+                RendererExactViewportOutcome::Unavailable,
+            );
+            return;
+        }
+        let mut split_ratios = SplitRatios::default();
+        hydrate_split_ratios(&mut split_ratios, &tab_strip, None);
+        self.pending_active_attach = Some(PendingActiveAttach {
+            session_id: new_id,
+            handoff_request_id: None,
+            viewport_request: Some(request),
+            exact_viewport: Some(exact_viewport),
+            event_gate_epoch,
+            window_dims: self.window_dims(),
+            projection_received: true,
+            tab_strip_line: apply_set_tab_strip(Some(&tab_strip)),
+            tab_strip_source: Some(tab_strip),
+            split_ratios,
+        });
+        self.retain_attached_sessions_for_cleanup();
+        self.shared.clear_viewport();
+        self.neutralize_for_pending_attach();
+        self.start_pending_attachment_handoff_cancels();
+        self.try_admit_pending_active_attach();
     }
 
     /// The session-role transition with the already-observed full-window terminal geometry. Keeping
     /// that input explicit makes the load-bearing pane-content resize calculation testable without a
     /// native window/renderer, while production always supplies [`App::window_dims`].
     fn attach_session_with_window_dims(&mut self, new_id: String, window_dims: Option<(u16, u16)>) {
-        if new_id == self.session_id {
-            // Same session: nothing to switch. A redraw is harmless and lets a caller
-            // use AttachSession purely as a "refresh" nudge.
+        self.stage_session_attach(new_id, window_dims);
+    }
+
+    fn stage_session_attach(&mut self, new_id: String, window_dims: Option<(u16, u16)>) {
+        if self.runtime_attachment_handoff.is_none()
+            && new_id == self.session_id
+            && self.shared.active_snapshot().id.as_deref() == Some(new_id.as_str())
+        {
+            // Refreshing an already-proven exact lifetime does not need a new membership claim.
             self.request_redraw();
             return;
         }
-
-        let old_id = std::mem::replace(&mut self.session_id, new_id.clone());
-
-        // Capture role/geometry while the old primary grid is still published. Product new-pane
-        // foregrounding deliberately sends SetTabStrip before AttachSession; at this point the new
-        // id may therefore already be in `pane_cache_dims`, while the old primary remains visible
-        // and must be demoted into that cache rather than detached from the daemon.
-        let old_remains_visible = self
-            .current_split_layout()
-            .filter(|layout| layout.panes.len() > 1)
-            .is_some_and(|layout| layout.panes.iter().any(|pane| pane.session_id == old_id));
-
-        // UI-side state that is keyed to the old session's grid coords must not carry
-        // over. Clear it now.
-        self.clear_selection();
-        self.force_live_view();
-        self.wheel = WheelAccumulator::default();
-        // A reattach is a session switch; drop any transient top-bar hover so a stale highlight from
-        // before the switch does not linger (it will be recomputed on the next CursorMoved).
-        self.hover_tab_id = None;
-        self.pane_header_action_hover_tab_id = None;
-
-        // Rebase the reader/sync side first, then immediately reconcile pane roles against the
-        // already-delivered strip. This removes the promoted new primary from the pane cache
-        // WITHOUT detaching it, and attaches/caches the still-visible old primary before output can
-        // be missed. The reader's membership reconcile is intentionally sync-state-only.
-        self.shared.set_active_session(&new_id);
-        let split_frame = self.current_split_frame();
-        self.sync_sibling_session(split_frame.as_ref());
-        self.sync_pane_cache();
-
-        // A primary-role change invalidates the old session's remembered region even when the old
-        // and new panes happen to have equal dimensions. Map the full-window geometry through the
-        // NEW primary id's content region before constructing the attach plan; sending the raw window
-        // size here makes a promoted split pane wrap/clip outside its slot. `None` deliberately leaves
-        // the cache empty so the first real resize/sync cannot be suppressed.
-        self.primary_pane_dims = None;
-        let new_primary_dims = window_dims.map(|dims| self.primary_resize_dims(dims));
-        self.primary_pane_dims = new_primary_dims;
-
-        // Clear the SHARED published primary state IMMEDIATELY, on the UI thread, before the redraw
-        // below. The cache reconcile above used the old grid only as a geometry fallback; no redraw
-        // can interleave this synchronous transition. The reader's later reset is idempotent.
-        reset_session_state(&self.shared);
-
-        // Enqueue the active switch. If the old primary is still a visible pane, its pane-cache
-        // Attach above owns the subscription and the ordinary tab-switch Detach would kill it.
-        for req in plan_attach_switch(&old_id, &new_id, new_primary_dims) {
-            if old_remains_visible && matches!(&req, ClientRequest::Detach { id } if id == &old_id)
-            {
-                continue;
-            }
-            self.shared.send_request(&req);
-        }
-        self.request_redraw();
+        let _ = window_dims;
+        // A textual id cannot authorize a new PTY lifetime. Legacy switches fail closed locally and
+        // emit no Attach; callers must use AttachExactViewport with a one-snapshot cohort.
+        self.clear_viewport();
     }
 
     fn update_fps(&mut self) {
@@ -12847,6 +16497,28 @@ impl App {
         self.frame_times
             .retain(|t| now.duration_since(*t) < Duration::from_secs(1));
         self.fps = self.frame_times.len() as f32;
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        // Revoke the operational Claim socket and every local projection before a fast exact
+        // cancellation worker can publish a terminal disposition to App/domain state.
+        self.shared.abort_connection();
+        self.connection_closed();
+        if self.handoff_event_sender.is_some() {
+            self.start_pending_attachment_handoff_cancels();
+            // Workers now own authority clones and will route a correlated fallback disposition
+            // directly to the public event channel when the owner loop rejects completion.
+            for guard in &self.pending_attachment_handoff_cancels {
+                guard.handoff.mark_settled();
+            }
+        } else {
+            for guard in self.pending_attachment_handoff_cancels.drain(..) {
+                guard.handoff.mark_settled();
+                spawn_detached_authority_cancel(guard.handoff.authority().clone());
+            }
+        }
     }
 }
 
@@ -12933,6 +16605,9 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // winit reports one DroppedFile per path. AboutToWait is the batch boundary after all
+        // currently queued window events, so one multi-file gesture becomes one PTY insertion.
+        self.flush_pending_file_drop();
         // Flush any geometry that was throttled during a resize burst so the
         // daemon always ends at the TRUE settled size. If a
         // send is still pending under the min-interval, wake again after it.
@@ -12951,7 +16626,7 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         }
-        if self.stashed_pane_drag.is_some() {
+        if self.stashed_pane_drag.is_some() && self.frame_recovery.continuous_redraw_allowed() {
             self.request_redraw();
             event_loop.set_control_flow(ControlFlow::Poll);
             return;
@@ -12969,11 +16644,25 @@ impl App {
     /// grid/redraw/title/bell/clipboard updates and bridged `RendererCommand`s take effect while
     /// the window is completely idle (no keyboard/mouse/focus/resize/GTK activity required).
     fn handle_user_event(&mut self, event: UserEvent) {
+        // Daemon/grid and app-command wakes are independent progress. Re-arm one
+        // bounded surface recovery attempt before applying the event; the native
+        // RedrawRequested generated by that attempt does not pass through here.
+        self.frame_recovery.rearm_from_external_event();
         match event {
             UserEvent::Redraw => {
+                // Reader wakes only after it has accepted and committed a Grid. Retire a runtime
+                // handoff only when that grid lives under the exact output-generation binding
+                // created for this Claim; unrelated/stale redraws leave cancellation armed.
+                self.settle_pending_exact_viewport(true);
                 if let Some(h) = self.host.as_ref() {
                     h.request_redraw();
                 }
+            }
+            UserEvent::OutboundWritable => {
+                self.retry_pending_outbound();
+            }
+            UserEvent::ConnectionClosed => {
+                self.connection_closed();
             }
             UserEvent::SessionExited {
                 session_id,
@@ -12995,39 +16684,95 @@ impl App {
                     });
                 }
             }
-            UserEvent::TerminalBell => {
-                if let Some(h) = self.host.as_ref() {
-                    h.request_attention();
+            UserEvent::TerminalBell { binding } => {
+                if self.viewport_is_bound() && self.shared.viewport_token_is_current(&binding) {
+                    if let Some(h) = self.host.as_ref() {
+                        h.request_attention();
+                    }
                 }
             }
-            UserEvent::TerminalTitle { title } => {
-                if let Some(h) = self.host.as_ref() {
-                    let clean: String = title
-                        .unwrap_or_else(|| self.window_title.clone())
-                        .chars()
-                        .filter(|c| !c.is_control())
-                        .take(256)
-                        .collect();
-                    h.set_title(if clean.is_empty() {
-                        &self.window_title
-                    } else {
-                        &clean
-                    });
+            UserEvent::TerminalTitle { binding, title } => {
+                if self.viewport_is_bound() && self.shared.viewport_token_is_current(&binding) {
+                    if let Some(h) = self.host.as_ref() {
+                        let clean: String = title
+                            .unwrap_or_else(|| self.window_title.clone())
+                            .chars()
+                            .filter(|c| !c.is_control())
+                            .take(256)
+                            .collect();
+                        h.set_title(if clean.is_empty() {
+                            &self.window_title
+                        } else {
+                            &clean
+                        });
+                    }
                 }
             }
-            UserEvent::TerminalClipboardStore { text } => {
+            UserEvent::TerminalClipboardStore { binding, text } => {
                 // OSC 52 store is bounded by the daemon and treated exactly like
                 // an explicit copy: renderer-local OS clipboard access only. It
                 // is opt-in because remote/untrusted programs must not silently
                 // overwrite the user's system clipboard.
-                if std::env::var("HYDRA_ALLOW_OSC52").as_deref() == Ok("1") {
+                if self.viewport_is_bound()
+                    && self.shared.viewport_token_is_current(&binding)
+                    && std::env::var("HYDRA_ALLOW_OSC52").as_deref() == Ok("1")
+                {
                     self.store_clipboard_text(text);
                 }
+            }
+            UserEvent::ClearViewport => {
+                self.clear_viewport();
             }
             UserEvent::AttachSession { session_id } => {
                 self.attach_session(session_id);
             }
+            UserEvent::AttachExactViewport { request } => {
+                self.attach_exact_viewport(request);
+            }
+            UserEvent::AttachSessionWithHandoff {
+                session_id,
+                handoff,
+                tab_strip,
+                exact_viewport,
+            } => {
+                self.attach_session_with_handoff(session_id, handoff, tab_strip, exact_viewport);
+            }
+            UserEvent::AttachmentHandoffCancellationFinished {
+                request_id,
+                authority,
+                claim_status,
+                cancelled,
+            } => {
+                self.finish_attachment_handoff_cancellation(
+                    request_id,
+                    authority,
+                    claim_status,
+                    cancelled,
+                );
+            }
             UserEvent::SetTabStrip { tab_strip } => {
+                // ConnectionClosed is terminal for this App instance. Delayed command-bridge
+                // events from the former connection must not repopulate terminal hit targets or
+                // revive a pending bind after fail-closed teardown.
+                if !self.connection_alive {
+                    return;
+                }
+                // Exact membership and the active role arrive only through RendererExactViewport.
+                // A display-only strip must never complete, replace, or mutate an in-flight bind.
+                if self.pending_active_attach.is_some() {
+                    return;
+                }
+                if !self.viewport_is_bound() {
+                    return;
+                }
+                let compatible = self.exact_viewport.as_ref().is_some_and(|exact| {
+                    tab_strip.as_ref().map_or(exact.roles.len() == 1, |strip| {
+                        exact.matches_projection(strip)
+                    })
+                });
+                if !compatible {
+                    return;
+                }
                 // Refresh BOTH overlay representations from the one update: the bottom-overlay
                 // structured line (text + hit targets) and the top tab-bar layout source. The top
                 // bar derives its pixel layout from `tab_strip_source` on the next draw.
@@ -13035,6 +16780,13 @@ impl App {
                     self.tab_strip_source.as_ref(),
                     tab_strip.as_ref(),
                 );
+                if selection_geometry_changed {
+                    // Geometry may refresh within the already-proven exact cohort. Revoke gestures
+                    // captured under the old cells, but never issue Attach/Detach or change the
+                    // active role from this presentation-only command.
+                    self.clear_chrome_drag_state();
+                    self.clear_selection();
+                }
                 self.tab_strip_line = apply_set_tab_strip(tab_strip.as_ref());
                 let previous_strip = self.tab_strip_source.take();
                 self.tab_strip_source = tab_strip;
@@ -13072,28 +16824,6 @@ impl App {
                 // A replaced/cleared strip may have removed the hovered tab; drop a now-stale hover so
                 // the highlight does not survive onto a tab that no longer exists.
                 self.invalidate_hover_for_strip();
-                // The split geometry may have changed (a tab split toggled, or the active pane switched
-                // sides) at the SAME window size, so the active session's pane region — and thus its PTY
-                // size — can change without a window resize. Defeat the coalescer's value dedup and
-                // re-emit so the active session adopts its new pane region; the sibling re-syncs on draw.
-                self.resize.invalidate_last_sent();
-                self.schedule_resize();
-                // Existing attached panes receive Resize without a new baseline. After a structural
-                // split/stash/revive (but not a cosmetic title/attention refresh), arm the bounded
-                // settled refit so every visible pane gets a final Snapshot at its current geometry.
-                // This is especially important while an idle shell produces no damage of its own.
-                if selection_geometry_changed {
-                    self.schedule_resize_refit();
-                }
-                // SPLIT FIX: reconcile the pane cache HERE (as the mouse split/close paths do at the
-                // sites above), not only on the next draw. A split's SetTabStrip introduces a NEW
-                // non-primary pane; without this, that pane has no daemon attach yet and paints the
-                // PRIMARY pane's grid (so a split looked like the SAME shell with the source's old
-                // scrollback until a later draw). sync_sibling_session tears down stale bindings and
-                // sync_pane_cache issues the Attach for the new pane's OWN session id.
-                let split_frame = self.current_split_frame();
-                self.sync_sibling_session(split_frame.as_ref());
-                self.sync_pane_cache();
                 if let Some(h) = self.host.as_ref() {
                     h.request_redraw();
                 }
@@ -13364,6 +17094,55 @@ impl App {
     /// so both the macOS winit adapter and the Linux Tao/GTK host feed the same logic. Semantics,
     /// ordering, redraw scheduling, and control flow are unchanged from the winit path.
     fn handle_host_event(&mut self, event: HostEvent) -> HostControl {
+        // A redraw generated by the one-shot surface retry must not replenish its
+        // own budget. Every independently delivered window/input event may re-arm
+        // recovery, so the next real state/geometry change gets one fresh attempt.
+        if !matches!(
+            &event,
+            HostEvent::RedrawRequested | HostEvent::CloseRequested
+        ) {
+            self.frame_recovery.rearm_from_external_event();
+        }
+        // With no exact viewport authority, all terminal/modal interaction is inert. Resize/scale and
+        // redraw still maintain/present the native surface, and Close must always work; everything that
+        // could activate an invisible stale model, emit an app intent, or enqueue PTY traffic returns
+        // before consulting any retained geometry/hit target.
+        #[allow(unused_mut)]
+        let mut terminal_interaction = matches!(
+            &event,
+            HostEvent::Focused(_)
+                | HostEvent::Keyboard(_)
+                | HostEvent::ModifiersChanged(_)
+                | HostEvent::Ime(_)
+                | HostEvent::DroppedFiles { .. }
+                | HostEvent::CursorMoved { .. }
+                | HostEvent::CursorLeft
+                | HostEvent::MouseInput { .. }
+                | HostEvent::MouseWheel { .. }
+        );
+        #[cfg(target_os = "linux")]
+        {
+            terminal_interaction |= matches!(&event, HostEvent::Clipboard(_));
+        }
+        if !self.viewport_is_bound() && terminal_interaction {
+            // Preserve only passive physical-input mirrors while blank. They authorize nothing now,
+            // but the first post-rebind click/key must use the pointer/modifier state the host actually
+            // delivered during the neutral interval rather than stale pre-clear coordinates/defaults.
+            match &event {
+                HostEvent::CursorMoved { x, y } => {
+                    self.cursor_px = (*x as f32, *y as f32);
+                }
+                HostEvent::ModifiersChanged(modifiers) => self.modifiers = *modifiers,
+                HostEvent::CursorLeft => {
+                    self.hover_tab_id = None;
+                    self.pane_header_action_hover_tab_id = None;
+                    self.hovered_terminal_link = None;
+                    self.clear_chrome_drag_state();
+                }
+                _ => {}
+            }
+            return HostControl::Continue;
+        }
         match event {
             HostEvent::CloseRequested => return HostControl::Exit,
             HostEvent::Resized { width, height } => {
@@ -13414,7 +17193,9 @@ impl App {
                             "linux-host geometry present-after-resize width={width} height={height}"
                         );
                     }
-                    self.draw_frame(false);
+                    if self.draw_frame(false) == HostControl::Exit {
+                        return HostControl::Exit;
+                    }
                 }
             }
             HostEvent::CursorMoved { x, y } => {
@@ -13461,6 +17242,7 @@ impl App {
                 if !self.update_react_chrome_resize_cursor() {
                     self.update_divider_cursor();
                 }
+                self.update_terminal_link_hover(true);
                 // TUI mouse reporting: forward motion (drag/any-motion) to the PTY instead
                 // of extending a local selection, but only when a cell boundary is crossed.
                 if self.mouse_reporting_active() {
@@ -13612,21 +17394,34 @@ impl App {
                             // renderer only reports the intent — it mutates no record and touches no
                             // session; the app decides what (if anything) a close does.
                             if let Some(tab_id) = self.top_bar_close_at_cursor() {
-                                emit_tab_close_requested(self.events.as_ref(), &tab_id);
+                                emit_tab_close_requested(
+                                    self.events.as_ref(),
+                                    self.tab_strip_source
+                                        .as_ref()
+                                        .map(|strip| strip.window_id.as_str())
+                                        .unwrap_or_default(),
+                                    &tab_id,
+                                );
                                 self.top_bar_click_in_progress = true;
                                 self.mouse_held = None;
                                 self.last_reported_cell = None;
                                 return HostControl::Continue;
                             }
                             // New-tab control is checked AFTER close but BEFORE tab activation: a press
-                            // on the drawn `+` emits exactly one intent-only, payload-free
-                            // `NewTabRequested` and consumes the band press, so it never also activates
-                            // a tab, reaches PTY mouse reporting, or starts a selection. Its matching
-                            // release is swallowed via `top_bar_click_in_progress`. The renderer only
-                            // reports the intent — it creates no session and mutates no record; the app
-                            // decides what (if anything) a new-tab request does.
+                            // on the drawn `+` emits exactly one intent-only `NewTabRequested` bound to
+                            // the emitting strip window (with no requested tab/session identity) and
+                            // consumes the band press, so it never also activates a tab, reaches PTY
+                            // mouse reporting, or starts a selection. Its matching release is swallowed
+                            // via `top_bar_click_in_progress`. The renderer creates no session and
+                            // mutates no record; the app decides what (if anything) the request does.
                             if self.top_bar_new_tab_at_cursor() {
-                                emit_new_tab_requested(self.events.as_ref());
+                                emit_new_tab_requested(
+                                    self.events.as_ref(),
+                                    self.tab_strip_source
+                                        .as_ref()
+                                        .map(|strip| strip.window_id.as_str())
+                                        .unwrap_or_default(),
+                                );
                                 self.top_bar_click_in_progress = true;
                                 self.mouse_held = None;
                                 self.last_reported_cell = None;
@@ -13652,7 +17447,15 @@ impl App {
                                         )
                                     })
                                     .map(str::to_string);
-                                emit_split_requested(self.events.as_ref(), axis, from_tab_id);
+                                emit_split_requested(
+                                    self.events.as_ref(),
+                                    self.tab_strip_source
+                                        .as_ref()
+                                        .map(|strip| strip.window_id.as_str())
+                                        .unwrap_or_default(),
+                                    axis,
+                                    from_tab_id,
+                                );
                                 self.top_bar_click_in_progress = true;
                                 self.mouse_held = None;
                                 self.last_reported_cell = None;
@@ -13668,8 +17471,18 @@ impl App {
                             // the grid, but no event fires. The renderer only reports the intent — it
                             // mutates no record and touches no session; the app owns the position swap.
                             if self.top_bar_swap_at_cursor() {
-                                if let Some((tab_id_a, tab_id_b)) = self.active_split_pair() {
-                                    emit_swap_requested(self.events.as_ref(), &tab_id_a, &tab_id_b);
+                                if let (Some((tab_id_a, tab_id_b)), Some(window_id)) = (
+                                    self.active_split_pair(),
+                                    self.tab_strip_source
+                                        .as_ref()
+                                        .map(|strip| strip.window_id.as_str()),
+                                ) {
+                                    emit_swap_requested(
+                                        self.events.as_ref(),
+                                        window_id,
+                                        &tab_id_a,
+                                        &tab_id_b,
+                                    );
                                 }
                                 self.top_bar_click_in_progress = true;
                                 self.mouse_held = None;
@@ -13686,8 +17499,13 @@ impl App {
                             // to the grid, but no event fires. The renderer only reports the intent — it
                             // mutates no record and touches no session; the app owns the swallow.
                             if self.top_bar_swallow_at_cursor() {
-                                if let Some((_source, child)) = self.active_split_pair() {
-                                    emit_swallow_requested(self.events.as_ref(), &child);
+                                if let (Some((_source, child)), Some(window_id)) = (
+                                    self.active_split_pair(),
+                                    self.tab_strip_source
+                                        .as_ref()
+                                        .map(|strip| strip.window_id.as_str()),
+                                ) {
+                                    emit_swallow_requested(self.events.as_ref(), window_id, &child);
                                 }
                                 self.top_bar_click_in_progress = true;
                                 self.mouse_held = None;
@@ -13742,7 +17560,14 @@ impl App {
                             // decides what a clear does (`clear_tab_attention_and_refresh_strip`). A
                             // press on the tab body (not the marker) falls through to plain activation.
                             if let Some(tab_id) = self.top_bar_attention_marker_at_cursor() {
-                                emit_tab_attention_clear_requested(self.events.as_ref(), &tab_id);
+                                emit_tab_attention_clear_requested(
+                                    self.events.as_ref(),
+                                    self.tab_strip_source
+                                        .as_ref()
+                                        .map(|strip| strip.window_id.as_str())
+                                        .unwrap_or_default(),
+                                    &tab_id,
+                                );
                                 self.top_bar_click_in_progress = true;
                                 self.mouse_held = None;
                                 self.last_reported_cell = None;
@@ -13754,7 +17579,14 @@ impl App {
                             );
                             match outcome {
                                 TopTabClickOutcome::Activate(tab_id) => {
-                                    emit_tab_strip_activation(self.events.as_ref(), &tab_id);
+                                    emit_tab_strip_activation(
+                                        self.events.as_ref(),
+                                        self.tab_strip_source
+                                            .as_ref()
+                                            .map(|strip| strip.window_id.as_str())
+                                            .unwrap_or_default(),
+                                        &tab_id,
+                                    );
                                     self.top_bar_click_in_progress = true;
                                     self.mouse_held = None;
                                     self.last_reported_cell = None;
@@ -13795,7 +17627,14 @@ impl App {
                             // other column in the same segment still falls through to activation.
                             if let Some(tab_id) = self.overlay_tab_marker_at_cursor() {
                                 let tab_id = tab_id.to_string();
-                                emit_tab_attention_clear_requested(self.events.as_ref(), &tab_id);
+                                emit_tab_attention_clear_requested(
+                                    self.events.as_ref(),
+                                    self.tab_strip_source
+                                        .as_ref()
+                                        .map(|strip| strip.window_id.as_str())
+                                        .unwrap_or_default(),
+                                    &tab_id,
+                                );
                                 self.tab_strip_click_in_progress = true;
                                 self.mouse_held = None;
                                 self.last_reported_cell = None;
@@ -13803,7 +17642,14 @@ impl App {
                             }
                             if let Some(tab_id) = self.overlay_tab_at_cursor() {
                                 let tab_id = tab_id.to_string();
-                                emit_tab_strip_activation(self.events.as_ref(), &tab_id);
+                                emit_tab_strip_activation(
+                                    self.events.as_ref(),
+                                    self.tab_strip_source
+                                        .as_ref()
+                                        .map(|strip| strip.window_id.as_str())
+                                        .unwrap_or_default(),
+                                    &tab_id,
+                                );
                                 self.tab_strip_click_in_progress = true;
                                 // Drop any stale reporting state so the consumed press can't leak
                                 // into a later report, mirroring the selection-start cleanup.
@@ -13907,6 +17753,39 @@ impl App {
                         }
                     }
                 }
+                // Consume the release half of an exact modifier-link press before it
+                // can reach pane focus, PTY mouse reporting, or local selection.
+                if button == MouseButton::Left
+                    && state == ElementState::Released
+                    && self.terminal_link_click_in_progress
+                {
+                    self.terminal_link_click_in_progress = false;
+                    self.mouse_held = None;
+                    self.last_reported_cell = None;
+                    return HostControl::Continue;
+                }
+                // A terminal URL is inert unless the exact platform modifier is held.
+                // Handle the gesture before split-pane focus/selection so a modifier-
+                // click outside a proven target is a true no-op. Re-resolve from the
+                // live painted grid on press (never trust stale hover state); the host
+                // boundary validates the URL again before invoking its native opener.
+                if button == MouseButton::Left
+                    && state == ElementState::Pressed
+                    && terminal_link_modifier_matches(self.modifiers, cfg!(target_os = "macos"))
+                {
+                    let target = self.terminal_link_at_cursor();
+                    self.terminal_link_click_in_progress = true;
+                    self.mouse_held = None;
+                    self.last_reported_cell = None;
+                    if let Some(target) = target {
+                        self.hovered_terminal_link = Some(target.clone());
+                        if let Some(host) = self.host.as_ref() {
+                            let _ = host.open_http_url(&target.url);
+                        }
+                        self.request_redraw();
+                    }
+                    return HostControl::Continue;
+                }
                 // Renderer-local pane chrome/focus takes precedence over PTY mouse reporting. A click on
                 // a divider starts resizing and is consumed. A click inside a pane first updates the
                 // keyboard focus; if that pane's app has mouse reporting enabled, the press is then
@@ -13993,6 +17872,10 @@ impl App {
                                     );
                                     emit_pane_swap_requested(
                                         self.events.as_ref(),
+                                        self.tab_strip_source
+                                            .as_ref()
+                                            .map(|strip| strip.window_id.as_str())
+                                            .unwrap_or_default(),
                                         &tab_id,
                                         &neighbor.tab_id,
                                     );
@@ -14018,6 +17901,10 @@ impl App {
                                 );
                                 emit_pane_swallow_requested(
                                     self.events.as_ref(),
+                                    self.tab_strip_source
+                                        .as_ref()
+                                        .map(|strip| strip.window_id.as_str())
+                                        .unwrap_or_default(),
                                     &tab_id,
                                     direction,
                                 );
@@ -14038,7 +17925,14 @@ impl App {
                                     "hydra-renderer: pane close hit tab_id={} cell=({}, {})",
                                     target.tab_id, cell.col, cell.row
                                 );
-                                emit_pane_close_requested(self.events.as_ref(), &target.tab_id);
+                                emit_pane_close_requested(
+                                    self.events.as_ref(),
+                                    self.tab_strip_source
+                                        .as_ref()
+                                        .map(|strip| strip.window_id.as_str())
+                                        .unwrap_or_default(),
+                                    &target.tab_id,
+                                );
                                 self.clear_selection();
                                 self.request_redraw();
                                 return HostControl::Continue;
@@ -14238,12 +18132,12 @@ impl App {
                 }
             }
             HostEvent::MouseWheel { delta } => {
-                // A wheel gesture targets the pane under the pointer. Reset fractional carry when
-                // focus changes so a sub-line gesture accumulated over one pane cannot trigger a
-                // line in another pane.
+                // Resolve pointer focus before accumulating this event. Fractional motion belongs
+                // to exactly one pane; carrying the previous pane's residue across a focus change
+                // could fabricate a key or mouse-report step in the newly focused terminal.
                 let focus_changed = self.focus_pane_under_cursor();
                 if focus_changed {
-                    self.wheel = WheelAccumulator::default();
+                    self.wheel.reset();
                 }
                 // Positive y = scroll UP into history (winit: positive y reveals content
                 // above). Accumulate sub-line deltas so a slow trackpad scroll (a stream of
@@ -14259,35 +18153,27 @@ impl App {
                     }
                     return HostControl::Continue;
                 }
-
-                let alt_screen = self.live_view_geometry().is_some_and(|(alt, _)| alt);
-                match wheel_route(lines, alt_screen, self.mouse_reporting_active()) {
-                    WheelRoute::NoOp => {}
-                    // TUI mouse reporting: forward button-64/65 reports when the application
-                    // explicitly negotiated them. This remains higher priority than fallback.
-                    WheelRoute::MouseReport { event, steps } => {
+                match self.wheel_input_action(lines) {
+                    // TUI mouse reporting remains first priority: forward one button-64/65
+                    // report per bounded step rather than moving renderer scrollback.
+                    WheelInputAction::MouseReport { direction, steps } => {
+                        let ev = match direction {
+                            WheelDirection::Up => MouseEv::WheelUp,
+                            WheelDirection::Down => MouseEv::WheelDown,
+                        };
                         for _ in 0..steps {
-                            self.report_mouse(event);
+                            self.report_mouse(ev);
                         }
                     }
-                    // Xterm-compatible alternate-scroll fallback: a full-screen application that
-                    // did not enable mouse reporting receives bounded cursor keys. Encode once under
-                    // the pane's live DECCKM mode and send one atomic Write to avoid a wheel burst
-                    // producing many queue entries on the UI thread.
-                    WheelRoute::AlternateScroll { key, steps } => {
-                        if let Some(seq) = encode_key(
-                            &HostKey::Named(key),
-                            None,
-                            None,
-                            &HostModifiers::default(),
-                            self.current_modes(),
-                        ) {
-                            self.write_to_pty(seq.repeat(usize::from(steps)));
-                        }
+                    // Alternate-screen applications without mouse reporting own the wheel as
+                    // conventional cursor-key input. No provider/process inspection is involved.
+                    WheelInputAction::AlternateScrollKeys { direction, steps } => {
+                        self.write_alternate_scroll_keys(direction, steps);
                     }
-                    WheelRoute::RendererScroll(action) => {
+                    WheelInputAction::RendererScrollback(action) => {
                         self.apply_scroll(action);
                     }
+                    WheelInputAction::NoOp => {}
                 }
                 if focus_changed {
                     self.request_redraw();
@@ -14309,8 +18195,12 @@ impl App {
             HostEvent::ModifiersChanged(m) => {
                 self.modifiers = m;
             }
+            HostEvent::DroppedFiles { paths, position } => {
+                self.queue_dropped_files(paths, position);
+            }
             HostEvent::CursorLeft => {
                 self.pane_header_action_hover_tab_id = None;
+                self.hovered_terminal_link = None;
                 self.clear_chrome_drag_state();
                 self.request_redraw();
             }
@@ -14349,8 +18239,12 @@ impl App {
                 if self.stashed_pane_drag.is_some() {
                     self.refresh_cursor_from_global_mouse();
                 }
-                self.draw();
-                if self.stashed_pane_drag.is_some() {
+                if self.draw() == HostControl::Exit {
+                    return HostControl::Exit;
+                }
+                if self.stashed_pane_drag.is_some()
+                    && self.frame_recovery.continuous_redraw_allowed()
+                {
                     self.request_redraw();
                 }
             }
@@ -14830,7 +18724,15 @@ impl App {
                         focused_split_source_tab_id(strip, self.focused_pane_session.as_deref())
                     })
                     .map(str::to_string);
-                emit_split_requested(self.events.as_ref(), axis, from_tab_id);
+                emit_split_requested(
+                    self.events.as_ref(),
+                    self.tab_strip_source
+                        .as_ref()
+                        .map(|strip| strip.window_id.as_str())
+                        .unwrap_or_default(),
+                    axis,
+                    from_tab_id,
+                );
                 return;
             }
         }
@@ -14854,7 +18756,14 @@ impl App {
                     focused_split_source_tab_id(strip, self.focused_pane_session.as_deref())
                 })
                 .map(str::to_string);
-            emit_close_focused_pane_requested(self.events.as_ref(), tab_id);
+            emit_close_focused_pane_requested(
+                self.events.as_ref(),
+                self.tab_strip_source
+                    .as_ref()
+                    .map(|strip| strip.window_id.as_str())
+                    .unwrap_or_default(),
+                tab_id,
+            );
             return;
         }
 
@@ -15682,6 +19591,75 @@ impl App {
         }
     }
 
+    /// Resolve the real pointer against the exact pane/grid currently painted there.
+    /// The returned highlight is in absolute window-grid cells so rendering and click
+    /// handling consume one geometry projection on both desktop hosts.
+    fn terminal_link_at_cursor(&self) -> Option<HoveredTerminalLink> {
+        if self.selecting
+            || self.picker_shown()
+            || self.command_palette_shown()
+            || self.file_path_input_shown()
+            || self.file_preview.is_some()
+            || self.shortcut_hint_shown()
+            || self.outbound_stalled
+            || self.cursor_in_top_bar()
+            || self.cursor_in_dashboard_panel()
+            || self.cursor_in_dock()
+        {
+            return None;
+        }
+
+        if let Some(layout) = self.current_split_layout() {
+            let absolute = self.hit_test_window_grid(self.cursor_px)?;
+            let pane = layout_pane_at_cell(&layout, absolute.col, absolute.row)?;
+            let content = pane_content_region_for_layout(pane.region, layout.panes.len());
+            let (local_col, local_row) =
+                pane_local_cell_in_region(content, absolute.col, absolute.row)?;
+            let grid = self.focused_pane_grid(&pane.session_id)?;
+            let row = grid.rows_cells.get(local_row)?;
+            // A cached PTY grid can briefly be wider than its painted split region
+            // during resize. Detect only in the visible slice so neither hit geometry
+            // nor the underline can cross a divider into the adjacent pane.
+            let visible_cols = usize::from(content.cols).min(row.len());
+            let span = terminal_links::link_at_cell(&row[..visible_cols], local_col)?;
+            return Some(HoveredTerminalLink {
+                url: span.url,
+                highlight: TerminalLinkHighlight {
+                    row: content.row as usize + local_row,
+                    start_col: content.col as usize + span.start_col,
+                    end_col: content.col as usize + span.end_col,
+                },
+            });
+        }
+
+        let cell = self.hit_test(self.cursor_px)?;
+        let grid = self.focused_pane_grid(&self.session_id)?;
+        let row = grid.rows_cells.get(cell.row)?;
+        let span = terminal_links::link_at_cell(row, cell.col)?;
+        Some(HoveredTerminalLink {
+            url: span.url,
+            highlight: TerminalLinkHighlight {
+                row: cell.row,
+                start_col: span.start_col,
+                end_col: span.end_col,
+            },
+        })
+    }
+
+    fn update_terminal_link_hover(&mut self, request_redraw: bool) {
+        let next = self.terminal_link_at_cursor();
+        let changed = self.hovered_terminal_link != next;
+        self.hovered_terminal_link = next;
+        if self.hovered_terminal_link.is_some() {
+            self.set_cursor_icon(HostCursorIcon::Pointer);
+        } else if changed && !self.update_react_chrome_resize_cursor() {
+            self.update_divider_cursor();
+        }
+        if changed && request_redraw {
+            self.request_redraw();
+        }
+    }
+
     fn resolve_pane_header_action_hover_at_cursor(&self) -> Option<String> {
         let layout = self.current_split_layout()?;
         if layout.panes.len() < 2 {
@@ -15808,6 +19786,7 @@ impl App {
         self.sel_anchor = pos;
         self.sel_focus = pos;
         self.selecting = true;
+        self.hovered_terminal_link = None;
         self.sel_session_id = pos.map(|_| self.focused_session_id());
         self.sel_generation = self.sel_session_id.as_deref().and_then(|id| {
             self.shared
@@ -15831,6 +19810,9 @@ impl App {
     /// Keeping this projection separate makes pane ownership/coordinate translation independently
     /// testable on every host; [`Self::copy_selection`] remains the only native side-effect boundary.
     fn selected_text(&self) -> Option<String> {
+        if !self.viewport_is_bound() {
+            return None;
+        }
         let (anchor, focus) = self.current_selection()?;
         let owner = self.sel_session_id.as_deref()?;
         // Read from the selection OWNER rather than inferring the source from layout shape. A zoomed
@@ -15867,26 +19849,91 @@ impl App {
     pub(crate) fn resume_linux_terminal_presentation(
         &mut self,
         resume: crate::linux_host::present_target::TerminalPresentationResume,
-    ) {
+    ) -> HostControl {
+        self.frame_recovery.rearm_from_external_event();
         if let Some((width, height)) = resume.deferred_resize {
             if let Some(renderer) = self.renderer.as_mut() {
                 renderer.resize(width, height);
             }
         }
         if resume.redraw_required {
-            self.draw_frame(true);
+            return self.draw_frame(true);
         }
+        HostControl::Continue
     }
 
-    fn draw(&mut self) {
-        self.draw_frame(true);
+    fn draw(&mut self) -> HostControl {
+        self.draw_frame(true)
+    }
+
+    fn outbound_refusal_overlay(&self) -> Option<Vec<RendererCommandPaletteOverlayLine>> {
+        self.outbound_stalled.then(|| {
+            vec![RendererCommandPaletteOverlayLine {
+                text: "terminal I/O paused: daemon connection is not writable".to_string(),
+                selectable: false,
+                selected: false,
+                action_index: None,
+            }]
+        })
+    }
+
+    /// Present a completely terminal-neutral surface. This is deliberately independent of App's
+    /// possibly stale strip/store mirrors because reader-side EOF can revoke Shared authority before
+    /// ConnectionClosed reaches the owner. All terminal chrome, panes, grids, selection, and geometry
+    /// are cleared; only the fixed low-cardinality outbound diagnostic may remain.
+    fn draw_neutral_frame(&mut self) -> HostControl {
+        let refusal = self.outbound_refusal_overlay();
+        if let Some(host) = self.host.as_ref() {
+            host.set_title(&self.window_title);
+        }
+        let Some(renderer) = self.renderer.as_mut() else {
+            return HostControl::Continue;
+        };
+        renderer.set_top_bar(None, 0.0, None);
+        renderer.set_dashboard_panel(None, 0.0, None);
+        renderer.set_dock_width_x(0.0);
+        renderer.set_grid_origin_x(0.0);
+        renderer.set_dock_rows(Vec::new(), false);
+        renderer.set_picker_overlay(None);
+        renderer.set_command_palette_overlay(None);
+        renderer.set_shortcut_hint_overlay(refusal);
+        renderer.set_file_preview_overlay(None);
+        renderer.set_file_path_input_overlay(None);
+        renderer.set_split_frame(None, SiblingPaneStatus::Detached);
+        renderer.set_sibling_grid(None);
+        renderer.set_extra_panes(Vec::new(), Vec::new());
+        renderer.set_focus_indicator(None);
+        renderer.set_inactive_dims(Vec::new());
+        renderer.set_drop_highlight(None);
+        let outcome = renderer.render(None, None, None);
+        match self.frame_recovery.observe(outcome) {
+            FrameRecoveryAction::None => HostControl::Continue,
+            FrameRecoveryAction::RequestRedraw => {
+                self.request_redraw();
+                HostControl::Continue
+            }
+            FrameRecoveryAction::Exit => HostControl::Exit,
+        }
     }
 
     /// Compose and present one frame. Normal redraws synchronize every visible PTY/pane geometry
     /// before painting. A Linux GTK allocation uses `sync_session_geometry = false`: its purpose is
     /// to commit a correctly sized WGPU buffer immediately, while the existing ResizeCoalescer and
     /// settled refit remain the sole bounded path for daemon winsize changes during resize bursts.
-    fn draw_frame(&mut self, sync_session_geometry: bool) {
+    fn draw_frame(&mut self, sync_session_geometry: bool) -> HostControl {
+        // Reader/writer fail-close publishes the atomic transport latch and wakes the owner before
+        // physical cache teardown, which may still be waiting for an in-flight authority reader.
+        // Honor that latch before ANY retry path: retry_pending_recoveries can otherwise discover a
+        // terminal queue and recursively enter teardown, blocking this owner thread instead of
+        // presenting the required neutral frame. Explicit user ClearViewport keeps the connection
+        // alive, so its neutral Detach-only cleanup still reaches the retry immediately below.
+        if !self.connection_alive || self.shared.connection_is_closed() {
+            return self.draw_neutral_frame();
+        }
+        // A queue-lock contention can complete after the writer's last capacity transition. The
+        // producer schedules this immediate redraw; retry before composing the frame so there is no
+        // missed-wake path even when the daemon is otherwise idle.
+        self.retry_pending_outbound();
         // A synchronized Wayland child placed below the full-window WebKit overlay may stop
         // receiving FIFO release/frame progress. Mesa can then block indefinitely inside
         // acquire/present on this sole Tao/GTK owner thread. The host closes this gate before
@@ -15899,7 +19946,7 @@ impl App {
             .as_ref()
             .is_some_and(|host| !host.try_begin_terminal_frame())
         {
-            return;
+            return HostControl::Continue;
         }
         // NOTE: draw() must never call `request_inner_size` (or any programmatic window
         // sizing) — see RUNTIME_WINDOW_AUTOSIZE. On macOS a redraw can fire from inside
@@ -15908,6 +19955,9 @@ impl App {
         // boundary). The OS owns the window size after creation; the daemon grid follows
         // the window via WindowEvent::Resized, never the other way around.
         self.update_fps();
+        if !self.viewport_is_bound() {
+            return self.draw_neutral_frame();
+        }
 
         // Resolve the primary pane through the same uniform per-id accessor every other pane
         // uses (`pane_paint`), so the primary session is no longer a privileged paint path — it is just
@@ -16193,7 +20243,19 @@ impl App {
         let grid_origin_x = self.terminal_grid_origin_x_px();
         let grid_top_offset = self.grid_top_offset_px();
         let panel_origin = self.dashboard_panel_origin_px();
+        // Output can replace the row under a stationary pointer without another
+        // CursorMoved event. Re-resolve once per presented frame so stale URL text
+        // is never underlined or later trusted; the scan remains one bounded row.
+        self.update_terminal_link_hover(false);
+        let terminal_link_highlight = self
+            .hovered_terminal_link
+            .as_ref()
+            .map(|target| target.highlight);
 
+        let shortcut_overlay = self
+            .outbound_refusal_overlay()
+            .or_else(|| self.shortcut_hint_lines.clone());
+        let mut frame_outcome = None;
         if let Some(r) = self.renderer.as_mut() {
             // Reserved top pixels include the surface-owned React band, one native tab row when drawn,
             // and the dashboard-panel rows. `set_top_bar(None, 0.0)` plus an empty panel starts the
@@ -16240,7 +20302,7 @@ impl App {
             // read-only list of the current split controls drawn over the grid. SEPARATE carrier from the
             // picker/command-palette overlays; `None` keeps every existing path byte-identical. The grid
             // stays visible behind it and ordinary keys keep reaching the PTY while it is shown.
-            r.set_shortcut_hint_overlay(self.shortcut_hint_lines.clone());
+            r.set_shortcut_hint_overlay(shortcut_overlay);
             // Read-only file-preview overlay (when one is active): the bounded preview the app's reader
             // produced, projected through `compose_file_preview_overlay_lines` and painted as a NON-modal
             // band anchored to the RIGHT half of the window. SEPARATE carrier; `None` keeps every path
@@ -16316,13 +20378,29 @@ impl App {
             // drag, drawn over the dim but under the focus indicator. `None` whenever no drag is in
             // flight, keeping every non-drag frame byte-identical.
             r.set_drop_highlight(drop_highlight);
+            r.set_terminal_link_highlight(terminal_link_highlight);
             // With a split, all panes (primary included) paint via `set_extra_panes`
             // region-local from their own stores, so the privileged primary-grid pass must paint
             // nothing — otherwise it would re-paint the primary clipped to the (wrong) active region.
             // The divider is carried in `extra_dividers`. With no split, `grid` is the single pane.
             let grid_for_render = if split_active { None } else { grid };
             let legacy_bottom_overlay = LEGACY_BOTTOM_OVERLAY_VISIBLE.then_some(overlay.as_str());
-            r.render(grid_for_render, legacy_bottom_overlay, selection);
+            frame_outcome = Some(r.render(grid_for_render, legacy_bottom_overlay, selection));
+        }
+
+        let Some(frame_outcome) = frame_outcome else {
+            return HostControl::Continue;
+        };
+        match self.frame_recovery.observe(frame_outcome) {
+            FrameRecoveryAction::None => HostControl::Continue,
+            FrameRecoveryAction::RequestRedraw => {
+                self.request_redraw();
+                HostControl::Continue
+            }
+            FrameRecoveryAction::Exit => {
+                eprintln!("maestro-renderer: fatal GPU surface failure; exiting renderer host");
+                HostControl::Exit
+            }
         }
     }
 }
@@ -16413,6 +20491,8 @@ fn run_renderer_impl(
     let RendererLaunch {
         socket_path,
         session_id,
+        attachment_handoff,
+        exact_viewport,
         window_title: launch_title,
         status_label,
         tab_strip,
@@ -16424,34 +20504,126 @@ fn run_renderer_impl(
         theme,
         react_chrome,
     } = launch;
+    if let Some(handoff) = attachment_handoff.as_ref() {
+        match handoff.register_attempt(&session_id, tab_strip.as_ref(), exact_viewport.as_ref()) {
+            RendererAttachmentHandoffAttemptRegistration::New => {}
+            RendererAttachmentHandoffAttemptRegistration::Duplicate
+            | RendererAttachmentHandoffAttemptRegistration::Conflict => {
+                // Another renderer owner already registered this one-shot wrapper. Conservatively
+                // close the compensation-safe boundary without cancelling the competing owner.
+                handoff.authority().mark_claim_admitted();
+                return Err(unavailable_handoff_error(handoff));
+            }
+        }
+    }
+    let desired_viewport = exact_viewport
+        .as_ref()
+        .and_then(|exact| desired_viewport_for_launch(&session_id, exact, tab_strip.as_ref()));
+    let legacy_read_only = exact_viewport.is_none() && attachment_handoff.is_none();
+    let handoff_exactly_matches = attachment_handoff.as_ref().is_none_or(|handoff| {
+        handoff.authority().session_id().0.as_str() == session_id
+            && exact_viewport.as_ref().is_some_and(|exact| {
+                exact.primary().generation() == handoff.authority().expected_generation()
+            })
+    });
+    if (!legacy_read_only && desired_viewport.is_none()) || !handoff_exactly_matches {
+        return Err(attachment_handoff.as_ref().map_or(
+            RendererRunError::ViewportAuthorityUnavailable,
+            unavailable_handoff_error,
+        ));
+    }
     let title = window_title(launch_title.as_deref()).to_string();
     let tab_strip_line = compose_tab_strip_line(tab_strip.as_ref());
+    // Do not create any native/React surface before every exact route proves. Client workers wake
+    // this staging adapter while their validated caches advance; it forwards nothing to UI until
+    // the synchronous aggregate gate succeeds and the real owner loop is activated below.
+    let (startup_wake_tx, startup_wake_rx) = std::sync::mpsc::channel();
+    let startup_sender = StartupEventSender::new(startup_wake_tx);
+    let attachment_claim = attachment_handoff.as_ref().map(claim_for_handoff);
+    let spawned = client::spawn_with_initial_binding(
+        socket_path,
+        session_id.clone(),
+        desired_viewport,
+        attachment_claim,
+        Box::new(startup_sender.clone()),
+    );
+    let client::SpawnedClient {
+        shared,
+        initial_binding,
+        initial_exact_viewport,
+    } = spawned;
+    let startup_proven = if legacy_read_only {
+        initial_binding.as_ref().is_some_and(|binding| {
+            wait_for_startup_legacy_binding(shared.as_ref(), binding, &startup_wake_rx)
+        }) && initial_exact_viewport.is_none()
+    } else {
+        initial_exact_viewport.as_ref().is_some_and(|binding| {
+            wait_for_startup_exact_viewport(shared.as_ref(), binding, &startup_wake_rx)
+        })
+    };
+    if !startup_proven {
+        shared.abort_connection();
+        return Err(attachment_handoff
+            .as_ref()
+            .map_or(RendererRunError::ViewportAuthorityUnavailable, |handoff| {
+                unavailable_startup_handoff_error(handoff, initial_exact_viewport.as_ref())
+            }));
+    }
 
-    // Build the OWNER event loop FIRST so its user-event sender can be handed to the client;
-    // the client wakes the owner loop through it on every validated change.
-    //
-    // macOS (and other winit platforms): the winit loop is the owner, exactly as before.
+    // All native/App/WebView producers write through one publication gate. Startup reaches this
+    // point only after every exact baseline; runtime Clear/rebind closes the same Arc before local
+    // projection teardown and aggregate commit reopens it afterward.
+    let viewport_event_gate = Arc::new(ViewportEventGate::new(true));
+    let renderer_events = viewport_gated_renderer_events(events, Arc::clone(&viewport_event_gate));
+
+    // Only a complete aggregate baseline may create the native owner and any embedded chrome.
+    // macOS (and other winit platforms): the winit loop remains the eventual owner.
     #[cfg(not(target_os = "linux"))]
-    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
+    let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
+        Ok(event_loop) => event_loop,
+        Err(error) => {
+            shared.abort_connection();
+            return Err(attachment_handoff.as_ref().map_or_else(
+                || RendererRunError::EventLoop(error),
+                |handoff| {
+                    unavailable_startup_handoff_error(handoff, initial_exact_viewport.as_ref())
+                },
+            ));
+        }
+    };
     #[cfg(not(target_os = "linux"))]
     event_loop.set_control_flow(ControlFlow::Wait);
     #[cfg(not(target_os = "linux"))]
     let wake_sender: Box<dyn UserEventSender> = Box::new(event_loop.create_proxy());
 
-    // Linux: the Tao/GTK DashboardHost owns the window AND user-event delivery, so it is built
-    // BEFORE the client connects — its Tao proxy is the wake path (a send wakes the blocked GLib
-    // main context directly; there is no secondary winit loop to pump). The host needs the React
-    // chrome + events sender before `App::new` consumes the launch values, hence the clones.
+    // Linux: build the Tao/GTK DashboardHost only after proof, so its sidebar/topbar/overlay WebViews
+    // cannot expose or admit app intents for an unproven viewport.
     #[cfg(target_os = "linux")]
     let linux_host = {
         use crate::linux_host::LinuxDashboardHost;
-        LinuxDashboardHost::new(&title, react_chrome.clone(), events.clone())
-            .map_err(|e| RendererRunError::LinuxHost(e.to_string()))?
+        match LinuxDashboardHost::new(&title, react_chrome.clone(), renderer_events.clone()) {
+            Ok(host) => host,
+            Err(error) => {
+                shared.abort_connection();
+                return Err(attachment_handoff.as_ref().map_or_else(
+                    || RendererRunError::LinuxHost(error.to_string()),
+                    |handoff| {
+                        unavailable_startup_handoff_error(handoff, initial_exact_viewport.as_ref())
+                    },
+                ));
+            }
+        }
     };
     #[cfg(target_os = "linux")]
     let wake_sender: Box<dyn UserEventSender> = linux_host.user_event_sender();
-
-    let shared = client::spawn(socket_path, session_id.clone(), wake_sender.clone_sender());
+    if !startup_sender.activate(wake_sender.clone_sender()) || shared.connection_is_closed() {
+        shared.abort_connection();
+        return Err(attachment_handoff
+            .as_ref()
+            .map_or(RendererRunError::ViewportAuthorityUnavailable, |handoff| {
+                unavailable_startup_handoff_error(handoff, initial_exact_viewport.as_ref())
+            }));
+    }
 
     // Optional external command channel: a detached bridge thread translates each
     // RendererCommand onto its own owner-loop sender and exits when the channel closes or the
@@ -16474,8 +20646,8 @@ fn run_renderer_impl(
     let app_event_proxy: Option<EventLoopProxy<UserEvent>> = None;
 
     let mut app = App::new(
-        shared,
-        session_id,
+        Arc::clone(&shared),
+        session_id.clone(),
         title,
         status_label,
         tab_strip_line,
@@ -16485,11 +20657,52 @@ fn run_renderer_impl(
         react_chrome,
         picker,
         command_palette,
-        events,
+        None,
+        Some(wake_sender.clone_sender()),
         app_event_proxy,
         font_size_px,
         theme,
     );
+    app.events = AppRendererEvents(renderer_events);
+    app.viewport_event_gate = viewport_event_gate;
+    app.exact_viewport = exact_viewport.clone();
+    if let Some(handoff) = attachment_handoff {
+        let initial_exact_viewport = initial_exact_viewport
+            .as_ref()
+            .expect("attachment handoff requires an exact startup viewport");
+        let mut guard = RuntimeAttachmentHandoffCancelGuard::new(handoff);
+        guard.mark_claim_admitted(initial_exact_viewport.clone());
+        match guard.claim_if_exact_grid_proven(shared.as_ref(), true) {
+            RuntimeAttachmentHandoffProof::Proven(disposition) => {
+                app.emit_handoff_disposition(disposition);
+            }
+            RuntimeAttachmentHandoffProof::Pending
+            | RuntimeAttachmentHandoffProof::ClaimedViewportUnavailable(_)
+            | RuntimeAttachmentHandoffProof::Contradicted => {
+                shared.abort_connection();
+                return Err(unavailable_startup_handoff_error(
+                    &guard.handoff,
+                    guard.claim_binding.as_ref(),
+                ));
+            }
+        }
+    }
+    // The window/chrome are born only after the relevant baseline proof. Canonical v3 publishes the
+    // complete exact cohort. A retained legacy peer has only the one primary textual route, which is
+    // permanently mutation-read-only for this App lifetime.
+    if legacy_read_only {
+        app.enter_mutation_read_only();
+        app.attached_sessions.insert(session_id.clone());
+    } else {
+        app.attached_sessions.extend(
+            exact_viewport
+                .as_ref()
+                .expect("validated exact viewport")
+                .targets()
+                .map(|target| target.session_id().to_string()),
+        );
+    }
+    let _ = wake_sender.send(UserEvent::Redraw);
 
     #[cfg(not(target_os = "linux"))]
     {
@@ -16543,6 +20756,149 @@ fn run_renderer_impl(
     }
 }
 
+#[cfg(test)]
+mod retained_v2_startup_admission_tests {
+    use super::{client, wait_for_startup_legacy_binding, StartupEventSender};
+    use crate::wire::{
+        Cell, Color, CursorShape, DaemonEvent, GridSnapshot, NamedColor, Revision,
+        SessionGeneration,
+    };
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::sync::mpsc;
+
+    fn retained_grid() -> GridSnapshot {
+        GridSnapshot {
+            version: crate::sync::SUPPORTED_VERSION,
+            generation: SessionGeneration("retained-v2-generation".into()),
+            revision: Revision(1),
+            base_revision: Revision(1),
+            cols: 1,
+            rows: 1,
+            rows_cells: vec![vec![Cell {
+                text: " ".into(),
+                fg: Color::Named {
+                    name: NamedColor::Foreground,
+                },
+                bg: Color::Named {
+                    name: NamedColor::Background,
+                },
+                bold: false,
+                italic: false,
+                underline: Default::default(),
+                inverse: false,
+                strikeout: false,
+                dim: false,
+                hidden: false,
+                hyperlink: None,
+                width: 1,
+            }]],
+            cursor_line: 0,
+            cursor_col: 0,
+            cursor_visible: true,
+            cursor_shape: CursorShape::Block,
+            alt_screen: false,
+            app_cursor: false,
+            bracketed_paste: false,
+            focus_reporting: false,
+            mouse_report: false,
+            mouse_drag: false,
+            mouse_motion: false,
+            mouse_sgr: false,
+        }
+    }
+
+    #[test]
+    fn retained_v2_no_handoff_transport_reaches_grid_without_exact_viewport() {
+        let socket = std::path::PathBuf::from("/tmp").join(format!(
+            "mr-v2-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut probe, _) = listener.accept().unwrap();
+            let mut probe_reader = BufReader::new(probe.try_clone().unwrap());
+            let mut request = String::new();
+            probe_reader.read_line(&mut request).unwrap();
+            assert_eq!(request.trim(), r#"{"op":"daemon_info"}"#);
+            writeln!(
+                probe,
+                "{}",
+                serde_json::to_string(&DaemonEvent::DaemonInfo {
+                    protocol_version: 2,
+                    build_version: "retained-v2".into(),
+                    daemon_instance_id: None,
+                    output_generation_echo: false,
+                    child_environment: false,
+                    generation_conditional_mutations: false,
+                    attachment_aware_conditional_kill: false,
+                    generation_conditional_attach: false,
+                })
+                .unwrap()
+            )
+            .unwrap();
+            probe.flush().unwrap();
+
+            let mut stream = probe;
+            let mut reader = probe_reader;
+            let mut operations = Vec::new();
+            for _ in 0..2 {
+                request.clear();
+                reader.read_line(&mut request).unwrap();
+                let value: serde_json::Value = serde_json::from_str(&request).unwrap();
+                operations.push(value["op"].as_str().unwrap().to_string());
+                if value["op"] == "attach" {
+                    assert_eq!(value["id"], "retained-session");
+                    assert!(value["expected_session_generation"].is_null());
+                    assert!(value["handoff"].is_null());
+                }
+            }
+            writeln!(
+                stream,
+                "{}",
+                serde_json::to_string(&DaemonEvent::Grid {
+                    id: "retained-session".into(),
+                    grid: retained_grid(),
+                })
+                .unwrap()
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            release_rx.recv().unwrap();
+            operations
+        });
+
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let startup_sender = StartupEventSender::new(wake_tx);
+        let spawned = client::spawn_with_initial_binding(
+            socket.to_string_lossy().into_owned(),
+            "retained-session".into(),
+            None,
+            None,
+            Box::new(startup_sender),
+        );
+        let binding = spawned
+            .initial_binding
+            .as_ref()
+            .expect("legacy fallback publishes exactly one primary binding");
+        assert!(spawned.initial_exact_viewport.is_none());
+        assert!(wait_for_startup_legacy_binding(
+            spawned.shared.as_ref(),
+            binding,
+            &wake_rx,
+        ));
+        spawned.shared.abort_connection();
+        release_tx.send(()).unwrap();
+        assert_eq!(server.join().unwrap(), ["attach", "snapshot"]);
+        let _ = std::fs::remove_file(socket);
+    }
+}
+
 /// Run the renderer against the synthetic fixture. A background thread cycles the
 /// cursor shape (block → underline → beam) every ~1.5s and bumps the revision so
 /// the overlay stays live and all three shapes can be eyeballed in one session.
@@ -16589,6 +20945,7 @@ pub fn run_demo_scene() -> Result<(), RendererRunError> {
         None,
         None,
         false,
+        None,
         None,
         None,
         None,
@@ -16648,6 +21005,7 @@ pub fn run_stress(mode: StressMode) -> Result<(), RendererRunError> {
         None,
         None,
         None,
+        None,
     );
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -16697,6 +21055,97 @@ mod window_sizing_policy_tests {
             "runtime programmatic window sizing must stay disabled (macOS SIGABRT on \
              green-button maximize/fullscreen)"
         );
+    }
+}
+
+#[cfg(test)]
+mod frame_recovery_tests {
+    use super::{FrameRecoveryAction, FrameRecoveryState};
+    use crate::render::FrameOutcome;
+
+    #[test]
+    fn second_acquire_failure_requests_one_bounded_redraw() {
+        let mut recovery = FrameRecoveryState::default();
+
+        assert_eq!(
+            recovery.observe(FrameOutcome::SurfaceUnavailable),
+            FrameRecoveryAction::RequestRedraw
+        );
+        assert_eq!(
+            recovery.observe(FrameOutcome::SurfaceUnavailable),
+            FrameRecoveryAction::None,
+            "the recovery redraw cannot queue itself forever"
+        );
+        assert!(!recovery.continuous_redraw_allowed());
+    }
+
+    #[test]
+    fn successful_present_resets_and_rearms_surface_recovery() {
+        let mut recovery = FrameRecoveryState::default();
+        assert_eq!(
+            recovery.observe(FrameOutcome::SurfaceUnavailable),
+            FrameRecoveryAction::RequestRedraw
+        );
+        assert_eq!(
+            recovery.observe(FrameOutcome::Presented),
+            FrameRecoveryAction::None
+        );
+        assert!(recovery.continuous_redraw_allowed());
+        assert_eq!(
+            recovery.observe(FrameOutcome::SurfaceUnavailable),
+            FrameRecoveryAction::RequestRedraw
+        );
+    }
+
+    #[test]
+    fn text_prepare_failure_requests_one_bounded_redraw() {
+        let mut recovery = FrameRecoveryState::default();
+
+        assert_eq!(
+            recovery.observe(FrameOutcome::PresentedWithoutText),
+            FrameRecoveryAction::RequestRedraw
+        );
+        assert_eq!(
+            recovery.observe(FrameOutcome::PresentedWithoutText),
+            FrameRecoveryAction::None,
+            "repeated prepare failure must stop requeueing until independent progress"
+        );
+        assert!(!recovery.continuous_redraw_allowed());
+
+        assert_eq!(
+            recovery.observe(FrameOutcome::Presented),
+            FrameRecoveryAction::None
+        );
+        assert_eq!(
+            recovery.observe(FrameOutcome::PresentedWithoutText),
+            FrameRecoveryAction::RequestRedraw,
+            "a later complete frame must re-arm prepare recovery"
+        );
+    }
+
+    #[test]
+    fn later_external_event_rearms_after_persistent_failure() {
+        let mut recovery = FrameRecoveryState::default();
+        recovery.observe(FrameOutcome::SurfaceUnavailable);
+        recovery.observe(FrameOutcome::SurfaceUnavailable);
+
+        recovery.rearm_from_external_event();
+
+        assert_eq!(
+            recovery.observe(FrameOutcome::SurfaceUnavailable),
+            FrameRecoveryAction::RequestRedraw
+        );
+    }
+
+    #[test]
+    fn fatal_surface_failure_exits_without_retry() {
+        let mut recovery = FrameRecoveryState::default();
+
+        assert_eq!(
+            recovery.observe(FrameOutcome::FatalSurface),
+            FrameRecoveryAction::Exit
+        );
+        assert!(!recovery.continuous_redraw_allowed());
     }
 }
 
@@ -16925,6 +21374,7 @@ mod file_path_input_tests {
             None,
             None,
             Some(tx),
+            None,
             None,
             None,
             None,
@@ -17984,14 +22434,14 @@ mod tab_strip_tests {
 mod split_frame_tests {
     use super::{
         active_pane_region, active_pane_session_id, active_pane_tab_id, active_resize_dims,
-        active_split_frame, compose_shortcut_hint_overlay_lines, compose_split_frame_hint,
-        compose_tab_strip_text, compute_split_frame, compute_split_frame_with,
-        compute_split_layout, compute_split_layout_with, divider_drag_share,
-        divider_target_at_cell, emit_pane_edge_dock_requested, first_share_to_per_mille,
-        focus_cycle_shortcut_matches, focused_pane_region, focused_session_write_target,
-        focused_split_child_to_reset, focused_split_source_tab_id, focused_terminal_cell_in_layout,
-        hydrate_split_ratios, inactive_pane_region, inactive_pane_regions,
-        inactive_pane_session_id, inactive_pane_tab_id, layout_pane_at_cell,
+        active_split_frame, bridge_commands, compose_shortcut_hint_overlay_lines,
+        compose_split_frame_hint, compose_tab_strip_text, compute_split_frame,
+        compute_split_frame_with, compute_split_layout, compute_split_layout_with,
+        divider_drag_share, divider_target_at_cell, emit_pane_edge_dock_requested,
+        first_share_to_per_mille, focus_cycle_shortcut_matches, focused_pane_region,
+        focused_session_write_target, focused_split_child_to_reset, focused_split_source_tab_id,
+        focused_terminal_cell_in_layout, hydrate_split_ratios, inactive_pane_region,
+        inactive_pane_regions, inactive_pane_session_id, inactive_pane_tab_id, layout_pane_at_cell,
         newly_split_child_session, pane_close_target_at_cell, pane_content_region,
         pane_content_region_for_layout, pane_cycle_target, pane_drag_origin_at_cell,
         pane_drop_highlight_region, pane_drop_zone_in_region, pane_focus_shortcut_matches,
@@ -18002,24 +22452,455 @@ mod split_frame_tests {
         shortcut_hint_toggle_matches, split_divider_targets, split_first_extent,
         split_ratio_nudge_delta, tab_id_for_session, terminal_pointer_cell_with_layout,
         visible_pane_drag_swap_target, zoom_collapsed_layout, zoom_paint_session,
-        zoom_toggle_shortcut_matches, App, CellPos, PaneCycleDirection, PaneDockEdge, PaneDropZone,
-        PaneFocusDirection, RendererEvent, RendererLayoutPane, RendererPaneRegion,
-        RendererSplitDivider, RendererSplitLayout, RendererTab, RendererTabSplitAxis,
-        RendererTabStrip, Shared, SiblingPaneStatus, SplitRatios, UserEvent, DEFAULT_SPLIT_RATIO,
-        DEFAULT_WINDOW_TITLE, MIN_SPLIT_RATIO, PANE_CLOSE_HIT_COLS, PANE_CLOSE_RIGHT_HIT_COLS,
-        PANE_HEADER_ROWS, RESIZE_RATIO_STEP, SHORTCUT_HINT_OVERLAY_MAX_ROWS,
+        zoom_toggle_shortcut_matches, App, CellPos, DividerDrag, OwnerBatchAdmission, OwnerRequest,
+        PaneCycleDirection, PaneDockEdge, PaneDrag, PaneDropZone, PaneFocusDirection,
+        ReactChromeResizeDrag, RectDividerDrag, RendererAttachmentHandoff,
+        RendererAttachmentHandoffOutcome, RendererCommand, RendererEvent,
+        RendererExactSessionTarget, RendererExactViewport, RendererExactViewportOutcome,
+        RendererExactViewportRequest, RendererExactViewportRole, RendererLayoutPane,
+        RendererPaneRegion, RendererSplitDivider, RendererSplitLayout, RendererTab,
+        RendererTabSplitAxis, RendererTabStrip, Shared, SiblingPaneStatus, SplitRatios,
+        StashedPaneDrag, UserEvent, UserEventSender, DEFAULT_SPLIT_RATIO, DEFAULT_WINDOW_TITLE,
+        MIN_SPLIT_RATIO, PANE_CLOSE_HIT_COLS, PANE_CLOSE_RIGHT_HIT_COLS, PANE_HEADER_ROWS,
+        RESIZE_RATIO_STEP, SHORTCUT_HINT_OVERLAY_MAX_ROWS,
     };
     use crate::client::ScrollAction;
     use crate::wire::{
         Cell, ClientRequest, Color, CursorShape, GridSnapshot, NamedColor, Revision,
         SessionGeneration, UnderlineStyle,
     };
-    use std::sync::Arc;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::sync::{mpsc, Arc, Mutex};
+
+    #[derive(Clone)]
+    struct HandoffOwnerSender(mpsc::Sender<UserEvent>);
+
+    impl UserEventSender for HandoffOwnerSender {
+        fn send(&self, event: UserEvent) -> Result<(), UserEvent> {
+            self.0.send(event).map_err(|error| error.0)
+        }
+
+        fn clone_sender(&self) -> Box<dyn UserEventSender> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FakeDaemonHandoffState {
+        Pending,
+        Claimed,
+        Cancelled,
+    }
+
+    struct OwnedHandoffFixture {
+        authority: Option<maestro_shell::AttachmentHandoffAuthority>,
+        server: Option<std::thread::JoinHandle<()>>,
+        base: std::path::PathBuf,
+        cancel_requests: Arc<std::sync::atomic::AtomicUsize>,
+        daemon_state: Arc<Mutex<FakeDaemonHandoffState>>,
+    }
+
+    impl OwnedHandoffFixture {
+        fn authority(&self) -> maestro_shell::AttachmentHandoffAuthority {
+            self.authority.as_ref().expect("fixture authority").clone()
+        }
+    }
+
+    impl Drop for OwnedHandoffFixture {
+        fn drop(&mut self) {
+            drop(self.authority.take());
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn owned_handoff_fixture(instance: &str) -> OwnedHandoffFixture {
+        owned_handoff_fixture_with_cancel_reply(instance, true)
+    }
+
+    fn owned_handoff_fixture_with_cancel_reply(
+        instance: &str,
+        acknowledge_cancel: bool,
+    ) -> OwnedHandoffFixture {
+        static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let suffix = NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!(
+            "maestro-renderer-handoff-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let socket = base.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let instance = instance.to_string();
+        let cancel_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_cancel_requests = Arc::clone(&cancel_requests);
+        let daemon_state = Arc::new(Mutex::new(FakeDaemonHandoffState::Pending));
+        let server_daemon_state = Arc::clone(&daemon_state);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut offered_token = None::<String>;
+            let mut start_operation = None::<(String, String)>;
+            let mut start_applied = false;
+            let mut grid_sent = false;
+            let mut start_operation_retired = false;
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                let request: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                match request.get("op").and_then(serde_json::Value::as_str) {
+                    Some("daemon_info") => {
+                        writeln!(
+                            stream,
+                            "{{\"ev\":\"daemon_info\",\"protocol_version\":3,\"build_version\":\"test-v3\",\"daemon_instance_id\":\"{instance}\",\"output_generation_echo\":true,\"child_environment\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"generation_conditional_attach\":true}}"
+                        )
+                        .unwrap();
+                    }
+                    Some("reserve_start_operation") => {
+                        assert!(
+                            start_operation.is_none(),
+                            "fixture accepts exactly one start operation"
+                        );
+                        let id = request["id"].as_str().unwrap().to_string();
+                        let operation_token =
+                            request["operation_token"].as_str().unwrap().to_string();
+                        assert_eq!(id, "sid-B");
+                        start_operation = Some((id.clone(), operation_token.clone()));
+                        writeln!(
+                            stream,
+                            "{}",
+                            serde_json::json!({
+                                "ev": "start_operation_reserved",
+                                "id": id,
+                                "operation_token": operation_token,
+                                "daemon_instance_id": instance,
+                                "outcome": {"status": "reserved"},
+                            })
+                        )
+                        .unwrap();
+                    }
+                    Some("start_session") => {
+                        let operation_token = request["conditional_start"]["operation_token"]
+                            .as_str()
+                            .unwrap();
+                        let (reserved_id, reserved_token) = start_operation
+                            .as_ref()
+                            .expect("ReserveStartOperation precedes StartSession");
+                        assert_eq!(request["id"].as_str(), Some(reserved_id.as_str()));
+                        assert_eq!(operation_token, reserved_token);
+                        assert!(
+                            !request["restart_exited"].as_bool().unwrap_or(false),
+                            "ordinary conditional Start must not request exited replacement"
+                        );
+                        assert_eq!(
+                            request["conditional_start"]["precondition"]["kind"].as_str(),
+                            Some("absent")
+                        );
+                        assert!(!start_applied);
+                        start_applied = true;
+                        writeln!(
+                            stream,
+                            "{{\"ev\":\"conditional_session_start\",\"id\":\"sid-B\",\"operation_token\":\"{operation_token}\",\"daemon_instance_id\":\"{instance}\",\"outcome\":{{\"status\":\"applied\",\"generation\":\"gen-C\"}}}}"
+                        )
+                        .unwrap();
+                    }
+                    Some("attach") => {
+                        assert!(start_applied, "Applied ACK precedes exact Attach");
+                        assert!(!grid_sent, "fixture emits one exact Grid");
+                        assert_eq!(request["id"].as_str(), Some("sid-B"));
+                        assert_eq!(
+                            request["expected_session_generation"].as_str(),
+                            Some("gen-C")
+                        );
+                        let output_generation = request["output_generation"]
+                            .as_u64()
+                            .expect("exact attach output generation");
+                        offered_token = Some(
+                            request["handoff"]["token"]
+                                .as_str()
+                                .expect("Offer token")
+                                .to_string(),
+                        );
+                        writeln!(
+                            stream,
+                            "{{\"ev\":\"grid\",\"id\":\"sid-B\",\"output_generation\":{output_generation},\"grid\":{{\"generation\":\"gen-C\",\"revision\":1}}}}"
+                        )
+                        .unwrap();
+                        grid_sent = true;
+                    }
+                    Some("retire_start_operation") => {
+                        assert!(grid_sent, "exact Grid precedes Applied retirement");
+                        assert!(
+                            !start_operation_retired,
+                            "fixture retires the start operation once"
+                        );
+                        let (reserved_id, reserved_token) = start_operation
+                            .as_ref()
+                            .expect("retirement preserves the reserved tuple");
+                        assert_eq!(request["id"].as_str(), Some(reserved_id.as_str()));
+                        assert_eq!(
+                            request["operation_token"].as_str(),
+                            Some(reserved_token.as_str())
+                        );
+                        assert_eq!(request["expected"]["state"].as_str(), Some("applied"));
+                        assert_eq!(request["expected"]["generation"].as_str(), Some("gen-C"));
+                        start_operation_retired = true;
+                        writeln!(
+                            stream,
+                            "{}",
+                            serde_json::json!({
+                                "ev": "start_operation_retired",
+                                "id": reserved_id,
+                                "operation_token": reserved_token,
+                                "daemon_instance_id": instance,
+                                "outcome": {"status": "retired"},
+                            })
+                        )
+                        .unwrap();
+                    }
+                    Some("cancel_attachment_handoff") => {
+                        assert!(
+                            start_operation_retired,
+                            "handoff cancellation follows durable start-operation retirement"
+                        );
+                        server_cancel_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        assert_eq!(
+                            request["token"].as_str(),
+                            offered_token.as_deref(),
+                            "cancellation must use the exact offered token"
+                        );
+                        let mut state = server_daemon_state.lock().unwrap();
+                        if *state == FakeDaemonHandoffState::Pending {
+                            *state = FakeDaemonHandoffState::Cancelled;
+                        }
+                        drop(state);
+                        if !acknowledge_cancel {
+                            break;
+                        }
+                        writeln!(
+                            stream,
+                            "{{\"ev\":\"attachment_handoff_cancelled\",\"id\":\"sid-B\",\"token\":\"{}\",\"daemon_instance_id\":\"{instance}\"}}",
+                            offered_token.as_deref().unwrap()
+                        )
+                        .unwrap();
+                        stream.flush().unwrap();
+                        break;
+                    }
+                    other => panic!("unexpected fake daemon request: {other:?}"),
+                }
+                stream.flush().unwrap();
+            }
+        });
+
+        let paths = maestro_shell::AppPaths::with_base(base.join("app"));
+        maestro_shell::ProjectService::new(&paths)
+            .create(
+                "project-test",
+                "project-test",
+                base.to_string_lossy(),
+                maestro_shell::NewProject::default(),
+                1,
+            )
+            .unwrap();
+        maestro_shell::write_record(
+            &paths,
+            maestro_shell::RecordKind::Workspace,
+            "workspace-test",
+            2,
+            &maestro_shell::Workspace {
+                workspace_id: "workspace-test".to_string(),
+                project_id: "project-test".to_string(),
+                root: base.to_string_lossy().into_owned(),
+                policy: maestro_shell::WorkspacePolicy::ScratchCwd,
+                consent: maestro_shell::WorkspaceConsent::default(),
+            },
+        )
+        .unwrap();
+        let params = maestro_shell::StartParams::adhoc(
+            "sid-B",
+            "workspace-test",
+            maestro_shell::SessionKind::Shell,
+            base.to_string_lossy().into_owned(),
+            &["sh".to_string()],
+            80,
+            24,
+            1,
+        );
+        let mut outcome = maestro_shell::ShellRuntime::new(&paths)
+            .without_endpoint_persist()
+            .with_connect_timeout(std::time::Duration::from_secs(2))
+            .start_session_for_renderer(Some(socket), &maestro_shell::ProcessEnv, &params)
+            .unwrap();
+        let authority = outcome
+            .take_attachment_handoff()
+            .expect("renderer handoff authority");
+        OwnedHandoffFixture {
+            authority: Some(authority),
+            server: Some(server),
+            base,
+            cancel_requests,
+            daemon_state,
+        }
+    }
+
+    struct OperationalClaimPeer {
+        socket: std::path::PathBuf,
+        claim_accepted: mpsc::Receiver<bool>,
+        close: mpsc::Sender<()>,
+        server: std::thread::JoinHandle<()>,
+    }
+
+    fn same_daemon_operational_claim_peer(
+        fixture: &OwnedHandoffFixture,
+        name: &str,
+    ) -> OperationalClaimPeer {
+        let socket = fixture.base.join(format!("{name}.sock"));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let instance = fixture
+            .authority
+            .as_ref()
+            .unwrap()
+            .expected_daemon_instance()
+            .as_str()
+            .to_string();
+        let expected_token = fixture.authority.as_ref().unwrap().token().clone();
+        let daemon_state = Arc::clone(&fixture.daemon_state);
+        let (claim_tx, claim_accepted) = mpsc::channel();
+        let (close, close_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut read_request = || {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(!line.is_empty(), "renderer closed before expected request");
+                serde_json::from_str::<ClientRequest>(line.trim()).unwrap()
+            };
+            assert!(matches!(read_request(), ClientRequest::DaemonInfo));
+            writeln!(
+                stream,
+                "{{\"ev\":\"daemon_info\",\"protocol_version\":3,\"build_version\":\"test-v3\",\"daemon_instance_id\":\"{instance}\",\"output_generation_echo\":true,\"child_environment\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"generation_conditional_attach\":true}}"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            let claim_matches = matches!(
+                read_request(),
+                ClientRequest::Attach {
+                    id,
+                    handoff: Some(maestro_shell::AttachmentHandoff::Claim { token }),
+                    ..
+                } if id == "sid-B" && token == expected_token
+            );
+            assert!(matches!(
+                read_request(),
+                ClientRequest::Snapshot { id } if id == "sid-B"
+            ));
+            let accepted = {
+                let mut state = daemon_state.lock().unwrap();
+                if claim_matches && *state == FakeDaemonHandoffState::Pending {
+                    *state = FakeDaemonHandoffState::Claimed;
+                    true
+                } else {
+                    false
+                }
+            };
+            claim_tx.send(accepted).unwrap();
+            close_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+        });
+        OperationalClaimPeer {
+            socket,
+            claim_accepted,
+            close,
+            server,
+        }
+    }
+
+    fn wait_for_test_connection_closed(events: &mpsc::Receiver<UserEvent>) {
+        loop {
+            if matches!(
+                events
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap(),
+                UserEvent::ConnectionClosed
+            ) {
+                return;
+            }
+        }
+    }
 
     fn strip(tabs: Vec<RendererTab>) -> RendererTabStrip {
         RendererTabStrip {
             window_id: "win".to_string(),
             tabs,
+        }
+    }
+
+    fn exact_viewport_for_strip(
+        strip: &RendererTabStrip,
+        generation: &str,
+    ) -> RendererExactViewport {
+        let primary_tab = strip
+            .tabs
+            .iter()
+            .find(|tab| tab.active)
+            .expect("test strip has one active tab");
+        let roles = strip
+            .tabs
+            .iter()
+            .map(|tab| RendererExactViewportRole {
+                tab_id: tab.tab_id.clone(),
+                target: RendererExactSessionTarget {
+                    session_id: tab.session_id.clone(),
+                    generation: generation.to_string(),
+                },
+            })
+            .collect::<Vec<_>>();
+        let unique_targets = strip
+            .tabs
+            .iter()
+            .map(|tab| tab.session_id.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|session_id| RendererExactSessionTarget {
+                session_id,
+                generation: generation.to_string(),
+            })
+            .collect();
+        RendererExactViewport {
+            window_id: strip.window_id.clone(),
+            primary_tab_id: primary_tab.tab_id.clone(),
+            primary: RendererExactSessionTarget {
+                session_id: primary_tab.session_id.clone(),
+                generation: generation.to_string(),
+            },
+            roles,
+            unique_targets,
+        }
+    }
+
+    fn exact_desired_viewport(
+        session_id: &str,
+        generation: &str,
+    ) -> crate::client::DesiredViewportBinding {
+        crate::client::DesiredViewportBinding {
+            primary_session_id: session_id.to_string(),
+            primary_expected_generation: SessionGeneration(generation.to_string()),
+            primary_dims: None,
+            panes: Vec::new(),
         }
     }
 
@@ -18088,6 +22969,7 @@ mod split_frame_tests {
             strikeout: false,
             dim: false,
             hidden: false,
+            hyperlink: None,
             width: 1,
         };
         GridSnapshot {
@@ -18113,8 +22995,25 @@ mod split_frame_tests {
         }
     }
 
+    fn exact_single_viewport(session_id: &str, generation: &str) -> RendererExactViewport {
+        let target = RendererExactSessionTarget {
+            session_id: session_id.to_string(),
+            generation: generation.to_string(),
+        };
+        RendererExactViewport {
+            window_id: "win".to_string(),
+            primary_tab_id: "fixture-primary".to_string(),
+            primary: target.clone(),
+            roles: vec![RendererExactViewportRole {
+                tab_id: "fixture-primary".to_string(),
+                target: target.clone(),
+            }],
+            unique_targets: vec![target],
+        }
+    }
+
     fn role_transition_app(shared: Arc<Shared>, session_id: &str) -> App {
-        App::new(
+        let mut app = App::new(
             shared,
             session_id.to_string(),
             DEFAULT_WINDOW_TITLE.to_string(),
@@ -18130,27 +23029,1521 @@ mod split_frame_tests {
             None,
             None,
             None,
-        )
+            None,
+        );
+        app.exact_viewport = Some(exact_single_viewport(session_id, "gen-C"));
+        app
     }
 
-    fn replay_attached_sessions(
-        initial: &[&str],
-        requests: &[ClientRequest],
-    ) -> std::collections::BTreeSet<String> {
-        let mut attached: std::collections::BTreeSet<String> =
-            initial.iter().map(|id| (*id).to_string()).collect();
-        for request in requests {
-            match request {
-                ClientRequest::Attach { id, .. } => {
-                    attached.insert(id.clone());
+    fn role_transition_handoff_app(
+        shared: Arc<Shared>,
+        session_id: &str,
+    ) -> (
+        App,
+        mpsc::Receiver<UserEvent>,
+        mpsc::Receiver<RendererEvent>,
+    ) {
+        let (owner_tx, owner_rx) = mpsc::channel();
+        let (events_tx, events_rx) = mpsc::channel();
+        let mut app = App::new(
+            shared,
+            session_id.to_string(),
+            DEFAULT_WINDOW_TITLE.to_string(),
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(events_tx),
+            Some(Box::new(HandoffOwnerSender(owner_tx))),
+            None,
+            None,
+            None,
+        );
+        app.exact_viewport = Some(exact_single_viewport(session_id, "gen-C"));
+        (app, owner_rx, events_rx)
+    }
+
+    fn handoff_event(
+        session_id: &str,
+        handoff: RendererAttachmentHandoff,
+        active_tab_session_id: &str,
+    ) -> UserEvent {
+        let mut tab = plain_tab("handoff", true);
+        tab.session_id = active_tab_session_id.to_string();
+        let tab_strip = strip(vec![tab]);
+        let exact_viewport =
+            exact_viewport_for_strip(&tab_strip, handoff.authority().expected_generation());
+        UserEvent::AttachSessionWithHandoff {
+            session_id: session_id.to_string(),
+            handoff,
+            tab_strip,
+            exact_viewport,
+        }
+    }
+
+    fn finish_handoff_worker(
+        app: &mut App,
+        owner_rx: &mpsc::Receiver<UserEvent>,
+        events_rx: &mpsc::Receiver<RendererEvent>,
+    ) -> super::RendererAttachmentHandoffDisposition {
+        let completion = owner_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("bounded handoff cancellation completion");
+        app.handle_user_event(completion);
+        match events_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("bounded handoff disposition")
+        {
+            RendererEvent::AttachmentHandoffDisposition(disposition) => disposition,
+            other => panic!("unexpected renderer event: {other:?}"),
+        }
+    }
+
+    fn receive_exact_viewport_disposition(
+        events: &mpsc::Receiver<RendererEvent>,
+    ) -> super::RendererExactViewportDisposition {
+        match events
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("bounded exact viewport disposition")
+        {
+            RendererEvent::ExactViewportDisposition(disposition) => disposition,
+            other => panic!("unexpected renderer event: {other:?}"),
+        }
+    }
+
+    fn install_exact_test_grid(shared: &Arc<Shared>, id: &str, generation: &str) {
+        let mut grid = role_transition_grid(80, 24);
+        grid.generation = SessionGeneration(generation.to_string());
+        if shared.active_snapshot().id.as_deref() == Some(id) {
+            *shared.grid.lock().unwrap() = Some(Arc::new(grid));
+        } else {
+            let epoch = shared.pane_epoch(id).expect("exact pane binding");
+            assert!(shared.apply_pane_grid(id, epoch, Arc::new(grid)));
+        }
+    }
+
+    fn request_exact_test_viewport(
+        app: &mut App,
+        tab_strip: RendererTabStrip,
+        generation: &str,
+    ) -> mpsc::Receiver<RendererEvent> {
+        let exact_viewport = exact_viewport_for_strip(&tab_strip, generation);
+        let primary_session_id = exact_viewport.primary().session_id().to_string();
+        let (dispositions, received) = mpsc::channel();
+        let request = RendererExactViewportRequest::new(
+            primary_session_id,
+            exact_viewport,
+            tab_strip,
+            dispositions,
+        )
+        .unwrap();
+        app.handle_user_event(UserEvent::AttachExactViewport { request });
+        received
+    }
+
+    fn prove_exact_test_viewport(
+        app: &mut App,
+        shared: &Arc<Shared>,
+        tab_strip: &RendererTabStrip,
+        generation: &str,
+        received: &mpsc::Receiver<RendererEvent>,
+    ) {
+        let exact_viewport = exact_viewport_for_strip(tab_strip, generation);
+        for target in exact_viewport.targets() {
+            assert!(shared.prove_test_exact_viewport_grid(target.session_id(), target.generation()));
+            install_exact_test_grid(shared, target.session_id(), target.generation());
+        }
+        app.handle_user_event(UserEvent::Redraw);
+        assert_eq!(
+            receive_exact_viewport_disposition(received).outcome(),
+            RendererExactViewportOutcome::Published
+        );
+        assert!(app.viewport_is_bound());
+    }
+
+    fn reconcile_exact_test_geometry(
+        app: &mut App,
+        shared: &Arc<Shared>,
+        generation: &str,
+        window_dims: (u16, u16),
+    ) -> Vec<ClientRequest> {
+        let mut grid = role_transition_grid(usize::from(window_dims.0), usize::from(window_dims.1));
+        grid.generation = SessionGeneration(generation.to_string());
+        *shared.grid.lock().unwrap() = Some(Arc::new(grid));
+        app.sync_primary_resize();
+        app.sync_pane_cache();
+        shared.drain_test_requests()
+    }
+
+    #[test]
+    fn ordinary_exact_viewport_publishes_once_only_after_every_route_baseline() {
+        use RendererTabSplitAxis::Right;
+
+        let daemon_instance: maestro_shell::DaemonInstanceId =
+            "33333333333343338333333333333333".parse().unwrap();
+        let shared = Shared::with_test_handoff_peer_facts(Some(daemon_instance.clone()), None);
+        shared.set_active_session("sid-A").unwrap();
+        install_exact_test_grid(&shared, "sid-A", "gen-C");
+        let (mut app, _owner_events, app_events) =
+            role_transition_handoff_app(shared.clone(), "sid-A");
+        app.events
+            .as_ref()
+            .unwrap()
+            .send(RendererEvent::ReactChromeIntent {
+                json: "{\"type\":\"beforeRebind\"}".to_string(),
+            })
+            .unwrap();
+        assert!(matches!(
+            app_events.try_recv().unwrap(),
+            RendererEvent::ReactChromeIntent { .. }
+        ));
+        let target_strip = strip(vec![
+            plain_tab("B", true),
+            split_child("C", "B", Right, false),
+        ]);
+        let exact = exact_viewport_for_strip(&target_strip, "gen-C");
+        let (dispositions, received) = mpsc::channel();
+        let request = RendererExactViewportRequest::new(
+            "sid-B".to_string(),
+            exact,
+            target_strip,
+            dispositions,
+        )
+        .unwrap();
+        let request_id = request.request_id();
+
+        app.handle_user_event(UserEvent::AttachExactViewport { request });
+        let plan = shared.drain_test_requests();
+        assert_eq!(
+            plan.iter()
+                .filter(|request| matches!(request, ClientRequest::Attach { .. }))
+                .count(),
+            2
+        );
+        assert!(!app.viewport_is_bound());
+        assert!(received.try_recv().is_err(), "admission is not publication");
+        app.events
+            .as_ref()
+            .unwrap()
+            .send(RendererEvent::ReactChromeIntent {
+                json: "{\"type\":\"duringRebind\"}".to_string(),
+            })
+            .unwrap();
+        assert!(
+            app_events.try_recv().is_err(),
+            "the App-level producer gate closes at exact-rebind receipt"
+        );
+
+        assert!(shared.prove_test_exact_viewport_grid("sid-B", "gen-C"));
+        install_exact_test_grid(&shared, "sid-B", "gen-C");
+        app.handle_user_event(UserEvent::Redraw);
+        assert!(!app.viewport_is_bound());
+        assert!(
+            received.try_recv().is_err(),
+            "primary proof alone stays neutral"
+        );
+
+        assert!(shared.prove_test_exact_viewport_grid("sid-C", "gen-C"));
+        install_exact_test_grid(&shared, "sid-C", "gen-C");
+        app.handle_user_event(UserEvent::Redraw);
+        let disposition = receive_exact_viewport_disposition(&received);
+        assert_eq!(disposition.request_id(), request_id);
+        assert_eq!(disposition.session_id(), "sid-B");
+        assert_eq!(disposition.generation(), "gen-C");
+        assert_eq!(disposition.daemon_instance_id(), Some(&daemon_instance));
+        assert_eq!(
+            disposition.outcome(),
+            RendererExactViewportOutcome::Published
+        );
+        assert!(app.viewport_is_bound());
+        assert_eq!(app.session_id, "sid-B");
+        app.events
+            .as_ref()
+            .unwrap()
+            .send(RendererEvent::ReactChromeIntent {
+                json: "{\"type\":\"afterPublish\"}".to_string(),
+            })
+            .unwrap();
+        assert!(matches!(
+            app_events.try_recv().unwrap(),
+            RendererEvent::ReactChromeIntent { .. }
+        ));
+        app.handle_user_event(UserEvent::Redraw);
+        assert!(
+            received.try_recv().is_err(),
+            "publication is terminal exactly once"
+        );
+    }
+
+    #[test]
+    fn ordinary_exact_viewport_clear_or_wrong_generation_is_unavailable_once_and_neutral() {
+        for wrong_generation in [false, true] {
+            let daemon_instance: maestro_shell::DaemonInstanceId =
+                "33333333333343338333333333333333".parse().unwrap();
+            let shared = Shared::with_test_handoff_peer_facts(Some(daemon_instance.clone()), None);
+            shared.set_active_session("sid-A").unwrap();
+            install_exact_test_grid(&shared, "sid-A", "gen-C");
+            let (mut app, _owner_events, app_events) =
+                role_transition_handoff_app(shared.clone(), "sid-A");
+            let mut tab = plain_tab("B", true);
+            tab.session_id = "sid-B".to_string();
+            let target_strip = strip(vec![tab]);
+            let exact = exact_viewport_for_strip(&target_strip, "gen-C");
+            let (dispositions, received) = mpsc::channel();
+            let request = RendererExactViewportRequest::new(
+                "sid-B".to_string(),
+                exact,
+                target_strip,
+                dispositions,
+            )
+            .unwrap();
+            let request_id = request.request_id();
+
+            app.handle_user_event(UserEvent::AttachExactViewport { request });
+            shared.drain_test_requests();
+            assert!(!app.viewport_is_bound());
+            if wrong_generation {
+                assert!(!shared.prove_test_exact_viewport_grid("sid-B", "gen-wrong"));
+                app.handle_user_event(UserEvent::Redraw);
+            } else {
+                app.handle_user_event(UserEvent::ClearViewport);
+            }
+            let disposition = receive_exact_viewport_disposition(&received);
+            assert_eq!(disposition.request_id(), request_id);
+            assert_eq!(
+                disposition.outcome(),
+                RendererExactViewportOutcome::Unavailable
+            );
+            assert!(disposition.daemon_instance_id().is_none());
+            assert!(!app.viewport_is_bound());
+            assert!(shared.active_snapshot().id.is_none());
+            app.events
+                .as_ref()
+                .unwrap()
+                .send(RendererEvent::ReactChromeIntent {
+                    json: "{\"type\":\"afterUnavailable\"}".to_string(),
+                })
+                .unwrap();
+            assert!(
+                app_events.try_recv().is_err(),
+                "the intent gate is neutral before Unavailable reaches App"
+            );
+            app.handle_user_event(UserEvent::ClearViewport);
+            app.handle_user_event(UserEvent::Redraw);
+            assert!(received.try_recv().is_err(), "failure settles exactly once");
+        }
+    }
+
+    #[test]
+    fn primary_claim_then_sibling_failure_is_forward_only_viewport_unavailable() {
+        use RendererTabSplitAxis::Right;
+
+        let fixture = owned_handoff_fixture("22222222222242228222222222222222");
+        let authority = fixture.authority();
+        let expected_instance = authority.expected_daemon_instance().clone();
+        let shared = Shared::with_test_handoff_peer(&authority);
+        shared.set_active_session("sid-A").unwrap();
+        install_exact_test_grid(&shared, "sid-A", "gen-C");
+        let (mut app, owner_rx, events_rx) = role_transition_handoff_app(shared.clone(), "sid-A");
+        let target_strip = strip(vec![
+            plain_tab("B", true),
+            split_child("C", "B", Right, false),
+        ]);
+        let exact = exact_viewport_for_strip(&target_strip, "gen-C");
+        let handoff = RendererAttachmentHandoff::new(authority);
+
+        app.handle_user_event(UserEvent::AttachSessionWithHandoff {
+            session_id: "sid-B".to_string(),
+            handoff,
+            tab_strip: target_strip,
+            exact_viewport: exact,
+        });
+        shared.drain_test_requests();
+        assert!(shared.prove_test_exact_viewport_grid("sid-B", "gen-C"));
+        assert_eq!(
+            fixture.authority().claim_status(),
+            maestro_shell::daemon_client::AttachmentHandoffClaimStatus::PossiblyApplied
+        );
+        shared.fail_test_exact_viewport_admission();
+        app.handle_user_event(UserEvent::Redraw);
+
+        let disposition = match events_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+        {
+            RendererEvent::AttachmentHandoffDisposition(disposition) => disposition,
+            other => panic!("unexpected renderer event: {other:?}"),
+        };
+        assert_eq!(
+            disposition.outcome(),
+            RendererAttachmentHandoffOutcome::ClaimedViewportUnavailable
+        );
+        assert_eq!(disposition.daemon_instance_id(), Some(&expected_instance));
+        assert_eq!(disposition.generation(), Some("gen-C"));
+        assert!(disposition.retry_authority().is_none());
+        assert!(
+            owner_rx.try_recv().is_err(),
+            "no cancellation worker is armed"
+        );
+        assert_eq!(
+            fixture
+                .cancel_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(!app.viewport_is_bound());
+        assert!(shared.connection_is_closed());
+    }
+
+    #[test]
+    fn concurrent_exact_request_is_serially_refused_without_stealing_old_primary_proof() {
+        use RendererTabSplitAxis::Right;
+
+        let fixture = owned_handoff_fixture("22222222222242228222222222222222");
+        let authority = fixture.authority();
+        let shared = Shared::with_test_handoff_peer(&authority);
+        shared.set_active_session("sid-A").unwrap();
+        install_exact_test_grid(&shared, "sid-A", "gen-C");
+        let (mut app, owner_rx, events_rx) = role_transition_handoff_app(shared.clone(), "sid-A");
+        let old_strip = strip(vec![
+            plain_tab("B", true),
+            split_child("C", "B", Right, false),
+        ]);
+        let old_exact = exact_viewport_for_strip(&old_strip, "gen-C");
+        app.handle_user_event(UserEvent::AttachSessionWithHandoff {
+            session_id: "sid-B".to_string(),
+            handoff: RendererAttachmentHandoff::new(authority),
+            tab_strip: old_strip,
+            exact_viewport: old_exact,
+        });
+        shared.drain_test_requests();
+        assert!(shared.prove_test_exact_viewport_grid("sid-B", "gen-C"));
+
+        let next_strip = strip(vec![plain_tab("D", true)]);
+        let next_exact = exact_viewport_for_strip(&next_strip, "gen-D");
+        let (next_events, next_received) = mpsc::channel();
+        let next = RendererExactViewportRequest::new(
+            "sid-D".to_string(),
+            next_exact,
+            next_strip,
+            next_events,
+        )
+        .unwrap();
+        let refused_request_id = next.request_id();
+        app.handle_user_event(UserEvent::AttachExactViewport { request: next });
+        let refused = receive_exact_viewport_disposition(&next_received);
+        assert_eq!(refused.request_id(), refused_request_id);
+        assert_eq!(refused.outcome(), RendererExactViewportOutcome::Unavailable);
+        assert!(
+            shared.drain_test_requests().is_empty(),
+            "refused B emits zero wire"
+        );
+        assert!(app.runtime_attachment_handoff.is_some());
+        assert!(!app.viewport_is_bound());
+
+        assert!(shared.prove_test_exact_viewport_grid("sid-C", "gen-C"));
+        install_exact_test_grid(&shared, "sid-B", "gen-C");
+        install_exact_test_grid(&shared, "sid-C", "gen-C");
+        app.handle_user_event(UserEvent::Redraw);
+        let old_disposition = match events_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+        {
+            RendererEvent::AttachmentHandoffDisposition(disposition) => disposition,
+            other => panic!("unexpected renderer event: {other:?}"),
+        };
+        assert_eq!(
+            old_disposition.outcome(),
+            RendererAttachmentHandoffOutcome::Claimed
+        );
+        assert!(app.viewport_is_bound());
+        assert!(owner_rx.try_recv().is_err());
+
+        let fresh_strip = strip(vec![plain_tab("D", true)]);
+        let fresh_exact = exact_viewport_for_strip(&fresh_strip, "gen-D");
+        let (fresh_events, fresh_received) = mpsc::channel();
+        let fresh = RendererExactViewportRequest::new(
+            "sid-D".to_string(),
+            fresh_exact,
+            fresh_strip,
+            fresh_events,
+        )
+        .unwrap();
+        app.handle_user_event(UserEvent::AttachExactViewport { request: fresh });
+        assert!(shared.drain_test_requests().iter().any(|request| matches!(
+            request,
+            ClientRequest::Attach {
+                id,
+                expected_session_generation: Some(generation),
+                ..
+            } if id == "sid-D" && generation == "gen-D"
+        )));
+        assert!(shared.prove_test_exact_viewport_grid("sid-D", "gen-D"));
+        install_exact_test_grid(&shared, "sid-D", "gen-D");
+        app.handle_user_event(UserEvent::Redraw);
+        assert_eq!(
+            receive_exact_viewport_disposition(&fresh_received).outcome(),
+            RendererExactViewportOutcome::Published
+        );
+        assert!(app.viewport_is_bound());
+        assert_eq!(app.session_id, "sid-D");
+        assert!(
+            next_received.try_recv().is_err(),
+            "refused request stays terminal"
+        );
+    }
+
+    #[test]
+    fn invalid_runtime_handoff_projection_neutralizes_then_cancels_owned_authority() {
+        let fixture = owned_handoff_fixture("22222222222242228222222222222222");
+        let authority = fixture.authority();
+        let shared = Shared::with_test_handoff_peer(&authority);
+        shared.set_active_session("sid-A").unwrap();
+        let (mut app, owner_rx, events_rx) = role_transition_handoff_app(shared.clone(), "sid-A");
+        let handoff = RendererAttachmentHandoff::new(authority);
+
+        app.handle_user_event(handoff_event("sid-B", handoff, "sid-wrong"));
+
+        assert!(app.pending_active_attach.is_none());
+        assert!(app.runtime_attachment_handoff.is_none());
+        assert_eq!(
+            finish_handoff_worker(&mut app, &owner_rx, &events_rx).outcome(),
+            RendererAttachmentHandoffOutcome::CancelledBeforeClaimAdmission
+        );
+        assert!(shared.active_snapshot().id.is_none());
+        assert!(!app.viewport_is_bound());
+        assert!(shared
+            .drain_test_requests()
+            .iter()
+            .all(|request| !matches!(request, ClientRequest::Attach { id, .. } if id == "sid-B")));
+    }
+
+    #[test]
+    fn runtime_handoff_on_closed_connection_cancels_original_owned_authority() {
+        let fixture = owned_handoff_fixture("22222222222242228222222222222222");
+        let authority = fixture.authority();
+        let shared = Shared::with_test_handoff_peer(&authority);
+        shared.set_active_session("sid-A").unwrap();
+        shared.abort_connection();
+        let (mut app, owner_rx, events_rx) = role_transition_handoff_app(shared.clone(), "sid-A");
+        let handoff = RendererAttachmentHandoff::new(authority);
+
+        app.handle_user_event(handoff_event("sid-B", handoff, "sid-B"));
+
+        assert!(app.runtime_attachment_handoff.is_none());
+        assert_eq!(
+            finish_handoff_worker(&mut app, &owner_rx, &events_rx).outcome(),
+            RendererAttachmentHandoffOutcome::CancelledBeforeClaimAdmission
+        );
+        assert!(shared.connection_is_closed());
+    }
+
+    #[test]
+    fn cancellation_transport_failure_emits_one_disposition_with_retry_authority() {
+        let fixture =
+            owned_handoff_fixture_with_cancel_reply("22222222222242228222222222222222", false);
+        let authority = fixture.authority();
+        let shared = Shared::with_test_handoff_peer(&authority);
+        shared.set_active_session("sid-A").unwrap();
+        let (mut app, owner_rx, events_rx) = role_transition_handoff_app(shared, "sid-A");
+
+        app.handle_user_event(handoff_event(
+            "sid-B",
+            RendererAttachmentHandoff::new(authority),
+            "sid-wrong",
+        ));
+
+        let disposition = finish_handoff_worker(&mut app, &owner_rx, &events_rx);
+        assert_eq!(
+            disposition.outcome(),
+            RendererAttachmentHandoffOutcome::CancellationUnresolvedBeforeClaimAdmission
+        );
+        assert!(disposition.retry_authority().is_some());
+        assert_eq!(
+            fixture
+                .cancel_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        app.handle_user_event(UserEvent::Redraw);
+        assert!(owner_rx.try_recv().is_err());
+        assert!(
+            events_rx.try_recv().is_err(),
+            "disposition is terminal exactly once"
+        );
+        assert!(app.pending_attachment_handoff_cancels.is_empty());
+    }
+
+    #[test]
+    fn startup_eof_after_claim_admission_keeps_immutable_possible_application_proof() {
+        let fixture = owned_handoff_fixture("22222222222242228222222222222222");
+        let authority = fixture.authority();
+        let handoff = RendererAttachmentHandoff::new(authority.clone());
+        let operational_socket = fixture.base.join("operational.sock");
+        let listener = UnixListener::bind(&operational_socket).unwrap();
+        let instance = authority.expected_daemon_instance().as_str().to_string();
+        let token = authority.token().clone();
+        let (plan_read_tx, plan_read_rx) = mpsc::channel();
+        let (close_tx, close_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<ClientRequest>(line.trim()).unwrap(),
+                ClientRequest::DaemonInfo
+            ));
+            writeln!(
+                stream,
+                "{{\"ev\":\"daemon_info\",\"protocol_version\":3,\"build_version\":\"test-v3\",\"daemon_instance_id\":\"{instance}\",\"output_generation_echo\":true,\"child_environment\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"generation_conditional_attach\":true}}"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            match serde_json::from_str::<ClientRequest>(line.trim()).unwrap() {
+                ClientRequest::Attach {
+                    id,
+                    handoff: Some(maestro_shell::AttachmentHandoff::Claim { token: claimed }),
+                    ..
+                } => {
+                    assert_eq!(id, "sid-B");
+                    assert_eq!(claimed, token);
                 }
-                ClientRequest::Detach { id } => {
-                    attached.remove(id);
-                }
-                _ => {}
+                other => panic!("expected exact startup Claim, got {other:?}"),
+            }
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<ClientRequest>(line.trim()).unwrap(),
+                ClientRequest::Snapshot { id } if id == "sid-B"
+            ));
+            plan_read_tx.send(()).unwrap();
+            close_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            // Dropping every server-side clone produces EOF after FIFO admission but before the
+            // renderer owner can install its runtime proof guard.
+        });
+        let (owner_tx, owner_rx) = mpsc::channel();
+        let spawned = crate::client::spawn_with_initial_binding(
+            operational_socket.to_string_lossy().into_owned(),
+            "sid-B".to_string(),
+            Some(exact_desired_viewport("sid-B", "gen-C")),
+            Some(super::claim_for_handoff(&handoff)),
+            Box::new(HandoffOwnerSender(owner_tx)),
+        );
+        let immutable_binding = spawned
+            .initial_binding
+            .clone()
+            .expect("Claim+Snapshot FIFO admission is immutable");
+        assert_eq!(immutable_binding.session_id, "sid-B");
+        plan_read_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        close_tx.send(()).unwrap();
+        loop {
+            if matches!(
+                owner_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap(),
+                UserEvent::ConnectionClosed
+            ) {
+                break;
             }
         }
-        attached
+        assert!(spawned.shared.connection_is_closed());
+        assert!(spawned.shared.active_snapshot().id.is_none());
+        assert_eq!(
+            handoff.authority().claim_status(),
+            maestro_shell::daemon_client::AttachmentHandoffClaimStatus::PossiblyApplied
+        );
+        match super::unavailable_handoff_error(&handoff) {
+            super::RendererRunError::AttachmentHandoffUnavailable(disposition) => {
+                assert_eq!(
+                    disposition.outcome(),
+                    RendererAttachmentHandoffOutcome::ClaimPossiblyApplied
+                );
+                assert!(disposition.retry_authority().is_some());
+            }
+            other => panic!("unexpected startup error: {other:?}"),
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn same_daemon_wire_ordering_rejects_cancelled_claim_and_keeps_claim_first_conservative() {
+        // Cancel wins at the daemon before the renderer can publish Claim: the retired token is
+        // rejected on the later operational connection even though the renderer still conservatively
+        // marks its attempted FIFO publication as possibly applied.
+        {
+            let fixture = owned_handoff_fixture("22222222222242228222222222222222");
+            let handoff = RendererAttachmentHandoff::new(fixture.authority());
+            assert_eq!(
+                handoff.authority().cancel().unwrap(),
+                maestro_shell::daemon_client::AttachmentHandoffClaimStatus::Unpublished
+            );
+            assert_eq!(
+                *fixture.daemon_state.lock().unwrap(),
+                FakeDaemonHandoffState::Cancelled
+            );
+            let peer = same_daemon_operational_claim_peer(&fixture, "cancel-first");
+            let (owner_tx, owner_rx) = mpsc::channel();
+            let spawned = crate::client::spawn_with_initial_binding(
+                peer.socket.to_string_lossy().into_owned(),
+                "sid-B".to_string(),
+                Some(exact_desired_viewport("sid-B", "gen-C")),
+                Some(super::claim_for_handoff(&handoff)),
+                Box::new(HandoffOwnerSender(owner_tx)),
+            );
+            assert!(spawned.initial_binding.is_some());
+            assert!(!peer
+                .claim_accepted
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap());
+            peer.close.send(()).unwrap();
+            wait_for_test_connection_closed(&owner_rx);
+            assert!(spawned.shared.connection_is_closed());
+            match super::unavailable_handoff_error(&handoff) {
+                super::RendererRunError::AttachmentHandoffUnavailable(disposition) => assert_eq!(
+                    disposition.outcome(),
+                    RendererAttachmentHandoffOutcome::ClaimPossiblyApplied
+                ),
+                other => panic!("unexpected startup error: {other:?}"),
+            }
+            peer.server.join().unwrap();
+        }
+
+        // Claim wins on the same daemon before cancellation reaches the retained Offer socket.
+        // The daemon keeps the token Claimed and the shared shell authority forbids an unsafe
+        // compensation-safe cancellation result.
+        {
+            let fixture = owned_handoff_fixture("22222222222242228222222222222222");
+            let handoff = RendererAttachmentHandoff::new(fixture.authority());
+            let peer = same_daemon_operational_claim_peer(&fixture, "claim-first");
+            let (owner_tx, owner_rx) = mpsc::channel();
+            let spawned = crate::client::spawn_with_initial_binding(
+                peer.socket.to_string_lossy().into_owned(),
+                "sid-B".to_string(),
+                Some(exact_desired_viewport("sid-B", "gen-C")),
+                Some(super::claim_for_handoff(&handoff)),
+                Box::new(HandoffOwnerSender(owner_tx)),
+            );
+            assert!(spawned.initial_binding.is_some());
+            assert!(peer
+                .claim_accepted
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap());
+            assert_eq!(
+                *fixture.daemon_state.lock().unwrap(),
+                FakeDaemonHandoffState::Claimed
+            );
+            assert_eq!(
+                handoff.authority().cancel().unwrap(),
+                maestro_shell::daemon_client::AttachmentHandoffClaimStatus::PossiblyApplied
+            );
+            assert_eq!(
+                *fixture.daemon_state.lock().unwrap(),
+                FakeDaemonHandoffState::Claimed
+            );
+            peer.close.send(()).unwrap();
+            wait_for_test_connection_closed(&owner_rx);
+            assert!(spawned.shared.connection_is_closed());
+            match super::unavailable_handoff_error(&handoff) {
+                super::RendererRunError::AttachmentHandoffUnavailable(disposition) => assert_eq!(
+                    disposition.outcome(),
+                    RendererAttachmentHandoffOutcome::ClaimPossiblyApplied
+                ),
+                other => panic!("unexpected startup error: {other:?}"),
+            }
+            peer.server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn clear_after_runtime_claim_admission_neutralizes_before_owned_cancel_disposition() {
+        let fixture = owned_handoff_fixture("22222222222242228222222222222222");
+        let authority = fixture.authority();
+        let token = authority.token().clone();
+        let shared = Shared::with_test_handoff_peer(&authority);
+        shared.set_active_session("sid-A").unwrap();
+        let (mut app, owner_rx, events_rx) = role_transition_handoff_app(shared.clone(), "sid-A");
+        app.handle_user_event(handoff_event(
+            "sid-B",
+            RendererAttachmentHandoff::new(authority),
+            "sid-B",
+        ));
+        let claim_plan = shared.drain_test_requests();
+        assert!(claim_plan.iter().any(|request| matches!(
+            request,
+            ClientRequest::Attach {
+                id,
+                handoff: Some(maestro_shell::AttachmentHandoff::Claim { token: claimed }),
+                ..
+            } if id == "sid-B" && claimed == &token
+        )));
+
+        app.handle_user_event(UserEvent::ClearViewport);
+
+        assert!(app.runtime_attachment_handoff.is_none());
+        assert!(shared.active_snapshot().id.is_none());
+        assert_eq!(
+            shared.drain_test_requests(),
+            vec![ClientRequest::Detach {
+                id: "sid-B".to_string(),
+            }],
+            "operational cleanup is neutral before original-Offer cancellation settles"
+        );
+        assert_eq!(
+            finish_handoff_worker(&mut app, &owner_rx, &events_rx).outcome(),
+            RendererAttachmentHandoffOutcome::ClaimPossiblyApplied
+        );
+    }
+
+    #[test]
+    fn conflicting_duplicate_runtime_handoff_aborts_without_a_second_claim() {
+        let fixture = owned_handoff_fixture("22222222222242228222222222222222");
+        let authority = fixture.authority();
+        let shared = Shared::with_test_handoff_peer(&authority);
+        shared.set_active_session("sid-A").unwrap();
+        let (mut app, owner_rx, events_rx) = role_transition_handoff_app(shared.clone(), "sid-A");
+        let handoff = RendererAttachmentHandoff::new(authority);
+        app.handle_user_event(handoff_event("sid-B", handoff.clone(), "sid-B"));
+        let first_plan = shared.drain_test_requests();
+        assert_eq!(
+            first_plan
+                .iter()
+                .filter(|request| matches!(request, ClientRequest::Attach { .. }))
+                .count(),
+            1
+        );
+
+        app.handle_user_event(handoff_event("sid-B", handoff, "sid-wrong"));
+
+        assert!(shared.connection_is_closed());
+        assert!(shared.active_snapshot().id.is_none());
+        assert!(shared.drain_test_requests().is_empty());
+        assert_eq!(
+            finish_handoff_worker(&mut app, &owner_rx, &events_rx).outcome(),
+            RendererAttachmentHandoffOutcome::ClaimPossiblyApplied
+        );
+    }
+
+    #[test]
+    fn output_generation_exhaustion_neutralizes_then_cancels_unpublished_handoff() {
+        let fixture = owned_handoff_fixture("22222222222242228222222222222222");
+        let authority = fixture.authority();
+        let shared = Shared::with_test_handoff_peer(&authority);
+        shared.set_active_session("sid-A").unwrap();
+        shared.exhaust_test_output_generations();
+        let (mut app, owner_rx, events_rx) = role_transition_handoff_app(shared.clone(), "sid-A");
+
+        app.handle_user_event(handoff_event(
+            "sid-B",
+            RendererAttachmentHandoff::new(authority),
+            "sid-B",
+        ));
+
+        assert!(!app.connection_alive);
+        assert!(app.runtime_attachment_handoff.is_none());
+        assert_eq!(
+            finish_handoff_worker(&mut app, &owner_rx, &events_rx).outcome(),
+            RendererAttachmentHandoffOutcome::CancelledBeforeClaimAdmission
+        );
+    }
+
+    #[test]
+    fn retryable_runtime_claim_keeps_cancel_armed_until_exact_grid_then_disarms() {
+        let fixture = owned_handoff_fixture("22222222222242228222222222222222");
+        let authority = fixture.authority();
+        let token = authority.token().clone();
+        let shared = Shared::with_test_handoff_peer(&authority);
+        shared.set_active_session("sid-A").unwrap();
+        let (mut app, owner_rx, events_rx) = role_transition_handoff_app(shared.clone(), "sid-A");
+        let handoff = RendererAttachmentHandoff::new(authority);
+        shared.saturate_test_outbound();
+
+        app.handle_user_event(handoff_event("sid-B", handoff.clone(), "sid-B"));
+        assert!(app.pending_active_attach.is_some());
+        assert!(app.runtime_attachment_handoff.is_some());
+        assert!(
+            owner_rx.try_recv().is_err(),
+            "retryable admission does not cancel"
+        );
+        assert_eq!(
+            handoff.authority().claim_status(),
+            maestro_shell::daemon_client::AttachmentHandoffClaimStatus::PossiblyApplied,
+            "the pre-enqueue shared boundary stays conservative even on refusal"
+        );
+
+        shared.discard_test_outbound();
+        app.handle_user_event(UserEvent::OutboundWritable);
+        assert!(app.pending_active_attach.is_none());
+        assert!(app
+            .runtime_attachment_handoff
+            .as_ref()
+            .is_some_and(|guard| guard.claim_binding.is_some()));
+        let claim_plan = shared.drain_test_requests();
+        assert!(claim_plan.iter().any(|request| matches!(
+            request,
+            ClientRequest::Attach {
+                id,
+                handoff: Some(maestro_shell::AttachmentHandoff::Claim { token: claimed }),
+                ..
+            } if id == "sid-B" && claimed == &token
+        )));
+
+        // A redraw without a matching exact-route Grid is not proof and must retain cancellation.
+        app.handle_user_event(UserEvent::Redraw);
+        assert!(app.runtime_attachment_handoff.is_some());
+        let binding = shared.active_token().expect("runtime claim binding");
+        assert_eq!(binding.session_id, "sid-B");
+        assert!(shared.prove_test_exact_viewport_grid("sid-B", "gen-C"));
+        install_exact_test_grid(&shared, "sid-B", "gen-C");
+        app.handle_user_event(UserEvent::Redraw);
+        assert!(app.runtime_attachment_handoff.is_none());
+        let disposition = match events_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("exact Claim disposition")
+        {
+            RendererEvent::AttachmentHandoffDisposition(disposition) => disposition,
+            other => panic!("unexpected event: {other:?}"),
+        };
+        assert_eq!(
+            disposition.outcome(),
+            RendererAttachmentHandoffOutcome::Claimed
+        );
+        assert_eq!(disposition.generation(), Some("gen-C"));
+
+        // An exact duplicate after the terminal Claim is a no-op, never a replay of the retired
+        // one-shot token.
+        shared.drain_test_requests();
+        app.handle_user_event(handoff_event("sid-B", handoff, "sid-B"));
+        assert!(shared.drain_test_requests().is_empty());
+
+        // Claim has consumed the one-shot token. Later Clear only detaches the ordinary attachment;
+        // it cannot emit a stale post-proof Cancel.
+        app.handle_user_event(UserEvent::ClearViewport);
+        assert_eq!(
+            shared.drain_test_requests(),
+            vec![ClientRequest::Detach {
+                id: "sid-B".to_string(),
+            }]
+        );
+        assert!(owner_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn same_id_wrong_generation_stays_neutral_then_cancels_as_possibly_applied() {
+        let fixture = owned_handoff_fixture("22222222222242228222222222222222");
+        let authority = fixture.authority();
+        let shared = Shared::with_test_handoff_peer(&authority);
+        shared.set_active_session("sid-B").unwrap();
+        let (mut app, owner_rx, events_rx) = role_transition_handoff_app(shared.clone(), "sid-B");
+        app.handle_user_event(handoff_event(
+            "sid-B",
+            RendererAttachmentHandoff::new(authority),
+            "sid-B",
+        ));
+        shared.drain_test_requests();
+        assert!(!app.viewport_is_bound(), "same text id is still staged");
+
+        assert!(!shared.prove_test_exact_viewport_grid("sid-B", "gen-wrong"));
+        let (connection_tx, connection_rx) = mpsc::channel();
+        shared.fail_closed_connection_for_test(&HandoffOwnerSender(connection_tx));
+        app.handle_user_event(
+            connection_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("wrong-generation reader teardown wake"),
+        );
+
+        assert!(shared.connection_is_closed());
+        assert!(shared.active_snapshot().id.is_none());
+        assert_eq!(
+            finish_handoff_worker(&mut app, &owner_rx, &events_rx).outcome(),
+            RendererAttachmentHandoffOutcome::ClaimPossiblyApplied
+        );
+    }
+
+    #[test]
+    fn runtime_handoff_wrong_daemon_instance_refuses_before_claim_serialization() {
+        let fixture = owned_handoff_fixture("22222222222242228222222222222222");
+        let authority = fixture.authority();
+        let wrong_instance: maestro_shell::DaemonInstanceId =
+            "33333333333343338333333333333333".parse().unwrap();
+        let shared = Shared::with_test_handoff_peer_facts(
+            Some(wrong_instance),
+            authority.expected_server_pid(),
+        );
+        shared.set_active_session("sid-A").unwrap();
+        let (mut app, owner_rx, events_rx) = role_transition_handoff_app(shared.clone(), "sid-A");
+        app.handle_user_event(handoff_event(
+            "sid-B",
+            RendererAttachmentHandoff::new(authority),
+            "sid-B",
+        ));
+
+        assert!(shared.drain_test_requests().is_empty());
+        assert!(shared.connection_is_closed());
+        assert_eq!(
+            finish_handoff_worker(&mut app, &owner_rx, &events_rx).outcome(),
+            RendererAttachmentHandoffOutcome::CancelledBeforeClaimAdmission
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_handoff_wrong_kernel_peer_pid_refuses_before_claim_serialization() {
+        let fixture = owned_handoff_fixture("22222222222242228222222222222222");
+        let authority = fixture.authority();
+        let wrong_pid = authority
+            .expected_server_pid()
+            .expect("Linux Offer peer PID")
+            .saturating_add(1);
+        let shared = Shared::with_test_handoff_peer_facts(
+            Some(authority.expected_daemon_instance().clone()),
+            Some(wrong_pid),
+        );
+        shared.set_active_session("sid-A").unwrap();
+        let (mut app, owner_rx, events_rx) = role_transition_handoff_app(shared.clone(), "sid-A");
+        app.handle_user_event(handoff_event(
+            "sid-B",
+            RendererAttachmentHandoff::new(authority),
+            "sid-B",
+        ));
+
+        assert!(shared.drain_test_requests().is_empty());
+        assert!(shared.connection_is_closed());
+        assert_eq!(
+            finish_handoff_worker(&mut app, &owner_rx, &events_rx).outcome(),
+            RendererAttachmentHandoffOutcome::CancelledBeforeClaimAdmission
+        );
+    }
+
+    fn install_split_baselines(
+        shared: &Arc<Shared>,
+        layout: &RendererSplitLayout,
+        primary_session_id: &str,
+    ) {
+        for pane in &layout.panes {
+            let content = pane_content_region_for_layout(pane.region, layout.panes.len());
+            let grid = Arc::new(role_transition_grid(
+                usize::from(content.cols),
+                usize::from(content.rows),
+            ));
+            if pane.session_id == primary_session_id {
+                *shared.grid.lock().unwrap() = Some(grid);
+            } else {
+                let epoch = shared
+                    .pane_epoch(&pane.session_id)
+                    .unwrap_or_else(|| panic!("{} pane binding", pane.session_id));
+                assert!(shared.apply_pane_grid(&pane.session_id, epoch, grid));
+            }
+        }
+    }
+
+    #[test]
+    fn empty_bootstrap_id_is_never_retained_as_a_daemon_attachment() {
+        let shared = Shared::with_test_outbound();
+        let mut app = role_transition_app(shared.clone(), "");
+        assert!(app.attached_sessions.is_empty());
+
+        app.clear_viewport();
+
+        assert!(app.pending_detach_sessions.is_empty());
+        assert!(shared.drain_test_requests().is_empty());
+    }
+
+    #[test]
+    fn clear_without_a_future_attach_detaches_every_admitted_forwarder() {
+        use RendererTabSplitAxis::Right;
+
+        let shared = Shared::with_test_handoff_peer_facts(None, None);
+        shared.set_active_session("sid-A");
+        let mut app = role_transition_app(shared.clone(), "sid-A");
+        let target_strip = strip(vec![
+            plain_tab("A", true),
+            split_child("B", "A", Right, false),
+        ]);
+        let received = request_exact_test_viewport(&mut app, target_strip.clone(), "gen-C");
+        shared.drain_test_requests();
+        prove_exact_test_viewport(&mut app, &shared, &target_strip, "gen-C", &received);
+        assert_eq!(
+            app.attached_sessions,
+            ["sid-A".to_string(), "sid-B".to_string()]
+                .into_iter()
+                .collect()
+        );
+
+        app.clear_viewport();
+
+        assert!(shared.active_snapshot().id.is_none());
+        assert!(app.pending_detach_sessions.is_empty());
+        assert_eq!(
+            shared.drain_test_requests(),
+            vec![
+                ClientRequest::Detach {
+                    id: "sid-A".to_string(),
+                },
+                ClientRequest::Detach {
+                    id: "sid-B".to_string(),
+                },
+            ],
+            "neutral cleanup is one sorted Detach-only transaction"
+        );
+    }
+
+    #[test]
+    fn saturated_clear_blanks_promptly_then_writable_retries_detach_only_cleanup() {
+        let shared = Shared::with_test_outbound();
+        shared.set_active_session("sid-A");
+        let mut app = role_transition_app(shared.clone(), "sid-A");
+        shared.saturate_test_outbound();
+
+        let started = std::time::Instant::now();
+        app.clear_viewport();
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        assert!(shared.active_snapshot().id.is_none());
+        assert_eq!(
+            app.pending_detach_sessions,
+            ["sid-A".to_string()].into_iter().collect()
+        );
+
+        shared.discard_test_outbound();
+        app.handle_user_event(UserEvent::OutboundWritable);
+        assert_eq!(
+            shared.drain_test_requests(),
+            vec![ClientRequest::Detach {
+                id: "sid-A".to_string(),
+            }]
+        );
+        assert!(app.pending_detach_sessions.is_empty());
+    }
+
+    #[test]
+    fn bridged_clear_overtakes_a_retained_owner_write_on_saturated_queue() {
+        let shared = Shared::with_test_outbound();
+        shared.set_active_session("sid-A");
+        *shared.grid.lock().unwrap() = Some(Arc::new(role_transition_grid(80, 24)));
+        let mut app = role_transition_app(shared.clone(), "sid-A");
+        shared.saturate_test_outbound();
+
+        let started = std::time::Instant::now();
+        app.write_to_session("sid-A", "must-not-cross-clear".to_string());
+        assert_eq!(app.pending_owner_requests.len(), 1);
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(RendererCommand::ClearViewport).unwrap();
+        drop(tx);
+        bridge_commands(rx, |event| {
+            app.handle_user_event(event);
+            Ok(())
+        });
+
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        assert!(shared.active_snapshot().id.is_none());
+        assert!(app.tab_strip_source.is_none());
+        assert!(app.pane_cache_dims.is_empty());
+        assert!(app.pending_owner_requests.is_empty());
+        assert_eq!(
+            app.pending_detach_sessions,
+            ["sid-A".to_string()].into_iter().collect()
+        );
+
+        shared.discard_test_outbound();
+        app.handle_user_event(UserEvent::OutboundWritable);
+        let requests = shared.drain_test_requests();
+        assert_eq!(
+            requests,
+            vec![ClientRequest::Detach {
+                id: "sid-A".to_string(),
+            }],
+            "neutral writable retry permits cleanup only, never the retained Write"
+        );
+    }
+
+    #[test]
+    fn legacy_mutation_refusal_latches_read_only_without_blocking_snapshot_batches() {
+        let shared = Shared::with_test_outbound();
+        shared.set_active_session("sid-A").unwrap();
+        *shared.grid.lock().unwrap() = Some(Arc::new(role_transition_grid(80, 24)));
+        let mut app = role_transition_app(shared.clone(), "sid-A");
+        shared.set_test_generation_conditional_mutations(false);
+
+        app.write_to_session("sid-A", "must-stay-local".to_string());
+        assert!(app.mutation_read_only);
+        assert!(!app.outbound_hard_refusal);
+        assert!(!app.outbound_stalled);
+        assert!(app.pending_owner_requests.is_empty());
+        assert!(shared.drain_test_requests().is_empty());
+
+        // The post-baseline geometry path is also suppressed and cannot advance its mirror or arm
+        // a retry loop merely because a legacy daemon cannot accept conditional Resize.
+        let binding = shared
+            .binding_token_for_session("sid-A")
+            .expect("bound legacy viewport");
+        assert_eq!(
+            app.admit_or_retain_owner_batch(
+                binding.clone(),
+                vec![OwnerRequest::Resize {
+                    id: "sid-A".to_string(),
+                    cols: 120,
+                    rows: 40,
+                }],
+            ),
+            OwnerBatchAdmission::Rejected
+        );
+        assert_eq!(app.primary_pane_dims, None);
+        assert!(!app.resize.has_pending());
+        assert_eq!(app.pending_resize_refit_at, None);
+        assert!(shared.drain_test_requests().is_empty());
+
+        assert_eq!(
+            app.admit_or_retain_owner_batch(
+                binding,
+                vec![OwnerRequest::Snapshot {
+                    id: "sid-A".to_string(),
+                }],
+            ),
+            OwnerBatchAdmission::Admitted
+        );
+        assert_eq!(
+            shared.drain_test_requests(),
+            vec![ClientRequest::Snapshot {
+                id: "sid-A".to_string(),
+            }]
+        );
+        assert!(shared.grid.lock().unwrap().is_some());
+        assert!(app.connection_alive);
+    }
+
+    #[test]
+    fn bridged_clear_stays_prompt_while_outbound_mutex_is_held() {
+        let shared = Shared::with_test_outbound();
+        shared.set_active_session("sid-A");
+        *shared.grid.lock().unwrap() = Some(Arc::new(role_transition_grid(80, 24)));
+        let mut app = role_transition_app(shared.clone(), "sid-A");
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(RendererCommand::ClearViewport).unwrap();
+        drop(tx);
+
+        let started = std::time::Instant::now();
+        shared.with_test_outbound_contended(|| {
+            app.write_to_session("sid-A", "must-not-cross-clear".to_string());
+            bridge_commands(rx, |event| {
+                app.handle_user_event(event);
+                Ok(())
+            });
+        });
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        assert!(shared.active_snapshot().id.is_none());
+        assert!(app.pending_owner_requests.is_empty());
+        assert_eq!(
+            app.pending_detach_sessions,
+            ["sid-A".to_string()].into_iter().collect()
+        );
+
+        app.retry_pending_outbound();
+        assert_eq!(
+            shared.drain_test_requests(),
+            vec![ClientRequest::Detach {
+                id: "sid-A".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn contended_clear_blanks_promptly_and_retries_after_immediate_wake() {
+        let shared = Shared::with_test_outbound();
+        shared.set_active_session("sid-A");
+        let mut app = role_transition_app(shared.clone(), "sid-A");
+
+        let started = std::time::Instant::now();
+        shared.with_test_outbound_contended(|| app.clear_viewport());
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        assert!(shared.active_snapshot().id.is_none());
+        assert_eq!(
+            app.pending_detach_sessions,
+            ["sid-A".to_string()].into_iter().collect()
+        );
+
+        app.retry_pending_outbound();
+        assert_eq!(
+            shared.drain_test_requests(),
+            vec![ClientRequest::Detach {
+                id: "sid-A".to_string(),
+            }]
+        );
+        assert!(app.pending_detach_sessions.is_empty());
+    }
+
+    #[test]
+    fn same_id_attach_before_writable_consumes_cleanup_once_in_aggregate_prefix() {
+        let shared = Shared::with_test_handoff_peer_facts(None, None);
+        shared.set_active_session("sid-A");
+        let mut app = role_transition_app(shared.clone(), "sid-A");
+        shared.saturate_test_outbound();
+        app.clear_viewport();
+
+        let target_strip = strip(vec![plain_tab("A", true)]);
+        let received = request_exact_test_viewport(&mut app, target_strip.clone(), "gen-C");
+        assert!(shared.active_snapshot().id.is_none());
+        shared.discard_test_outbound();
+        app.handle_user_event(UserEvent::OutboundWritable);
+        let requests = shared.drain_test_requests();
+        assert_aggregate_topology_transaction(&requests, &["sid-A"], &["sid-A"]);
+        assert!(app.pending_detach_sessions.is_empty());
+        prove_exact_test_viewport(&mut app, &shared, &target_strip, "gen-C", &received);
+        app.handle_user_event(UserEvent::OutboundWritable);
+        assert!(
+            shared
+                .drain_test_requests()
+                .iter()
+                .all(|request| !matches!(request, ClientRequest::Detach { .. })),
+            "a later wake cannot detach the revived same-id binding"
+        );
+    }
+
+    #[test]
+    fn admitted_neutral_cleanup_stays_fifo_before_later_same_id_attach() {
+        let shared = Shared::with_test_handoff_peer_facts(None, None);
+        shared.set_active_session("sid-A");
+        let mut app = role_transition_app(shared.clone(), "sid-A");
+
+        app.clear_viewport();
+        assert!(app.pending_detach_sessions.is_empty());
+        let target_strip = strip(vec![plain_tab("A", true)]);
+        let received = request_exact_test_viewport(&mut app, target_strip.clone(), "gen-C");
+        let requests = shared.drain_test_requests();
+        let detach = requests
+            .iter()
+            .position(|request| matches!(request, ClientRequest::Detach { id } if id == "sid-A"))
+            .expect("cleanup Detach");
+        let attach = requests
+            .iter()
+            .position(
+                |request| matches!(request, ClientRequest::Attach { id, .. } if id == "sid-A"),
+            )
+            .expect("revive Attach");
+        assert!(
+            detach < attach,
+            "cleanup must remain FIFO before same-id Attach: {requests:?}"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| matches!(request, ClientRequest::Detach { id } if id == "sid-A"))
+                .count(),
+            1
+        );
+        prove_exact_test_viewport(&mut app, &shared, &target_strip, "gen-C", &received);
+    }
+
+    #[test]
+    fn full_queue_retained_write_and_resize_are_dropped_after_pty_generation_rollover() {
+        let shared = Shared::with_test_outbound();
+        shared.set_active_session("s").unwrap();
+        *shared.grid.lock().unwrap() = Some(Arc::new(role_transition_grid(80, 24)));
+        let mut app = role_transition_app(shared.clone(), "s");
+
+        shared.saturate_test_outbound();
+        app.write_to_session("s", "generation-a-input".to_string());
+        assert!(
+            app.send_resize((81, 25)),
+            "retryable Full counts as retained geometry intent"
+        );
+        assert_eq!(app.pending_owner_requests.len(), 2);
+        assert!(app
+            .pending_owner_requests
+            .iter()
+            .all(|batch| batch.expected_generation.0 == "gen-C"));
+
+        // The same viewport/output-generation remains bound, but the PTY lifetime rolls over before
+        // capacity returns. Neither retained A intent may be re-stamped or delivered to B.
+        let mut generation_b = role_transition_grid(80, 24);
+        generation_b.generation = SessionGeneration("gen-B".to_string());
+        *shared.grid.lock().unwrap() = Some(Arc::new(generation_b));
+        shared.discard_test_outbound();
+        app.retry_pending_owner_requests();
+
+        assert!(app.pending_owner_requests.is_empty());
+        assert!(shared.drain_test_requests().is_empty());
+        assert_eq!(
+            app.primary_pane_dims, None,
+            "refused Resize never advances mirror"
+        );
+    }
+
+    #[test]
+    fn structural_window_projection_cancels_every_topology_drag_before_release() {
+        use RendererTabSplitAxis::Right;
+
+        let shared = Shared::with_test_handoff_peer_facts(None, None);
+        shared.set_active_session("session-a-child");
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        let mut app = App::new(
+            Arc::clone(&shared),
+            "session-a-child".to_string(),
+            DEFAULT_WINDOW_TITLE.to_string(),
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(events_tx),
+            None,
+            None,
+            None,
+            None,
+        );
+        let mut a_root = plain_tab("root", false);
+        a_root.session_id = "session-a-root".into();
+        let mut a_child = split_child("child", "root", Right, true);
+        a_child.session_id = "session-a-child".into();
+        let a_strip = RendererTabStrip {
+            window_id: "window-a".into(),
+            tabs: vec![a_root, a_child],
+        };
+        let a_received = request_exact_test_viewport(&mut app, a_strip.clone(), "gen-C");
+        let _ = shared.drain_test_requests();
+        prove_exact_test_viewport(&mut app, &shared, &a_strip, "gen-C", &a_received);
+        while events_rx.try_recv().is_ok() {
+            // The assertion below is scoped to mutations emitted by the post-reprojection release.
+        }
+        let _ = shared.drain_test_requests();
+
+        app.divider_drag = Some(DividerDrag {
+            child_tab_id: "child".into(),
+            axis: Right,
+        });
+        app.split_ratios.set_first_share("child", 0.8);
+        app.react_chrome_resize_drag = Some(ReactChromeResizeDrag);
+        app.rect_divider_drag = Some(RectDividerDrag {
+            vertical: true,
+            line: 20,
+            left_panes: vec!["root".into()],
+            right_panes: vec!["child".into()],
+        });
+        app.pane_drag = Some(PaneDrag {
+            source_tab_id: "child".into(),
+        });
+        app.stashed_pane_drag = Some(StashedPaneDrag {
+            window_id: "window-a".into(),
+            tab_id: "parked".into(),
+            session_id: "session-a-parked".into(),
+        });
+        app.sel_anchor = Some(CellPos { col: 1, row: 1 });
+        app.sel_focus = Some(CellPos { col: 2, row: 1 });
+        app.sel_session_id = Some("session-a-child".into());
+        shared.saturate_test_outbound();
+
+        // Window B deliberately reuses the same tab ids and the exact primary while changing the
+        // other role. Keep admission Full to prove exact-cohort receipt cancels old gestures before
+        // the pending topology transaction can reach the writer queue.
+        let mut b_root = plain_tab("root", false);
+        b_root.session_id = "session-b-root".into();
+        let mut b_child = split_child("child", "root", Right, true);
+        b_child.session_id = "session-a-child".into();
+        let b_strip = RendererTabStrip {
+            window_id: "window-b".into(),
+            tabs: vec![b_root, b_child],
+        };
+        let _b_received = request_exact_test_viewport(&mut app, b_strip, "gen-C");
+
+        assert!(app.divider_drag.is_none());
+        assert!(app.react_chrome_resize_drag.is_none());
+        assert!(app.rect_divider_drag.is_none());
+        assert!(app.pane_drag.is_none());
+        assert!(app.stashed_pane_drag.is_none());
+        assert!(app.current_selection().is_none());
+        assert!(app.pending_active_attach.is_some());
+        assert_eq!(
+            app.split_ratios.first_share("child"),
+            DEFAULT_SPLIT_RATIO,
+            "window-local ratio from A cannot leak through B's duplicate child id"
+        );
+        assert!(
+            !app.finish_chrome_drag_on_release(),
+            "release after structural projection is inert"
+        );
+        assert!(
+            events_rx.try_recv().is_err(),
+            "no divider/rect/pane/stashed mutation event may escape after cancellation"
+        );
+    }
+
+    fn assert_aggregate_topology_transaction(
+        requests: &[ClientRequest],
+        expected_old: &[&str],
+        expected_new: &[&str],
+    ) {
+        let first_non_detach = requests
+            .iter()
+            .position(|request| !matches!(request, ClientRequest::Detach { .. }))
+            .unwrap_or(requests.len());
+        let detach_prefix: std::collections::BTreeSet<_> = requests[..first_non_detach]
+            .iter()
+            .map(|request| match request {
+                ClientRequest::Detach { id } => id.clone(),
+                _ => unreachable!("prefix is Detach-only"),
+            })
+            .collect();
+        assert_eq!(
+            detach_prefix,
+            expected_old
+                .iter()
+                .map(|id| (*id).to_string())
+                .collect(),
+            "every previously admitted forwarder must be detached in the cleanup prefix: {requests:?}"
+        );
+        assert!(
+            requests[first_non_detach..]
+                .iter()
+                .all(|request| !matches!(request, ClientRequest::Detach { .. })),
+            "no Detach may appear after the first new Attach: {requests:?}"
+        );
+
+        let attached: std::collections::BTreeSet<_> = requests
+            .iter()
+            .filter_map(|request| match request {
+                ClientRequest::Attach {
+                    id,
+                    want_raw_output: false,
+                    output_generation: Some(generation),
+                    ..
+                } if *generation != 0 => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            attached,
+            expected_new.iter().map(|id| (*id).to_string()).collect(),
+            "the aggregate suffix must attach every desired role exactly once: {requests:?}"
+        );
+        for id in expected_new {
+            let attach = requests
+                .iter()
+                .position(|request| matches!(request, ClientRequest::Attach { id: request_id, .. } if request_id == id))
+                .unwrap_or_else(|| panic!("missing Attach({id}) in {requests:?}"));
+            assert!(
+                requests[attach + 1..]
+                    .iter()
+                    .any(|request| matches!(request, ClientRequest::Snapshot { id: request_id } if request_id == id)),
+                "Attach({id}) must be followed by its authoritative Snapshot: {requests:?}"
+            );
+        }
     }
 
     #[test]
@@ -18212,55 +24605,48 @@ mod split_frame_tests {
     }
 
     #[test]
-    fn set_strip_then_attach_promotes_fourth_pane_without_detaching_its_live_role() {
+    fn attach_waits_for_four_pane_projection_then_detaches_every_old_role_before_rebind() {
         use RendererTabSplitAxis::{Down, Right};
 
-        let shared = Shared::with_test_outbound();
+        let shared = Shared::with_test_handoff_peer_facts(None, None);
         shared.set_active_session("sid-C");
         *shared.grid.lock().unwrap() = Some(Arc::new(role_transition_grid(120, 38)));
         let mut app = role_transition_app(shared.clone(), "sid-C");
 
-        // Existing A | B/C layout with C primary. This seeds the UI-owned cache with A+B.
+        // First admit the existing A | B/C topology through the same aggregate path production
+        // uses. Unknown native geometry still attaches every visible role; only Resize is deferred.
         let before = strip(vec![
             plain_tab("A", false),
             split_child("B", "A", Right, false),
             split_child("C", "B", Down, true),
         ]);
-        app.handle_user_event(UserEvent::SetTabStrip {
-            tab_strip: Some(before),
-        });
-        shared.drain_test_requests();
+        let before_received = request_exact_test_viewport(&mut app, before.clone(), "gen-C");
+        let before_requests = shared.drain_test_requests();
+        assert_aggregate_topology_transaction(
+            &before_requests,
+            &["sid-C"],
+            &["sid-A", "sid-B", "sid-C"],
+        );
+        prove_exact_test_viewport(&mut app, &shared, &before, "gen-C", &before_received);
         assert_eq!(
-            app.pane_cache_dims
-                .keys()
-                .cloned()
-                .collect::<std::collections::BTreeSet<_>>(),
-            ["sid-A".to_string(), "sid-B".to_string()]
-                .into_iter()
-                .collect()
+            app.attached_sessions,
+            [
+                "sid-A".to_string(),
+                "sid-B".to_string(),
+                "sid-C".to_string()
+            ]
+            .into_iter()
+            .collect()
         );
 
-        // Product foreground order is SetTabStrip FIRST: D is briefly a non-primary cache pane
-        // because C is still the primary storage id.
+        // The exact cohort revokes the old viewport and enqueues one complete topology.
         let four = strip(vec![
             plain_tab("A", false),
             split_child("B", "A", Right, false),
             split_child("C", "B", Down, false),
             split_child("D", "C", Right, true),
         ]);
-        app.handle_user_event(UserEvent::SetTabStrip {
-            tab_strip: Some(four),
-        });
-        let strip_requests = shared.drain_test_requests();
-        assert!(
-            strip_requests.iter().any(
-                |request| matches!(request, ClientRequest::Attach { id, want_raw_output: false } if id == "sid-D")
-            ),
-            "SetTabStrip temporarily attaches the new D pane"
-        );
-        assert!(app.pane_cache_dims.contains_key("sid-D"));
-
-        let layout = app.current_split_layout().expect("four-pane layout");
+        let layout = compute_split_layout(&four, 120, 38).expect("four-pane layout");
         let content_dims = |id: &str| {
             let region = layout
                 .panes
@@ -18268,61 +24654,45 @@ mod split_frame_tests {
                 .find(|pane| pane.session_id == id)
                 .unwrap_or_else(|| panic!("missing {id} pane"))
                 .region;
-            let content = pane_content_region(region);
+            let content = pane_content_region_for_layout(region, layout.panes.len());
             (content.cols, content.rows)
         };
-        let c_content_dims = content_dims("sid-C");
         let d_content_dims = content_dims("sid-D");
-        assert_eq!(
-            c_content_dims, d_content_dims,
-            "regression setup must cover the equal-size old/new-primary transition"
-        );
         assert_ne!(d_content_dims, (120, 38));
 
-        // AttachSession then promotes D. The same synchronous transition must demote still-visible C
-        // into the cache and remove D's stale Pane role WITHOUT Detach(D). Detach is per session, not
-        // per role, so the old behavior froze D forever after its initial blank baseline.
-        app.attach_session_with_window_dims("sid-D".to_string(), Some((120, 38)));
+        let four_received = request_exact_test_viewport(&mut app, four.clone(), "gen-C");
+        assert!(!app.viewport_is_bound());
         let transition = shared.drain_test_requests();
+        assert_aggregate_topology_transaction(
+            &transition,
+            &["sid-A", "sid-B", "sid-C"],
+            &["sid-A", "sid-B", "sid-C", "sid-D"],
+        );
         assert!(
-            !transition
+            transition
                 .iter()
-                .any(|request| matches!(request, ClientRequest::Detach { id } if id == "sid-D")),
-            "removing D's old Pane role must not detach the now-active D"
+                .all(|request| !matches!(request, ClientRequest::Resize { .. })),
+            "exact Attach/Snapshot is read-only before every baseline"
         );
-        assert!(
-            !transition
-                .iter()
-                .any(|request| matches!(request, ClientRequest::Detach { id } if id == "sid-C")),
-            "still-visible old primary C must be demoted, not detached"
-        );
-        assert!(
-            transition.iter().any(
-                |request| matches!(request, ClientRequest::Attach { id, want_raw_output: false } if id == "sid-C")
-            ),
-            "old primary C is immediately attached as a cached visible pane"
-        );
-        assert!(
-            transition.iter().any(
-                |request| matches!(request, ClientRequest::Attach { id, want_raw_output: false } if id == "sid-D")
-            ),
-            "D is attached for its active role"
-        );
-        let d_resizes: Vec<(u16, u16)> = transition
+        prove_exact_test_viewport(&mut app, &shared, &four, "gen-C", &four_received);
+        let geometry = reconcile_exact_test_geometry(&mut app, &shared, "gen-C", (120, 38));
+        let d_resizes: Vec<(u16, u16)> = geometry
             .iter()
             .filter_map(|request| match request {
-                ClientRequest::Resize { id, cols, rows } if id == "sid-D" => Some((*cols, *rows)),
+                ClientRequest::Resize { id, cols, rows, .. } if id == "sid-D" => {
+                    Some((*cols, *rows))
+                }
                 _ => None,
             })
             .collect();
         assert_eq!(
             d_resizes,
             vec![d_content_dims],
-            "promoted D must receive its pane-content geometry, never the full window"
+            "after proof, promoted D receives its pane-content geometry, never the full window"
         );
         assert_eq!(app.primary_pane_dims, Some(d_content_dims));
         assert_eq!(app.session_id, "sid-D");
-        assert_eq!(shared.active_snapshot().id, "sid-D");
+        assert_eq!(shared.active_snapshot().id.as_deref(), Some("sid-D"));
         assert!(!app.pane_cache_dims.contains_key("sid-D"));
         assert!(app.pane_cache_dims.contains_key("sid-C"));
         assert_eq!(
@@ -18341,25 +24711,18 @@ mod split_frame_tests {
     }
 
     #[test]
-    fn attach_first_split_stash_revive_and_outer_resize_keep_every_visible_pty_attached_and_sized()
-    {
+    fn attach_first_split_stash_and_revive_each_use_one_complete_topology_transaction() {
         use RendererTabSplitAxis::Right;
 
         const FIRST_WINDOW: (u16, u16) = (120, 38);
-        const RESIZED_WINDOW: (u16, u16) = (160, 50);
 
-        let shared = Shared::with_test_outbound();
+        let shared = Shared::with_test_handoff_peer_facts(None, None);
         shared.set_active_session("sid-A");
         *shared.grid.lock().unwrap() = Some(Arc::new(role_transition_grid(
             usize::from(FIRST_WINDOW.0),
             usize::from(FIRST_WINDOW.1),
         )));
         let mut app = role_transition_app(shared.clone(), "sid-A");
-        app.handle_user_event(UserEvent::SetTabStrip {
-            tab_strip: Some(strip(vec![plain_tab("A", true)])),
-        });
-        shared.drain_test_requests();
-
         let split = strip(vec![
             plain_tab("A", false),
             split_child("B", "A", Right, true),
@@ -18376,147 +24739,61 @@ mod split_frame_tests {
             (content.cols, content.rows)
         };
 
-        // React split/revive currently foregrounds the destination session BEFORE publishing the
-        // replacement strip. The old one-pane strip must not create a transient cache role that is
-        // immediately detached yet still remembered as attached.
-        app.attach_session_with_window_dims("sid-B".to_string(), Some(FIRST_WINDOW));
-        let mut split_requests = shared.drain_test_requests();
-        *shared.grid.lock().unwrap() = Some(Arc::new(role_transition_grid(
-            usize::from(FIRST_WINDOW.0),
-            usize::from(FIRST_WINDOW.1),
-        )));
-        app.handle_user_event(UserEvent::SetTabStrip {
-            tab_strip: Some(split.clone()),
-        });
-        app.sync_primary_resize();
-        split_requests.extend(shared.drain_test_requests());
-
-        let source_attach = split_requests
-            .iter()
-            .rposition(
-                |request| matches!(request, ClientRequest::Attach { id, .. } if id == "sid-A"),
-            )
-            .expect("source pane is reattached");
-        let source_resize = split_requests[source_attach + 1..]
-            .iter()
-            .position(|request| {
-                matches!(
-                    request,
-                    ClientRequest::Resize { id, cols, rows }
-                        if id == "sid-A" && (*cols, *rows) == first_dims("sid-A")
-                )
-            })
-            .map(|offset| source_attach + 1 + offset)
-            .unwrap_or_else(|| {
-                panic!(
-                "source pane must be resized after its notification-safe Attach: {split_requests:?}"
-            )
-            });
+        // Exact cohort receipt revokes locally and admits one read-only Attach/Snapshot topology.
+        let split_received = request_exact_test_viewport(&mut app, split.clone(), "gen-C");
+        let split_requests = shared.drain_test_requests();
+        assert_aggregate_topology_transaction(&split_requests, &["sid-A"], &["sid-A", "sid-B"]);
         assert!(
-            split_requests[source_resize + 1..].iter().any(
-                |request| matches!(request, ClientRequest::Snapshot { id } if id == "sid-A")
-            ),
-            "new cache panes need a final pane-sized baseline after Attach+Resize: {split_requests:?}",
+            split_requests
+                .iter()
+                .all(|request| !matches!(request, ClientRequest::Resize { .. })),
+            "pre-baseline topology must stay mutation-free"
         );
-        assert!(
-            app.pending_resize_refit_at.is_some(),
-            "a structural split must arm the settled all-pane snapshot"
-        );
-        app.pending_resize_refit_at = Some(std::time::Instant::now());
-        assert!(app.flush_resize_refit_if_due());
-        let split_refit = shared.drain_test_requests();
-        for id in ["sid-A", "sid-B"] {
-            assert!(split_refit.iter().any(
-                |request| matches!(request, ClientRequest::Snapshot { id: request_id } if request_id == id)
-            ));
-        }
-        split_requests.extend(split_refit);
-
-        assert_eq!(
-            replay_attached_sessions(&["sid-A"], &split_requests),
-            ["sid-A".to_string(), "sid-B".to_string()]
-                .into_iter()
-                .collect(),
-            "after an attach-first split, both visible pane forwarders must be live; requests={split_requests:?}",
-        );
+        prove_exact_test_viewport(&mut app, &shared, &split, "gen-C", &split_received);
+        let split_geometry =
+            reconcile_exact_test_geometry(&mut app, &shared, "gen-C", FIRST_WINDOW);
         for id in ["sid-A", "sid-B"] {
             let expected = first_dims(id);
             assert!(
-                split_requests.iter().any(|request| matches!(
+                split_geometry.iter().any(|request| matches!(
                     request,
-                    ClientRequest::Resize { id: request_id, cols, rows }
+                    ClientRequest::Resize { id: request_id, cols, rows, .. }
                         if request_id == id && (*cols, *rows) == expected
                 )),
-                "split must resize {id} to {expected:?}; requests={split_requests:?}",
+                "split must resize {id} to {expected:?}; requests={split_geometry:?}",
             );
         }
 
-        // Stashing the active B pane switches to survivor A before publishing the one-pane strip.
-        // A must expand to the complete window and B must be the only forwarder detached.
-        app.attach_session_with_window_dims("sid-A".to_string(), Some(FIRST_WINDOW));
-        let mut stash_requests = shared.drain_test_requests();
-        *shared.grid.lock().unwrap() = Some(Arc::new(role_transition_grid(
-            usize::from(FIRST_WINDOW.0),
-            usize::from(FIRST_WINDOW.1),
-        )));
-        app.handle_user_event(UserEvent::SetTabStrip {
-            tab_strip: Some(strip(vec![plain_tab("A", true)])),
-        });
-        app.sync_primary_resize();
-        stash_requests.extend(shared.drain_test_requests());
-        assert!(
-            app.pending_resize_refit_at.is_some(),
-            "stash geometry change must arm the settled refit"
-        );
-        app.pending_resize_refit_at = Some(std::time::Instant::now());
-        assert!(app.flush_resize_refit_if_due());
-        stash_requests.extend(shared.drain_test_requests());
-        assert_eq!(
-            replay_attached_sessions(&["sid-A", "sid-B"], &stash_requests),
-            ["sid-A".to_string()].into_iter().collect(),
-            "stash must leave only the survivor attached; requests={stash_requests:?}",
-        );
-        assert!(stash_requests.iter().any(|request| matches!(
+        // Stash B: the one-pane exact cohort detaches BOTH old roles (including survivor A) before
+        // reattaching A under the reviewed generation.
+        let stashed = strip(vec![plain_tab("A", true)]);
+        let stash_received = request_exact_test_viewport(&mut app, stashed.clone(), "gen-C");
+        let stash_requests = shared.drain_test_requests();
+        assert_aggregate_topology_transaction(&stash_requests, &["sid-A", "sid-B"], &["sid-A"]);
+        prove_exact_test_viewport(&mut app, &shared, &stashed, "gen-C", &stash_received);
+        let stash_geometry =
+            reconcile_exact_test_geometry(&mut app, &shared, "gen-C", FIRST_WINDOW);
+        assert!(stash_geometry.iter().any(|request| matches!(
             request,
-            ClientRequest::Resize { id, cols, rows }
+            ClientRequest::Resize { id, cols, rows, .. }
                 if id == "sid-A" && (*cols, *rows) == FIRST_WINDOW
         )));
         assert!(stash_requests
             .iter()
             .any(|request| matches!(request, ClientRequest::Snapshot { id } if id == "sid-A")));
 
-        // Revive uses the same attach-first ordering as a fresh split. Both sessions must be live
-        // again and must return to their split content dimensions.
-        app.attach_session_with_window_dims("sid-B".to_string(), Some(FIRST_WINDOW));
-        let mut revive_requests = shared.drain_test_requests();
-        *shared.grid.lock().unwrap() = Some(Arc::new(role_transition_grid(
-            usize::from(FIRST_WINDOW.0),
-            usize::from(FIRST_WINDOW.1),
-        )));
-        app.handle_user_event(UserEvent::SetTabStrip {
-            tab_strip: Some(split.clone()),
-        });
-        app.sync_primary_resize();
-        revive_requests.extend(shared.drain_test_requests());
-        assert!(
-            app.pending_resize_refit_at.is_some(),
-            "revive geometry change must arm the settled refit"
-        );
-        app.pending_resize_refit_at = Some(std::time::Instant::now());
-        assert!(app.flush_resize_refit_if_due());
-        revive_requests.extend(shared.drain_test_requests());
-        assert_eq!(
-            replay_attached_sessions(&["sid-A"], &revive_requests),
-            ["sid-A".to_string(), "sid-B".to_string()]
-                .into_iter()
-                .collect(),
-            "revive must reattach both visible panes; requests={revive_requests:?}",
-        );
+        // Revive uses the same exact-cohort barrier and complete old-set cleanup.
+        let revive_received = request_exact_test_viewport(&mut app, split.clone(), "gen-C");
+        let revive_requests = shared.drain_test_requests();
+        assert_aggregate_topology_transaction(&revive_requests, &["sid-A"], &["sid-A", "sid-B"]);
+        prove_exact_test_viewport(&mut app, &shared, &split, "gen-C", &revive_received);
+        let revive_geometry =
+            reconcile_exact_test_geometry(&mut app, &shared, "gen-C", FIRST_WINDOW);
         for id in ["sid-A", "sid-B"] {
             let expected = first_dims(id);
-            assert!(revive_requests.iter().any(|request| matches!(
+            assert!(revive_geometry.iter().any(|request| matches!(
                 request,
-                ClientRequest::Resize { id: request_id, cols, rows }
+                ClientRequest::Resize { id: request_id, cols, rows, .. }
                     if request_id == id && (*cols, *rows) == expected
             )));
             assert!(revive_requests.iter().any(
@@ -18524,80 +24801,66 @@ mod split_frame_tests {
             ));
         }
 
-        // A later outer-window resize must update BOTH the primary and the pre-existing cached pane.
-        *shared.grid.lock().unwrap() = Some(Arc::new(role_transition_grid(
-            usize::from(RESIZED_WINDOW.0),
-            usize::from(RESIZED_WINDOW.1),
-        )));
-        app.send_resize(RESIZED_WINDOW);
-        app.sync_pane_cache();
-        let mut outer_resize_requests = shared.drain_test_requests();
-        let resized_layout = compute_split_layout(&split, RESIZED_WINDOW.0, RESIZED_WINDOW.1)
-            .expect("resized split layout");
-        for id in ["sid-A", "sid-B"] {
-            let pane = resized_layout
-                .panes
-                .iter()
-                .find(|pane| pane.session_id == id)
-                .unwrap_or_else(|| panic!("missing resized {id}"));
-            let content = pane_content_region_for_layout(pane.region, resized_layout.panes.len());
-            let expected = (content.cols, content.rows);
-            assert!(
-                outer_resize_requests.iter().any(|request| matches!(
-                    request,
-                    ClientRequest::Resize { id: request_id, cols, rows }
-                        if request_id == id && (*cols, *rows) == expected
-                )),
-                "outer resize must update {id} to {expected:?}; requests={outer_resize_requests:?}"
-            );
-        }
-        // The real HostEvent::Resized path arms this settled refit after the coalesced Resize.
-        // Flush it here to prove both panes receive final authoritative baselines even when neither
-        // shell emits output after the outer-window resize.
-        app.schedule_resize_refit();
-        app.pending_resize_refit_at = Some(std::time::Instant::now());
-        assert!(app.flush_resize_refit_if_due());
-        outer_resize_requests.extend(shared.drain_test_requests());
-        for id in ["sid-A", "sid-B"] {
-            assert!(
-                outer_resize_requests.iter().any(
-                    |request| matches!(request, ClientRequest::Snapshot { id: request_id } if request_id == id)
-                ),
-                "outer resize must settle {id} with a final Snapshot; requests={outer_resize_requests:?}"
-            );
-        }
         assert_eq!(
-            replay_attached_sessions(&["sid-A", "sid-B"], &outer_resize_requests),
+            app.attached_sessions,
             ["sid-A".to_string(), "sid-B".to_string()]
                 .into_iter()
-                .collect(),
-            "outer resize/refit must not disturb either visible forwarder"
+                .collect()
         );
     }
 
     #[test]
-    fn pane_cache_teardown_never_detaches_primary_or_sibling_roles() {
-        let shared = Shared::with_test_outbound();
-        shared.set_active_session("primary");
-        let mut app = role_transition_app(shared.clone(), "primary");
-        app.sibling_id = Some("sibling".to_string());
-        app.pane_cache_dims.insert("primary".to_string(), (10, 5));
-        app.pane_cache_dims.insert("sibling".to_string(), (10, 5));
-        app.pane_cache_dims.insert("gone".to_string(), (10, 5));
-        shared.set_pane_sessions(&["primary", "sibling", "gone"]);
+    fn structural_strip_clear_detaches_all_old_roles_before_reattaching_primary() {
+        const FULL_WINDOW: (u16, u16) = (120, 38);
+        let shared = Shared::with_test_handoff_peer_facts(None, None);
+        shared.set_active_session("sid-C");
+        *shared.grid.lock().unwrap() = Some(Arc::new(role_transition_grid(
+            usize::from(FULL_WINDOW.0),
+            usize::from(FULL_WINDOW.1),
+        )));
+        let mut app = role_transition_app(shared.clone(), "sid-C");
+        let split = strip(vec![
+            plain_tab("A", false),
+            split_child("B", "A", RendererTabSplitAxis::Right, false),
+            split_child("C", "B", RendererTabSplitAxis::Down, true),
+        ]);
+        let split_received = request_exact_test_viewport(&mut app, split.clone(), "gen-C");
+        let initial = shared.drain_test_requests();
+        assert_aggregate_topology_transaction(&initial, &["sid-C"], &["sid-A", "sid-B", "sid-C"]);
+        prove_exact_test_viewport(&mut app, &shared, &split, "gen-C", &split_received);
 
-        // No strip means wanted is empty: only the truly-gone pane may lose its daemon forwarder.
-        app.sync_pane_cache();
+        // Collapse to a reviewed one-pane cohort. It must size the survivor from the desired
+        // primary-only topology, never consult the old split and retain C's former pane region.
+        let primary_only = strip(vec![plain_tab("C", true)]);
+        let primary_received = request_exact_test_viewport(&mut app, primary_only.clone(), "gen-C");
         let requests = shared.drain_test_requests();
-        assert!(requests
-            .iter()
-            .any(|request| matches!(request, ClientRequest::Detach { id } if id == "gone")));
+        assert_aggregate_topology_transaction(&requests, &["sid-A", "sid-B", "sid-C"], &["sid-C"]);
         assert!(
-            !requests.iter().any(
-                |request| matches!(request, ClientRequest::Detach { id } if id == "primary" || id == "sibling")
-            ),
-            "cache teardown cannot cancel another live renderer role: {requests:?}"
+            requests
+                .iter()
+                .all(|request| !matches!(request, ClientRequest::Resize { .. })),
+            "exact Attach/Snapshot remains mutation-free before Grid"
         );
+        prove_exact_test_viewport(&mut app, &shared, &primary_only, "gen-C", &primary_received);
+        let geometry = reconcile_exact_test_geometry(&mut app, &shared, "gen-C", FULL_WINDOW);
+        assert_eq!(
+            geometry
+                .iter()
+                .filter_map(|request| match request {
+                    ClientRequest::Resize { id, cols, rows, .. } if id == "sid-C" => {
+                        Some((*cols, *rows))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![FULL_WINDOW],
+            "the one-pane cohort must resize the surviving primary to the full terminal window"
+        );
+        assert_eq!(
+            app.attached_sessions,
+            ["sid-C".to_string()].into_iter().collect()
+        );
+        assert!(shared.pane_ids().is_empty());
     }
 
     #[test]
@@ -20556,34 +26819,17 @@ mod split_frame_tests {
     #[test]
     fn cached_empty_history_reprobes_each_split_pane_without_closing_either() {
         let tab_strip = strip(vec![
-            plain_tab("A", false),
-            split_child("B", "A", RendererTabSplitAxis::Right, true),
+            plain_tab("A", true),
+            split_child("B", "A", RendererTabSplitAxis::Right, false),
         ]);
         let layout = compute_split_layout(&tab_strip, 60, 20).expect("two-pane layout");
-        let shared = Shared::with_test_outbound();
-        shared.set_active_session("sid-A");
-        *shared.grid.lock().unwrap() = Some(Arc::new(role_transition_grid(60, 20)));
-        let mut app = role_transition_app(shared.clone(), "sid-A");
-        app.handle_user_event(UserEvent::SetTabStrip {
-            tab_strip: Some(tab_strip),
-        });
+        let shared = Shared::with_test_handoff_peer_facts(None, None);
+        shared.set_active_session("sid-bootstrap");
+        let mut app = role_transition_app(shared.clone(), "sid-bootstrap");
+        let received = request_exact_test_viewport(&mut app, tab_strip.clone(), "gen-C");
         shared.drain_test_requests();
-
-        let pane_b = layout
-            .panes
-            .iter()
-            .find(|pane| pane.session_id == "sid-B")
-            .expect("pane B");
-        let pane_b_content = pane_content_region(pane_b.region);
-        let pane_b_epoch = shared.pane_epoch("sid-B").expect("pane B binding");
-        assert!(shared.apply_pane_grid(
-            "sid-B",
-            pane_b_epoch,
-            Arc::new(role_transition_grid(
-                usize::from(pane_b_content.cols),
-                usize::from(pane_b_content.rows),
-            )),
-        ));
+        prove_exact_test_viewport(&mut app, &shared, &tab_strip, "gen-C", &received);
+        install_split_baselines(&shared, &layout, "sid-A");
 
         // Both panes previously asked while empty. These point-in-time zero replies must
         // not appoint one permanent scroll owner or require deleting it before the other
@@ -20607,13 +26853,15 @@ mod split_frame_tests {
                 }] => {
                     assert_eq!(actual_id, id);
                     assert_eq!(*offset_from_top, 1);
+                    let pane = layout
+                        .panes
+                        .iter()
+                        .find(|pane| pane.session_id == id)
+                        .expect("visible pane");
+                    let content = pane_content_region_for_layout(pane.region, layout.panes.len());
                     assert_eq!(
-                        *count,
-                        if id == "sid-A" {
-                            20
-                        } else {
-                            pane_b_content.rows
-                        }
+                        *count, content.rows,
+                        "each query uses that pane's accepted live baseline height"
                     );
                 }
                 other => panic!(
@@ -20941,11 +27189,12 @@ mod split_frame_tests {
         )
         .expect("remote-owned pane has a reclaim target");
 
-        let shared = Shared::with_test_outbound();
+        let shared = Shared::with_test_handoff_peer_facts(None, None);
+        shared.set_active_session("sid-bootstrap");
         let (events_tx, events_rx) = std::sync::mpsc::channel();
         let mut app = App::new(
             shared.clone(),
-            "sid-right".to_string(),
+            "sid-bootstrap".to_string(),
             DEFAULT_WINDOW_TITLE.to_string(),
             None,
             None,
@@ -20959,14 +27208,29 @@ mod split_frame_tests {
             None,
             None,
             None,
+            None,
         );
+        let received = request_exact_test_viewport(&mut app, tabs.clone(), "gen-C");
+        shared.drain_test_requests();
+        prove_exact_test_viewport(&mut app, &shared, &tabs, "gen-C", &received);
+        // Headless tests have no native window geometry, so retain the historical full-window
+        // fallback for split-frame sizing while installing the target pane's exact accepted store
+        // baseline after the aggregate bind cleared every old cache.
+        *shared.grid.lock().unwrap() = Some(Arc::new(role_transition_grid(100, 12)));
+        let left_epoch = shared
+            .pane_epoch(&target.session_id)
+            .expect("left pane binding");
+        let left_content = pane_content_region_for_layout(target.region, layout.panes.len());
+        assert!(shared.apply_pane_grid(
+            &target.session_id,
+            left_epoch,
+            Arc::new(role_transition_grid(
+                usize::from(left_content.cols),
+                usize::from(left_content.rows),
+            )),
+        ));
         app.external_winsize_sessions
             .insert(target.session_id.clone());
-        *shared.grid.lock().unwrap() = Some(Arc::new(role_transition_grid(100, 12)));
-        app.handle_user_event(UserEvent::SetTabStrip {
-            tab_strip: Some(tabs),
-        });
-        shared.drain_test_requests();
         let _ = events_rx.try_iter().collect::<Vec<_>>();
         app.pending_resize_refit_at = None;
 
@@ -20976,6 +27240,7 @@ mod split_frame_tests {
             events_rx.try_iter().collect::<Vec<_>>(),
             vec![
                 RendererEvent::PaneFocused {
+                    window_id: "win".into(),
                     tab_id: target.tab_id.clone(),
                 },
                 RendererEvent::ViewportReclaimRequested {
@@ -21012,7 +27277,7 @@ mod split_frame_tests {
         let refit = shared.drain_test_requests();
         assert!(refit.iter().any(|request| matches!(
             request,
-            ClientRequest::Resize { id, cols, rows }
+            ClientRequest::Resize { id, cols, rows, .. }
                 if id == &target.session_id && (*cols, *rows) == local_dims
         )));
         assert!(refit.iter().any(|request| matches!(
@@ -21574,16 +27839,19 @@ mod split_frame_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         assert!(emit_pane_edge_dock_requested(
             Some(&tx),
+            "w1",
             "src",
             "tgt",
             PaneDockEdge::Bottom
         ));
         match rx.recv().expect("event") {
             RendererEvent::PaneEdgeDockRequested {
+                window_id,
                 source_tab_id,
                 target_tab_id,
                 edge,
             } => {
+                assert_eq!(window_id, "w1");
                 assert_eq!(source_tab_id, "src");
                 assert_eq!(target_tab_id, "tgt");
                 assert_eq!(edge, PaneDockEdge::Bottom);
@@ -21593,6 +27861,7 @@ mod split_frame_tests {
         // No sender / dropped receiver -> false, never panics.
         assert!(!emit_pane_edge_dock_requested(
             None,
+            "w1",
             "s",
             "t",
             PaneDockEdge::Left
@@ -21600,6 +27869,7 @@ mod split_frame_tests {
         drop(rx);
         assert!(!emit_pane_edge_dock_requested(
             Some(&tx),
+            "w1",
             "s",
             "t",
             PaneDockEdge::Left
@@ -22401,18 +28671,18 @@ mod split_frame_tests {
             (
                 "two-pane",
                 strip(vec![
-                    plain_tab("A", false),
-                    split_child("B", "A", Right, true),
+                    plain_tab("A", true),
+                    split_child("B", "A", Right, false),
                 ]),
                 2,
             ),
             (
                 "canonical-four-pane",
                 strip(vec![
-                    plain_tab("A", false),
+                    plain_tab("A", true),
                     split_child("B", "A", Right, false),
                     split_child("C", "A", Down, false),
-                    split_child("D", "B", Down, true),
+                    split_child("D", "B", Down, false),
                 ]),
                 4,
             ),
@@ -22423,21 +28693,24 @@ mod split_frame_tests {
                 .unwrap_or_else(|| panic!("{label}: layout"));
             assert_eq!(layout.panes.len(), expected_panes, "{label}");
 
-            let shared = Shared::with_test_outbound();
-            shared.set_active_session("sid-A");
-            *shared.grid.lock().unwrap() = Some(Arc::new(role_transition_grid(
-                usize::from(WINDOW_COLS),
-                usize::from(WINDOW_ROWS),
-            )));
-            let mut app = role_transition_app(shared.clone(), "sid-A");
-            app.handle_user_event(UserEvent::SetTabStrip {
-                tab_strip: Some(tab_strip),
-            });
-            // In production the subsequent draw performs this primary-side half of the same
-            // reconciliation; call it explicitly in the headless fixture so every visible PTY is
-            // represented in the outbound assertion below.
-            app.sync_primary_resize();
-            let requests = shared.drain_test_requests();
+            let shared = Shared::with_test_handoff_peer_facts(None, None);
+            shared.set_active_session("sid-bootstrap");
+            let mut app = role_transition_app(shared.clone(), "sid-bootstrap");
+            let received = request_exact_test_viewport(&mut app, tab_strip.clone(), "gen-C");
+            let attach_requests = shared.drain_test_requests();
+            assert!(
+                attach_requests
+                    .iter()
+                    .all(|request| !matches!(request, ClientRequest::Resize { .. })),
+                "{label}: exact Attach/Snapshot stays mutation-free before Grid"
+            );
+            prove_exact_test_viewport(&mut app, &shared, &tab_strip, "gen-C", &received);
+            let requests = reconcile_exact_test_geometry(
+                &mut app,
+                &shared,
+                "gen-C",
+                (WINDOW_COLS, WINDOW_ROWS),
+            );
 
             for pane in &layout.panes {
                 let content = pane_content_region_for_layout(pane.region, layout.panes.len());
@@ -22445,7 +28718,7 @@ mod split_frame_tests {
                 assert!(
                     requests.iter().any(|request| matches!(
                         request,
-                        ClientRequest::Resize { id, cols, rows }
+                        ClientRequest::Resize { id, cols, rows, .. }
                             if id == &pane.session_id && (*cols, *rows) == expected_dims
                     )),
                     "{label}: {} PTY must receive its exact painted content dimensions {expected_dims:?}; requests={requests:?}",
@@ -23592,7 +29865,7 @@ mod split_frame_tests {
 mod tab_bar_tests {
     use super::{
         compute_split_layout, hit_test_tab_bar_pixel, layout_tab_bar, rect_divider_targets,
-        RectDividerTarget, RendererPaneRect, RendererTab, RendererTabAttention,
+        RectDividerTarget, RendererPaneRect, RendererPaneRegion, RendererTab, RendererTabAttention,
         RendererTabAttentionKind, RendererTabBarLayout, RendererTabSplitAxis, RendererTabStrip,
     };
 
@@ -24983,6 +31256,8 @@ mod tab_bar_tests {
         let launch = RendererLaunch {
             socket_path: "/tmp/sock".into(),
             session_id: "sid".into(),
+            attachment_handoff: None,
+            exact_viewport: None,
             window_title: None,
             status_label: None,
             tab_strip: None,
@@ -25003,6 +31278,8 @@ mod tab_bar_tests {
         let plain = RendererLaunch {
             socket_path: "/tmp/sock".into(),
             session_id: "sid".into(),
+            attachment_handoff: None,
+            exact_viewport: None,
             window_title: None,
             status_label: None,
             tab_strip: None,
@@ -25023,6 +31300,8 @@ mod tab_bar_tests {
         let launch = RendererLaunch {
             socket_path: "/tmp/sock".into(),
             session_id: "sid".into(),
+            attachment_handoff: None,
+            exact_viewport: None,
             window_title: None,
             status_label: None,
             tab_strip: None,
@@ -25046,6 +31325,8 @@ mod tab_bar_tests {
         let launch = RendererLaunch {
             socket_path: "/tmp/sock".into(),
             session_id: "sid".into(),
+            attachment_handoff: None,
+            exact_viewport: None,
             window_title: None,
             status_label: None,
             tab_strip: None,
@@ -25740,13 +32021,13 @@ mod tab_bar_tests {
         let (tx, rx) = channel::<RendererEvent>();
         match decide_top_tab_click(true, tab_id) {
             TopTabClickOutcome::Activate(id) => {
-                assert!(emit_tab_strip_activation(Some(&tx), &id));
+                assert!(emit_tab_strip_activation(Some(&tx), "w1", &id));
             }
             other => panic!("expected Activate, got {other:?}"),
         }
 
         match rx.try_recv() {
-            Ok(RendererEvent::TabStripActivated { tab_id }) => assert_eq!(tab_id, "b"),
+            Ok(RendererEvent::TabStripActivated { tab_id, .. }) => assert_eq!(tab_id, "b"),
             other => panic!("expected one TabStripActivated, got {other:?}"),
         }
         assert!(rx.try_recv().is_err(), "exactly one event must be emitted");
@@ -25787,7 +32068,7 @@ mod tab_bar_tests {
         match decide_top_tab_click(true, tab_id) {
             TopTabClickOutcome::Activate(id) => {
                 // No outbound sender: emit is a no-op and must not panic.
-                assert!(!emit_tab_strip_activation(None, &id));
+                assert!(!emit_tab_strip_activation(None, "w1", &id));
             }
             other => panic!("expected Activate, got {other:?}"),
         }
@@ -25808,9 +32089,9 @@ mod tab_bar_tests {
         use std::sync::mpsc::channel;
 
         let (tx, rx) = channel::<RendererEvent>();
-        assert!(emit_tab_close_requested(Some(&tx), "b"));
+        assert!(emit_tab_close_requested(Some(&tx), "w1", "b"));
         match rx.try_recv() {
-            Ok(RendererEvent::TabCloseRequested { tab_id }) => assert_eq!(tab_id, "b"),
+            Ok(RendererEvent::TabCloseRequested { tab_id, .. }) => assert_eq!(tab_id, "b"),
             other => panic!("expected one TabCloseRequested, got {other:?}"),
         }
         assert!(rx.try_recv().is_err(), "exactly one close event");
@@ -25822,43 +32103,52 @@ mod tab_bar_tests {
         use std::sync::mpsc::channel;
 
         // No sender: false, no panic.
-        assert!(!emit_tab_close_requested(None, "a"));
+        assert!(!emit_tab_close_requested(None, "w1", "a"));
         // Dropped receiver: send fails -> false, no panic.
         let (tx, rx) = channel::<RendererEvent>();
         drop(rx);
-        assert!(!emit_tab_close_requested(Some(&tx), "a"));
+        assert!(!emit_tab_close_requested(Some(&tx), "w1", "a"));
     }
 
     #[test]
-    fn new_tab_event_is_payload_free_and_distinct_from_tab_events() {
+    fn new_tab_event_is_window_bound_without_tab_or_session_identity() {
         use super::RendererEvent;
         // NewTabRequested carries no payload and is its own value, never equal to an activation or a
         // close — even for a tab whose id is empty/anything.
-        let n = RendererEvent::NewTabRequested;
-        assert_eq!(n, RendererEvent::NewTabRequested);
+        let n = RendererEvent::NewTabRequested {
+            window_id: "w1".into(),
+        };
+        assert_eq!(
+            n,
+            RendererEvent::NewTabRequested {
+                window_id: "w1".into()
+            }
+        );
         assert_ne!(
             n,
             RendererEvent::TabStripActivated {
+                window_id: "w1".into(),
                 tab_id: String::new()
             }
         );
         assert_ne!(
             n,
             RendererEvent::TabCloseRequested {
+                window_id: "w1".into(),
                 tab_id: String::new()
             }
         );
     }
 
     #[test]
-    fn new_tab_emit_helper_sends_exactly_one_payload_free_event() {
+    fn new_tab_emit_helper_sends_exactly_one_window_bound_event() {
         use super::{emit_new_tab_requested, RendererEvent};
         use std::sync::mpsc::channel;
 
         let (tx, rx) = channel::<RendererEvent>();
-        assert!(emit_new_tab_requested(Some(&tx)));
+        assert!(emit_new_tab_requested(Some(&tx), "w1"));
         match rx.try_recv() {
-            Ok(RendererEvent::NewTabRequested) => {}
+            Ok(RendererEvent::NewTabRequested { window_id }) => assert_eq!(window_id, "w1"),
             other => panic!("expected one NewTabRequested, got {other:?}"),
         }
         assert!(rx.try_recv().is_err(), "exactly one new-tab event");
@@ -25870,11 +32160,11 @@ mod tab_bar_tests {
         use std::sync::mpsc::channel;
 
         // No sender: false, no panic.
-        assert!(!emit_new_tab_requested(None));
+        assert!(!emit_new_tab_requested(None, "w1"));
         // Dropped receiver: send fails -> false, no panic.
         let (tx, rx) = channel::<RendererEvent>();
         drop(rx);
-        assert!(!emit_new_tab_requested(Some(&tx)));
+        assert!(!emit_new_tab_requested(Some(&tx), "w1"));
     }
 
     #[test]
@@ -26246,15 +32536,15 @@ mod tab_bar_tests {
         let resolve = |x: f32, y: f32| -> RendererEvent {
             let (tx, rx) = channel::<RendererEvent>();
             if let Some(id) = pixel_in_tab_close(Some(&layout), x, y, width, CELL_W, CELL_H) {
-                emit_tab_close_requested(Some(&tx), id);
+                emit_tab_close_requested(Some(&tx), "w1", id);
             } else if pixel_in_new_tab_control(Some(&layout), x, y, width, CELL_W, CELL_H) {
-                emit_new_tab_requested(Some(&tx));
+                emit_new_tab_requested(Some(&tx), "w1");
             } else if let Some(axis) =
                 pixel_in_split_control(Some(&layout), x, y, width, CELL_W, CELL_H)
             {
-                emit_split_requested(Some(&tx), axis, Some("a".into()));
+                emit_split_requested(Some(&tx), "w1", axis, Some("a".into()));
             } else if let Some(id) = hit_test_tab_bar_pixel(Some(&layout), x, y, width, CELL_H) {
-                emit_tab_strip_activation(Some(&tx), id);
+                emit_tab_strip_activation(Some(&tx), "w1", id);
             }
             let ev = rx.try_recv().expect("one event");
             assert!(rx.try_recv().is_err(), "exactly one event per press");
@@ -26266,7 +32556,10 @@ mod tab_bar_tests {
         let (_, cy) = center(&layout, 1);
         assert_eq!(
             resolve(close_x, cy),
-            RendererEvent::TabCloseRequested { tab_id: "b".into() }
+            RendererEvent::TabCloseRequested {
+                window_id: "w1".into(),
+                tab_id: "b".into()
+            }
         );
 
         // The new-tab control cell -> new-tab, never an activation/close.
@@ -26274,7 +32567,9 @@ mod tab_bar_tests {
             super::render::new_tab_rect(layout.overflow, width, CELL_W, CELL_H).unwrap();
         assert_eq!(
             resolve(nx + nw / 2.0, CELL_H / 2.0),
-            RendererEvent::NewTabRequested
+            RendererEvent::NewTabRequested {
+                window_id: "w1".into()
+            }
         );
 
         // The split control cells (left of `+`) -> split, never an activation/close/new-tab.
@@ -26285,6 +32580,7 @@ mod tab_bar_tests {
         assert_eq!(
             resolve(srx + srw / 2.0, CELL_H / 2.0),
             RendererEvent::SplitRequested {
+                window_id: "w1".into(),
                 axis: RendererTabSplitAxis::Right,
                 from_tab_id: Some("a".into())
             }
@@ -26292,6 +32588,7 @@ mod tab_bar_tests {
         assert_eq!(
             resolve(sdx + sdw / 2.0, CELL_H / 2.0),
             RendererEvent::SplitRequested {
+                window_id: "w1".into(),
                 axis: RendererTabSplitAxis::Down,
                 from_tab_id: Some("a".into())
             }
@@ -26302,7 +32599,10 @@ mod tab_bar_tests {
         let (_, ay) = center(&layout, 0);
         assert_eq!(
             resolve(body_x, ay),
-            RendererEvent::TabStripActivated { tab_id: "a".into() }
+            RendererEvent::TabStripActivated {
+                window_id: "w1".into(),
+                tab_id: "a".into()
+            }
         );
     }
 
@@ -26333,17 +32633,17 @@ mod tab_bar_tests {
         let (tx, rx) = channel::<RendererEvent>();
         // Handler precedence: a close hit emits close and returns BEFORE the activation decision.
         if let Some(id) = hit {
-            assert!(emit_tab_close_requested(Some(&tx), id));
+            assert!(emit_tab_close_requested(Some(&tx), "w1", id));
         } else {
             match decide_top_tab_click(true, Some("b")) {
                 super::TopTabClickOutcome::Activate(id) => {
-                    emit_tab_strip_activation(Some(&tx), &id);
+                    emit_tab_strip_activation(Some(&tx), "w1", &id);
                 }
                 other => panic!("unexpected {other:?}"),
             }
         }
         match rx.try_recv() {
-            Ok(RendererEvent::TabCloseRequested { tab_id }) => assert_eq!(tab_id, "b"),
+            Ok(RendererEvent::TabCloseRequested { tab_id, .. }) => assert_eq!(tab_id, "b"),
             other => panic!("expected one TabCloseRequested, got {other:?}"),
         }
         assert!(
@@ -26378,11 +32678,13 @@ mod tab_bar_tests {
         // No close hit -> activation path, as the handler does.
         let activated = hit_test_tab_bar_pixel(Some(&layout), body_x, cy, width, CELL_H);
         match decide_top_tab_click(true, activated) {
-            TopTabClickOutcome::Activate(id) => assert!(emit_tab_strip_activation(Some(&tx), &id)),
+            TopTabClickOutcome::Activate(id) => {
+                assert!(emit_tab_strip_activation(Some(&tx), "w1", &id))
+            }
             other => panic!("expected Activate, got {other:?}"),
         }
         match rx.try_recv() {
-            Ok(RendererEvent::TabStripActivated { tab_id }) => assert_eq!(tab_id, "b"),
+            Ok(RendererEvent::TabStripActivated { tab_id, .. }) => assert_eq!(tab_id, "b"),
             other => panic!("expected one TabStripActivated, got {other:?}"),
         }
         assert!(rx.try_recv().is_err());
@@ -26565,17 +32867,17 @@ mod tab_bar_tests {
         use std::sync::mpsc::channel;
 
         let (tx, rx) = channel::<RendererEvent>();
-        assert!(emit_tab_attention_clear_requested(Some(&tx), "b"));
+        assert!(emit_tab_attention_clear_requested(Some(&tx), "w1", "b"));
         match rx.try_recv() {
-            Ok(RendererEvent::TabAttentionClearRequested { tab_id }) => assert_eq!(tab_id, "b"),
+            Ok(RendererEvent::TabAttentionClearRequested { tab_id, .. }) => assert_eq!(tab_id, "b"),
             other => panic!("expected one TabAttentionClearRequested, got {other:?}"),
         }
         assert!(rx.try_recv().is_err(), "exactly one attention-clear event");
         // No sender / closed receiver -> false, no panic.
-        assert!(!emit_tab_attention_clear_requested(None, "b"));
+        assert!(!emit_tab_attention_clear_requested(None, "w1", "b"));
         let (tx2, rx2) = channel::<RendererEvent>();
         drop(rx2);
-        assert!(!emit_tab_attention_clear_requested(Some(&tx2), "b"));
+        assert!(!emit_tab_attention_clear_requested(Some(&tx2), "w1", "b"));
     }
 
     #[test]
@@ -26928,14 +33230,32 @@ mod tab_bar_tests {
     }
 
     #[test]
-    fn rect_divider_targets_unsplit_has_no_seams() {
-        let strip = RendererTabStrip {
-            window_id: "w1".into(),
-            tabs: vec![rect_tab("a", None, true, [0, 0, 1000, 1000])],
-        };
-        let layout = compute_split_layout(&strip, 80, 24).expect("rect layout");
-        // A single full-grid pane: no internal edges, no seams.
-        assert!(rect_divider_targets(&layout, 80, 24).is_empty());
+    fn rect_layout_canonicalizes_any_stale_single_pane_rect_to_the_full_grid() {
+        for stale in [
+            [0, 0, 500, 1000],
+            [500, 0, 500, 1000],
+            [0, 0, 1000, 500],
+            [0, 500, 1000, 500],
+        ] {
+            let strip = RendererTabStrip {
+                window_id: "w1".into(),
+                tabs: vec![rect_tab("a", None, true, stale)],
+            };
+            let layout = compute_split_layout(&strip, 80, 24).expect("rect layout");
+            assert_eq!(layout.panes.len(), 1);
+            assert_eq!(
+                layout.panes[0].region,
+                RendererPaneRegion {
+                    col: 0,
+                    row: 0,
+                    cols: 80,
+                    rows: 24,
+                },
+                "stale split-era rect {stale:?} must not leave a black viewport region"
+            );
+            assert!(layout.dividers.is_empty());
+            assert!(rect_divider_targets(&layout, 80, 24).is_empty());
+        }
     }
 }
 
@@ -26980,8 +33300,9 @@ mod command_channel_tests {
         apply_set_tab_strip, bridge_commands, compose_tab_strip_text, emit_tab_strip_activation,
         hit_test_tab_strip_line, run_renderer_with_commands_and_events,
         tab_strip_selection_geometry_changed, user_event_for_command, ReactChromeScriptKind,
-        RendererCommand, RendererEvent, RendererLaunch, RendererRunError, RendererTab,
-        RendererTabStrip, RendererTheme, UserEvent,
+        RendererCommand, RendererEvent, RendererExactSessionTarget, RendererExactViewport,
+        RendererExactViewportOutcome, RendererExactViewportRequest, RendererExactViewportRole,
+        RendererLaunch, RendererRunError, RendererTab, RendererTabStrip, RendererTheme, UserEvent,
     };
     use std::sync::mpsc;
 
@@ -27011,6 +33332,122 @@ mod command_channel_tests {
                 pane_rect: None,
             }],
         }
+    }
+
+    fn one_tab_exact_viewport(strip: &RendererTabStrip) -> RendererExactViewport {
+        let target = RendererExactSessionTarget {
+            session_id: "s0".to_string(),
+            generation: "gen-0".to_string(),
+        };
+        RendererExactViewport {
+            window_id: strip.window_id.clone(),
+            primary_tab_id: "t0".to_string(),
+            primary: target.clone(),
+            roles: vec![RendererExactViewportRole {
+                tab_id: "t0".to_string(),
+                target: target.clone(),
+            }],
+            unique_targets: vec![target],
+        }
+    }
+
+    fn exact_viewport_request(
+        dispositions: mpsc::Sender<RendererEvent>,
+    ) -> RendererExactViewportRequest {
+        let strip = one_tab_strip();
+        RendererExactViewportRequest::new(
+            "s0".to_string(),
+            one_tab_exact_viewport(&strip),
+            strip,
+            dispositions,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn exact_viewport_bridge_failure_settles_current_request_once() {
+        let (dispositions, received) = mpsc::channel();
+        let request = exact_viewport_request(dispositions);
+        let request_id = request.request_id();
+        let (commands, bridge) = mpsc::channel();
+        commands
+            .send(RendererCommand::AttachExactViewport { request })
+            .unwrap();
+        drop(commands);
+
+        bridge_commands(bridge, |_event| Err(()));
+
+        let disposition = match received
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap()
+        {
+            RendererEvent::ExactViewportDisposition(disposition) => disposition,
+            other => panic!("unexpected renderer event: {other:?}"),
+        };
+        assert_eq!(disposition.request_id(), request_id);
+        assert_eq!(
+            disposition.outcome(),
+            RendererExactViewportOutcome::Unavailable
+        );
+        assert!(received.try_recv().is_err());
+    }
+
+    #[test]
+    fn exact_viewport_bridge_failure_settles_every_queued_request_once() {
+        let (dispositions, received) = mpsc::channel();
+        let first = exact_viewport_request(dispositions.clone());
+        let second = exact_viewport_request(dispositions);
+        let expected = [first.request_id(), second.request_id()]
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let (commands, bridge) = mpsc::channel();
+        commands
+            .send(RendererCommand::AttachExactViewport { request: first })
+            .unwrap();
+        commands
+            .send(RendererCommand::AttachExactViewport { request: second })
+            .unwrap();
+        drop(commands);
+
+        bridge_commands(bridge, |_event| Err(()));
+
+        let actual = (0..2)
+            .map(|_| {
+                match received
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .unwrap()
+                {
+                    RendererEvent::ExactViewportDisposition(disposition) => {
+                        assert_eq!(
+                            disposition.outcome(),
+                            RendererExactViewportOutcome::Unavailable
+                        );
+                        disposition.request_id()
+                    }
+                    other => panic!("unexpected renderer event: {other:?}"),
+                }
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(actual, expected);
+        assert!(received.try_recv().is_err());
+    }
+
+    #[test]
+    fn exact_viewport_request_duplicate_delivery_and_settlement_are_noops() {
+        let (dispositions, received) = mpsc::channel();
+        let request = exact_viewport_request(dispositions);
+        assert!(request.begin_delivery());
+        assert!(!request.clone().begin_delivery());
+        request.settle(RendererExactViewportOutcome::Unavailable, None);
+        request
+            .clone()
+            .settle(RendererExactViewportOutcome::Published, None);
+        assert!(matches!(
+            received.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
+            RendererEvent::ExactViewportDisposition(ref disposition)
+                if disposition.outcome() == RendererExactViewportOutcome::Unavailable
+        ));
+        assert!(received.try_recv().is_err());
     }
 
     #[test]
@@ -27176,16 +33613,28 @@ mod command_channel_tests {
                 UserEvent::AttachSession { session_id } => {
                     forwarded.push(format!("attach:{session_id}"))
                 }
+                UserEvent::AttachSessionWithHandoff { session_id, .. } => {
+                    forwarded.push(format!("attach-handoff:{session_id}"))
+                }
+                UserEvent::AttachExactViewport { request } => {
+                    forwarded.push(format!("attach-exact:{}", request.session_id()))
+                }
                 UserEvent::SetTabStrip { tab_strip } => match tab_strip {
                     Some(s) => forwarded.push(format!("set:{}", s.window_id)),
                     None => forwarded.push("clear".to_string()),
                 },
+                UserEvent::ClearViewport => forwarded.push("viewport-clear".to_string()),
                 UserEvent::Redraw => forwarded.push("redraw".to_string()),
+                UserEvent::OutboundWritable => forwarded.push("outbound-writable".to_string()),
+                UserEvent::ConnectionClosed => forwarded.push("connection-closed".to_string()),
+                UserEvent::AttachmentHandoffCancellationFinished { .. } => {
+                    forwarded.push("handoff-cancel-finished".to_string())
+                }
                 UserEvent::SessionExited { session_id, .. } => {
                     forwarded.push(format!("session-exited:{session_id}"))
                 }
-                UserEvent::TerminalBell => forwarded.push("terminal-bell".to_string()),
-                UserEvent::TerminalTitle { title } => {
+                UserEvent::TerminalBell { .. } => forwarded.push("terminal-bell".to_string()),
+                UserEvent::TerminalTitle { title, .. } => {
                     forwarded.push(format!("terminal-title:{title:?}"))
                 }
                 UserEvent::TerminalClipboardStore { .. } => {
@@ -27439,12 +33888,15 @@ mod command_channel_tests {
     #[test]
     fn renderer_event_tab_strip_activated_carries_exact_tab_id_and_derives_eq() {
         let a = RendererEvent::TabStripActivated {
+            window_id: "w1".into(),
             tab_id: "t1".into(),
         };
         let b = RendererEvent::TabStripActivated {
+            window_id: "w1".into(),
             tab_id: "t1".into(),
         };
         let c = RendererEvent::TabStripActivated {
+            window_id: "w1".into(),
             tab_id: "t2".into(),
         };
         assert_eq!(a, b);
@@ -27453,20 +33905,23 @@ mod command_channel_tests {
         // The additive close-intent variant is a distinct value (not equal to an activation with the
         // same id) and carries its own `tab_id`.
         let close = RendererEvent::TabCloseRequested {
+            window_id: "w1".into(),
             tab_id: "t1".into(),
         };
         assert_ne!(close, a);
 
         match &a {
-            RendererEvent::TabStripActivated { tab_id } => assert_eq!(tab_id, "t1"),
-            RendererEvent::TabCloseRequested { tab_id } => {
+            RendererEvent::TabStripActivated { tab_id, .. } => assert_eq!(tab_id, "t1"),
+            RendererEvent::TabCloseRequested { tab_id, .. } => {
                 panic!("unexpected close variant for {tab_id:?}")
             }
-            RendererEvent::NewTabRequested => panic!("unexpected new-tab variant"),
-            RendererEvent::TabAttentionClearRequested { tab_id } => {
+            RendererEvent::NewTabRequested { .. } => panic!("unexpected new-tab variant"),
+            RendererEvent::TabAttentionClearRequested { tab_id, .. } => {
                 panic!("unexpected attention-clear variant for {tab_id:?}")
             }
             RendererEvent::SessionExited { .. }
+            | RendererEvent::AttachmentHandoffDisposition(_)
+            | RendererEvent::ExactViewportDisposition(_)
             | RendererEvent::PickerRowActivated { .. }
             | RendererEvent::PickerConsentGrantRequested { .. }
             | RendererEvent::PickerConsentGrantConfirmed { .. }
@@ -27504,15 +33959,17 @@ mod command_channel_tests {
             }
         }
         match &close {
-            RendererEvent::TabCloseRequested { tab_id } => assert_eq!(tab_id, "t1"),
-            RendererEvent::TabStripActivated { tab_id } => {
+            RendererEvent::TabCloseRequested { tab_id, .. } => assert_eq!(tab_id, "t1"),
+            RendererEvent::TabStripActivated { tab_id, .. } => {
                 panic!("unexpected activation variant for {tab_id:?}")
             }
-            RendererEvent::NewTabRequested => panic!("unexpected new-tab variant"),
-            RendererEvent::TabAttentionClearRequested { tab_id } => {
+            RendererEvent::NewTabRequested { .. } => panic!("unexpected new-tab variant"),
+            RendererEvent::TabAttentionClearRequested { tab_id, .. } => {
                 panic!("unexpected attention-clear variant for {tab_id:?}")
             }
             RendererEvent::SessionExited { .. }
+            | RendererEvent::AttachmentHandoffDisposition(_)
+            | RendererEvent::ExactViewportDisposition(_)
             | RendererEvent::PickerRowActivated { .. }
             | RendererEvent::PickerConsentGrantRequested { .. }
             | RendererEvent::PickerConsentGrantConfirmed { .. }
@@ -27552,6 +34009,7 @@ mod command_channel_tests {
         // The additive attention-clear variant is distinct from activation/close/new-tab and
         // carries its own `tab_id`.
         let clear = RendererEvent::TabAttentionClearRequested {
+            window_id: "w1".into(),
             tab_id: "t1".into(),
         };
         assert_ne!(clear, a);
@@ -27559,12 +34017,14 @@ mod command_channel_tests {
         assert_eq!(
             clear,
             RendererEvent::TabAttentionClearRequested {
+                window_id: "w1".into(),
                 tab_id: "t1".into()
             }
         );
         assert_ne!(
             clear,
             RendererEvent::TabAttentionClearRequested {
+                window_id: "w1".into(),
                 tab_id: "t2".into()
             }
         );
@@ -27584,10 +34044,11 @@ mod command_channel_tests {
     #[test]
     fn emit_tab_strip_activation_some_sends_exactly_the_event_and_returns_true() {
         let (tx, rx) = mpsc::channel::<RendererEvent>();
-        assert!(emit_tab_strip_activation(Some(&tx), "t1"));
+        assert!(emit_tab_strip_activation(Some(&tx), "w1", "t1"));
         assert_eq!(
             rx.try_recv(),
             Ok(RendererEvent::TabStripActivated {
+                window_id: "w1".into(),
                 tab_id: "t1".into()
             })
         );
@@ -27597,7 +34058,7 @@ mod command_channel_tests {
 
     #[test]
     fn emit_tab_strip_activation_none_returns_false() {
-        assert!(!emit_tab_strip_activation(None, "t1"));
+        assert!(!emit_tab_strip_activation(None, "w1", "t1"));
     }
 
     #[test]
@@ -27605,7 +34066,7 @@ mod command_channel_tests {
         let (tx, rx) = mpsc::channel::<RendererEvent>();
         drop(rx);
         // A closed channel is non-fatal: the helper reports false and does not panic.
-        assert!(!emit_tab_strip_activation(Some(&tx), "t1"));
+        assert!(!emit_tab_strip_activation(Some(&tx), "w1", "t1"));
     }
 }
 
@@ -28792,9 +35253,9 @@ mod command_palette_activation_tests {
         RendererCommandPaletteModel, RendererCommandPaletteOverlayLine,
         RendererCommandPaletteResult, RendererCommandPaletteRow, RendererDashboardPanel,
         RendererEvent, RendererSettingsPanelEditDraft, RendererTab, RendererTabSplitAxis,
-        RendererTabStrip, SettingsEditDraftValidation, Shared, UserEvent,
-        COMMAND_PALETTE_RESULT_MAX_CHARS, LEGACY_BOTTOM_OVERLAY_VISIBLE, SETTINGS_CHROME_BOOL_KEYS,
-        SETTINGS_EDIT_DRAFT_FRAGMENT_CAP, SETTINGS_EDIT_DRAFT_VALUE_CAP,
+        RendererTabStrip, SettingsEditDraftValidation, Shared, UserEvent, WheelDirection,
+        WheelInputAction, COMMAND_PALETTE_RESULT_MAX_CHARS, LEGACY_BOTTOM_OVERLAY_VISIBLE,
+        SETTINGS_CHROME_BOOL_KEYS, SETTINGS_EDIT_DRAFT_FRAGMENT_CAP, SETTINGS_EDIT_DRAFT_VALUE_CAP,
     };
     use std::sync::Arc;
 
@@ -28833,6 +35294,7 @@ mod command_palette_activation_tests {
             strikeout: false,
             dim: false,
             hidden: false,
+            hyperlink: None,
             width: 1,
         }
     }
@@ -29183,6 +35645,7 @@ mod command_palette_activation_tests {
             let (tx, rx) = std::sync::mpsc::channel();
             assert!(emit_split_requested(
                 Some(&tx),
+                "w1",
                 axis,
                 Some("tab-src".to_string())
             ));
@@ -29190,6 +35653,7 @@ mod command_palette_activation_tests {
                 RendererEvent::SplitRequested {
                     axis: got,
                     from_tab_id,
+                    ..
                 } => {
                     assert_eq!(got, axis);
                     assert_eq!(from_tab_id.as_deref(), Some("tab-src"));
@@ -29204,6 +35668,7 @@ mod command_palette_activation_tests {
         // A closed/absent channel is non-fatal.
         assert!(!emit_split_requested(
             None,
+            "w1",
             RendererTabSplitAxis::Right,
             None
         ));
@@ -29213,9 +35678,14 @@ mod command_palette_activation_tests {
     fn emit_swap_request_sends_exactly_one_event_with_both_ids() {
         use super::emit_swap_requested;
         let (tx, rx) = std::sync::mpsc::channel();
-        assert!(emit_swap_requested(Some(&tx), "src", "child"));
+        assert!(emit_swap_requested(Some(&tx), "w1", "src", "child"));
         match rx.recv().expect("event round-trips") {
-            RendererEvent::SwapRequested { tab_id_a, tab_id_b } => {
+            RendererEvent::SwapRequested {
+                window_id,
+                tab_id_a,
+                tab_id_b,
+            } => {
+                assert_eq!(window_id, "w1");
                 assert_eq!(tab_id_a, "src");
                 assert_eq!(tab_id_b, "child");
             }
@@ -29226,7 +35696,7 @@ mod command_palette_activation_tests {
             "exactly one swap-request event is emitted"
         );
         // A closed/absent channel is non-fatal.
-        assert!(!emit_swap_requested(None, "src", "child"));
+        assert!(!emit_swap_requested(None, "w1", "src", "child"));
     }
 
     #[test]
@@ -29234,9 +35704,19 @@ mod command_palette_activation_tests {
         use super::emit_pane_swap_requested;
         let (tx, rx) = std::sync::mpsc::channel();
         // Dragged pane (source) is `tab_id_a`; drop-target pane is `tab_id_b`.
-        assert!(emit_pane_swap_requested(Some(&tx), "dragged", "target"));
+        assert!(emit_pane_swap_requested(
+            Some(&tx),
+            "w1",
+            "dragged",
+            "target"
+        ));
         match rx.recv().expect("event round-trips") {
-            RendererEvent::PaneSwapRequested { tab_id_a, tab_id_b } => {
+            RendererEvent::PaneSwapRequested {
+                window_id,
+                tab_id_a,
+                tab_id_b,
+            } => {
+                assert_eq!(window_id, "w1");
                 assert_eq!(tab_id_a, "dragged");
                 assert_eq!(tab_id_b, "target");
             }
@@ -29247,16 +35727,19 @@ mod command_palette_activation_tests {
             "exactly one pane-swap-request event is emitted"
         );
         // A closed/absent channel is non-fatal.
-        assert!(!emit_pane_swap_requested(None, "dragged", "target"));
+        assert!(!emit_pane_swap_requested(None, "w1", "dragged", "target"));
     }
 
     #[test]
     fn emit_swallow_request_sends_exactly_one_event_with_child_id() {
         use super::emit_swallow_requested;
         let (tx, rx) = std::sync::mpsc::channel();
-        assert!(emit_swallow_requested(Some(&tx), "child"));
+        assert!(emit_swallow_requested(Some(&tx), "w1", "child"));
         match rx.recv().expect("event round-trips") {
-            RendererEvent::SwallowRequested { tab_id } => assert_eq!(tab_id, "child"),
+            RendererEvent::SwallowRequested { window_id, tab_id } => {
+                assert_eq!(window_id, "w1");
+                assert_eq!(tab_id, "child");
+            }
             other => panic!("expected one SwallowRequested, got {other:?}"),
         }
         assert!(
@@ -29264,7 +35747,7 @@ mod command_palette_activation_tests {
             "exactly one swallow-request event is emitted"
         );
         // A closed/absent channel is non-fatal.
-        assert!(!emit_swallow_requested(None, "child"));
+        assert!(!emit_swallow_requested(None, "w1", "child"));
     }
 
     #[test]
@@ -29273,11 +35756,17 @@ mod command_palette_activation_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         assert!(emit_pane_swallow_requested(
             Some(&tx),
+            "w1",
             "pane-a",
             PaneSwallowDirection::Down
         ));
         match rx.recv().expect("event round-trips") {
-            RendererEvent::PaneSwallowRequested { tab_id, direction } => {
+            RendererEvent::PaneSwallowRequested {
+                window_id,
+                tab_id,
+                direction,
+            } => {
+                assert_eq!(window_id, "w1");
                 assert_eq!(tab_id, "pane-a");
                 assert_eq!(direction, PaneSwallowDirection::Down);
             }
@@ -29289,6 +35778,7 @@ mod command_palette_activation_tests {
         );
         assert!(!emit_pane_swallow_requested(
             None,
+            "w1",
             "pane-a",
             PaneSwallowDirection::Down
         ));
@@ -29356,10 +35846,11 @@ mod command_palette_activation_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         assert!(emit_close_focused_pane_requested(
             Some(&tx),
+            "w1",
             Some("t-leaf".to_string())
         ));
         match rx.recv().expect("event round-trips") {
-            RendererEvent::CloseFocusedPaneRequested { tab_id } => {
+            RendererEvent::CloseFocusedPaneRequested { tab_id, .. } => {
                 assert_eq!(tab_id.as_deref(), Some("t-leaf"));
             }
             other => panic!("expected one CloseFocusedPaneRequested, got {other:?}"),
@@ -29370,13 +35861,13 @@ mod command_palette_activation_tests {
         );
         // A `None` focus (no resolvable tab) still emits exactly one event carrying `None`.
         let (tx2, rx2) = std::sync::mpsc::channel();
-        assert!(emit_close_focused_pane_requested(Some(&tx2), None));
+        assert!(emit_close_focused_pane_requested(Some(&tx2), "w1", None));
         match rx2.recv().expect("event round-trips") {
-            RendererEvent::CloseFocusedPaneRequested { tab_id } => assert_eq!(tab_id, None),
+            RendererEvent::CloseFocusedPaneRequested { tab_id, .. } => assert_eq!(tab_id, None),
             other => panic!("expected CloseFocusedPaneRequested(None), got {other:?}"),
         }
         // A closed/absent channel is non-fatal.
-        assert!(!emit_close_focused_pane_requested(None, None));
+        assert!(!emit_close_focused_pane_requested(None, "w1", None));
     }
 
     #[test]
@@ -29385,6 +35876,7 @@ mod command_palette_activation_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         assert!(emit_divider_ratio_persisted(
             Some(&tx),
+            "w1",
             "child".to_string(),
             640
         ));
@@ -29392,6 +35884,7 @@ mod command_palette_activation_tests {
             RendererEvent::DividerRatioPersisted {
                 child_tab_id,
                 ratio_per_mille,
+                ..
             } => {
                 assert_eq!(child_tab_id, "child");
                 assert_eq!(ratio_per_mille, 640);
@@ -29405,6 +35898,7 @@ mod command_palette_activation_tests {
         // A closed/absent channel is non-fatal.
         assert!(!emit_divider_ratio_persisted(
             None,
+            "w1",
             "child".to_string(),
             500
         ));
@@ -30447,29 +36941,30 @@ mod command_palette_activation_tests {
             None,
             None,
             None,
+            None,
         )
     }
 
     #[test]
-    fn current_modes_follow_focused_split_pane_grid_not_only_active_grid() {
+    fn current_modes_and_wheel_policy_follow_focused_split_pane_grid() {
         let shared = Arc::new(Shared::default());
-        *shared.grid.lock().unwrap() = Some(Arc::new(grid_with_modes(
-            "active", 21, 10, false, false, false, false,
-        )));
-        let sibling_epoch = shared.set_sibling_session("sid-src");
-        assert!(shared.apply_sibling_grid(
-            "sid-src",
-            sibling_epoch,
-            Arc::new(grid_with_modes("sibling", 10, 10, true, true, true, true)),
-        ));
+        shared.init_active_session("sid-child").unwrap();
+        let mut active_grid = grid_with_modes("active", 21, 10, false, false, false, false);
+        active_grid.alt_screen = true;
+        *shared.grid.lock().unwrap() = Some(Arc::new(active_grid));
+        let sibling_epoch = shared.set_sibling_session("sid-src").unwrap();
+        let mut sibling_grid = grid_with_modes("sibling", 10, 10, true, true, true, true);
+        sibling_grid.alt_screen = true;
+        assert!(shared.apply_sibling_grid("sid-src", sibling_epoch, Arc::new(sibling_grid),));
 
         let mut app = App::new(
-            shared,
+            shared.clone(),
             "sid-child".to_string(),
             super::DEFAULT_WINDOW_TITLE.to_string(),
             None,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -30498,6 +36993,14 @@ mod command_palette_activation_tests {
         assert!(!active_modes.bracketed_paste);
         assert!(!active_modes.focus_reporting);
         assert!(!active_modes.mouse.any());
+        assert_eq!(
+            app.wheel_input_action(2),
+            WheelInputAction::AlternateScrollKeys {
+                direction: WheelDirection::Up,
+                steps: 2,
+            },
+            "the focused active pane owns its generic alternate-screen fallback"
+        );
 
         app.focused_pane_session = Some("sid-src".to_string());
         let focused_modes = app.current_modes();
@@ -30505,6 +37008,30 @@ mod command_palette_activation_tests {
         assert!(focused_modes.bracketed_paste);
         assert!(focused_modes.focus_reporting);
         assert!(focused_modes.mouse.any());
+        assert_eq!(
+            app.wheel_input_action(-3),
+            WheelInputAction::MouseReport {
+                direction: WheelDirection::Down,
+                steps: 3,
+            },
+            "the focused sibling's negotiated mouse mode takes precedence"
+        );
+
+        let mut sibling_without_mouse = grid_with_modes("sibling", 10, 10, true, true, true, false);
+        sibling_without_mouse.alt_screen = true;
+        assert!(shared.apply_sibling_grid(
+            "sid-src",
+            sibling_epoch,
+            Arc::new(sibling_without_mouse),
+        ));
+        assert_eq!(
+            app.wheel_input_action(-1),
+            WheelInputAction::AlternateScrollKeys {
+                direction: WheelDirection::Down,
+                steps: 1,
+            },
+            "the focused sibling receives the same generic fallback without mouse mode"
+        );
     }
 
     /// Build a headless App wired to an outbound event channel, with a settings panel already
@@ -30526,6 +37053,7 @@ mod command_palette_activation_tests {
             None,
             None,
             Some(tx),
+            None,
             None,
             None,
             None,
@@ -30936,6 +37464,7 @@ mod shortcut_hint_overlay_tests {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -30986,22 +37515,26 @@ mod terminal_selection_ownership_tests {
     use std::cell::RefCell;
     #[cfg(target_os = "macos")]
     use std::rc::Rc;
-    use std::sync::Arc;
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
+    #[cfg(target_os = "macos")]
+    use super::Clipboard;
     use super::{
-        attach_selection_to_owner, focusable_split_pane_at_cell, pane_content_region, App, CellPos,
-        PaneFocusDirection, RendererTab, RendererTabSplitAxis, RendererTabStrip, Shared,
-        DEFAULT_WINDOW_TITLE,
+        apply_set_tab_strip, attach_selection_to_owner, file_drop_target_session_at_cell,
+        focusable_split_pane_at_cell, pane_content_region, App, CellPos, HostControl,
+        PaneFocusDirection, PendingFileDrop, RendererEvent, RendererExactSessionTarget,
+        RendererExactViewport, RendererExactViewportOutcome, RendererExactViewportRequest,
+        RendererExactViewportRole, RendererTab, RendererTabSplitAxis, RendererTabStrip, Shared,
+        UserEvent, UserEventSender, DEFAULT_WINDOW_TITLE,
     };
-    #[cfg(target_os = "macos")]
-    use super::{Clipboard, HostEvent, HostKey, HostKeyEvent, HostModifiers};
-    #[cfg(target_os = "macos")]
-    use crate::host_event::HostKeyLocation;
-    #[cfg(target_os = "macos")]
-    use crate::wire::ClientRequest;
+    use super::{HostEvent, HostKey, HostKeyEvent, HostModifiers};
+    use crate::host_event::{HostIme, HostKeyLocation, HostNamedKey, HostPointerButton};
+    use crate::host_services::{HostCursorIcon, HostServices, TerminalSurfaceScope};
     use crate::wire::{
-        Cell, Color, CursorShape, GridSnapshot, NamedColor, Revision, SessionGeneration,
-        UnderlineStyle,
+        Cell, ClientRequest, Color, CursorShape, GridSnapshot, NamedColor, Revision,
+        SessionGeneration, UnderlineStyle,
     };
 
     #[cfg(target_os = "macos")]
@@ -31037,6 +37570,7 @@ mod terminal_selection_ownership_tests {
             strikeout: false,
             dim: false,
             hidden: false,
+            hyperlink: None,
             width: 1,
         }
     }
@@ -31093,10 +37627,8 @@ mod terminal_selection_ownership_tests {
         }
     }
 
-    fn app_with_primary_grid() -> (App, Arc<Shared>) {
-        let shared = Shared::with_test_outbound();
-        *shared.grid.lock().unwrap() = Some(Arc::new(grid("primary-gen", 20, 6, "hello-primary")));
-        let app = App::new(
+    fn selection_fixture_app(shared: Arc<Shared>) -> App {
+        App::new(
             shared.clone(),
             "primary".to_string(),
             DEFAULT_WINDOW_TITLE.to_string(),
@@ -31112,13 +37644,152 @@ mod terminal_selection_ownership_tests {
             None,
             None,
             None,
+            None,
+        )
+    }
+
+    fn bind_exact_fixture_viewport(
+        app: &mut App,
+        shared: &Arc<Shared>,
+        tab_strip: RendererTabStrip,
+        grids: Vec<(&str, GridSnapshot)>,
+    ) {
+        let generations = grids
+            .iter()
+            .map(|(session_id, grid)| ((*session_id).to_string(), grid.generation.0.to_string()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(generations.len(), grids.len(), "one grid per exact target");
+        let primary_tab = tab_strip
+            .tabs
+            .iter()
+            .find(|tab| tab.active)
+            .expect("exact fixture has one active tab");
+        let target = |session_id: &str| RendererExactSessionTarget {
+            session_id: session_id.to_string(),
+            generation: generations
+                .get(session_id)
+                .unwrap_or_else(|| panic!("missing exact grid for {session_id}"))
+                .clone(),
+        };
+        let exact_viewport = RendererExactViewport {
+            window_id: tab_strip.window_id.clone(),
+            primary_tab_id: primary_tab.tab_id.clone(),
+            primary: target(&primary_tab.session_id),
+            roles: tab_strip
+                .tabs
+                .iter()
+                .map(|tab| RendererExactViewportRole {
+                    tab_id: tab.tab_id.clone(),
+                    target: target(&tab.session_id),
+                })
+                .collect(),
+            unique_targets: generations
+                .keys()
+                .map(|session_id| target(session_id))
+                .collect(),
+        };
+        let (dispositions, received) = mpsc::channel();
+        let request = RendererExactViewportRequest::new(
+            primary_tab.session_id.clone(),
+            exact_viewport,
+            tab_strip,
+            dispositions,
+        )
+        .expect("coherent exact fixture cohort");
+
+        app.handle_user_event(UserEvent::AttachExactViewport { request });
+        assert!(
+            !app.viewport_is_bound(),
+            "queue admission alone cannot publish the fixture viewport"
+        );
+        for (session_id, grid) in grids {
+            assert!(shared.prove_test_exact_viewport_grid(session_id, &grid.generation.0));
+            if shared.active_snapshot().id.as_deref() == Some(session_id) {
+                *shared.grid.lock().unwrap() = Some(Arc::new(grid));
+            } else {
+                let epoch = shared
+                    .pane_epoch(session_id)
+                    .expect("exact fixture pane binding");
+                assert!(shared.apply_pane_grid(session_id, epoch, Arc::new(grid)));
+            }
+        }
+        app.handle_user_event(UserEvent::Redraw);
+        match received
+            .recv_timeout(Duration::from_secs(1))
+            .expect("bounded exact fixture disposition")
+        {
+            RendererEvent::ExactViewportDisposition(disposition) => assert_eq!(
+                disposition.outcome(),
+                RendererExactViewportOutcome::Published
+            ),
+            other => panic!("unexpected fixture disposition: {other:?}"),
+        }
+        assert!(app.viewport_is_bound());
+        shared.drain_test_requests();
+    }
+
+    fn app_with_primary_grid() -> (App, Arc<Shared>) {
+        let shared = Shared::with_test_handoff_peer_facts(None, None);
+        let mut app = selection_fixture_app(shared.clone());
+        bind_exact_fixture_viewport(
+            &mut app,
+            &shared,
+            RendererTabStrip {
+                window_id: "window".to_string(),
+                tabs: vec![tab("tab-primary", "primary", true, None, None)],
+            },
+            vec![("primary", grid("primary-gen", 20, 6, "hello-primary"))],
         );
         (app, shared)
     }
 
+    struct RecordingNeutralHost {
+        titles: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Clone)]
+    struct ChannelEventSender(mpsc::Sender<UserEvent>);
+
+    impl UserEventSender for ChannelEventSender {
+        fn send(&self, event: UserEvent) -> Result<(), UserEvent> {
+            self.0.send(event).map_err(|error| error.0)
+        }
+
+        fn clone_sender(&self) -> Box<dyn UserEventSender> {
+            Box::new(self.clone())
+        }
+    }
+
+    impl HostServices for RecordingNeutralHost {
+        fn request_redraw(&self) {}
+
+        fn inner_size(&self) -> (u32, u32) {
+            (800, 600)
+        }
+
+        fn scale_factor(&self) -> f64 {
+            1.0
+        }
+
+        fn set_cursor(&self, _icon: HostCursorIcon) {}
+
+        fn set_title(&self, title: &str) {
+            self.titles.lock().unwrap().push(title.to_string());
+        }
+
+        fn request_attention(&self) {}
+
+        fn set_ime_allowed(&self, _allowed: bool) {}
+
+        fn terminal_surface_scope(&self) -> TerminalSurfaceScope {
+            TerminalSurfaceScope::TerminalSlot
+        }
+    }
+
     fn app_with_right_child() -> (App, Arc<Shared>, CellPos) {
-        let (mut app, shared) = app_with_primary_grid();
-        app.tab_strip_source = Some(RendererTabStrip {
+        let shared = Shared::with_test_handoff_peer_facts(None, None);
+        let mut app = selection_fixture_app(shared.clone());
+        let tab_strip = RendererTabStrip {
             window_id: "window".to_string(),
             tabs: vec![
                 tab("tab-primary", "primary", true, None, None),
@@ -31130,7 +37801,16 @@ mod terminal_selection_ownership_tests {
                     Some("tab-primary"),
                 ),
             ],
-        });
+        };
+        bind_exact_fixture_viewport(
+            &mut app,
+            &shared,
+            tab_strip,
+            vec![
+                ("primary", grid("primary-gen", 20, 6, "hello-primary")),
+                ("child", grid("child-gen", 20, 6, "child-copy")),
+            ],
+        );
         let layout = app.current_split_layout().expect("two-pane layout");
         let child = layout
             .panes
@@ -31148,8 +37828,6 @@ mod terminal_selection_ownership_tests {
                 .map(|pane| pane.session_id.as_str()),
             Some("child"),
         );
-
-        shared.set_pane_sessions(&["child"]);
         let epoch = shared.pane_epoch("child").expect("child epoch");
         assert!(shared.apply_pane_grid(
             "child",
@@ -31163,6 +37841,121 @@ mod terminal_selection_ownership_tests {
         ));
         app.focused_pane_session = Some("child".to_string());
         (app, shared, origin)
+    }
+
+    #[test]
+    fn file_drop_hit_target_is_pointer_pane_content_not_header_or_divider() {
+        let (app, _shared, child_content_origin) = app_with_right_child();
+        let layout = app.current_split_layout().expect("two-pane layout");
+        assert_eq!(
+            file_drop_target_session_at_cell(&layout, child_content_origin),
+            Some("child"),
+            "drop targets the pane under the pointer, independent of prior focus",
+        );
+
+        let child = layout
+            .panes
+            .iter()
+            .find(|pane| pane.session_id == "child")
+            .expect("child pane");
+        assert_eq!(
+            file_drop_target_session_at_cell(
+                &layout,
+                CellPos {
+                    col: usize::from(child.region.col),
+                    row: usize::from(child.region.row),
+                },
+            ),
+            None,
+            "pane header is renderer chrome",
+        );
+        let divider = layout.dividers.first().expect("right-split divider");
+        assert_eq!(
+            file_drop_target_session_at_cell(
+                &layout,
+                CellPos {
+                    col: usize::from(divider.col),
+                    row: usize::from(divider.row),
+                },
+            ),
+            None,
+            "divider is renderer chrome",
+        );
+    }
+
+    #[test]
+    fn file_drop_flush_is_one_bracketed_write_without_submission() {
+        let (mut app, shared) = app_with_primary_grid();
+        let mut live = grid("primary-gen", 20, 6, "prompt");
+        live.bracketed_paste = true;
+        *shared.grid.lock().unwrap() = Some(Arc::new(live));
+        let binding = shared
+            .binding_token_for_session("primary")
+            .expect("exact fixture binding");
+        app.pending_file_drop = Some(PendingFileDrop {
+            target_session_id: "primary".to_string(),
+            target_generation: SessionGeneration("primary-gen".to_string()),
+            binding,
+            payload: "'/tmp/a b' '/tmp/; && $(nope)'".to_string(),
+            path_count: 2,
+        });
+
+        app.flush_pending_file_drop();
+        match shared.drain_test_requests().as_slice() {
+            [ClientRequest::Write {
+                id,
+                expected_generation,
+                data,
+            }] => {
+                assert_eq!(id, "primary");
+                assert_eq!(expected_generation.0, "primary-gen");
+                assert_eq!(data, "\u{1b}[200~'/tmp/a b' '/tmp/; && $(nope)'\u{1b}[201~");
+                assert!(!data.ends_with('\n'), "drop never submits the command line");
+            }
+            other => panic!("expected exactly one bracketed file-drop Write, got {other:?}"),
+        }
+        assert!(app.pending_file_drop.is_none());
+    }
+
+    #[test]
+    fn file_drop_flush_is_plain_when_bracketed_paste_is_disabled() {
+        let (mut app, shared) = app_with_primary_grid();
+        let binding = shared
+            .binding_token_for_session("primary")
+            .expect("exact fixture binding");
+        app.pending_file_drop = Some(PendingFileDrop {
+            target_session_id: "primary".to_string(),
+            target_generation: SessionGeneration("primary-gen".to_string()),
+            binding,
+            payload: "'/tmp/plain path'".to_string(),
+            path_count: 1,
+        });
+
+        app.flush_pending_file_drop();
+        match shared.drain_test_requests().as_slice() {
+            [ClientRequest::Write { data, .. }] => assert_eq!(data, "'/tmp/plain path'"),
+            other => panic!("expected one unwrapped file-drop Write, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stale_file_drop_generation_is_discarded_instead_of_retargeted() {
+        let (mut app, shared) = app_with_primary_grid();
+        let binding = shared
+            .binding_token_for_session("primary")
+            .expect("exact fixture binding");
+        app.pending_file_drop = Some(PendingFileDrop {
+            target_session_id: "primary".to_string(),
+            target_generation: SessionGeneration("primary-gen".to_string()),
+            binding,
+            payload: "'/tmp/stale'".to_string(),
+            path_count: 1,
+        });
+        *shared.grid.lock().unwrap() = Some(Arc::new(grid("revived-gen", 20, 6, "new")));
+
+        app.flush_pending_file_drop();
+        assert!(shared.drain_test_requests().is_empty());
+        assert!(app.pending_file_drop.is_none());
     }
 
     #[cfg(target_os = "macos")]
@@ -31213,6 +38006,57 @@ mod terminal_selection_ownership_tests {
     }
 
     #[test]
+    fn modifier_click_outside_a_proven_link_is_a_selection_and_focus_noop() {
+        let (mut app, shared) = app_with_primary_grid();
+        app.begin_local_selection(Some(CellPos { col: 0, row: 0 }));
+        app.sel_focus = Some(CellPos { col: 4, row: 0 });
+        app.selecting = false;
+        let before = (
+            app.sel_anchor,
+            app.sel_focus,
+            app.sel_session_id.clone(),
+            app.sel_generation.clone(),
+            app.focused_pane_session.clone(),
+            app.selected_text(),
+        );
+        app.modifiers = if cfg!(target_os = "macos") {
+            HostModifiers {
+                super_key: true,
+                ..HostModifiers::default()
+            }
+        } else {
+            HostModifiers {
+                control: true,
+                ..HostModifiers::default()
+            }
+        };
+
+        for pressed in [true, false] {
+            assert_eq!(
+                app.handle_host_event(HostEvent::MouseInput {
+                    button: HostPointerButton::Left,
+                    pressed,
+                }),
+                HostControl::Continue
+            );
+        }
+
+        assert_eq!(
+            (
+                app.sel_anchor,
+                app.sel_focus,
+                app.sel_session_id.clone(),
+                app.sel_generation.clone(),
+                app.focused_pane_session.clone(),
+                app.selected_text(),
+            ),
+            before
+        );
+        assert!(!app.terminal_link_click_in_progress);
+        assert!(shared.drain_test_requests().is_empty());
+    }
+
+    #[test]
     fn split_selection_extracts_and_paints_only_on_its_owner() {
         let (mut app, _shared, origin) = app_with_right_child();
         app.begin_local_selection(Some(origin));
@@ -31243,6 +38087,342 @@ mod terminal_selection_ownership_tests {
             app.current_selection().is_none(),
             "focus-away then focus-back must not resurrect a selection"
         );
+    }
+
+    #[test]
+    fn revoked_active_authority_blocks_stale_split_copy_and_draw_side_effects() {
+        let (mut app, shared, origin) = app_with_right_child();
+        app.begin_local_selection(Some(origin));
+        app.sel_focus = Some(CellPos {
+            col: origin.col + 4,
+            row: origin.row,
+        });
+        app.selecting = false;
+        assert_eq!(app.selected_text().as_deref(), Some("child"));
+        app.tab_strip_line = apply_set_tab_strip(app.tab_strip_source.as_ref());
+
+        let titles = Arc::new(Mutex::new(vec!["stale terminal title".to_string()]));
+        app.host = Some(Box::new(RecordingNeutralHost {
+            titles: Arc::clone(&titles),
+        }));
+
+        // Model the reader's fail-closed linearization point before its later ConnectionClosed owner
+        // event. Deliberately leave every primary/pane grid and App strip/selection mirror stale.
+        {
+            let mut active = shared.active.lock().unwrap();
+            active.epoch = active.epoch.checked_add(1).unwrap();
+            active.id = None;
+            active.output_generation = None;
+        }
+        assert!(shared.grid.lock().unwrap().is_some());
+        assert!(shared.stores.lock().unwrap().get("child").is_some());
+        assert!(app.tab_strip_source.is_some());
+        assert!(app.tab_strip_line.is_some());
+
+        assert_eq!(
+            app.selected_text(),
+            None,
+            "neutral copy cannot expose stale pane text"
+        );
+        assert_eq!(app.draw_frame(true), HostControl::Continue);
+        assert!(
+            shared.drain_test_requests().is_empty(),
+            "a neutral redraw may not emit Resize/Snapshot/Scrollback for stale panes"
+        );
+        assert_eq!(
+            titles.lock().unwrap().last().map(String::as_str),
+            Some(DEFAULT_WINDOW_TITLE),
+            "neutral redraw restores the fixed native title before ConnectionClosed arrives"
+        );
+    }
+
+    #[test]
+    fn early_connection_closed_event_draws_neutral_before_blocked_physical_teardown() {
+        let (mut app, shared, _) = app_with_right_child();
+        app.tab_strip_line = apply_set_tab_strip(app.tab_strip_source.as_ref());
+        let titles = Arc::new(Mutex::new(vec!["stale terminal title".to_string()]));
+        app.host = Some(Box::new(RecordingNeutralHost {
+            titles: Arc::clone(&titles),
+        }));
+
+        // Hold both physical teardown locks. Fail-close must publish its latch and owner wake before
+        // waiting for either; the owner must then skip all outbound retry/abort work and present a
+        // terminal-neutral frame while both guards are still held.
+        let (active_ready_tx, active_ready_rx) = mpsc::channel();
+        let (active_release_tx, active_release_rx) = mpsc::channel();
+        let active_holder = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || {
+                let _guard = shared.active.lock().unwrap();
+                active_ready_tx.send(()).unwrap();
+                let _ = active_release_rx.recv_timeout(Duration::from_secs(1));
+            })
+        };
+        active_ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let (queue_ready_tx, queue_ready_rx) = mpsc::channel();
+        let (queue_release_tx, queue_release_rx) = mpsc::channel();
+        let queue_holder = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || {
+                shared.with_test_outbound_contended(|| {
+                    queue_ready_tx.send(()).unwrap();
+                    let _ = queue_release_rx.recv_timeout(Duration::from_secs(1));
+                });
+            })
+        };
+        queue_ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let closing = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || {
+                shared.fail_closed_connection_for_test(&ChannelEventSender(tx));
+            })
+        };
+        let event = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("fail-close wakes the owner before physical teardown");
+        assert!(matches!(event, UserEvent::ConnectionClosed));
+        app.handle_user_event(event);
+
+        let started = Instant::now();
+        assert_eq!(app.draw_frame(true), HostControl::Continue);
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "neutral draw must not enter retry/teardown while transport locks are held"
+        );
+        assert_eq!(app.selected_text(), None);
+        assert_eq!(
+            titles.lock().unwrap().last().map(String::as_str),
+            Some(DEFAULT_WINDOW_TITLE)
+        );
+        assert!(rx.try_recv().is_err(), "ConnectionClosed is exactly once");
+
+        // Queue teardown has now progressed to the deliberately-held active lock. Releasing it lets
+        // the physical leaves erase; no second owner event may be emitted.
+        let _ = queue_release_tx.send(());
+        queue_holder.join().unwrap();
+        let _ = active_release_tx.send(());
+        active_holder.join().unwrap();
+        closing.join().unwrap();
+        assert!(rx.try_recv().is_err());
+        assert!(shared.grid.lock().unwrap().is_none());
+        assert!(shared.stores.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn neutralization_erases_hidden_modal_authority_and_makes_host_input_inert() {
+        for connection_failure in [false, true] {
+            let (mut app, shared) = app_with_primary_grid();
+            let (events_tx, events_rx) = mpsc::channel();
+            app.events = super::AppRendererEvents(super::viewport_gated_renderer_events(
+                Some(events_tx),
+                Arc::clone(&app.viewport_event_gate),
+            ));
+            app.picker_rows = Some(vec![super::RendererPickerRow {
+                text: "stale picker".to_string(),
+                target: super::PickerRowTarget::Project {
+                    project_id: "stale-project".to_string(),
+                },
+            }]);
+            app.command_palette_lines = Some(vec![super::RendererCommandPaletteOverlayLine {
+                text: "stale action".to_string(),
+                selectable: true,
+                selected: true,
+                action_index: Some(0),
+            }]);
+            app.command_palette_model = Some(super::RendererCommandPaletteModel {
+                title: "stale".to_string(),
+                query: None,
+                rows: vec![super::RendererCommandPaletteRow {
+                    id: "stale.action".to_string(),
+                    label: "stale".to_string(),
+                    category: "stale".to_string(),
+                    summary: "stale".to_string(),
+                    command: "stale".to_string(),
+                }],
+                selected_row: Some(0),
+            });
+            app.command_palette_query = "secret query".to_string();
+            app.dashboard_panel = Some(super::RendererDashboardPanel {
+                lines: vec!["stale settings".to_string()],
+                source: super::DashboardPanelSource::Settings,
+                settings_rows: Vec::new(),
+                dashboard_rows: Vec::new(),
+                accent_color: None,
+            });
+            app.selected_settings_panel_row = Some(0);
+            app.settings_edit_draft = Some(super::RendererSettingsPanelEditDraft {
+                row_id: "stale-row".to_string(),
+                setting_key: "stale.key".to_string(),
+                value: "stale-value".to_string(),
+                validation: None,
+            });
+            app.file_preview = Some(super::RendererFilePreview {
+                path: "/secret".to_string(),
+                ..Default::default()
+            });
+            app.file_path_input = Some(super::RendererFilePathInput {
+                path: "/stale".to_string(),
+            });
+            app.dock = Some(super::RendererDockModel {
+                collapsed: false,
+                width_px: 240,
+                rows: Vec::new(),
+            });
+            app.react_overlay_visible = true;
+            app.latest_react_chrome_model_json = Some("{\"stale\":true}".to_string());
+            app.picker_click_in_progress = true;
+            app.dashboard_panel_click_in_progress = true;
+            app.dock_click_in_progress = true;
+
+            if connection_failure {
+                shared.clear_viewport();
+                app.connection_closed();
+            } else {
+                app.clear_viewport();
+            }
+            shared.drain_test_requests(); // Detach-only cleanup is permitted; input below is not.
+
+            assert!(app.picker_rows.is_none());
+            assert!(app.command_palette_lines.is_none());
+            assert!(app.command_palette_model.is_none());
+            assert!(app.command_palette_query.is_empty());
+            assert!(app.dashboard_panel.is_none());
+            assert!(app.selected_settings_panel_row.is_none());
+            assert!(app.settings_edit_draft.is_none());
+            assert!(app.file_preview.is_none());
+            assert!(app.file_path_input.is_none());
+            assert!(app.dock.is_none());
+            assert!(!app.react_overlay_visible);
+            assert!(app.latest_react_chrome_model_json.is_none());
+
+            for event in [
+                HostEvent::CursorMoved { x: 1.0, y: 1.0 },
+                HostEvent::MouseInput {
+                    button: HostPointerButton::Left,
+                    pressed: true,
+                },
+                HostEvent::Keyboard(HostKeyEvent {
+                    key: HostKey::Named(HostNamedKey::Enter),
+                    text: None,
+                    base_text: None,
+                    location: HostKeyLocation::Standard,
+                    pressed: true,
+                    repeat: false,
+                }),
+                HostEvent::Keyboard(HostKeyEvent {
+                    key: HostKey::Character("x".to_string()),
+                    text: Some("x".to_string()),
+                    base_text: Some("x".to_string()),
+                    location: HostKeyLocation::Standard,
+                    pressed: true,
+                    repeat: false,
+                }),
+                HostEvent::Ime(HostIme::Commit("must-not-send".to_string())),
+            ] {
+                assert_eq!(app.handle_host_event(event), HostControl::Continue);
+            }
+            assert!(events_rx.try_recv().is_err());
+            assert!(shared.drain_test_requests().is_empty());
+        }
+    }
+
+    #[test]
+    fn neutral_input_updates_only_passive_mirrors_used_by_the_first_rebound_key() {
+        let (mut app, shared) = app_with_primary_grid();
+        app.clear_viewport();
+        shared.drain_test_requests();
+
+        assert_eq!(
+            app.handle_host_event(HostEvent::CursorMoved { x: 321.0, y: 123.0 }),
+            HostControl::Continue
+        );
+        assert_eq!(
+            app.handle_host_event(HostEvent::ModifiersChanged(HostModifiers {
+                control: true,
+                ..HostModifiers::default()
+            })),
+            HostControl::Continue
+        );
+        assert_eq!(app.cursor_px, (321.0, 123.0));
+        assert!(app.modifiers.control);
+        assert!(shared.drain_test_requests().is_empty());
+
+        // Rebind through an exact one-role cohort without another pointer or modifier event. The
+        // first key must use the mirrors delivered while neutral.
+        bind_exact_fixture_viewport(
+            &mut app,
+            &shared,
+            RendererTabStrip {
+                window_id: "window".to_string(),
+                tabs: vec![tab("tab-primary", "primary", true, None, None)],
+            },
+            vec![("primary", grid("rebound-generation", 20, 6, "rebound"))],
+        );
+        app.handle_host_event(HostEvent::Keyboard(HostKeyEvent {
+            key: HostKey::Character("v".to_string()),
+            text: Some("v".to_string()),
+            base_text: Some("v".to_string()),
+            location: HostKeyLocation::Standard,
+            pressed: true,
+            repeat: false,
+        }));
+        match shared.drain_test_requests().as_slice() {
+            [ClientRequest::Write { id, data, .. }] => {
+                assert_eq!(id, "primary");
+                assert_eq!(
+                    data.as_bytes(),
+                    &[0x16],
+                    "neutral Ctrl mirror reaches first key"
+                );
+            }
+            other => panic!("expected one rebound Ctrl-V write, got {other:?}"),
+        }
+        assert_eq!(app.cursor_px, (321.0, 123.0));
+    }
+
+    #[test]
+    fn modifier_held_continuously_through_clear_is_used_by_the_first_rebound_key() {
+        let (mut app, shared) = app_with_primary_grid();
+        app.modifiers = HostModifiers {
+            control: true,
+            ..HostModifiers::default()
+        };
+
+        app.clear_viewport();
+        shared.drain_test_requests();
+        assert!(
+            app.modifiers.control,
+            "Clear revokes gesture owners but preserves the passive physical key mirror"
+        );
+
+        // No ModifiersChanged event is delivered while blank: the physical key stayed down.
+        bind_exact_fixture_viewport(
+            &mut app,
+            &shared,
+            RendererTabStrip {
+                window_id: "window".to_string(),
+                tabs: vec![tab("tab-primary", "primary", true, None, None)],
+            },
+            vec![(
+                "primary",
+                grid("held-modifier-generation", 20, 6, "rebound"),
+            )],
+        );
+        app.handle_host_event(HostEvent::Keyboard(HostKeyEvent {
+            key: HostKey::Character("v".to_string()),
+            text: Some("v".to_string()),
+            base_text: Some("v".to_string()),
+            location: HostKeyLocation::Standard,
+            pressed: true,
+            repeat: false,
+        }));
+        match shared.drain_test_requests().as_slice() {
+            [ClientRequest::Write { data, .. }] => assert_eq!(data.as_bytes(), &[0x16]),
+            other => panic!("expected one held-Ctrl rebound write, got {other:?}"),
+        }
     }
 
     #[test]
@@ -31352,7 +38532,7 @@ mod terminal_selection_ownership_tests {
         app.handle_host_event(HostEvent::ModifiersChanged(HostModifiers::default()));
         app.handle_key(key_event("x"));
         match shared.drain_test_requests().as_slice() {
-            [ClientRequest::Write { id, data }] => {
+            [ClientRequest::Write { id, data, .. }] => {
                 assert_eq!(id, "primary");
                 assert_eq!(data, "x");
             }
@@ -31458,6 +38638,9 @@ mod linux_clipboard_tests {
         text: &str,
     ) -> (App, Arc<Shared>, Rc<FakeClipboardHost>) {
         let shared = Shared::with_test_outbound();
+        shared
+            .init_active_session("clipboard-session")
+            .expect("fixture installs exact clipboard viewport authority");
         *shared.grid.lock().unwrap() = Some(Arc::new(grid(generation, bracketed_paste, text)));
         let fake = Rc::new(FakeClipboardHost::default());
         let mut app = App::new(
@@ -31467,6 +38650,7 @@ mod linux_clipboard_tests {
             None,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -31518,7 +38702,7 @@ mod linux_clipboard_tests {
         let sent = shared.drain_test_requests();
         assert_eq!(sent.len(), 1);
         match &sent[0] {
-            ClientRequest::Write { id, data } => {
+            ClientRequest::Write { id, data, .. } => {
                 assert_eq!(id, "clipboard-session");
                 assert_eq!(data, "hello");
             }
@@ -31528,6 +38712,35 @@ mod linux_clipboard_tests {
 
         app.finish_clipboard_paste(1, Some("duplicate".to_string()));
         assert!(shared.drain_test_requests().is_empty());
+    }
+
+    #[test]
+    fn clear_and_same_id_revive_rejects_old_async_paste_even_with_same_pty_generation() {
+        let (mut app, shared, host) = app_with_grid("same-generation", false, "prompt");
+        app.begin_clipboard_paste(app.current_modes());
+        let stale = app
+            .pending_paste
+            .clone()
+            .expect("paste captures exact binding");
+        assert_eq!(&*host.requests.borrow(), &[stale.request_id]);
+
+        app.handle_user_event(super::UserEvent::ClearViewport);
+        app.handle_user_event(super::UserEvent::AttachSession {
+            session_id: "clipboard-session".into(),
+        });
+        app.handle_user_event(super::UserEvent::SetTabStrip { tab_strip: None });
+        *shared.grid.lock().unwrap() = Some(Arc::new(grid("same-generation", false, "new prompt")));
+        shared.drain_test_requests();
+
+        // Model an already-queued native callback carrying the old request record. Textual session id
+        // and PTY generation deliberately alias; only the viewport binding token distinguishes it.
+        app.pending_paste = Some(stale.clone());
+        app.finish_clipboard_paste(stale.request_id, Some("must-not-cross-revive".into()));
+        assert!(
+            shared.drain_test_requests().is_empty(),
+            "old async completion cannot Write into the same-id revived viewport"
+        );
+        assert!(app.pending_paste.is_none());
     }
 
     #[test]
@@ -31573,7 +38786,7 @@ mod linux_clipboard_tests {
         app.finish_clipboard_paste(id, Some("x\x1b[201~y".to_string()));
         let sent = shared.drain_test_requests();
         match sent.as_slice() {
-            [ClientRequest::Write { id, data }] => {
+            [ClientRequest::Write { id, data, .. }] => {
                 assert_eq!(id, "clipboard-session");
                 assert_eq!(data, "\x1b[200~xy\x1b[201~");
             }
@@ -31754,12 +38967,18 @@ mod linux_clipboard_tests {
 #[cfg(test)]
 mod idle_wake_delivery_tests {
     use super::{
-        user_event_for_command, App, RendererCommand, RendererEvent, Shared, UserEvent,
+        user_event_for_command, App, RendererCommand, RendererEvent, RendererExactSessionTarget,
+        RendererExactViewport, RendererExactViewportRole, Shared, UserEvent, ViewportBindingToken,
         DEFAULT_WINDOW_TITLE, RESIZE_MIN_INTERVAL,
     };
+    use crate::client::ActiveBindingToken;
     use crate::host_services::{HostCursorIcon, HostServices, TerminalSurfaceScope};
     #[cfg(target_os = "linux")]
     use crate::wire::ClientRequest;
+    use crate::wire::{
+        Cell, Color, CursorShape, GridSnapshot, NamedColor, Revision, SessionGeneration,
+        UnderlineStyle,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -31781,11 +39000,74 @@ mod idle_wake_delivery_tests {
             None,
             None,
             None,
+            None,
         )
     }
 
     fn headless_app() -> App {
         headless_app_with_shared(Arc::new(Shared::default()))
+    }
+
+    fn bound_headless_app() -> App {
+        let shared = Shared::with_test_outbound();
+        shared
+            .set_active_session("idle-wake-test")
+            .expect("exact active binding");
+        let cell = Cell {
+            text: " ".to_string(),
+            fg: Color::Named {
+                name: NamedColor::Foreground,
+            },
+            bg: Color::Named {
+                name: NamedColor::Background,
+            },
+            bold: false,
+            italic: false,
+            underline: UnderlineStyle::None,
+            inverse: false,
+            strikeout: false,
+            dim: false,
+            hidden: false,
+            hyperlink: None,
+            width: 1,
+        };
+        *shared.grid.lock().unwrap() = Some(Arc::new(GridSnapshot {
+            version: crate::sync::SUPPORTED_VERSION,
+            generation: SessionGeneration("idle-wake-generation".to_string()),
+            revision: Revision(1),
+            base_revision: Revision(0),
+            cols: 1,
+            rows: 1,
+            rows_cells: vec![vec![cell]],
+            cursor_line: 0,
+            cursor_col: 0,
+            cursor_visible: true,
+            cursor_shape: CursorShape::Block,
+            alt_screen: false,
+            app_cursor: false,
+            bracketed_paste: false,
+            focus_reporting: false,
+            mouse_report: false,
+            mouse_drag: false,
+            mouse_motion: false,
+            mouse_sgr: false,
+        }));
+        let mut app = headless_app_with_shared(shared);
+        let target = RendererExactSessionTarget {
+            session_id: "idle-wake-test".to_string(),
+            generation: "idle-wake-generation".to_string(),
+        };
+        app.exact_viewport = Some(RendererExactViewport {
+            window_id: "idle-wake-window".to_string(),
+            primary_tab_id: "idle-wake-tab".to_string(),
+            primary: target.clone(),
+            roles: vec![RendererExactViewportRole {
+                tab_id: "idle-wake-tab".to_string(),
+                target: target.clone(),
+            }],
+            unique_targets: vec![target],
+        });
+        app
     }
 
     #[test]
@@ -31841,8 +39123,16 @@ mod idle_wake_delivery_tests {
 
         // Redraw/bell/title route through the (absent) host services — all guarded no-ops.
         app.handle_user_event(UserEvent::Redraw);
-        app.handle_user_event(UserEvent::TerminalBell);
+        let stale_binding = ViewportBindingToken::Active(ActiveBindingToken {
+            session_id: "stale".to_string(),
+            epoch: 0,
+            output_generation: 0,
+        });
+        app.handle_user_event(UserEvent::TerminalBell {
+            binding: stale_binding.clone(),
+        });
         app.handle_user_event(UserEvent::TerminalTitle {
+            binding: stale_binding,
             title: Some("t".to_string()),
         });
     }
@@ -31853,7 +39143,10 @@ mod idle_wake_delivery_tests {
         let redraws = Arc::new(AtomicUsize::new(0));
         app.host = Some(Box::new(RedrawHost(redraws.clone())));
         let (tx, rx) = std::sync::mpsc::channel();
-        app.events = Some(tx);
+        app.events = super::AppRendererEvents(super::viewport_gated_renderer_events(
+            Some(tx),
+            Arc::clone(&app.viewport_event_gate),
+        ));
 
         app.handle_user_event(UserEvent::SessionExited {
             session_id: "s-exit".to_string(),
@@ -31886,7 +39179,7 @@ mod idle_wake_delivery_tests {
 
     #[test]
     fn flush_deferred_holds_trailing_resize_deadline_until_flushed() {
-        let mut app = headless_app();
+        let mut app = bound_headless_app();
         let now = Instant::now();
         // Two geometries inside the min interval: the first sends immediately, the second is
         // held for the trailing flush.
@@ -31940,7 +39233,7 @@ mod idle_wake_delivery_tests {
         let resize_dims: Vec<(u16, u16)> = requests
             .into_iter()
             .filter_map(|request| match request {
-                ClientRequest::Resize { id, cols, rows } if id == "idle-wake-test" => {
+                ClientRequest::Resize { id, cols, rows, .. } if id == "idle-wake-test" => {
                     Some((cols, rows))
                 }
                 _ => None,
@@ -31952,7 +39245,7 @@ mod idle_wake_delivery_tests {
 
     #[test]
     fn flush_deferred_reports_refit_deadline_then_flushes_it() {
-        let mut app = headless_app();
+        let mut app = bound_headless_app();
         app.schedule_resize_refit();
 
         // The pending refit's settle deadline is reported so the owner loop can sleep exactly
@@ -31986,6 +39279,7 @@ mod linux_chrome_state_tests {
         scripts: RefCell<Vec<String>>,
         script_kinds: RefCell<Vec<ReactChromeScriptKind>>,
         widths: RefCell<Vec<u32>>,
+        overlay_visibility: RefCell<Vec<bool>>,
         focus_calls: Cell<usize>,
     }
 
@@ -32003,7 +39297,9 @@ mod linux_chrome_state_tests {
             self.focus_calls.set(self.focus_calls.get() + 1);
         }
 
-        fn set_overlay_visible(&self, _visible: bool) {}
+        fn set_overlay_visible(&self, visible: bool) {
+            self.overlay_visibility.borrow_mut().push(visible);
+        }
 
         fn pick_folder(&self, _request_id: &str) {}
     }
@@ -32033,6 +39329,7 @@ mod linux_chrome_state_tests {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -32047,6 +39344,19 @@ mod linux_chrome_state_tests {
         assert_eq!(host.focus_calls.get(), 1);
         assert!(host.widths.borrow().is_empty());
         assert!(host.scripts.borrow().is_empty());
+    }
+
+    #[test]
+    fn viewport_clear_physically_hides_the_native_overlay_child() {
+        let mut app = headless_app(460);
+        let host = Rc::new(RecordingChromeHost::default());
+        app.chrome_host = Some(host.clone());
+        app.react_overlay_visible = true;
+
+        app.clear_viewport();
+
+        assert!(!app.react_overlay_visible);
+        assert_eq!(host.overlay_visibility.borrow().as_slice(), &[false]);
     }
 
     #[test]

@@ -185,6 +185,9 @@ pub enum TabAttentionClearRefreshError {
     /// The record was cleared and the strip rebuilt, but the renderer command channel is closed
     /// (event loop gone); the `SetTabStrip` refresh was not delivered.
     RendererControlClosed,
+    /// The record was cleared and the strip rebuilt, but no exact published viewport currently
+    /// authorizes a display-only strip refresh. The renderer stays neutral and no command is sent.
+    ViewportAuthorityRequired,
 }
 
 impl std::fmt::Display for TabAttentionClearRefreshError {
@@ -210,6 +213,9 @@ impl std::fmt::Display for TabAttentionClearRefreshError {
             }
             TabAttentionClearRefreshError::RendererControlClosed => {
                 write!(f, "renderer control channel is closed")
+            }
+            TabAttentionClearRefreshError::ViewportAuthorityRequired => {
+                write!(f, "renderer viewport has no exact published authority")
             }
         }
     }
@@ -269,6 +275,9 @@ pub fn clear_tab_attention_and_refresh_strip(
     runtime.set_tab_strip(Some(&model)).map_err(|e| match e {
         TabSwitchError::RendererControlClosed => {
             TabAttentionClearRefreshError::RendererControlClosed
+        }
+        TabSwitchError::ViewportAuthorityRequired => {
+            TabAttentionClearRefreshError::ViewportAuthorityRequired
         }
         // set_tab_strip only ever reports a closed channel; tab-lookup variants are unreachable here.
         other => unreachable!("set_tab_strip returned an unexpected error: {other:?}"),

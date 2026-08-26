@@ -37,15 +37,33 @@
 //! is preserved. The endpoint record may have been persisted (the connect succeeded), which is
 //! correct: the daemon really is reachable at that socket.
 
-use std::path::PathBuf;
-use std::time::Duration;
+// Runtime errors carry the original consume-once start/recovery authority back to their caller.
+#![allow(clippy::large_enum_variant, clippy::result_large_err)]
 
-use crate::daemon_client::{DaemonClient, DaemonClientError, DEFAULT_TIMEOUT};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use crate::daemon_client::{
+    AttachmentHandoffAuthority, ConditionalStartPeerIdentity, DaemonClient, DaemonClientError,
+    DEFAULT_TIMEOUT,
+};
 use crate::daemon_endpoint::{self, DaemonEndpoint, EnvLookup};
 use crate::paths::{AppPaths, RecordKind};
 use crate::records::{SessionRecord, SessionStatus};
-use crate::session_service::{ReconcileReport, SessionService, SessionServiceError, StartParams};
+use crate::session_service::{
+    ExactExistingAttach, ExistingSessionAttach, ExistingSessionMissingStart, ExistingSessionStart,
+    FreshDaemonSessionStart, PreparedAgentTaskPublicationRecoveryAuthority,
+    PreparedAgentTaskPublicationSettlement, PreparedAgentTaskSessionStartError,
+    PreparedNewSessionStartError, PreparedNewSessionStarted, ReconcileReport, SessionService,
+    SessionServiceError, StartParams,
+};
 use crate::store::{self, LoadOutcome, StoreError};
+use crate::window_layout::{
+    PreparedAgentTaskSessionCompensation, PreparedAgentTaskSessionStart, WindowLayoutError,
+    WindowLayoutService,
+};
+use crate::ReservedProductShellStart;
+use crate::{PreparedNewSessionCompensationReceipt, PreparedNewSessionStart};
 
 /// Everything that can go wrong composing a one-session runtime. Each underlying layer keeps its own
 /// typed error so a caller can still tell "couldn't figure out / persist the socket path"
@@ -105,6 +123,178 @@ impl From<SessionServiceError> for ShellRuntimeError {
 pub struct StartSessionOutcome {
     pub socket_path: PathBuf,
     pub record: SessionRecord,
+    attachment_handoff: Option<AttachmentHandoffAuthority>,
+}
+
+/// Runtime result for a transaction-prepared Session. It owns the rebased compensation receipt
+/// and, for renderer launches, the only handoff authority for the finalized lifetime.
+pub struct PreparedNewSessionRuntimeOutcome {
+    pub socket_path: PathBuf,
+    started: PreparedNewSessionStarted,
+    attachment_handoff: Option<AttachmentHandoffAuthority>,
+}
+
+impl PreparedNewSessionRuntimeOutcome {
+    pub fn record(&self) -> &SessionRecord {
+        self.started.record()
+    }
+
+    pub fn take_attachment_handoff(&mut self) -> Option<AttachmentHandoffAuthority> {
+        self.attachment_handoff.take()
+    }
+
+    pub(crate) fn agent_task(&self) -> Option<&crate::records::AgentTask> {
+        self.started.agent_task()
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        PathBuf,
+        SessionRecord,
+        PreparedNewSessionCompensationReceipt,
+        Option<AttachmentHandoffAuthority>,
+    ) {
+        let (record, compensation) = self.started.into_parts();
+        (
+            self.socket_path,
+            record,
+            compensation,
+            self.attachment_handoff,
+        )
+    }
+}
+
+impl std::fmt::Debug for PreparedNewSessionRuntimeOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedNewSessionRuntimeOutcome")
+            .field("socket_path", &self.socket_path)
+            .field("started", &self.started)
+            .field("handoff_offered", &self.attachment_handoff.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Runtime-level ownership-preserving error for a consumed prepared start.
+pub enum PreparedNewSessionRuntimeError {
+    DefinitelyUnpublished {
+        error: ShellRuntimeError,
+        start: PreparedNewSessionStart,
+    },
+    Refused {
+        error: ShellRuntimeError,
+        compensation: PreparedNewSessionCompensationReceipt,
+    },
+    PossiblyApplied {
+        error: ShellRuntimeError,
+    },
+}
+
+pub(crate) enum PreparedAgentTaskSessionRuntimeError {
+    DefinitelyUnpublished {
+        error: ShellRuntimeError,
+        start: PreparedAgentTaskSessionStart,
+    },
+    Refused {
+        error: ShellRuntimeError,
+        compensation: PreparedAgentTaskSessionCompensation,
+    },
+    PossiblyApplied {
+        error: ShellRuntimeError,
+        recovery: PreparedAgentTaskSessionRuntimeRecovery,
+    },
+}
+
+pub(crate) struct PreparedAgentTaskSessionRuntimeRecovery {
+    socket_path: PathBuf,
+    publication: PreparedAgentTaskPublicationRecoveryAuthority,
+}
+
+impl PreparedAgentTaskSessionRuntimeRecovery {
+    pub(crate) fn session_id(&self) -> &str {
+        self.publication.session_id()
+    }
+
+    pub(crate) fn agent_task_id(&self) -> &str {
+        self.publication.agent_task_id()
+    }
+}
+
+impl std::fmt::Debug for PreparedAgentTaskSessionRuntimeRecovery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedAgentTaskSessionRuntimeRecovery")
+            .field("session_id", &self.session_id())
+            .field("agent_task_id", &self.agent_task_id())
+            .finish_non_exhaustive()
+    }
+}
+
+pub(crate) enum PreparedAgentTaskSessionRuntimeSettlement {
+    Published(PreparedNewSessionRuntimeOutcome),
+    Pending {
+        recovery: PreparedAgentTaskSessionRuntimeRecovery,
+        error: Option<ShellRuntimeError>,
+    },
+    Changed {
+        recovery: PreparedAgentTaskSessionRuntimeRecovery,
+        error: ShellRuntimeError,
+    },
+}
+
+impl std::fmt::Debug for PreparedNewSessionRuntimeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DefinitelyUnpublished { error, start } => formatter
+                .debug_struct("PreparedNewSessionRuntimeError::DefinitelyUnpublished")
+                .field("error", error)
+                .field("start", start)
+                .finish(),
+            Self::Refused {
+                error,
+                compensation,
+            } => formatter
+                .debug_struct("PreparedNewSessionRuntimeError::Refused")
+                .field("error", error)
+                .field("compensation", compensation)
+                .finish(),
+            Self::PossiblyApplied { error } => formatter
+                .debug_struct("PreparedNewSessionRuntimeError::PossiblyApplied")
+                .field("error", error)
+                .finish(),
+        }
+    }
+}
+
+impl StartSessionOutcome {
+    pub fn new(socket_path: PathBuf, record: SessionRecord) -> Self {
+        Self {
+            socket_path,
+            record,
+            attachment_handoff: None,
+        }
+    }
+
+    pub fn for_renderer(
+        socket_path: PathBuf,
+        record: SessionRecord,
+        attachment_handoff: AttachmentHandoffAuthority,
+    ) -> Self {
+        Self {
+            socket_path,
+            record,
+            attachment_handoff: Some(attachment_handoff),
+        }
+    }
+
+    pub fn attachment_handoff(&self) -> Option<&AttachmentHandoffAuthority> {
+        self.attachment_handoff.as_ref()
+    }
+
+    pub fn take_attachment_handoff(&mut self) -> Option<AttachmentHandoffAuthority> {
+        self.attachment_handoff.take()
+    }
 }
 
 /// The result of a reconciliation pass through the runtime: the socket path used + the
@@ -163,6 +353,35 @@ impl<'a> ShellRuntime<'a> {
         Ok((client, socket_path))
     }
 
+    /// Conditional Start captures its absolute deadline before the initial AF_UNIX connect. The
+    /// returned client carries that deadline through capability proof, mutation, acknowledgement,
+    /// recovery lookup/replay, Attach/Grid, and any exact handoff cancellation.
+    fn resolve_and_connect_for_generation_mutation(
+        &self,
+        explicit: Option<PathBuf>,
+        env: &impl EnvLookup,
+    ) -> Result<(DaemonClient, PathBuf), ShellRuntimeError> {
+        let socket_path = daemon_endpoint::resolve_socket_path(self.paths, explicit, env)?;
+        let client =
+            DaemonClient::connect_for_generation_mutation(&socket_path, self.connect_timeout)?;
+        Ok((client, socket_path))
+    }
+
+    fn resolve_and_connect_for_generation_mutation_before(
+        &self,
+        explicit: Option<PathBuf>,
+        env: &impl EnvLookup,
+        deadline: Instant,
+    ) -> Result<(DaemonClient, PathBuf), ShellRuntimeError> {
+        let socket_path = daemon_endpoint::resolve_socket_path(self.paths, explicit, env)?;
+        let client = DaemonClient::connect_for_generation_mutation_before(
+            &socket_path,
+            self.connect_timeout,
+            deadline,
+        )?;
+        Ok((client, socket_path))
+    }
+
     /// Resolve + connect + (persist endpoint) + start/attach ONE session, persisting the record per
     /// the record-backed session semantics described above.
     ///
@@ -176,7 +395,244 @@ impl<'a> ShellRuntime<'a> {
         env: &impl EnvLookup,
         params: &StartParams,
     ) -> Result<StartSessionOutcome, ShellRuntimeError> {
-        self.start_session_with_restart(explicit_socket, env, params, false)
+        self.start_session_with_restart(explicit_socket, env, params, false, false)
+    }
+
+    pub fn start_session_for_renderer(
+        &self,
+        explicit_socket: Option<PathBuf>,
+        env: &impl EnvLookup,
+        params: &StartParams,
+    ) -> Result<StartSessionOutcome, ShellRuntimeError> {
+        self.start_session_with_restart(explicit_socket, env, params, false, true)
+    }
+
+    pub fn start_prepared_new_session(
+        &self,
+        explicit_socket: Option<PathBuf>,
+        env: &impl EnvLookup,
+        start: PreparedNewSessionStart,
+    ) -> Result<PreparedNewSessionRuntimeOutcome, PreparedNewSessionRuntimeError> {
+        self.start_prepared_new_session_inner(explicit_socket, env, start, false, None)
+    }
+
+    pub fn start_prepared_new_session_for_renderer(
+        &self,
+        explicit_socket: Option<PathBuf>,
+        env: &impl EnvLookup,
+        start: PreparedNewSessionStart,
+    ) -> Result<PreparedNewSessionRuntimeOutcome, PreparedNewSessionRuntimeError> {
+        self.start_prepared_new_session_inner(explicit_socket, env, start, true, None)
+    }
+
+    pub(crate) fn start_prepared_agent_task_session(
+        &self,
+        explicit_socket: Option<PathBuf>,
+        env: &impl EnvLookup,
+        mut start: PreparedAgentTaskSessionStart,
+        expected_peer: Option<&ConditionalStartPeerIdentity>,
+    ) -> Result<PreparedNewSessionRuntimeOutcome, PreparedAgentTaskSessionRuntimeError> {
+        let now_ms = start.as_inner().params().now_ms;
+        let (mut client, socket_path) = match self
+            .resolve_and_connect_for_generation_mutation(explicit_socket, env)
+        {
+            Ok(connected) => connected,
+            Err(error) => {
+                return Err(
+                    PreparedAgentTaskSessionRuntimeError::DefinitelyUnpublished { error, start },
+                )
+            }
+        };
+        let observed_peer = match client.conditional_start_peer_identity_before_current_deadline() {
+            Ok(peer) => peer,
+            Err(error) => {
+                return Err(
+                    PreparedAgentTaskSessionRuntimeError::DefinitelyUnpublished {
+                        error: ShellRuntimeError::Daemon(error),
+                        start,
+                    },
+                )
+            }
+        };
+        if expected_peer.is_some_and(|expected| expected != &observed_peer) {
+            return Err(
+                PreparedAgentTaskSessionRuntimeError::DefinitelyUnpublished {
+                    error: ShellRuntimeError::Session(SessionServiceError::AttachAuthorityLost {
+                        session_id: start.session_id().to_string(),
+                    }),
+                    start,
+                },
+            );
+        }
+        let expected_peer = expected_peer.unwrap_or(&observed_peer);
+        if let Err(error) = self.persist_endpoint_if_enabled(&socket_path, now_ms) {
+            return Err(
+                PreparedAgentTaskSessionRuntimeError::DefinitelyUnpublished { error, start },
+            );
+        }
+        if let Err(error) = WindowLayoutService::new(self.paths).bind_prepared_agent_task_start(
+            &mut start,
+            observed_peer.daemon_instance_id(),
+            observed_peer.server_pid(),
+            &socket_path,
+        ) {
+            let error = match error {
+                WindowLayoutError::Store(error) => ShellRuntimeError::Store(error),
+                _ => ShellRuntimeError::Session(SessionServiceError::AttachAuthorityLost {
+                    session_id: start.session_id().to_string(),
+                }),
+            };
+            return Err(
+                PreparedAgentTaskSessionRuntimeError::DefinitelyUnpublished { error, start },
+            );
+        }
+        match SessionService::new(self.paths).start_prepared_agent_task_session(
+            client,
+            start,
+            expected_peer,
+        ) {
+            Ok(started) => Ok(PreparedNewSessionRuntimeOutcome {
+                socket_path,
+                started,
+                attachment_handoff: None,
+            }),
+            Err(PreparedAgentTaskSessionStartError::DefinitelyUnpublished { error, start }) => Err(
+                PreparedAgentTaskSessionRuntimeError::DefinitelyUnpublished {
+                    error: ShellRuntimeError::Session(error),
+                    start,
+                },
+            ),
+            Err(PreparedAgentTaskSessionStartError::Refused {
+                error,
+                compensation,
+            }) => Err(PreparedAgentTaskSessionRuntimeError::Refused {
+                error: ShellRuntimeError::Session(error),
+                compensation,
+            }),
+            Err(PreparedAgentTaskSessionStartError::PossiblyApplied { error, recovery }) => {
+                Err(PreparedAgentTaskSessionRuntimeError::PossiblyApplied {
+                    error: ShellRuntimeError::Session(error),
+                    recovery: PreparedAgentTaskSessionRuntimeRecovery {
+                        socket_path,
+                        publication: recovery,
+                    },
+                })
+            }
+        }
+    }
+
+    pub(crate) fn settle_prepared_agent_task_session(
+        &self,
+        recovery: PreparedAgentTaskSessionRuntimeRecovery,
+    ) -> PreparedAgentTaskSessionRuntimeSettlement {
+        let PreparedAgentTaskSessionRuntimeRecovery {
+            socket_path,
+            publication,
+        } = recovery;
+        match SessionService::new(self.paths).settle_prepared_agent_task_publication(publication) {
+            PreparedAgentTaskPublicationSettlement::Published(started) => {
+                PreparedAgentTaskSessionRuntimeSettlement::Published(
+                    PreparedNewSessionRuntimeOutcome {
+                        socket_path,
+                        started,
+                        attachment_handoff: None,
+                    },
+                )
+            }
+            PreparedAgentTaskPublicationSettlement::Pending { recovery, error } => {
+                PreparedAgentTaskSessionRuntimeSettlement::Pending {
+                    recovery: PreparedAgentTaskSessionRuntimeRecovery {
+                        socket_path,
+                        publication: recovery,
+                    },
+                    error: error.map(ShellRuntimeError::Session),
+                }
+            }
+            PreparedAgentTaskPublicationSettlement::Changed { recovery, error } => {
+                PreparedAgentTaskSessionRuntimeSettlement::Changed {
+                    recovery: PreparedAgentTaskSessionRuntimeRecovery {
+                        socket_path,
+                        publication: recovery,
+                    },
+                    error: ShellRuntimeError::Session(error),
+                }
+            }
+        }
+    }
+
+    fn start_prepared_new_session_inner(
+        &self,
+        explicit_socket: Option<PathBuf>,
+        env: &impl EnvLookup,
+        start: PreparedNewSessionStart,
+        offer_renderer_handoff: bool,
+        externally_expected_peer: Option<&ConditionalStartPeerIdentity>,
+    ) -> Result<PreparedNewSessionRuntimeOutcome, PreparedNewSessionRuntimeError> {
+        let (mut client, socket_path) = match self
+            .resolve_and_connect_for_generation_mutation(explicit_socket, env)
+        {
+            Ok(connected) => connected,
+            Err(error) => {
+                return Err(PreparedNewSessionRuntimeError::DefinitelyUnpublished { error, start })
+            }
+        };
+        let observed_peer = match client.conditional_start_peer_identity_before_current_deadline() {
+            Ok(peer) => peer,
+            Err(error) => {
+                return Err(PreparedNewSessionRuntimeError::DefinitelyUnpublished {
+                    error: ShellRuntimeError::Daemon(error),
+                    start,
+                })
+            }
+        };
+        if externally_expected_peer.is_some_and(|expected| expected != &observed_peer) {
+            return Err(PreparedNewSessionRuntimeError::DefinitelyUnpublished {
+                error: ShellRuntimeError::Session(SessionServiceError::AttachAuthorityLost {
+                    session_id: start.session_id().to_string(),
+                }),
+                start,
+            });
+        }
+        let expected_peer = externally_expected_peer.unwrap_or(&observed_peer);
+        if let Err(error) = self.persist_endpoint_if_enabled(&socket_path, start.params().now_ms) {
+            return Err(PreparedNewSessionRuntimeError::DefinitelyUnpublished { error, start });
+        }
+
+        let service = SessionService::new(self.paths);
+        let result = if offer_renderer_handoff {
+            service
+                .start_prepared_new_session_for_renderer(client, start, expected_peer)
+                .map(|(started, authority)| (started, Some(authority)))
+        } else {
+            service
+                .start_prepared_new_session(client, start, expected_peer)
+                .map(|started| (started, None))
+        };
+        match result {
+            Ok((started, attachment_handoff)) => Ok(PreparedNewSessionRuntimeOutcome {
+                socket_path,
+                started,
+                attachment_handoff,
+            }),
+            Err(PreparedNewSessionStartError::DefinitelyUnpublished { error, start }) => {
+                Err(PreparedNewSessionRuntimeError::DefinitelyUnpublished {
+                    error: ShellRuntimeError::Session(error),
+                    start,
+                })
+            }
+            Err(PreparedNewSessionStartError::Refused {
+                error,
+                compensation,
+            }) => Err(PreparedNewSessionRuntimeError::Refused {
+                error: ShellRuntimeError::Session(error),
+                compensation,
+            }),
+            Err(PreparedNewSessionStartError::PossiblyApplied { error }) => {
+                Err(PreparedNewSessionRuntimeError::PossiblyApplied {
+                    error: ShellRuntimeError::Session(error),
+                })
+            }
+        }
     }
 
     /// Replace a retained exited same-id session after an explicit product/user restart action.
@@ -184,11 +640,183 @@ impl<'a> ShellRuntime<'a> {
     /// only the daemon request's narrowly scoped `restart_exited` authority differs.
     pub fn restart_exited_session(
         &self,
+        _explicit_socket: Option<PathBuf>,
+        _env: &impl EnvLookup,
+        params: &StartParams,
+    ) -> Result<StartSessionOutcome, ShellRuntimeError> {
+        Err(ShellRuntimeError::Session(
+            SessionServiceError::AttachAuthorityLost {
+                session_id: params.session_id.clone(),
+            },
+        ))
+    }
+
+    pub fn restart_exited_session_for_renderer(
+        &self,
+        _explicit_socket: Option<PathBuf>,
+        _env: &impl EnvLookup,
+        params: &StartParams,
+    ) -> Result<StartSessionOutcome, ShellRuntimeError> {
+        Err(ShellRuntimeError::Session(
+            SessionServiceError::AttachAuthorityLost {
+                session_id: params.session_id.clone(),
+            },
+        ))
+    }
+
+    /// Restart one exact durable Exited row inside a caller-owned absolute deadline. Every retry
+    /// opens a fresh reviewed connection but inherits this same deadline and must still match the
+    /// complete original row before any conditional mutation is admitted.
+    pub fn restart_exited_session_for_renderer_before(
+        &self,
+        explicit_socket: Option<PathBuf>,
+        env: &impl EnvLookup,
+        start: &ExistingSessionStart,
+        deadline: Instant,
+    ) -> Result<StartSessionOutcome, ShellRuntimeError> {
+        self.start_session_with_restart_before(
+            explicit_socket,
+            env,
+            start.params(),
+            true,
+            true,
+            Some((start, deadline)),
+        )
+    }
+
+    /// Product-only retained restart for one sealed reserved shell graph. This is deliberately a
+    /// separate API from [`ExistingSessionStart`]: an ordinary `Shell + OptOut` row may receive only
+    /// the renderer-scoped explicit default-shell authority represented there, never this reserved
+    /// product authority. The fixed graph is fenced before wire and in the final IMMEDIATE
+    /// publication transaction.
+    pub fn restart_reserved_product_shell_for_renderer_before(
+        &self,
+        explicit_socket: Option<PathBuf>,
+        env: &impl EnvLookup,
+        start: &ReservedProductShellStart,
+        deadline: Instant,
+    ) -> Result<StartSessionOutcome, ShellRuntimeError> {
+        let (client, socket_path) = self.resolve_and_connect_for_generation_mutation_before(
+            explicit_socket,
+            env,
+            deadline,
+        )?;
+        let params = start.params();
+        if !std::path::Path::new(&params.cwd).is_dir() {
+            return Err(ShellRuntimeError::Session(
+                SessionServiceError::InvalidCwd {
+                    cwd: params.cwd.clone(),
+                },
+            ));
+        }
+        self.persist_endpoint_if_enabled(&socket_path, params.now_ms)?;
+        let (record, authority) = SessionService::new(self.paths)
+            .restart_reserved_product_shell_and_attach_for_renderer(client, start)?;
+        Ok(StartSessionOutcome::for_renderer(
+            socket_path,
+            record,
+            authority,
+        ))
+    }
+
+    /// Recreate exact durable exited generation A after a reviewed fresh daemon proved the id
+    /// absent. This is deliberately separate from retained-daemon restart: the wire precondition is
+    /// `Absent { excluded_generation: A }`, never `ExitedGeneration(A)`.
+    pub fn start_absent_excluding_session(
+        &self,
         explicit_socket: Option<PathBuf>,
         env: &impl EnvLookup,
         params: &StartParams,
+        durable_start: FreshDaemonSessionStart<'_>,
+        expected_peer: &ConditionalStartPeerIdentity,
     ) -> Result<StartSessionOutcome, ShellRuntimeError> {
-        self.start_session_with_restart(explicit_socket, env, params, true)
+        self.start_absent_excluding_session_inner(
+            explicit_socket,
+            env,
+            params,
+            durable_start,
+            expected_peer,
+            false,
+        )
+    }
+
+    pub fn start_absent_excluding_session_for_renderer(
+        &self,
+        explicit_socket: Option<PathBuf>,
+        env: &impl EnvLookup,
+        params: &StartParams,
+        durable_start: FreshDaemonSessionStart<'_>,
+        expected_peer: &ConditionalStartPeerIdentity,
+    ) -> Result<StartSessionOutcome, ShellRuntimeError> {
+        self.start_absent_excluding_session_inner(
+            explicit_socket,
+            env,
+            params,
+            durable_start,
+            expected_peer,
+            true,
+        )
+    }
+
+    fn start_absent_excluding_session_inner(
+        &self,
+        explicit_socket: Option<PathBuf>,
+        env: &impl EnvLookup,
+        params: &StartParams,
+        durable_start: FreshDaemonSessionStart<'_>,
+        expected_peer: &ConditionalStartPeerIdentity,
+        offer_renderer_handoff: bool,
+    ) -> Result<StartSessionOutcome, ShellRuntimeError> {
+        let params = match durable_start {
+            FreshDaemonSessionStart::Existing { start } => start.params(),
+            FreshDaemonSessionStart::ReservedProductShell { start } => start.params(),
+            FreshDaemonSessionStart::New { .. } => params,
+        };
+        let (mut client, socket_path) =
+            self.resolve_and_connect_for_generation_mutation(explicit_socket, env)?;
+        if !std::path::Path::new(&params.cwd).is_dir() {
+            return Err(ShellRuntimeError::Session(
+                SessionServiceError::InvalidCwd {
+                    cwd: params.cwd.clone(),
+                },
+            ));
+        }
+        // Fresh-daemon authority is process-specific, not path-specific. Re-prove the exact
+        // readiness instance (and Linux kernel peer PID) on this same socket before endpoint,
+        // workspace, or Session persistence. A path rebound therefore produces zero durable or
+        // daemon mutation.
+        client.require_conditional_start_peer_identity(expected_peer)?;
+        self.persist_endpoint_if_enabled(&socket_path, params.now_ms)?;
+
+        let service = SessionService::new(self.paths);
+        if offer_renderer_handoff {
+            let (record, authority) = service.start_absent_excluding_and_attach_for_renderer(
+                client,
+                params,
+                durable_start,
+                expected_peer,
+            )?;
+            Ok(StartSessionOutcome::for_renderer(
+                socket_path,
+                record,
+                authority,
+            ))
+        } else {
+            let record = match service.start_absent_excluding_and_attach(
+                &mut client,
+                params,
+                durable_start,
+                expected_peer,
+            ) {
+                Ok(record) => record,
+                Err(error) => {
+                    return Err(ShellRuntimeError::Session(
+                        error.bind_conditional_start_recovery(client),
+                    ))
+                }
+            };
+            Ok(StartSessionOutcome::new(socket_path, record))
+        }
     }
 
     fn start_session_with_restart(
@@ -197,8 +825,35 @@ impl<'a> ShellRuntime<'a> {
         env: &impl EnvLookup,
         params: &StartParams,
         restart_exited: bool,
+        offer_renderer_handoff: bool,
     ) -> Result<StartSessionOutcome, ShellRuntimeError> {
-        let (mut client, socket_path) = self.resolve_and_connect(explicit_socket, env)?;
+        self.start_session_with_restart_before(
+            explicit_socket,
+            env,
+            params,
+            restart_exited,
+            offer_renderer_handoff,
+            None,
+        )
+    }
+
+    fn start_session_with_restart_before(
+        &self,
+        explicit_socket: Option<PathBuf>,
+        env: &impl EnvLookup,
+        params: &StartParams,
+        restart_exited: bool,
+        offer_renderer_handoff: bool,
+        expected_and_deadline: Option<(&ExistingSessionStart, Instant)>,
+    ) -> Result<StartSessionOutcome, ShellRuntimeError> {
+        let (mut client, socket_path) = match expected_and_deadline {
+            Some((_, deadline)) => self.resolve_and_connect_for_generation_mutation_before(
+                explicit_socket,
+                env,
+                deadline,
+            )?,
+            None => self.resolve_and_connect_for_generation_mutation(explicit_socket, env)?,
+        };
 
         // Keep malformed cwd behavior mutation-free (including no capability probe) and aligned
         // with SessionService's trust boundary.
@@ -210,23 +865,55 @@ impl<'a> ShellRuntime<'a> {
             ));
         }
 
-        // A retained v1/legacy daemon is intentionally attach-compatible so existing PTYs survive
-        // an app upgrade, but StartSession is unsafe there: old implementations could globally reap
-        // unrelated exited snapshots. Fail before endpoint/session persistence and before mutation.
-        client.require_start_session_protocol()?;
+        // Every start/restart proves the complete v3 peer before any endpoint or Session write.
+        // The opaque receipt is then reused by SessionService, so this exact connection emits one
+        // DaemonInfo request total while exact restart paths retain their sealed row CAS.
+        let start_peer = client.conditional_start_peer_identity_before_current_deadline()?;
 
-        // Only AFTER a proven-reachable connect do we advertise this socket durably.
+        // Only AFTER a mutation-compatible peer proof do we advertise this socket durably.
         self.persist_endpoint_if_enabled(&socket_path, params.now_ms)?;
 
         let svc = SessionService::new(self.paths);
-        let record = if restart_exited {
-            svc.restart_exited_and_attach(&mut client, params)?
+        let (record, attachment_handoff) = if restart_exited && offer_renderer_handoff {
+            let (record, authority) = match expected_and_deadline {
+                Some((expected, _)) => svc
+                    .restart_exited_and_attach_for_renderer_expected_after_peer_proof(
+                        client,
+                        expected,
+                        &start_peer,
+                    )?,
+                None => svc.restart_exited_and_attach_for_renderer(client, params)?,
+            };
+            (record, Some(authority))
+        } else if restart_exited {
+            let record = match svc.restart_exited_and_attach(&mut client, params) {
+                Ok(record) => record,
+                Err(error) => {
+                    return Err(ShellRuntimeError::Session(
+                        error.bind_conditional_start_recovery(client),
+                    ))
+                }
+            };
+            (record, None)
+        } else if offer_renderer_handoff {
+            let (record, authority) =
+                svc.start_and_attach_after_peer_proof_for_renderer(client, params, &start_peer)?;
+            (record, Some(authority))
         } else {
-            svc.start_and_attach(&mut client, params)?
+            let record =
+                match svc.start_and_attach_after_peer_proof(&mut client, params, &start_peer) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        return Err(ShellRuntimeError::Session(
+                            error.bind_conditional_start_recovery(client),
+                        ))
+                    }
+                };
+            (record, None)
         };
-        Ok(StartSessionOutcome {
-            socket_path,
-            record,
+        Ok(match attachment_handoff {
+            Some(token) => StartSessionOutcome::for_renderer(socket_path, record, token),
+            None => StartSessionOutcome::new(socket_path, record),
         })
     }
 
@@ -240,6 +927,29 @@ impl<'a> ShellRuntime<'a> {
         explicit_socket: Option<PathBuf>,
         env: &impl EnvLookup,
         params: &StartParams,
+    ) -> Result<StartSessionOutcome, ShellRuntimeError> {
+        self.attach_existing_session_with_renderer_handoff(explicit_socket, env, params, false)
+    }
+
+    pub fn attach_existing_session_for_renderer(
+        &self,
+        _explicit_socket: Option<PathBuf>,
+        _env: &impl EnvLookup,
+        params: &StartParams,
+    ) -> Result<StartSessionOutcome, ShellRuntimeError> {
+        Err(ShellRuntimeError::Session(
+            SessionServiceError::AttachAuthorityLost {
+                session_id: params.session_id.clone(),
+            },
+        ))
+    }
+
+    fn attach_existing_session_with_renderer_handoff(
+        &self,
+        explicit_socket: Option<PathBuf>,
+        env: &impl EnvLookup,
+        params: &StartParams,
+        offer_renderer_handoff: bool,
     ) -> Result<StartSessionOutcome, ShellRuntimeError> {
         let (mut client, socket_path) = self.resolve_and_connect(explicit_socket, env)?;
         let ids = client.list_sessions()?;
@@ -266,8 +976,23 @@ impl<'a> ShellRuntime<'a> {
             ));
         }
 
-        let record = match SessionService::new(self.paths).attach_existing(&mut client, params) {
-            Ok(record) => record,
+        if offer_renderer_handoff {
+            client.require_generation_conditional_mutations()?;
+            // A post-publication endpoint Store error must never discard the only Offer authority.
+            self.persist_endpoint_if_enabled(&socket_path, params.now_ms)?;
+        }
+
+        let attached = if offer_renderer_handoff {
+            SessionService::new(self.paths)
+                .attach_existing_for_renderer(client, params)
+                .map(|(record, authority)| (record, Some(authority)))
+        } else {
+            SessionService::new(self.paths)
+                .attach_existing(&mut client, params)
+                .map(|record| (record, None))
+        };
+        let (record, attachment_handoff) = match attached {
+            Ok(attached) => attached,
             // A durable Exited record is allowed past the live-only list specifically to probe its
             // retained latch. If this daemon no longer owns that exact id (for example it restarted),
             // translate the authoritative lookup miss back to the normal unavailable signal so the
@@ -282,11 +1007,128 @@ impl<'a> ShellRuntime<'a> {
             }
             Err(error) => return Err(ShellRuntimeError::Session(error)),
         };
-        self.persist_endpoint_if_enabled(&socket_path, params.now_ms)?;
-        Ok(StartSessionOutcome {
-            socket_path,
-            record,
+        if !offer_renderer_handoff {
+            // Compatibility attach remains entirely non-durable until exact Grid proves the
+            // requested retained lifetime. A typed miss therefore leaves no endpoint advertisement.
+            self.persist_endpoint_if_enabled(&socket_path, params.now_ms)?;
+        }
+        Ok(match attachment_handoff {
+            Some(token) => StartSessionOutcome::for_renderer(socket_path, record, token),
+            None => StartSessionOutcome::new(socket_path, record),
         })
+    }
+
+    /// Exact-id renderer reopen used by the product target path. Unlike the compatibility helper
+    /// above, this deliberately does not use the live-only list as an existence gate: an exited
+    /// retained grid is attachable even though it is absent there. Exact v3 attachment-fence
+    /// capability is proved before the Session service may insert or refresh durable state.
+    pub fn attach_existing_session_exact_for_renderer(
+        &self,
+        _explicit_socket: Option<PathBuf>,
+        _env: &impl EnvLookup,
+        params: &StartParams,
+    ) -> Result<StartSessionOutcome, ShellRuntimeError> {
+        Err(ShellRuntimeError::Session(
+            SessionServiceError::AttachAuthorityLost {
+                session_id: params.session_id.clone(),
+            },
+        ))
+    }
+
+    /// Headless exact retained-lifetime coordinator. It uses the same conditional probe and
+    /// same-client Missing -> Absent A+W CAS as the renderer path, but never creates an Offer token.
+    pub fn attach_or_start_existing_session_before(
+        &self,
+        explicit_socket: Option<PathBuf>,
+        env: &impl EnvLookup,
+        attach: &ExistingSessionAttach,
+        missing_start: Option<ExistingSessionMissingStart<'_>>,
+        deadline: Instant,
+    ) -> Result<StartSessionOutcome, ShellRuntimeError> {
+        self.attach_or_start_existing_session_inner(
+            explicit_socket,
+            env,
+            attach,
+            missing_start,
+            deadline,
+            false,
+        )
+    }
+
+    /// Exact renderer retained-lifetime coordinator. One inherited absolute/event budget carries a
+    /// single conditional Offer. Typed Missing closes the refusal-latched socket, reconnects to the
+    /// exact same daemon instance/PID, and continues with conditional Absent start.
+    pub fn attach_or_start_existing_session_for_renderer_before(
+        &self,
+        explicit_socket: Option<PathBuf>,
+        env: &impl EnvLookup,
+        attach: &ExistingSessionAttach,
+        missing_start: Option<ExistingSessionMissingStart<'_>>,
+        deadline: Instant,
+    ) -> Result<StartSessionOutcome, ShellRuntimeError> {
+        self.attach_or_start_existing_session_inner(
+            explicit_socket,
+            env,
+            attach,
+            missing_start,
+            deadline,
+            true,
+        )
+    }
+
+    fn attach_or_start_existing_session_inner(
+        &self,
+        explicit_socket: Option<PathBuf>,
+        env: &impl EnvLookup,
+        attach: &ExistingSessionAttach,
+        missing_start: Option<ExistingSessionMissingStart<'_>>,
+        deadline: Instant,
+        offer_renderer_handoff: bool,
+    ) -> Result<StartSessionOutcome, ShellRuntimeError> {
+        let (client, socket_path) = self.resolve_and_connect_for_generation_mutation_before(
+            explicit_socket,
+            env,
+            deadline,
+        )?;
+        // Endpoint persistence is separately authorized local metadata. Complete it before the
+        // first conditional Attach/Start frame so a Store failure remains definitely unpublished;
+        // a post-publication endpoint error must never discard the only renderer Offer authority.
+        self.persist_endpoint_if_enabled(&socket_path, attach.now_ms())?;
+        let service = SessionService::new(self.paths);
+        let reserved_product_shell = missing_start.and_then(|start| start.reserved());
+        let attached = if offer_renderer_handoff {
+            service.attach_existing_exact_for_renderer(client, attach, reserved_product_shell)?
+        } else {
+            service.attach_existing_exact_headless(client, attach, reserved_product_shell)?
+        };
+        let (record, authority) = match attached {
+            ExactExistingAttach::Attached(record, authority) => (record, authority),
+            ExactExistingAttach::StartIfAbsent(authority) => {
+                let start = missing_start.ok_or_else(|| {
+                    ShellRuntimeError::Daemon(DaemonClientError::RetainedSessionUnavailable {
+                        id: maestro_protocol::SessionId(attach.session_id().to_string()),
+                    })
+                })?;
+                if offer_renderer_handoff {
+                    let (record, authority) =
+                        service.start_retained_absent_for_renderer(authority, start)?;
+                    (record, Some(authority))
+                } else {
+                    (
+                        service.start_retained_absent_headless(authority, start)?,
+                        None,
+                    )
+                }
+            }
+        };
+        match authority {
+            Some(authority) => Ok(StartSessionOutcome::for_renderer(
+                socket_path,
+                record,
+                authority,
+            )),
+            None => Ok(StartSessionOutcome::new(socket_path, record)),
+        }
     }
 
     /// Resolve + connect + reconcile persisted session records against the daemon's live set.
@@ -335,7 +1177,7 @@ mod tests {
     use crate::records::{LaunchSpec, SessionKind, SessionStatus};
     use crate::store::{self, LoadOutcome};
     use std::collections::HashMap;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream as StdUnixStream};
     use std::sync::mpsc;
     use std::thread::JoinHandle;
@@ -357,6 +1199,18 @@ mod tests {
     impl EnvLookup for MapEnv {
         fn get(&self, key: &str) -> Option<String> {
             self.0.get(key).cloned()
+        }
+    }
+
+    struct RestartLaunchEnv;
+
+    impl crate::LaunchEnvLookup for RestartLaunchEnv {
+        fn shell_utf8(&self) -> Option<String> {
+            Some("/bin/sh".into())
+        }
+
+        fn home_os(&self) -> Option<std::ffi::OsString> {
+            None
         }
     }
 
@@ -423,14 +1277,155 @@ mod tests {
         assert_eq!(request, r#"{"op":"daemon_info"}"#);
         writeln!(
             stream,
-            "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\"}}",
+            "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"daemon_instance_id\":\"22222222222242228222222222222222\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"generation_conditional_attach\":true}}",
             maestro_protocol::DAEMON_PROTOCOL_VERSION
         )
         .unwrap();
         stream.flush().unwrap();
     }
 
-    /// A serve-script that answers a StartSession+Attach with a grid (a successful start).
+    const STUB_DAEMON_INSTANCE: &str = "22222222222242228222222222222222";
+
+    fn accept_start_operation(
+        reader: &mut impl BufRead,
+        stream: &mut StdUnixStream,
+        tx: &mpsc::Sender<String>,
+    ) -> (
+        maestro_protocol::SessionId,
+        maestro_protocol::SessionStartOperationToken,
+    ) {
+        let request: maestro_protocol::ClientRequest =
+            serde_json::from_str(&read_request(reader, tx).expect("ReserveStartOperation request"))
+                .unwrap();
+        let (id, operation_token) = match request {
+            maestro_protocol::ClientRequest::ReserveStartOperation {
+                id,
+                operation_token,
+            } => (id, operation_token),
+            other => panic!("expected ReserveStartOperation, got {other:?}"),
+        };
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({
+                "ev": "start_operation_reserved",
+                "id": id,
+                "operation_token": operation_token.as_str(),
+                "daemon_instance_id": STUB_DAEMON_INSTANCE,
+                "outcome": {"status": "reserved"},
+            })
+        )
+        .unwrap();
+        stream.flush().unwrap();
+        (id, operation_token)
+    }
+
+    fn accept_conditional_start_and_attach(
+        reader: &mut impl BufRead,
+        stream: &mut StdUnixStream,
+        tx: &mpsc::Sender<String>,
+        expected_id: &str,
+        generation: &str,
+    ) -> (
+        maestro_protocol::SessionId,
+        maestro_protocol::SessionStartOperationToken,
+        u64,
+    ) {
+        let (reserved_id, reserved_token) = accept_start_operation(reader, stream, tx);
+        let request: maestro_protocol::ClientRequest = serde_json::from_str(
+            &read_request(reader, tx).expect("conditional StartSession request"),
+        )
+        .unwrap();
+        let (id, operation_token) = match request {
+            maestro_protocol::ClientRequest::StartSession {
+                id,
+                restart_exited: false,
+                conditional_start:
+                    Some(maestro_protocol::ConditionalSessionStart {
+                        operation_token,
+                        precondition:
+                            maestro_protocol::SessionStartPrecondition::Absent {
+                                excluded_generation: None,
+                            },
+                    }),
+                ..
+            } => (id, operation_token),
+            other => panic!("expected conditional Absent StartSession, got {other:?}"),
+        };
+        assert_eq!(id, reserved_id);
+        assert_eq!(id.0, expected_id);
+        assert_eq!(operation_token, reserved_token);
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({
+                "ev": "conditional_session_start",
+                "id": id,
+                "operation_token": operation_token.as_str(),
+                "daemon_instance_id": STUB_DAEMON_INSTANCE,
+                "outcome": {"status": "applied", "generation": generation},
+            })
+        )
+        .unwrap();
+        stream.flush().unwrap();
+
+        let attach: maestro_protocol::ClientRequest = serde_json::from_str(
+            &read_request(reader, tx).expect("generation-conditional Attach request"),
+        )
+        .unwrap();
+        let output_generation = match attach {
+            maestro_protocol::ClientRequest::Attach {
+                id: attached_id,
+                want_raw_output: false,
+                expected_session_generation: Some(attached_generation),
+                output_generation: Some(output_generation),
+                handoff: None,
+            } if attached_id == id && attached_generation == generation => output_generation,
+            other => panic!("expected exact post-start Attach, got {other:?}"),
+        };
+        (id, operation_token, output_generation)
+    }
+
+    fn accept_applied_retirement(
+        reader: &mut impl BufRead,
+        stream: &mut StdUnixStream,
+        tx: &mpsc::Sender<String>,
+        expected_id: &maestro_protocol::SessionId,
+        expected_token: &maestro_protocol::SessionStartOperationToken,
+        expected_generation: &str,
+    ) {
+        let request: maestro_protocol::ClientRequest =
+            serde_json::from_str(&read_request(reader, tx).expect("RetireStartOperation request"))
+                .unwrap();
+        assert!(matches!(
+            request,
+            maestro_protocol::ClientRequest::RetireStartOperation {
+                ref id,
+                ref operation_token,
+                expected:
+                    maestro_protocol::SessionStartOperationRetireExpectation::Applied {
+                        ref generation,
+                    },
+            } if id == expected_id
+                && operation_token == expected_token
+                && generation == expected_generation
+        ));
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({
+                "ev": "start_operation_retired",
+                "id": expected_id,
+                "operation_token": expected_token.as_str(),
+                "daemon_instance_id": STUB_DAEMON_INSTANCE,
+                "outcome": {"status": "retired"},
+            })
+        )
+        .unwrap();
+        stream.flush().unwrap();
+    }
+
+    /// Answers ReserveStartOperation+conditional StartSession+Attach+Grid+retirement.
     fn serve_grid(
         id: &'static str,
         generation: &'static str,
@@ -438,12 +1433,21 @@ mod tests {
         move |tx, stream| {
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             accept_start_protocol(&mut reader, stream, tx);
-            read_request(&mut reader, tx); // StartSession
-            read_request(&mut reader, tx); // Attach
-            stream
-                .write_all(format!("{}\n", grid_line(id, generation, 1)).as_bytes())
-                .unwrap();
+            let (id, operation_token, output_generation) =
+                accept_conditional_start_and_attach(&mut reader, stream, tx, id, generation);
+            writeln!(
+                stream,
+                "{}",
+                serde_json::json!({
+                    "ev": "grid",
+                    "id": id,
+                    "output_generation": output_generation,
+                    "grid": {"generation": generation, "revision": 1},
+                })
+            )
+            .unwrap();
             stream.flush().unwrap();
+            accept_applied_retirement(&mut reader, stream, tx, &id, &operation_token, generation);
         }
     }
 
@@ -549,30 +1553,11 @@ mod tests {
     }
 
     #[test]
-    fn explicit_exited_restart_reaches_protocol_v2_and_persists_replacement_live() {
+    fn raw_exited_restart_is_rejected_before_connect_or_record_change() {
         let tmp = TempDir::new().unwrap();
         let paths = paths_in(&tmp);
         let cwd = TempDir::new().unwrap();
         let cwd_path = cwd.path().to_string_lossy().to_string();
-        let (sock_dir, sock_path) = stub_socket_path();
-        let stub = StubDaemon::spawn_at(sock_path.clone(), |tx, stream| {
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            accept_start_protocol(&mut reader, stream, tx);
-            let start = read_request(&mut reader, tx).expect("restart StartSession");
-            let start: serde_json::Value = serde_json::from_str(&start).unwrap();
-            assert_eq!(start["op"], "start_session");
-            assert_eq!(start["id"], "s1");
-            assert_eq!(start["restart_exited"], true);
-            let attach = read_request(&mut reader, tx).expect("replacement Attach");
-            assert_eq!(
-                attach,
-                r#"{"op":"attach","id":"s1","want_raw_output":false}"#
-            );
-            stream
-                .write_all(format!("{}\n", grid_line("s1", "gen-replaced", 2)).as_bytes())
-                .unwrap();
-            stream.flush().unwrap();
-        });
 
         let mut old = params("s1", &cwd_path);
         old.now_ms = 10;
@@ -590,16 +1575,293 @@ mod tests {
         };
         store::write_record(&paths, RecordKind::Session, "s1", 3, &old_record).unwrap();
 
-        let out = ShellRuntime::new(&paths)
-            .restart_exited_session(Some(sock_path), &MapEnv::new(&[]), &old)
-            .unwrap();
-        assert_eq!(out.record.status, SessionStatus::Live);
-        assert_eq!(
-            out.record.last_known_generation.as_deref(),
-            Some("gen-replaced")
-        );
+        let error = ShellRuntime::new(&paths)
+            .restart_exited_session(
+                Some(tmp.path().join("must-not-connect.sock")),
+                &MapEnv::new(&[]),
+                &old,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ShellRuntimeError::Session(SessionServiceError::AttachAuthorityLost { .. })
+        ));
+        assert!(matches!(
+            store::load_one::<SessionRecord>(&paths, RecordKind::Session, "s1").unwrap(),
+            Some(LoadOutcome::Loaded(ref current)) if current == &old_record
+        ));
+    }
+
+    #[test]
+    fn reviewed_exited_restart_refuses_v1_before_endpoint_or_record_change() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+        let cwd = TempDir::new().unwrap();
+        let workspace = match store::load_one::<crate::records::Workspace>(
+            &paths,
+            RecordKind::Workspace,
+            "ws1",
+        )
+        .unwrap()
+        .unwrap()
+        {
+            LoadOutcome::Loaded(workspace) => workspace,
+            other => panic!("expected Workspace, got {other:?}"),
+        };
+        let old_record = SessionRecord {
+            session_id: "reviewed-restart".into(),
+            workspace_id: workspace.workspace_id.clone(),
+            kind: SessionKind::Agent,
+            launch: LaunchSpec::KnownSafe {
+                launch_spec_id: "codex".into(),
+                params: vec![
+                    "resume".into(),
+                    "60000000-0000-4000-8000-000000000002".into(),
+                ],
+            },
+            cwd_resolved: cwd.path().to_string_lossy().into_owned(),
+            agent_task_id: None,
+            created_at_ms: 1,
+            last_attached_at_ms: 2,
+            last_known_generation: Some("gen-old".into()),
+            status: SessionStatus::Exited,
+        };
+        store::write_record(
+            &paths,
+            RecordKind::Session,
+            &old_record.session_id,
+            3,
+            &old_record,
+        )
+        .unwrap();
+        let start = ExistingSessionStart::known_safe_exact(
+            &old_record,
+            &workspace,
+            &RestartLaunchEnv,
+            80,
+            24,
+            1000,
+        )
+        .unwrap();
+
+        let (sock_dir, sock_path) = stub_socket_path();
+        let stub = StubDaemon::spawn_at(sock_path.clone(), |tx, stream| {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            assert_eq!(
+                read_request(&mut reader, tx).as_deref(),
+                Some(r#"{"op":"daemon_info"}"#)
+            );
+            stream
+                .write_all(
+                    b"{\"ev\":\"daemon_info\",\"protocol_version\":1,\"build_version\":\"legacy\"}\n",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+            assert!(
+                read_request(&mut reader, tx).is_none(),
+                "v1 restart preflight emits no Reserve or Start"
+            );
+        });
+
+        let error = ShellRuntime::new(&paths)
+            .restart_exited_session_for_renderer_before(
+                Some(sock_path),
+                &MapEnv::new(&[]),
+                &start,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ShellRuntimeError::Daemon(DaemonClientError::MutationProtocolUnsupported {
+                required: maestro_protocol::DAEMON_PROTOCOL_VERSION,
+                observed: Some(1),
+            })
+        ));
+        assert!(load_endpoint_record(&paths).is_none());
+        assert!(matches!(
+            store::load_one::<SessionRecord>(&paths, RecordKind::Session, &old_record.session_id)
+                .unwrap(),
+            Some(LoadOutcome::Loaded(ref current)) if current == &old_record
+        ));
         drop(stub);
         drop(sock_dir);
+    }
+
+    #[test]
+    fn headless_runtime_rejects_renderer_only_scopes_after_exact_missing_without_start() {
+        for explicit_shell in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let paths = paths_in(&tmp);
+            let cwd = TempDir::new().unwrap();
+            let workspace = match store::load_one::<crate::records::Workspace>(
+                &paths,
+                RecordKind::Workspace,
+                "ws1",
+            )
+            .unwrap()
+            .unwrap()
+            {
+                LoadOutcome::Loaded(workspace) => workspace,
+                other => panic!("expected Workspace, got {other:?}"),
+            };
+            let session_id = if explicit_shell {
+                "explicit-shell-headless"
+            } else {
+                "explicit-latest-headless"
+            };
+            let old_record = SessionRecord {
+                session_id: session_id.into(),
+                workspace_id: workspace.workspace_id.clone(),
+                kind: if explicit_shell {
+                    SessionKind::Shell
+                } else {
+                    SessionKind::Agent
+                },
+                launch: if explicit_shell {
+                    LaunchSpec::OptOut
+                } else {
+                    LaunchSpec::KnownSafe {
+                        launch_spec_id: "claude".into(),
+                        params: vec!["--continue".into(), "--dangerously-skip-permissions".into()],
+                    }
+                },
+                cwd_resolved: cwd.path().to_string_lossy().into_owned(),
+                agent_task_id: None,
+                created_at_ms: 1,
+                last_attached_at_ms: 2,
+                last_known_generation: Some("generation-A".into()),
+                status: SessionStatus::Exited,
+            };
+            store::write_record(
+                &paths,
+                RecordKind::Session,
+                &old_record.session_id,
+                3,
+                &old_record,
+            )
+            .unwrap();
+            let start = if explicit_shell {
+                ExistingSessionStart::explicit_user_shell_restart(
+                    &old_record,
+                    &workspace,
+                    vec!["/bin/sh".into(), "-l".into()],
+                    80,
+                    24,
+                    1000,
+                )
+            } else {
+                ExistingSessionStart::known_safe_explicit_user_restart(
+                    &old_record,
+                    &workspace,
+                    &RestartLaunchEnv,
+                    80,
+                    24,
+                    1000,
+                )
+            }
+            .unwrap();
+            let attach = ExistingSessionAttach::exact(&old_record, &workspace, 1000).unwrap();
+
+            let (sock_dir, sock_path) = stub_socket_path();
+            let listener = UnixListener::bind(&sock_path).unwrap();
+            let (request_tx, request_rx) = mpsc::channel::<String>();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+                accept_start_protocol(&mut reader, &mut stream, &request_tx);
+                let attach_request: maestro_protocol::ClientRequest = serde_json::from_str(
+                    &read_request(&mut reader, &request_tx).expect("exact headless Attach"),
+                )
+                .unwrap();
+                assert!(matches!(
+                    attach_request,
+                    maestro_protocol::ClientRequest::Attach {
+                        id: maestro_protocol::SessionId(ref id),
+                        want_raw_output: false,
+                        expected_session_generation: Some(ref generation),
+                        output_generation: Some(_),
+                        handoff: None,
+                    } if id == session_id && generation == "generation-A"
+                ));
+                writeln!(
+                    stream,
+                    "{}",
+                    serde_json::json!({
+                        "ev": "session_attach_refused",
+                        "id": session_id,
+                        "expected_generation": "generation-A",
+                        "daemon_instance_id": STUB_DAEMON_INSTANCE,
+                        "reason": "missing",
+                    })
+                )
+                .unwrap();
+                stream.flush().unwrap();
+
+                assert_eq!(
+                    read_request(&mut reader, &request_tx).as_deref(),
+                    Some(r#"{"op":"daemon_info"}"#),
+                    "typed Missing may only re-prove the same daemon peer"
+                );
+                writeln!(
+                    stream,
+                    "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"daemon_instance_id\":\"{}\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"generation_conditional_attach\":true}}",
+                    maestro_protocol::DAEMON_PROTOCOL_VERSION,
+                    STUB_DAEMON_INSTANCE,
+                )
+                .unwrap();
+                stream.flush().unwrap();
+
+                let mut remainder = String::new();
+                reader.read_to_string(&mut remainder).unwrap();
+                assert!(
+                    remainder.is_empty(),
+                    "headless renderer-only denial must send no Reserve or Start: {remainder}"
+                );
+            });
+
+            let missing_start = if explicit_shell {
+                ExistingSessionMissingStart::ExplicitUserShell(&start)
+            } else {
+                ExistingSessionMissingStart::KnownSafe(&start)
+            };
+            let error = ShellRuntime::new(&paths)
+                .attach_or_start_existing_session_before(
+                    Some(sock_path),
+                    &MapEnv::new(&[]),
+                    &attach,
+                    Some(missing_start),
+                    Instant::now() + Duration::from_secs(2),
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                ShellRuntimeError::Session(SessionServiceError::AttachAuthorityLost {
+                    ref session_id,
+                }) if session_id == &old_record.session_id
+            ));
+            server.join().unwrap();
+            let requests = request_rx.try_iter().collect::<Vec<_>>();
+            assert_eq!(
+                requests.len(),
+                3,
+                "only DaemonInfo, exact Attach, and same-peer DaemonInfo are allowed"
+            );
+            assert!(requests.iter().all(|request| {
+                !request.contains("reserve_start_operation") && !request.contains("start_session")
+            }));
+            assert!(matches!(
+                store::load_one::<SessionRecord>(
+                    &paths,
+                    RecordKind::Session,
+                    &old_record.session_id,
+                )
+                .unwrap(),
+                Some(LoadOutcome::Loaded(ref current)) if current == &old_record
+            ));
+            drop(sock_dir);
+        }
     }
 
     /// With NO explicit path, a stored endpoint record's socket is used.
@@ -720,11 +1982,12 @@ mod tests {
         drop(sock_dir);
     }
 
-    /// A daemon `Error` reply AFTER connect leaves the prewritten session record `Unknown`,
-    /// surfaced as a `Session` runtime error. The endpoint WAS persisted (connect
-    /// succeeded — the daemon is genuinely reachable).
+    /// A daemon `Error` after the ledger reservation frame crossed the writer boundary leaves the
+    /// prewritten row `Unknown` and owns exact possibly-applied recovery. The endpoint remains
+    /// persisted because capability proof established a genuinely reachable current daemon.
     #[test]
-    fn daemon_error_after_connect_leaves_record_unknown() {
+    fn daemon_error_after_start_operation_reservation_is_possibly_applied_and_leaves_record_unknown(
+    ) {
         let tmp = TempDir::new().unwrap();
         let paths = paths_in(&tmp);
         let cwd = TempDir::new().unwrap();
@@ -733,8 +1996,13 @@ mod tests {
         let stub = StubDaemon::spawn_at(sock_path.clone(), |tx, stream| {
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             accept_start_protocol(&mut reader, stream, tx);
-            read_request(&mut reader, tx);
-            read_request(&mut reader, tx);
+            assert!(matches!(
+                serde_json::from_str::<maestro_protocol::ClientRequest>(
+                    &read_request(&mut reader, tx).expect("ReserveStartOperation request")
+                )
+                .unwrap(),
+                maestro_protocol::ClientRequest::ReserveStartOperation { .. }
+            ));
             stream
                 .write_all(b"{\"ev\":\"error\",\"message\":\"nope\"}\n")
                 .unwrap();
@@ -747,10 +2015,20 @@ mod tests {
             .start_session(Some(sock_path.clone()), &env, &params("s1", &cwd_path))
             .unwrap_err();
         match err {
-            ShellRuntimeError::Session(SessionServiceError::Daemon(
-                DaemonClientError::DaemonError { message },
-            )) => assert_eq!(message, "nope"),
-            other => panic!("expected Session(Daemon(DaemonError)), got {other:?}"),
+            ShellRuntimeError::Session(SessionServiceError::ConditionalStartPossiblyApplied {
+                session_id,
+                source,
+                ..
+            }) => {
+                assert_eq!(session_id, "s1");
+                assert!(matches!(
+                    *source,
+                    SessionServiceError::Daemon(DaemonClientError::DaemonError {
+                        ref message
+                    }) if message == "nope"
+                ));
+            }
+            other => panic!("expected owned conditional-start recovery, got {other:?}"),
         }
 
         // Record persisted, still Unknown.
@@ -1093,7 +2371,7 @@ mod tests {
                 agent_task_id: None,
                 created_at_ms: 1,
                 last_attached_at_ms: 1,
-                last_known_generation: None,
+                last_known_generation: (id == "alive").then(|| "gen-alive".into()),
                 status: SessionStatus::Unknown,
             };
             store::write_record(&paths, RecordKind::Session, id, 1, &rec).unwrap();
@@ -1102,11 +2380,39 @@ mod tests {
         let (sock_dir, sock_path) = stub_socket_path();
         let stub = StubDaemon::spawn_at(sock_path.clone(), |tx, stream| {
             let mut reader = BufReader::new(stream.try_clone().unwrap());
-            read_request(&mut reader, tx); // ListSessions
-            stream
-                .write_all(b"{\"ev\":\"sessions\",\"ids\":[\"alive\"]}\n")
-                .unwrap();
+            read_request(&mut reader, tx); // DaemonInfo
+            writeln!(
+                stream,
+                "{}",
+                serde_json::json!({
+                    "ev": "daemon_info",
+                    "protocol_version": maestro_protocol::DAEMON_PROTOCOL_VERSION,
+                    "build_version": "shell-runtime-test",
+                    "daemon_instance_id": STUB_DAEMON_INSTANCE,
+                    "output_generation_echo": true,
+                    "generation_conditional_mutations": true,
+                    "attachment_aware_conditional_kill": true,
+                    "generation_conditional_start": true,
+                    "start_operation_ledger": true,
+                    "generation_conditional_attach": true,
+                })
+            )
+            .unwrap();
+            read_request(&mut reader, tx); // strict ListSessions
+            writeln!(
+                stream,
+                "{}",
+                serde_json::json!({
+                    "ev": "sessions",
+                    "ids": ["alive"],
+                    "sessions": [{"id": "alive", "generation": "gen-alive"}],
+                })
+            )
+            .unwrap();
             stream.flush().unwrap();
+            let mut remainder = String::new();
+            reader.read_to_string(&mut remainder).unwrap();
+            assert!(remainder.is_empty());
         });
         let env = MapEnv::new(&[]);
 
@@ -1148,7 +2454,7 @@ mod tests {
             agent_task_id: None,
             created_at_ms: 1,
             last_attached_at_ms: 1,
-            last_known_generation: None,
+            last_known_generation: Some("gen-kept".into()),
             status: SessionStatus::Unknown,
         };
         store::write_record(&paths, RecordKind::Session, "kept", 1, &rec).unwrap();
@@ -1156,11 +2462,42 @@ mod tests {
         let (sock_dir, sock_path) = stub_socket_path();
         let stub = StubDaemon::spawn_at(sock_path.clone(), |tx, stream| {
             let mut reader = BufReader::new(stream.try_clone().unwrap());
-            read_request(&mut reader, tx); // ListSessions
-            stream
-                .write_all(b"{\"ev\":\"sessions\",\"ids\":[\"kept\",\"ghost\"]}\n")
-                .unwrap();
+            read_request(&mut reader, tx); // DaemonInfo
+            writeln!(
+                stream,
+                "{}",
+                serde_json::json!({
+                    "ev": "daemon_info",
+                    "protocol_version": maestro_protocol::DAEMON_PROTOCOL_VERSION,
+                    "build_version": "shell-runtime-test",
+                    "daemon_instance_id": STUB_DAEMON_INSTANCE,
+                    "output_generation_echo": true,
+                    "generation_conditional_mutations": true,
+                    "attachment_aware_conditional_kill": true,
+                    "generation_conditional_start": true,
+                    "start_operation_ledger": true,
+                    "generation_conditional_attach": true,
+                })
+            )
+            .unwrap();
+            read_request(&mut reader, tx); // strict ListSessions
+            writeln!(
+                stream,
+                "{}",
+                serde_json::json!({
+                    "ev": "sessions",
+                    "ids": ["kept", "ghost"],
+                    "sessions": [
+                        {"id": "kept", "generation": "gen-kept"},
+                        {"id": "ghost", "generation": "gen-ghost"},
+                    ],
+                })
+            )
+            .unwrap();
             stream.flush().unwrap();
+            let mut remainder = String::new();
+            reader.read_to_string(&mut remainder).unwrap();
+            assert!(remainder.is_empty());
         });
         let env = MapEnv::new(&[]);
 

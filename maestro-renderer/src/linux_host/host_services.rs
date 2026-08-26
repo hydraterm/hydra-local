@@ -140,6 +140,15 @@ impl HostServices for LinuxHostServices {
         }
     }
 
+    fn open_http_url(&self, url: &str) -> bool {
+        // Use GLib's desktop-native URI handler boundary. `xdg-open` is intentionally
+        // not spawned: it is a shell dispatcher and can resolve helpers through the
+        // ambient PATH, both forbidden for terminal-controlled output.
+        maestro_protocol::is_safe_terminal_http_url(url)
+            && gtk::gio::AppInfo::launch_default_for_uri(url, None::<&gtk::gio::AppLaunchContext>)
+                .is_ok()
+    }
+
     fn terminal_surface_scope(&self) -> crate::host_services::TerminalSurfaceScope {
         // The Linux GTK host's WGPU surface is the terminal SLOT's own GTK-owned child surface; the sidebar is
         // a separate GTK widget outside it. So the terminal must NOT reserve the sidebar width again — grid

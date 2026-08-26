@@ -56,6 +56,7 @@ export type Intent =
       cwd: string
     }
   | { type: 'reviveSession'; session_id: string; window_id: string; tab_id: string }
+  | { type: 'reviveWindow'; window_id: string }
   | { type: 'openWorkspace'; project_id: string; workspace_id?: string }
   | {
       type: 'focusSessionOrPane'
@@ -455,7 +456,7 @@ function folderSessionMutation(
 const MUTATION_INTENTS = new Set([
   'createProject', 'deleteProject', 'updateProject', 'updateProjectOrder',
   'createWindow', 'updateWindow', 'removeWindow', 'stashWindow', 'updateWindowOrder',
-  'splitPane', 'removePane', 'stashPane', 'updatePane', 'reviveSession',
+  'splitPane', 'removePane', 'stashPane', 'updatePane', 'reviveSession', 'reviveWindow',
   'completeStashedPaneDrop', 'openLayoutPreset', 'saveLayoutPreset',
 ])
 
@@ -615,6 +616,10 @@ export const bridge = {
 
   reviveSession(session_id: string, window_id: string, tab_id: string): void {
     postIntent({ type: 'reviveSession', session_id, window_id, tab_id })
+  },
+
+  reviveWindow(window_id: string): void {
+    postIntent({ type: 'reviveWindow', window_id })
   },
 
   openWorkspace(project_id: string, workspace_id?: string): void {

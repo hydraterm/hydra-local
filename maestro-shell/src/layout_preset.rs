@@ -219,11 +219,10 @@ impl<'a> LayoutPresetService<'a> {
     }
 }
 
-/// How one preset slot should be brought back to life at restore time. The PLANNER decides this
-/// purely from the slot's `session_id` hint vs. the set of currently-live sessions; the APP then
-/// executes it through the daemon/session model (reattach a survivor, or launch a fresh session in
-/// the same layout position). Keeping the two cases explicit enforces the invariant that
-/// restoring a layout never relabels or restarts the WRONG pane.
+/// Candidate action for one preset slot. The PLANNER derives this only from the best-effort
+/// `session_id` hint and the caller's live-id set; it is not execution authority. The App currently
+/// refuses every non-empty plan until an exact topology transaction and correlated renderer proof
+/// can safely implement either action.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PresetRestoreAction {
     /// The slot's hinted session is still live: reattach to it (no relaunch, identity preserved).
@@ -233,10 +232,9 @@ pub enum PresetRestoreAction {
     LaunchFresh,
 }
 
-/// One ordered step of a preset restore: which layout position (title/pin/split provenance, copied
-/// from the preset) and how to back it (reattach vs. launch fresh). Pure data — no ids minted, no
-/// IO. `split_from` references another slot by its preset-local `index`; the executor resolves that
-/// to a freshly-minted `tab_id` as it walks the slots in order.
+/// One ordered candidate step: copied layout position plus the proposed backing action. Pure data —
+/// no ids minted, no IO, and no daemon/topology authority. `split_from` references another slot by
+/// its preset-local `index` for a future exact executor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PresetRestoreSlot {
     /// Preset-local order/identity of this slot (matches [`LayoutPresetTab::index`]).
@@ -250,9 +248,9 @@ pub struct PresetRestoreSlot {
 /// Pure restore planner. Walks `preset.tabs` IN ORDER and, for each slot, decides
 /// [`PresetRestoreAction::Reattach`] when the slot's best-effort `session_id` hint names a session
 /// in `live_session_ids`, else [`PresetRestoreAction::LaunchFresh`]. NEVER mints ids, touches the
-/// store, talks to the daemon, or mutates anything — the caller turns the slots into a launch
-/// SEQUENCE. Layout position (title/pin/split provenance) is copied verbatim so the rebuilt
-/// arrangement matches the captured one regardless of which slots reattach vs. relaunch.
+/// store, talks to the daemon, or mutates anything. Layout position (title/pin/split provenance) is
+/// copied verbatim for a future exact coordinator. Current App execution treats every non-empty
+/// result as unavailable rather than using these hints as authority.
 pub fn plan_preset_restore(
     preset: &LayoutPreset,
     live_session_ids: &[String],

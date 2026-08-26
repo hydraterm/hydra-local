@@ -165,9 +165,20 @@ fn queue_saturation_triggers_atomic_resync_baseline() {
     // test of the post-attach saturation path rather than a scheduler-speed race.
     let initial_grid = read_until(&mut reader, "\"ev\":\"grid\"", WITHIN);
     assert!(initial_grid.contains(id));
+    let generation = serde_json::from_str::<Value>(initial_grid.trim()).expect("initial Grid JSON")
+        ["grid"]["generation"]
+        .as_str()
+        .expect("initial Grid generation")
+        .to_string();
     send(
         &mut s,
-        &serde_json::json!({"op": "write", "id": id, "data": "\n"}).to_string(),
+        &serde_json::json!({
+            "op": "write",
+            "id": id,
+            "data": "\n",
+            "expected_generation": generation
+        })
+        .to_string(),
     );
 
     // Stay deliberately unread until the child has completed the entire fixed flood. A fixed sleep
@@ -220,7 +231,13 @@ fn queue_saturation_triggers_atomic_resync_baseline() {
                     if !tail_released {
                         send(
                             &mut s,
-                            &serde_json::json!({"op": "write", "id": id, "data": "\n"}).to_string(),
+                            &serde_json::json!({
+                                "op": "write",
+                                "id": id,
+                                "data": "\n",
+                                "expected_generation": generation
+                            })
+                            .to_string(),
                         );
                         tail_released = true;
                     }

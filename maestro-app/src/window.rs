@@ -8,13 +8,14 @@
 //! their typed error ([`TabSwitchError`]); the pure tab activation / close / next-active / only-tab
 //! transition cores ([`apply_tab_activation`], [`apply_inactive_tab_close`], [`apply_active_tab_close`],
 //! [`apply_only_tab_close`], [`plan_next_active_tab`], [`is_active_tab_close`],
-//! [`selection_from_strip_tabs`]) and their outcomes; the closed-tab daemon-session lifecycle planner
-//! and executor ([`plan_closed_tab_session_lifecycle`], [`execute_closed_tab_session_lifecycle`]); the
+//! [`selection_from_strip_tabs`]) and their outcomes; the legacy projection-only closed-tab lifecycle
+//! classifier/executor ([`plan_closed_tab_session_lifecycle`],
+//! [`execute_closed_tab_session_lifecycle`]); the
 //! [`WindowRecordParams`] launch-record DTO; the tab-strip DTOs/projections ([`AttentionJson`],
 //! [`WindowTabJson`], [`WindowViewTabJson`], [`TabStripItem`], [`TabStripModel`], [`TabStripModelError`],
 //! [`build_tab_strip_model`], [`build_tab_strip_model_from_window_view`], [`tab_strip_model_changed`],
-//! [`renderer_tab_strip`], [`tab_record_json`]); and the strip-driven new-tab snapshot helper
-//! ([`new_tab_snapshot_from_strip_tabs`]).
+//! [`renderer_tab_strip`], [`tab_record_json`]); and the live-strip/durable-record new-tab snapshot
+//! helpers ([`new_tab_snapshot_from_strip_tabs`], [`new_tab_snapshot_from_tab_records`]).
 //!
 //! These items perform no process IO of their own. The argument PARSER (`window ...`), the window
 //! success/failure JSON envelopes (`WindowLayoutSuccess`/`WindowViewSuccess`/`WindowFailure`), the
@@ -22,6 +23,9 @@
 //! `lib.rs`; the crate root re-exports this module's public items for `maestro_app::<Item>` callers.
 //! This module REFERENCES the `NewTabSnapshot` type and the
 //! attention/indicator helpers via `use crate::{...}`; it does not own them.
+
+// Settlement variants retain the exact pending viewport authority required for retry/neutralize.
+#![allow(clippy::large_enum_variant)]
 
 use serde::Serialize;
 
@@ -189,6 +193,18 @@ pub enum TabSwitchError {
     /// The renderer command channel is closed (event loop gone); the switch was not
     /// delivered and the active tab is left unchanged.
     RendererControlClosed,
+    /// Ordinary exact viewport requests need the same renderer lifecycle sender that the owner
+    /// passed to `run_renderer_with_commands_and_events`. Without it the App could enqueue an
+    /// Attach whose terminal publication proof has no route back to the listener.
+    RendererEventChannelUnavailable,
+    /// One exact lifetime handoff is still awaiting a correlated renderer disposition. No later
+    /// switch may overtake it or replace its rollback coordinate.
+    HandoffPending,
+    /// A textual window/tab/session selection carries no PTY lifetime authority. The caller must
+    /// load one coherent Shell viewport snapshot and use the exact viewport request seam.
+    ViewportAuthorityRequired,
+    /// The one-snapshot viewport could not be projected into a coherent renderer cohort.
+    ViewportProjection(RendererViewportProjectionError),
 }
 
 impl std::fmt::Display for TabSwitchError {
@@ -205,6 +221,18 @@ impl std::fmt::Display for TabSwitchError {
             }
             TabSwitchError::RendererControlClosed => {
                 write!(f, "renderer control channel is closed")
+            }
+            TabSwitchError::RendererEventChannelUnavailable => {
+                write!(f, "renderer lifecycle event channel is unavailable")
+            }
+            TabSwitchError::HandoffPending => {
+                write!(f, "renderer exact viewport transition is still pending")
+            }
+            TabSwitchError::ViewportAuthorityRequired => {
+                write!(f, "renderer switch requires an exact viewport authority")
+            }
+            TabSwitchError::ViewportProjection(error) => {
+                write!(f, "renderer viewport projection failed: {error}")
             }
         }
     }
@@ -226,17 +254,214 @@ pub struct TabSwitchController<S> {
     // Crate-internal so the in-crate test module in `lib.rs` can inspect a recording sink after a
     // switch (it was module-private when the controller lived in `lib.rs`). NOT public API.
     pub(crate) sender: S,
-    active_tab: Option<ActiveTab>,
+    active_viewport: Option<ActiveRendererViewport>,
+    pending_viewport: Option<PendingRendererViewport>,
+    /// Clear keeps the correlated facts drainable but irrevocably closes their adoption path.
+    /// A queued Published/Claimed disposition after the Clear FIFO admission is therefore consumed
+    /// only as a neutral terminal observation.
+    pending_viewport_adoption_allowed: bool,
 }
 
-/// The full coordinate of the renderer's currently attached tab. Window-scoped because a
-/// bare `tab_id` is NOT unique across windows: the same persisted `tab_id` in two windows
-/// can point at different sessions, so the no-op check must compare the whole `(window_id,
-/// tab_id)` pair, not the tab id alone.
+/// The full binding of the renderer's currently attached tab. Window-scoped because a bare
+/// `tab_id` is NOT unique across windows, and session-scoped because a second local writer may
+/// retarget the same durable `(window_id, tab_id)` row to a replacement session. The no-op check
+/// must compare all three fields; otherwise an idle projection can paint the replacement row while
+/// the native viewport keeps consuming the old PTY.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActiveTab {
     pub window_id: String,
     pub tab_id: String,
+    pub session_id: String,
+}
+
+/// One coherent App projection derived exclusively from Shell's all-or-none viewport snapshot.
+/// Presentation remains generation-free; `exact_viewport` is the separate immutable Attach
+/// authority for exactly the same visible tab/session cohort and primary role.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RendererViewportProjection {
+    target: ActiveTab,
+    strip_tabs: Vec<WindowTabJson>,
+    selection: Vec<TabSelection>,
+    strip_model: TabStripModel,
+    tab_strip: maestro_renderer::RendererTabStrip,
+    exact_viewport: maestro_renderer::RendererExactViewport,
+}
+
+impl RendererViewportProjection {
+    pub fn target(&self) -> &ActiveTab {
+        &self.target
+    }
+
+    pub fn selection(&self) -> &[TabSelection] {
+        &self.selection
+    }
+
+    pub fn strip_tabs(&self) -> &[WindowTabJson] {
+        &self.strip_tabs
+    }
+
+    pub fn strip_model(&self) -> &TabStripModel {
+        &self.strip_model
+    }
+
+    pub fn tab_strip(&self) -> &maestro_renderer::RendererTabStrip {
+        &self.tab_strip
+    }
+
+    pub fn exact_viewport(&self) -> &maestro_renderer::RendererExactViewport {
+        &self.exact_viewport
+    }
+
+    pub fn generation(&self) -> &str {
+        self.exact_viewport.primary().generation()
+    }
+}
+
+/// Typed failure from the single Shell-snapshot → renderer cohort projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RendererViewportProjectionError {
+    Strip(TabStripModelError),
+    Exact(maestro_renderer::RendererExactViewportError),
+}
+
+impl std::fmt::Display for RendererViewportProjectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Strip(error) => error.fmt(formatter),
+            Self::Exact(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for RendererViewportProjectionError {}
+
+/// Build the sole production renderer projection from one coherent Shell snapshot. Stashed tabs
+/// stay durable but absent from the visible cohort; the same primary tab drives the selection,
+/// generation-free strip and immutable exact viewport.
+pub fn renderer_viewport_projection_from_snapshot(
+    snapshot: &maestro_shell::WindowViewportSnapshot,
+    primary_tab_id: &str,
+) -> Result<RendererViewportProjection, RendererViewportProjectionError> {
+    let layout = &snapshot.window().layout;
+    let visible_tabs = live_tab_records_json(&layout.tabs);
+    let selection = selection_from_strip_tabs(&visible_tabs);
+    let strip_model = build_tab_strip_model(&layout.window_id, &visible_tabs, Some(primary_tab_id))
+        .map_err(RendererViewportProjectionError::Strip)?;
+    let tab_strip = renderer_tab_strip(&strip_model);
+    let exact_viewport =
+        maestro_renderer::RendererExactViewport::from_window_snapshot(snapshot, primary_tab_id)
+            .map_err(RendererViewportProjectionError::Exact)?;
+    let session_id = select_window_tab_session(&selection, primary_tab_id).map_err(|_| {
+        RendererViewportProjectionError::Exact(
+            maestro_renderer::RendererExactViewportError::PrimaryMissing,
+        )
+    })?;
+    if exact_viewport.window_id() != layout.window_id
+        || exact_viewport.primary_tab_id() != primary_tab_id
+        || exact_viewport.primary().session_id() != session_id
+    {
+        return Err(RendererViewportProjectionError::Exact(
+            maestro_renderer::RendererExactViewportError::CohortMismatch,
+        ));
+    }
+    Ok(RendererViewportProjection {
+        target: ActiveTab {
+            window_id: layout.window_id.clone(),
+            tab_id: primary_tab_id.to_string(),
+            session_id,
+        },
+        strip_tabs: visible_tabs,
+        selection,
+        strip_model,
+        tab_strip,
+        exact_viewport,
+    })
+}
+
+/// The App's adopted renderer viewport. Textual coordinates are accompanied by the exact daemon
+/// instance, PTY generation and immutable all-pane cohort proven by the renderer disposition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveRendererViewport {
+    projection: RendererViewportProjection,
+    daemon_instance_id: maestro_shell::DaemonInstanceId,
+}
+
+impl ActiveRendererViewport {
+    pub fn target(&self) -> &ActiveTab {
+        self.projection.target()
+    }
+
+    pub fn projection(&self) -> &RendererViewportProjection {
+        &self.projection
+    }
+
+    pub fn daemon_instance_id(&self) -> &maestro_shell::DaemonInstanceId {
+        &self.daemon_instance_id
+    }
+
+    pub fn generation(&self) -> &str {
+        self.projection.generation()
+    }
+}
+
+/// App-side correlation for the sole renderer transition in flight. Neither variant advances the
+/// active viewport on command send; only its matching proof disposition can consume and adopt it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PendingRendererViewport {
+    Ordinary {
+        request_id: maestro_renderer::RendererExactViewportRequestId,
+        target: RendererViewportProjection,
+        previous_active: Option<ActiveRendererViewport>,
+    },
+    Handoff {
+        request_id: maestro_renderer::RendererAttachmentHandoffRequestId,
+        target: RendererViewportProjection,
+        previous_active: Option<ActiveRendererViewport>,
+        expected_daemon_instance: maestro_shell::DaemonInstanceId,
+        expected_generation: String,
+    },
+}
+
+impl PendingRendererViewport {
+    pub fn target(&self) -> &RendererViewportProjection {
+        match self {
+            Self::Ordinary { target, .. } | Self::Handoff { target, .. } => target,
+        }
+    }
+
+    pub fn previous_active(&self) -> Option<&ActiveRendererViewport> {
+        match self {
+            Self::Ordinary {
+                previous_active, ..
+            }
+            | Self::Handoff {
+                previous_active, ..
+            } => previous_active.as_ref(),
+        }
+    }
+
+    pub fn handoff_request_id(
+        &self,
+    ) -> Option<maestro_renderer::RendererAttachmentHandoffRequestId> {
+        match self {
+            Self::Handoff { request_id, .. } => Some(*request_id),
+            Self::Ordinary { .. } => None,
+        }
+    }
+
+    pub fn ordinary_request_id(&self) -> Option<maestro_renderer::RendererExactViewportRequestId> {
+        match self {
+            Self::Ordinary { request_id, .. } => Some(*request_id),
+            Self::Handoff { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RendererViewportSettlement {
+    Stale,
+    Adopted(ActiveRendererViewport),
+    Neutralized(PendingRendererViewport),
 }
 
 impl<S: RendererCommandSink> TabSwitchController<S> {
@@ -244,52 +469,128 @@ impl<S: RendererCommandSink> TabSwitchController<S> {
     pub fn new(sender: S) -> Self {
         Self {
             sender,
-            active_tab: None,
+            active_viewport: None,
+            pending_viewport: None,
+            pending_viewport_adoption_allowed: false,
         }
     }
 
-    /// Record `(window_id, tab_id)` as the active coordinate WITHOUT sending any
+    /// Record `(window_id, tab_id, session_id)` as the active binding WITHOUT sending any
     /// `RendererCommand`. This is for the known initial renderer launch, where the renderer is
     /// started already attached to the selected tab's session (so a `switch_to` would only
     /// enqueue a duplicate attach). It does not touch the sender, so the receiver need not be
-    /// alive. It does not weaken `switch_to`: a later switch to the SAME `(window_id, tab_id)`
-    /// is the usual no-op, and any OTHER tab sends normally.
-    pub fn seed_active_tab(&mut self, window_id: &str, tab_id: &str) {
-        self.active_tab = Some(ActiveTab {
-            window_id: window_id.to_string(),
-            tab_id: tab_id.to_string(),
-        });
+    /// alive. It does not weaken `switch_to`: a later switch to the SAME complete binding is the
+    /// usual no-op, while a replacement session for the same row sends normally.
+    pub fn seed_active_tab(&mut self, window_id: &str, tab_id: &str, session_id: &str) {
+        let _ = (window_id, tab_id, session_id);
+        // Textual startup facts cannot prove a PTY lifetime. Kept temporarily as a source-compatible
+        // fail-closed seam while production call sites migrate to `install_initial_handoff`.
+        self.active_viewport = None;
     }
 
     /// The full active coordinate (`window_id` + `tab_id`), if any tab has been switched to.
     pub fn active_tab_key(&self) -> Option<&ActiveTab> {
-        self.active_tab.as_ref()
+        self.active_viewport
+            .as_ref()
+            .map(ActiveRendererViewport::target)
+    }
+
+    pub fn active_viewport(&self) -> Option<&ActiveRendererViewport> {
+        self.active_viewport.as_ref()
+    }
+
+    /// Unit-test-only setup for display/chrome helpers that are unrelated to Attach admission.
+    /// Tests must supply a real coherent projection and a validated daemon instance; textual
+    /// coordinates alone never become active, even in this seam.
+    #[cfg(test)]
+    fn seed_exact_active_for_test(
+        &mut self,
+        projection: RendererViewportProjection,
+        daemon_instance_id: maestro_shell::DaemonInstanceId,
+    ) {
+        self.pending_viewport = None;
+        self.pending_viewport_adoption_allowed = false;
+        self.active_viewport = Some(ActiveRendererViewport {
+            projection,
+            daemon_instance_id,
+        });
     }
 
     /// The currently attached tab id, if any tab has been successfully switched to.
     pub fn active_tab_id(&self) -> Option<&str> {
-        self.active_tab.as_ref().map(|a| a.tab_id.as_str())
+        self.active_tab_key().map(|active| active.tab_id.as_str())
     }
 
     /// The currently attached window id, if any tab has been successfully switched to.
     pub fn active_window_id(&self) -> Option<&str> {
-        self.active_tab.as_ref().map(|a| a.window_id.as_str())
+        self.active_tab_key()
+            .map(|active| active.window_id.as_str())
+    }
+
+    /// The daemon session currently bound to the renderer viewport.
+    pub fn active_session_id(&self) -> Option<&str> {
+        self.active_tab_key()
+            .map(|active| active.session_id.as_str())
+    }
+
+    pub fn pending_viewport(&self) -> Option<&PendingRendererViewport> {
+        self.pending_viewport.as_ref()
+    }
+
+    pub fn pending_handoff(&self) -> Option<&PendingRendererViewport> {
+        self.pending_viewport
+            .as_ref()
+            .filter(|pending| matches!(pending, PendingRendererViewport::Handoff { .. }))
+    }
+
+    pub fn handoff_is_pending(&self) -> bool {
+        self.pending_viewport.is_some()
+    }
+
+    /// Install launch-time correlation before the renderer/event listener starts. This sends no
+    /// command and exposes no active projection; only a later exact Claimed disposition may adopt
+    /// the target.
+    pub fn install_initial_handoff(
+        &mut self,
+        projection: RendererViewportProjection,
+        handoff: &maestro_renderer::RendererAttachmentHandoff,
+    ) -> Result<(), TabSwitchError> {
+        if self.pending_viewport.is_some() {
+            return Err(TabSwitchError::HandoffPending);
+        }
+        if handoff.authority().session_id().0 != projection.target.session_id
+            || handoff.authority().expected_generation() != projection.generation()
+        {
+            return Err(TabSwitchError::ViewportAuthorityRequired);
+        }
+        self.pending_viewport = Some(PendingRendererViewport::Handoff {
+            request_id: handoff.request_id(),
+            target: projection,
+            previous_active: self.active_viewport.take(),
+            expected_daemon_instance: handoff.authority().expected_daemon_instance().clone(),
+            expected_generation: handoff.authority().expected_generation().to_string(),
+        });
+        self.pending_viewport_adoption_allowed = true;
+        Ok(())
     }
 
     /// Switch the renderer to `tab_id` within `window_id`, given that window's layout
     /// already projected into [`TabSelection`]s (the caller scopes the projection to the
     /// window, exactly as `attach-tab`/`main.rs` already do).
     ///
-    /// Returns `Ok(true)` if a command was sent, `Ok(false)` if the SAME `(window_id,
-    /// tab_id)` was already active (no-op, nothing sent). Selecting the same `tab_id` in a
-    /// different window is NOT a no-op — it points at that window's own session and is sent.
-    /// Errors are typed and never advance the active tab.
+    /// Returns `Ok(true)` if a command was sent, `Ok(false)` if the SAME complete
+    /// `(window_id, tab_id, session_id)` binding was already active (no-op, nothing sent). Selecting
+    /// the same `tab_id` in a different window or after a durable session retarget is NOT a no-op.
+    /// Errors are typed and never advance the active binding.
     pub fn switch_to(
         &mut self,
         window_id: &str,
         layout: &[TabSelection],
         tab_id: &str,
     ) -> Result<bool, TabSwitchError> {
+        if self.pending_viewport.is_some() {
+            return Err(TabSwitchError::HandoffPending);
+        }
         let session_id = select_window_tab_session(layout, tab_id).map_err(|e| match e {
             TabSelectionError::TabNotFound { tab_id } => TabSwitchError::TabNotFound {
                 window_id: window_id.to_string(),
@@ -301,23 +602,289 @@ impl<S: RendererCommandSink> TabSwitchController<S> {
             },
         })?;
 
-        let already_active = self
-            .active_tab
-            .as_ref()
-            .is_some_and(|a| a.window_id == window_id && a.tab_id == tab_id);
+        let already_active = self.active_tab_key().is_some_and(|a| {
+            a.window_id == window_id && a.tab_id == tab_id && a.session_id == session_id
+        });
         if already_active {
             return Ok(false);
         }
+        Err(TabSwitchError::ViewportAuthorityRequired)
+    }
 
+    /// Deliver the first renderer bind for a freshly started lifetime together with its opaque
+    /// daemon-side attachment handoff. Unlike an ordinary switch this is never collapsed as a
+    /// same-binding no-op: the Claim itself must reach the renderer connection so the starter's
+    /// pending ownership token is consumed atomically with the new active guard.
+    /// Begin an owned runtime handoff. This records only pending correlation facts; active state is
+    /// adopted exclusively through [`Self::adopt_claimed_handoff_disposition`].
+    pub fn switch_to_with_handoff(
+        &mut self,
+        projection: RendererViewportProjection,
+        handoff: maestro_renderer::RendererAttachmentHandoff,
+    ) -> Result<bool, TabSwitchError> {
+        if self.pending_viewport.is_some() {
+            return Err(TabSwitchError::HandoffPending);
+        }
+        let session_id = projection.target.session_id.clone();
+        if handoff.authority().session_id().0 != session_id
+            || handoff.authority().expected_generation() != projection.generation()
+        {
+            return Err(TabSwitchError::ViewportAuthorityRequired);
+        }
+
+        let request_id = handoff.request_id();
+        let expected_daemon_instance = handoff.authority().expected_daemon_instance().clone();
+        let expected_generation = handoff.authority().expected_generation().to_string();
         self.sender
-            .send(maestro_renderer::RendererCommand::AttachSession { session_id })
+            .send(
+                maestro_renderer::RendererCommand::AttachSessionWithHandoff {
+                    session_id: session_id.clone(),
+                    handoff,
+                    tab_strip: projection.tab_strip.clone(),
+                    exact_viewport: projection.exact_viewport.clone(),
+                },
+            )
             .map_err(|()| TabSwitchError::RendererControlClosed)?;
 
-        self.active_tab = Some(ActiveTab {
-            window_id: window_id.to_string(),
-            tab_id: tab_id.to_string(),
+        self.pending_viewport = Some(PendingRendererViewport::Handoff {
+            request_id,
+            target: projection,
+            previous_active: self.active_viewport.take(),
+            expected_daemon_instance,
+            expected_generation,
         });
+        self.pending_viewport_adoption_allowed = true;
         Ok(true)
+    }
+
+    /// Begin an ordinary exact rebind. Command delivery installs pending correlation only; active
+    /// state remains neutral until the renderer emits the matching all-baseline `Published` proof.
+    pub fn switch_to_exact(
+        &mut self,
+        projection: RendererViewportProjection,
+        events: std::sync::mpsc::Sender<maestro_renderer::RendererEvent>,
+    ) -> Result<Option<maestro_renderer::RendererExactViewportRequestId>, TabSwitchError> {
+        if self.pending_viewport.is_some() {
+            return Err(TabSwitchError::HandoffPending);
+        }
+        if self.active_viewport.as_ref().is_some_and(|active| {
+            active.projection.exact_viewport == projection.exact_viewport
+                && active.projection.target == projection.target
+        }) {
+            let strip_changed = self
+                .active_viewport
+                .as_ref()
+                .is_some_and(|active| active.projection.tab_strip != projection.tab_strip);
+            if strip_changed {
+                self.sender
+                    .send(maestro_renderer::RendererCommand::SetTabStrip {
+                        tab_strip: Some(projection.tab_strip.clone()),
+                    })
+                    .map_err(|()| TabSwitchError::RendererControlClosed)?;
+            }
+            // A coherent durable refresh can change App-only selection/row projections even when
+            // the renderer-facing strip bytes are identical. Once the exact lifetime/cohort and
+            // primary target match, retain the whole fresh projection rather than leaving those
+            // App caches pinned to pre-Claim bytes.
+            if let Some(active) = self.active_viewport.as_mut() {
+                active.projection = projection;
+            }
+            return Ok(None);
+        }
+        let request = maestro_renderer::RendererExactViewportRequest::new(
+            projection.target.session_id.clone(),
+            projection.exact_viewport.clone(),
+            projection.tab_strip.clone(),
+            events,
+        )
+        .map_err(|error| {
+            TabSwitchError::ViewportProjection(RendererViewportProjectionError::Exact(error))
+        })?;
+        let request_id = request.request_id();
+        self.sender
+            .send(maestro_renderer::RendererCommand::AttachExactViewport { request })
+            .map_err(|()| TabSwitchError::RendererControlClosed)?;
+        self.pending_viewport = Some(PendingRendererViewport::Ordinary {
+            request_id,
+            target: projection,
+            previous_active: self.active_viewport.take(),
+        });
+        self.pending_viewport_adoption_allowed = true;
+        Ok(Some(request_id))
+    }
+
+    /// Validate and adopt one exact renderer disposition. Request/session/instance/generation must
+    /// all match the installed pending facts; stale or contradictory events are inert.
+    pub fn adopt_claimed_handoff_disposition(
+        &mut self,
+        disposition: &maestro_renderer::RendererAttachmentHandoffDisposition,
+    ) -> bool {
+        matches!(
+            self.settle_handoff_disposition(disposition),
+            RendererViewportSettlement::Adopted(_)
+        )
+    }
+
+    pub fn settle_handoff_disposition(
+        &mut self,
+        disposition: &maestro_renderer::RendererAttachmentHandoffDisposition,
+    ) -> RendererViewportSettlement {
+        let Some(PendingRendererViewport::Handoff {
+            request_id,
+            target,
+            expected_daemon_instance,
+            expected_generation,
+            ..
+        }) = self.pending_viewport.as_ref()
+        else {
+            return RendererViewportSettlement::Stale;
+        };
+        if disposition.request_id() != *request_id
+            || disposition.session_id() != target.target.session_id
+        {
+            return RendererViewportSettlement::Stale;
+        }
+        let exact_proof = matches!(
+            disposition.outcome(),
+            maestro_renderer::RendererAttachmentHandoffOutcome::Claimed
+                | maestro_renderer::RendererAttachmentHandoffOutcome::ClaimedViewportUnavailable
+        );
+        if exact_proof
+            && (disposition.daemon_instance_id() != Some(expected_daemon_instance)
+                || disposition.generation() != Some(expected_generation.as_str()))
+        {
+            return RendererViewportSettlement::Stale;
+        }
+        if disposition
+            .daemon_instance_id()
+            .is_some_and(|instance| instance != expected_daemon_instance)
+            || disposition
+                .generation()
+                .is_some_and(|generation| generation != expected_generation)
+        {
+            return RendererViewportSettlement::Stale;
+        }
+        let expected_daemon_instance = expected_daemon_instance.clone();
+        let pending = self
+            .pending_viewport
+            .take()
+            .expect("matched pending handoff");
+        let adoption_allowed =
+            std::mem::replace(&mut self.pending_viewport_adoption_allowed, false);
+        if adoption_allowed
+            && disposition.outcome() == maestro_renderer::RendererAttachmentHandoffOutcome::Claimed
+        {
+            let active = ActiveRendererViewport {
+                projection: pending.target().clone(),
+                daemon_instance_id: expected_daemon_instance,
+            };
+            self.active_viewport = Some(active.clone());
+            RendererViewportSettlement::Adopted(active)
+        } else {
+            self.active_viewport = None;
+            RendererViewportSettlement::Neutralized(pending)
+        }
+    }
+
+    pub fn settle_exact_viewport_disposition(
+        &mut self,
+        disposition: &maestro_renderer::RendererExactViewportDisposition,
+    ) -> RendererViewportSettlement {
+        self.settle_exact_viewport_facts(
+            disposition.request_id(),
+            disposition.session_id(),
+            disposition.generation(),
+            disposition.daemon_instance_id(),
+            disposition.outcome(),
+        )
+    }
+
+    /// Keep disposition matching as one testable App-owned transition. The public seam above is
+    /// the only production caller; unit tests exercise these already-decoded facts without adding
+    /// a forgeable renderer-proof constructor to the cross-crate API.
+    fn settle_exact_viewport_facts(
+        &mut self,
+        disposition_request_id: maestro_renderer::RendererExactViewportRequestId,
+        disposition_session_id: &str,
+        disposition_generation: &str,
+        disposition_daemon_instance_id: Option<&maestro_shell::DaemonInstanceId>,
+        disposition_outcome: maestro_renderer::RendererExactViewportOutcome,
+    ) -> RendererViewportSettlement {
+        let Some(PendingRendererViewport::Ordinary {
+            request_id, target, ..
+        }) = self.pending_viewport.as_ref()
+        else {
+            return RendererViewportSettlement::Stale;
+        };
+        if disposition_request_id != *request_id
+            || disposition_session_id != target.target.session_id
+            || disposition_generation != target.generation()
+        {
+            return RendererViewportSettlement::Stale;
+        }
+        let pending = self
+            .pending_viewport
+            .take()
+            .expect("matched pending viewport");
+        let adoption_allowed =
+            std::mem::replace(&mut self.pending_viewport_adoption_allowed, false);
+        if adoption_allowed
+            && disposition_outcome == maestro_renderer::RendererExactViewportOutcome::Published
+        {
+            let Some(daemon_instance_id) = disposition_daemon_instance_id.cloned() else {
+                self.active_viewport = None;
+                return RendererViewportSettlement::Neutralized(pending);
+            };
+            let active = ActiveRendererViewport {
+                projection: pending.target().clone(),
+                daemon_instance_id,
+            };
+            self.active_viewport = Some(active.clone());
+            RendererViewportSettlement::Adopted(active)
+        } else {
+            self.active_viewport = None;
+            RendererViewportSettlement::Neutralized(pending)
+        }
+    }
+
+    /// Consume one exact non-Claimed pending coordinate after the renderer has already established
+    /// neutrality. The caller decides whether its durable operation is rollbackable.
+    pub fn take_nonclaimed_handoff(
+        &mut self,
+        request_id: maestro_renderer::RendererAttachmentHandoffRequestId,
+        session_id: &str,
+    ) -> Option<PendingRendererViewport> {
+        let matches = self.pending_viewport.as_ref().is_some_and(|pending| {
+            pending.handoff_request_id() == Some(request_id)
+                && pending.target().target.session_id == session_id
+        });
+        matches.then(|| {
+            self.active_viewport = None;
+            self.pending_viewport_adoption_allowed = false;
+            self.pending_viewport
+                .take()
+                .expect("matched pending handoff")
+        })
+    }
+
+    pub fn take_pending_viewport(&mut self) -> Option<PendingRendererViewport> {
+        self.active_viewport = None;
+        self.pending_viewport_adoption_allowed = false;
+        self.pending_viewport.take()
+    }
+
+    /// Restore the prior active renderer only by forcing an Attach followed by the complete strip
+    /// projection in FIFO order. Active state remains neutral unless both sends succeed.
+    pub fn restore_previous_active_after_handoff(
+        &mut self,
+        previous_active: Option<ActiveTab>,
+        tab_strip: Option<maestro_renderer::RendererTabStrip>,
+    ) -> Result<bool, TabSwitchError> {
+        let _ = (previous_active, tab_strip);
+        self.pending_viewport = None;
+        self.pending_viewport_adoption_allowed = false;
+        self.active_viewport = None;
+        Err(TabSwitchError::ViewportAuthorityRequired)
     }
 
     /// Replace (`Some`) or clear (`None`) the renderer's read-only tab-strip overlay by sending
@@ -330,10 +897,44 @@ impl<S: RendererCommandSink> TabSwitchController<S> {
     /// closed receiver maps to [`TabSwitchError::RendererControlClosed`], the same error
     /// `switch_to` surfaces, without altering the active tab.
     pub fn set_tab_strip(&mut self, model: Option<&TabStripModel>) -> Result<(), TabSwitchError> {
-        let tab_strip = model.map(renderer_tab_strip);
+        if self.pending_viewport.is_some() {
+            return Err(TabSwitchError::HandoffPending);
+        }
+        let Some(model) = model else {
+            return Err(TabSwitchError::ViewportAuthorityRequired);
+        };
+        let tab_strip = renderer_tab_strip(model);
+        let Some(active) = self.active_viewport.as_mut() else {
+            return Err(TabSwitchError::ViewportAuthorityRequired);
+        };
+        if !display_strip_matches_exact_cohort(&active.projection.tab_strip, &tab_strip) {
+            return Err(TabSwitchError::ViewportAuthorityRequired);
+        }
         self.sender
-            .send(maestro_renderer::RendererCommand::SetTabStrip { tab_strip })
-            .map_err(|()| TabSwitchError::RendererControlClosed)
+            .send(maestro_renderer::RendererCommand::SetTabStrip {
+                tab_strip: Some(tab_strip.clone()),
+            })
+            .map_err(|()| TabSwitchError::RendererControlClosed)?;
+        active.projection.strip_model = model.clone();
+        active.projection.tab_strip = tab_strip;
+        Ok(())
+    }
+
+    /// Neutralize the renderer viewport and, only after that single command is delivered, drop the
+    /// app's active window/tab/session binding. `ClearViewport` owns both terminal and strip
+    /// cleanup in the renderer, so callers must not pair this with `SetTabStrip(None)`: doing so
+    /// would introduce a partial-delivery state and could schedule strip-driven resize work after
+    /// the viewport became neutral.
+    pub fn clear_viewport(&mut self) -> Result<(), TabSwitchError> {
+        // Revoke adoption before the Clear can race a previously queued terminal disposition. Keep
+        // the pending record itself until that disposition (or shutdown drain) consumes it, so the
+        // listener retains its exact recovery correlation while active getters stay neutral.
+        self.pending_viewport_adoption_allowed = false;
+        self.active_viewport = None;
+        self.sender
+            .send(maestro_renderer::RendererCommand::ClearViewport)
+            .map_err(|()| TabSwitchError::RendererControlClosed)?;
+        Ok(())
     }
 
     /// Update the renderer's read-only picker overlay through the same command channel:
@@ -629,16 +1230,16 @@ impl<S: RendererCommandSink> TabSwitchController<S> {
             .map_err(|()| TabSwitchError::RendererControlClosed)
     }
 
-    /// Drop the app's active-tab ownership: after this there is no attached tab coordinate, so later
-    /// close/activation classification no longer treats the previously-active tab as active. This is
-    /// the empty-window terminal state after the ONLY tab is closed.
+    /// Drop the app's active window/tab/session binding: after this there is no controller-owned tab
+    /// coordinate, so later close/activation classification no longer treats the previously-active
+    /// tab as active. This does not detach or clear the renderer's prior viewport/session/grid/input.
     ///
     /// It sends NO `RendererCommand` — clearing the displayed strip (`set_tab_strip(None)`) and
     /// clearing app active-tab ownership are deliberately separate operations. The only-tab close path
     /// sends the strip clear first and only calls this after that command is delivered, so a closed
     /// receiver never leaves the controller with a cleared active tab but an un-cleared strip.
     pub fn clear_active_tab(&mut self) {
-        self.active_tab = None;
+        self.active_viewport = None;
     }
 }
 
@@ -655,6 +1256,7 @@ impl<S: RendererCommandSink> TabSwitchController<S> {
 /// already-reviewed [`TabSwitchController`].
 pub struct RendererTabRuntime {
     controller: TabSwitchController<std::sync::mpsc::Sender<maestro_renderer::RendererCommand>>,
+    renderer_events: Option<std::sync::mpsc::Sender<maestro_renderer::RendererEvent>>,
 }
 
 impl RendererTabRuntime {
@@ -668,23 +1270,49 @@ impl RendererTabRuntime {
         (
             Self {
                 controller: TabSwitchController::new(tx),
+                renderer_events: None,
             },
             rx,
         )
     }
 
-    /// Seed the initial active `(window_id, tab_id)` WITHOUT sending a command, delegated to
+    /// Bind the renderer's lifecycle event sender before handing this runtime to the listener.
+    /// Ordinary exact viewport requests clone this same route into their request-owned settlement
+    /// sink, so command delivery can never leave App pending without a terminal disposition.
+    pub fn bind_renderer_events(
+        &mut self,
+        events: std::sync::mpsc::Sender<maestro_renderer::RendererEvent>,
+    ) {
+        self.renderer_events = Some(events);
+    }
+
+    /// Seed the initial active `(window_id, tab_id, session_id)` WITHOUT sending a command, delegated to
     /// the controller. Use this once, right before passing the receiver to
     /// `run_renderer_with_commands`, when the renderer is launched already attached to that
     /// tab's session — so the active coordinate matches reality without enqueueing a duplicate
     /// attach. Needs no live receiver and does not weaken `switch_to`.
-    pub fn seed_active_tab(&mut self, window_id: &str, tab_id: &str) {
-        self.controller.seed_active_tab(window_id, tab_id);
+    pub fn seed_active_tab(&mut self, window_id: &str, tab_id: &str, session_id: &str) {
+        self.controller
+            .seed_active_tab(window_id, tab_id, session_id);
     }
 
     /// The full active coordinate (`window_id` + `tab_id`), delegated to the controller.
     pub fn active_tab_key(&self) -> Option<&ActiveTab> {
         self.controller.active_tab_key()
+    }
+
+    pub fn active_viewport(&self) -> Option<&ActiveRendererViewport> {
+        self.controller.active_viewport()
+    }
+
+    #[cfg(test)]
+    fn seed_exact_active_for_test(
+        &mut self,
+        projection: RendererViewportProjection,
+        daemon_instance_id: maestro_shell::DaemonInstanceId,
+    ) {
+        self.controller
+            .seed_exact_active_for_test(projection, daemon_instance_id);
     }
 
     /// The currently attached window id, delegated to the controller.
@@ -695,6 +1323,31 @@ impl RendererTabRuntime {
     /// The currently attached tab id, delegated to the controller.
     pub fn active_tab_id(&self) -> Option<&str> {
         self.controller.active_tab_id()
+    }
+
+    /// The daemon session currently bound to the renderer viewport, delegated to the controller.
+    pub fn active_session_id(&self) -> Option<&str> {
+        self.controller.active_session_id()
+    }
+
+    pub fn pending_viewport(&self) -> Option<&PendingRendererViewport> {
+        self.controller.pending_viewport()
+    }
+
+    pub fn pending_handoff(&self) -> Option<&PendingRendererViewport> {
+        self.controller.pending_handoff()
+    }
+
+    pub fn handoff_is_pending(&self) -> bool {
+        self.controller.handoff_is_pending()
+    }
+
+    pub fn install_initial_handoff(
+        &mut self,
+        projection: RendererViewportProjection,
+        handoff: &maestro_renderer::RendererAttachmentHandoff,
+    ) -> Result<(), TabSwitchError> {
+        self.controller.install_initial_handoff(projection, handoff)
     }
 
     /// Switch the renderer to `tab_id` within `window_id`, delegating to the controller. All
@@ -709,6 +1362,71 @@ impl RendererTabRuntime {
         self.controller.switch_to(window_id, layout, tab_id)
     }
 
+    pub fn switch_to_with_handoff(
+        &mut self,
+        projection: RendererViewportProjection,
+        handoff: maestro_renderer::RendererAttachmentHandoff,
+    ) -> Result<bool, TabSwitchError> {
+        self.controller.switch_to_with_handoff(projection, handoff)
+    }
+
+    pub fn switch_to_exact(
+        &mut self,
+        projection: RendererViewportProjection,
+    ) -> Result<Option<maestro_renderer::RendererExactViewportRequestId>, TabSwitchError> {
+        let events = self
+            .renderer_events
+            .as_ref()
+            .cloned()
+            .ok_or(TabSwitchError::RendererEventChannelUnavailable)?;
+        self.controller.switch_to_exact(projection, events)
+    }
+
+    pub fn adopt_claimed_handoff_disposition(
+        &mut self,
+        disposition: &maestro_renderer::RendererAttachmentHandoffDisposition,
+    ) -> bool {
+        self.controller
+            .adopt_claimed_handoff_disposition(disposition)
+    }
+
+    pub fn settle_handoff_disposition(
+        &mut self,
+        disposition: &maestro_renderer::RendererAttachmentHandoffDisposition,
+    ) -> RendererViewportSettlement {
+        self.controller.settle_handoff_disposition(disposition)
+    }
+
+    pub fn settle_exact_viewport_disposition(
+        &mut self,
+        disposition: &maestro_renderer::RendererExactViewportDisposition,
+    ) -> RendererViewportSettlement {
+        self.controller
+            .settle_exact_viewport_disposition(disposition)
+    }
+
+    pub fn take_nonclaimed_handoff(
+        &mut self,
+        request_id: maestro_renderer::RendererAttachmentHandoffRequestId,
+        session_id: &str,
+    ) -> Option<PendingRendererViewport> {
+        self.controller
+            .take_nonclaimed_handoff(request_id, session_id)
+    }
+
+    pub fn take_pending_viewport(&mut self) -> Option<PendingRendererViewport> {
+        self.controller.take_pending_viewport()
+    }
+
+    pub fn restore_previous_active_after_handoff(
+        &mut self,
+        previous_active: Option<ActiveTab>,
+        tab_strip: Option<maestro_renderer::RendererTabStrip>,
+    ) -> Result<bool, TabSwitchError> {
+        self.controller
+            .restore_previous_active_after_handoff(previous_active, tab_strip)
+    }
+
     /// Update the renderer's read-only tab-strip overlay through the same command channel,
     /// delegating to the controller. `Some(&model)` replaces the displayed strip (converted via
     /// [`renderer_tab_strip`]); `None` clears it. Does NOT alter active-tab state — updating the
@@ -716,6 +1434,12 @@ impl RendererTabRuntime {
     /// receiver surfaces [`TabSwitchError::RendererControlClosed`], exactly like `switch_to`.
     pub fn set_tab_strip(&mut self, model: Option<&TabStripModel>) -> Result<(), TabSwitchError> {
         self.controller.set_tab_strip(model)
+    }
+
+    /// Deliver one renderer-local viewport neutralization and adopt cleared controller ownership
+    /// only after delivery succeeds.
+    pub fn clear_viewport(&mut self) -> Result<(), TabSwitchError> {
+        self.controller.clear_viewport()
     }
 
     /// Update the renderer's read-only picker overlay through the same command channel, delegating
@@ -1023,13 +1747,13 @@ impl RendererTabRuntime {
         self.controller.clear_active_tab();
     }
 
-    /// Handle one renderer overlay close click on the ACTIVE tab when it is the ONLY tab: clear the
-    /// visible strip (`SetTabStrip(None)`) and, only after that command is delivered, drop the app's
-    /// active-tab ownership so the window reaches its empty terminal state. Sends no `AttachSession`.
-    /// Delegates to the pure [`apply_only_tab_close`] so the foreground listener and unit tests share
-    /// one code path. The caller computes the only-tab `plan` via [`plan_next_active_tab`] and performs
-    /// the `WindowLayoutService::close_tab` record mutation (the window record remains with zero tabs)
-    /// before calling this.
+    /// Handle one renderer overlay close click on the ACTIVE tab when it is the ONLY LIVE tab:
+    /// neutralize the complete viewport with one `ClearViewport` and, only after that command is
+    /// delivered, drop the app's active window/tab/session ownership. Sends no `AttachSession` or
+    /// `SetTabStrip`. Delegates to the pure [`apply_only_tab_close`] so the foreground listener
+    /// and unit tests share one code path. The caller computes the plan via [`plan_next_active_tab`]
+    /// and performs the `WindowLayoutService::close_tab` record mutation (zero LIVE tabs; durable
+    /// parked rows may remain) before calling this.
     pub fn on_only_tab_close(
         &mut self,
         plan: &NextActivePlan,
@@ -1262,7 +1986,7 @@ pub fn apply_inactive_tab_close<S: RendererCommandSink>(
 pub enum NextActivePlan {
     /// Another tab remains: switch the renderer to this `tab_id` after the close.
     SelectNext { tab_id: String },
-    /// The closed tab was the ONLY tab in the window: this plan defers only-tab close —
+    /// The closed tab was the ONLY tab in the supplied LIVE projection: this plan defers only-tab close —
     /// the caller must not mutate records, clear the strip, or send any command.
     OnlyTabDeferred,
 }
@@ -1275,7 +1999,7 @@ pub enum NextActivePlan {
 /// 1. prefer the right neighbor — the tab that occupies the closed tab's old index after compaction,
 ///    i.e. the tab immediately AFTER the closed one in index order;
 /// 2. if the closed tab was last, choose the new last tab (the left neighbor);
-/// 3. if the closed tab was the only tab, return [`NextActivePlan::OnlyTabDeferred`].
+/// 3. if the closed tab was the only LIVE projected tab, return [`NextActivePlan::OnlyTabDeferred`].
 ///
 /// A `closed_tab_id` absent from `pre_close_tabs` is a typed, non-destructive
 /// [`TabSwitchError::TabNotFound`] — the caller must not mutate anything. PURE: no record, daemon, or
@@ -1315,8 +2039,8 @@ pub enum ActiveTabCloseOutcome {
     /// Another tab remained: the renderer was switched to `next_tab_id` (one `AttachSession`) and the
     /// strip was refreshed with it active. The record was already mutated by the caller.
     SwitchedTo { next_tab_id: String },
-    /// The closed tab was the ONLY tab: only-tab close is deferred. NOTHING was sent and the caller
-    /// must NOT have mutated the record.
+    /// The closed tab was the ONLY LIVE projected tab: only-tab close is deferred. NOTHING was sent
+    /// and the caller must NOT have mutated the record.
     OnlyTabDeferred,
 }
 
@@ -1371,25 +2095,26 @@ pub fn apply_active_tab_close<S: RendererCommandSink>(
 /// ONLY tab in the window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OnlyTabCloseOutcome {
-    /// The only tab was closed: the visible strip was cleared (`SetTabStrip(None)`) and the app's
-    /// active-tab ownership was dropped — the window reached its empty terminal state. No
-    /// `AttachSession` was sent. The record was already mutated by the caller to zero tabs.
+    /// The only tab was closed: the renderer accepted one `ClearViewport` and the app's active
+    /// window/tab/session ownership was dropped. No `AttachSession` or `SetTabStrip` was sent. The
+    /// record was already mutated by the caller to zero LIVE tabs; durable parked rows may remain.
     ClearedEmptyWindow,
 }
 
-/// Pure core of the foreground listener's ONLY-tab close (closing the last remaining active tab). The
-/// caller computes the plan via [`plan_next_active_tab`] (which returns [`NextActivePlan::OnlyTabDeferred`]
-/// for a one-tab window), performs the `WindowLayoutService::close_tab` record mutation (the window
-/// record remains with ZERO tabs), then calls this to clear the renderer UI and the app active state.
+/// Pure core of the foreground listener's ONLY-LIVE-tab close. The caller computes the plan via
+/// [`plan_next_active_tab`] (which returns [`NextActivePlan::OnlyTabDeferred`] for a one-live-tab
+/// projection), performs the `WindowLayoutService::close_tab` record mutation (zero LIVE tabs;
+/// durable parked rows may remain), then calls this to atomically deliver renderer neutralization
+/// before clearing controller ownership. `ClearViewport` is renderer-local and never performs a
+/// synchronous daemon detach.
 ///
 /// Behavior:
-/// - only-tab plan ([`NextActivePlan::OnlyTabDeferred`]): clear the visible strip via
-///   `set_tab_strip(None)`, then — ONLY after that command is delivered — drop the active-tab
-///   ownership via `clear_active_tab` and return [`OnlyTabCloseOutcome::ClearedEmptyWindow`]. Exactly
-///   one `SetTabStrip { tab_strip: None }` is sent and NO `AttachSession`;
-/// - closed renderer command channel: the `set_tab_strip(None)` send surfaces
+/// - only-tab plan ([`NextActivePlan::OnlyTabDeferred`]): send exactly one `ClearViewport`, then —
+///   ONLY after that command is delivered — drop active-tab ownership and return
+///   [`OnlyTabCloseOutcome::ClearedEmptyWindow`]. No `SetTabStrip` or `AttachSession` is sent;
+/// - closed renderer command channel: the `ClearViewport` send surfaces
 ///   [`TabSwitchError::RendererControlClosed`] and active-tab state is left UNCHANGED (not cleared),
-///   so the caller does not falsely adopt the empty terminal state for an undelivered clear;
+///   so the caller does not falsely drop strip/controller ownership for an undelivered clear;
 /// - a non-only-tab plan ([`NextActivePlan::SelectNext`]) is a caller bug — this path is only for the
 ///   only-tab case — and is rejected as a typed [`TabSwitchError::TabNotFound`] without sending
 ///   anything, so a misrouted remaining-tabs close can never silently clear the window.
@@ -1413,11 +2138,9 @@ pub fn apply_only_tab_close<S: RendererCommandSink>(
             });
         }
     }
-    // Clear the visible strip FIRST. Only if that command is delivered do we drop the active-tab
-    // ownership, so a closed receiver never leaves a cleared active tab with an un-cleared strip and
-    // the caller never adopts the empty terminal state for an undelivered clear.
-    controller.set_tab_strip(None)?;
-    controller.clear_active_tab();
+    // One local renderer transition owns both terminal and strip neutralization. Only if it is
+    // delivered do we drop controller ownership, so there is no two-command partial-send matrix.
+    controller.clear_viewport()?;
     Ok(OnlyTabCloseOutcome::ClearedEmptyWindow)
 }
 
@@ -1461,10 +2184,11 @@ pub fn surviving_active_tab_id(
         .or_else(|| surviving_tab_ids.first().cloned())
 }
 
-/// Project a no-I/O [`NewTabSnapshot`] from the listener's current app-owned strip tabs (the
-/// renderer's `RendererEvent::NewTabRequested` carries no payload, so uniqueness must be enforced
-/// against the app's own view). PURE: reads only the supplied `tabs` + `active_tab_id`, reads no
-/// records, and mutates nothing. The resulting snapshot feeds [`plan_new_tab`].
+/// Project a no-I/O [`NewTabSnapshot`] from the listener's current LIVE strip tabs. PURE: reads only
+/// the supplied `tabs` + `active_tab_id`, reads no records, and mutates nothing. Because parked rows
+/// are deliberately absent from the renderer projection, production new-tab planning must use
+/// [`new_tab_snapshot_from_tab_records`] after loading the full durable target layout so parked
+/// identities remain reserved.
 pub fn new_tab_snapshot_from_strip_tabs(
     tabs: &[WindowTabJson],
     active_tab_id: Option<&str>,
@@ -1476,13 +2200,27 @@ pub fn new_tab_snapshot_from_strip_tabs(
     }
 }
 
-/// What to do about the closed tab's daemon session after a SUCCESSFUL app-owned close transition.
+/// Project a no-I/O [`NewTabSnapshot`] from ALL durable rows in the target window, including parked
+/// (`stashed`) rows. Renderer/listener projections stay live-only, but a parked row still owns its
+/// `tab_id` and `session_id`; new-tab planning must not mint either identity again. PURE: reads only
+/// the supplied records and active id.
+pub fn new_tab_snapshot_from_tab_records(
+    tabs: &[maestro_shell::TabRecord],
+    active_tab_id: Option<&str>,
+) -> NewTabSnapshot {
+    NewTabSnapshot {
+        existing_tab_ids: tabs.iter().map(|tab| tab.tab_id.clone()).collect(),
+        existing_session_ids: tabs.iter().map(|tab| tab.session_id.clone()).collect(),
+        active_tab_id: active_tab_id.map(str::to_owned),
+    }
+}
+
+/// Legacy projection-only classification of a closed tab's daemon session.
 ///
-/// Produced by [`plan_closed_tab_session_lifecycle`] from the PRE-close projection (so the closed
-/// tab's `session_id` is resolved before any record mutation) and the POST-close tabs (so a still
-/// shared session is detected). The foreground listener executes the variant ONLY after the close
-/// branch reaches its existing success/adoption point — never before — keeping record/UI close the
-/// user-visible action and the daemon kill a best-effort cleanup step.
+/// This public shape remains for app/test compatibility, but it is not durable release authority:
+/// another process can retarget the tab after the PRE-close projection. Production close paths use
+/// maestro-shell's transaction-returned opaque release receipt, committed with the tab mutation,
+/// then pass it through the central full-ownership fence and generation-conditional daemon adapter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClosedTabSessionLifecycle {
     /// The closed tab's session is no longer referenced by any remaining tab: kill it.
@@ -1576,12 +2314,13 @@ pub fn split_subtree_close_order(strip: &[WindowTabJson], tab_id: &str) -> Vec<S
     out
 }
 
-/// Decide the closed tab's daemon-session lifecycle after a close, WITHOUT killing anything.
+/// Classify a legacy projection-only closed-tab lifecycle, WITHOUT killing anything.
 ///
 /// PURE: it reads the PRE-close `tab_id -> session_id` projection (`pre_close_selection`) to resolve
 /// the closed tab's session, and the POST-close tabs (`post_close_tabs`) to detect a session still
-/// shared by a remaining tab. It performs no daemon, record, or renderer work — the caller executes
-/// the returned plan after a successful close transition.
+/// shared by a remaining tab. It performs no daemon, record, or renderer work. Because either
+/// projection can be stale, production code must never treat the returned plan as destructive
+/// Session authority; see [`ClosedTabSessionLifecycle`] for the transaction-fenced replacement.
 ///
 /// Behavior:
 /// - closed tab found and NO remaining post-close tab references its `session_id` ->
@@ -1591,8 +2330,9 @@ pub fn split_subtree_close_order(strip: &[WindowTabJson], tab_id: &str) -> Vec<S
 /// - closed tab id absent from `pre_close_selection` ->
 ///   [`ClosedTabSessionLifecycle::MissingClosedTab`].
 ///
-/// The only-tab close produces an EMPTY `post_close_tabs`, so a found closed tab with no remaining
-/// references maps to `Kill` — exactly the desired empty-window cleanup.
+/// The listener passes ALL remaining durable rows as `post_close_tabs`, not its live-only renderer
+/// strip. Therefore an only-live-tab close maps to `Kill` only when no durable row references the
+/// session; a parked row sharing that session maps to `KeepShared`.
 pub fn plan_closed_tab_session_lifecycle(
     pre_close_selection: &[TabSelection],
     post_close_tabs: &[WindowTabJson],
@@ -1637,11 +2377,12 @@ pub enum ClosedTabKillOutcome {
     SkippedMissingTab { tab_id: String },
 }
 
-/// Execute a [`ClosedTabSessionLifecycle`] plan using an injected `kill` function, applying the
-/// best-effort failure policy. PURE w.r.t. the daemon: the ONLY side effect is invoking `kill`, and
-/// only for the `Kill` variant. `kill` is `FnOnce(&str) -> Result<(), String>` (session id -> ok or
-/// a typed-error string), so production passes a closure that connects a short-lived `DaemonClient`
-/// and calls `kill_session`, while tests pass a recording fake.
+/// Execute a legacy [`ClosedTabSessionLifecycle`] plan using an injected function, applying the
+/// best-effort failure policy. The ONLY side effect is invoking `kill`, and only for `Kill`.
+/// Production must not connect this compatibility helper to a destructive daemon request: the plan
+/// carries no transaction-local tab proof or global current-reference fence. Tests may pass a
+/// recording fake; current production close paths use the maestro-shell service seam documented on
+/// [`ClosedTabSessionLifecycle`].
 ///
 /// A `Kill` whose `kill` errors yields [`ClosedTabKillOutcome::KillFailed`] (logged by the caller,
 /// never fatal). `KeepShared` and `MissingClosedTab` never call `kill`.
@@ -1946,6 +2687,46 @@ pub fn renderer_tab_strip(model: &TabStripModel) -> maestro_renderer::RendererTa
     }
 }
 
+/// A display-only strip refresh may change labels, attention and geometry, but never its exact
+/// membership or primary role. Duplicate aliases of one session must keep one coherent geometry;
+/// otherwise a single PTY could be painted/resized through contradictory pane coordinates.
+fn display_strip_matches_exact_cohort(
+    current: &maestro_renderer::RendererTabStrip,
+    next: &maestro_renderer::RendererTabStrip,
+) -> bool {
+    if current.window_id != next.window_id || current.tabs.len() != next.tabs.len() {
+        return false;
+    }
+    let cohort = |strip: &maestro_renderer::RendererTabStrip| {
+        let mut tabs = std::collections::BTreeMap::new();
+        let mut primary = None;
+        let mut geometry_by_session = std::collections::BTreeMap::new();
+        for tab in &strip.tabs {
+            if tabs
+                .insert(tab.tab_id.clone(), tab.session_id.clone())
+                .is_some()
+            {
+                return None;
+            }
+            let geometry = tab.pane_rect.map(|rect| (rect.x, rect.y, rect.w, rect.h));
+            if geometry_by_session
+                .insert(tab.session_id.clone(), geometry)
+                .is_some_and(|existing| existing != geometry)
+            {
+                return None;
+            }
+            if tab.active && primary.replace(tab.tab_id.clone()).is_some() {
+                return None;
+            }
+        }
+        Some((tabs, primary))
+    };
+    match (cohort(current), cohort(next)) {
+        (Some(current), Some(next)) => current == next && current.1.is_some(),
+        _ => false,
+    }
+}
+
 /// Map a persisted [`PaneRectJson`] into the renderer's own [`maestro_renderer::RendererPaneRect`]
 /// for the rect-driven paint path. A trivial field copy — the renderer owns its rect type so it
 /// carries no app dependency, mirroring [`renderer_split_axis`].
@@ -2025,6 +2806,17 @@ pub fn tab_record_json(tab: &maestro_shell::TabRecord) -> WindowTabJson {
         split_from: split_from_json(tab.split_from.as_ref()),
         pane_rect: pane_rect_json(tab.pane_rect.as_ref()),
     }
+}
+
+/// Central live renderer/listener projection for persisted tab rows. Durable/CLI/dashboard callers
+/// continue to inspect every row; only a native viewport projection uses this helper, which excludes
+/// `stashed` panes before their identity can enter [`RendererTabRuntime`], activation, close, split,
+/// rename, reseed, or recovery state.
+pub fn live_tab_records_json(tabs: &[maestro_shell::TabRecord]) -> Vec<WindowTabJson> {
+    tabs.iter()
+        .filter(|tab| !tab.stashed)
+        .map(tab_record_json)
+        .collect()
 }
 
 /// Shape an optional persisted shell [`maestro_shell::PaneRect`] into the wire DTO [`PaneRectJson`] by
@@ -2143,6 +2935,485 @@ mod tests {
         v.to_string()
     }
 
+    // The store intentionally caches SQLite connections. A fresh database path per test therefore
+    // exhausts file descriptors late in the full App suite. Use one process-local database behind
+    // a lease held for every fixture that keeps reading it. The lease serializes default-parallel
+    // test workers, while unique durable ids (or explicit fixed-window retirement) prevent residue
+    // from becoming authority for the next fixture.
+    static EXACT_FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static EXACT_FIXTURE_BASE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+
+    struct ExactFixtureLease {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        cwd: tempfile::TempDir,
+    }
+
+    fn exact_fixture_lease() -> (ExactFixtureLease, maestro_shell::AppPaths) {
+        let guard = EXACT_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = EXACT_FIXTURE_BASE.get_or_init(|| {
+            tempfile::Builder::new()
+                .prefix("maestro-app-window-exact-")
+                .tempdir()
+                .expect("create process-local exact fixture base")
+        });
+        let cwd = tempfile::tempdir().expect("exact fixture cwd");
+        let paths = maestro_shell::AppPaths::with_base(base.path());
+        (ExactFixtureLease { _guard: guard, cwd }, paths)
+    }
+
+    fn next_exact_fixture_id(prefix: &str) -> String {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        format!(
+            "{prefix}-{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    }
+
+    /// Build two primary-role projections from one real Shell viewport snapshot. The fixture goes
+    /// through SQLite and `WindowLayoutService::load_viewport_snapshot`, so App tests cannot forge
+    /// a display strip independently from the exact generation cohort they exercise.
+    fn exact_viewport_fixture() -> (
+        ExactFixtureLease,
+        maestro_shell::AppPaths,
+        RendererViewportProjection,
+        RendererViewportProjection,
+    ) {
+        let (lease, paths) = exact_fixture_lease();
+        let suffix = next_exact_fixture_id("viewport");
+        let project_id = format!("viewport-project-{suffix}");
+        let workspace_id = format!("viewport-workspace-{suffix}");
+        let window_id = format!("viewport-window-{suffix}");
+        let session_a = format!("viewport-session-a-{suffix}");
+        let session_b = format!("viewport-session-b-{suffix}");
+        let tab_a = format!("viewport-tab-a-{suffix}");
+        let tab_b = format!("viewport-tab-b-{suffix}");
+        maestro_shell::ProjectService::new(&paths)
+            .create(
+                &project_id,
+                "Viewport",
+                lease.cwd.path().to_string_lossy(),
+                maestro_shell::NewProject::default(),
+                1,
+            )
+            .expect("create viewport project");
+        maestro_shell::store::write_record(
+            &paths,
+            maestro_shell::RecordKind::Workspace,
+            &workspace_id,
+            1,
+            &maestro_shell::Workspace {
+                workspace_id: workspace_id.clone(),
+                project_id: project_id.clone(),
+                root: lease.cwd.path().to_string_lossy().into_owned(),
+                policy: maestro_shell::WorkspacePolicy::ScratchCwd,
+                consent: maestro_shell::WorkspaceConsent::default(),
+            },
+        )
+        .expect("write viewport workspace");
+        for (session_id, generation) in [(&session_a, "generation-a"), (&session_b, "generation-b")]
+        {
+            maestro_shell::store::write_record(
+                &paths,
+                maestro_shell::RecordKind::Session,
+                session_id,
+                1,
+                &maestro_shell::SessionRecord {
+                    session_id: session_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    kind: maestro_shell::SessionKind::Shell,
+                    launch: maestro_shell::LaunchSpec::OptOut,
+                    cwd_resolved: lease.cwd.path().to_string_lossy().into_owned(),
+                    agent_task_id: None,
+                    created_at_ms: 1,
+                    last_attached_at_ms: 1,
+                    last_known_generation: Some(generation.into()),
+                    status: maestro_shell::SessionStatus::Live,
+                },
+            )
+            .expect("write exact viewport Session");
+        }
+        let service = maestro_shell::WindowLayoutService::new(&paths);
+        service
+            .create_empty(&window_id, 1)
+            .expect("create viewport window");
+        service
+            .open_tab(
+                &window_id,
+                &tab_a,
+                &session_a,
+                "A",
+                false,
+                maestro_shell::AttentionState::default(),
+                2,
+            )
+            .expect("open viewport primary");
+        service
+            .split_tab(
+                &window_id,
+                &tab_a,
+                &tab_b,
+                &session_b,
+                "B",
+                maestro_shell::SplitAxis::Right,
+                3,
+            )
+            .expect("split viewport sibling");
+        let snapshot = service
+            .load_viewport_snapshot(&window_id)
+            .expect("load coherent viewport snapshot");
+        let primary_a = renderer_viewport_projection_from_snapshot(&snapshot, &tab_a)
+            .expect("project primary A");
+        let primary_b = renderer_viewport_projection_from_snapshot(&snapshot, &tab_b)
+            .expect("project primary B");
+        (lease, paths, primary_a, primary_b)
+    }
+
+    fn test_daemon_instance() -> maestro_shell::DaemonInstanceId {
+        "00000000000040008000000000000001"
+            .parse()
+            .expect("valid test daemon instance")
+    }
+
+    /// Give an otherwise display-only unit test a proven one-pane lifetime using the same
+    /// SQLite→Shell snapshot→App projection path as production. This replaces the retired textual
+    /// `seed_active_tab` fixture without reopening any raw Attach behavior.
+    fn seed_exact_active_tab(
+        runtime: &mut RendererTabRuntime,
+        window_id: &str,
+        tab_id: &str,
+        session_id: &str,
+    ) {
+        let (lease, paths) = exact_fixture_lease();
+        let suffix = next_exact_fixture_id("exact-active");
+        let project_id = format!("exact-active-project-{suffix}");
+        let workspace_id = format!("exact-active-workspace-{suffix}");
+        maestro_shell::ProjectService::new(&paths)
+            .create(
+                &project_id,
+                "Exact Active",
+                lease.cwd.path().to_string_lossy(),
+                maestro_shell::NewProject::default(),
+                1,
+            )
+            .expect("create exact active project");
+        maestro_shell::store::write_record(
+            &paths,
+            maestro_shell::RecordKind::Workspace,
+            &workspace_id,
+            1,
+            &maestro_shell::Workspace {
+                workspace_id: workspace_id.clone(),
+                project_id: project_id.clone(),
+                root: lease.cwd.path().to_string_lossy().into_owned(),
+                policy: maestro_shell::WorkspacePolicy::ScratchCwd,
+                consent: maestro_shell::WorkspaceConsent::default(),
+            },
+        )
+        .expect("write exact active workspace");
+        maestro_shell::store::write_record(
+            &paths,
+            maestro_shell::RecordKind::Session,
+            session_id,
+            1,
+            &maestro_shell::SessionRecord {
+                session_id: session_id.into(),
+                workspace_id,
+                kind: maestro_shell::SessionKind::Shell,
+                launch: maestro_shell::LaunchSpec::OptOut,
+                cwd_resolved: lease.cwd.path().to_string_lossy().into_owned(),
+                agent_task_id: None,
+                created_at_ms: 1,
+                last_attached_at_ms: 1,
+                last_known_generation: Some("exact-active-generation".into()),
+                status: maestro_shell::SessionStatus::Live,
+            },
+        )
+        .expect("write exact active Session");
+        let service = maestro_shell::WindowLayoutService::new(&paths);
+        let _ = service.delete(window_id);
+        service
+            .create_empty(window_id, 1)
+            .expect("create exact active window");
+        service
+            .open_tab(
+                window_id,
+                tab_id,
+                session_id,
+                tab_id,
+                false,
+                maestro_shell::AttentionState::default(),
+                2,
+            )
+            .expect("open exact active tab");
+        let snapshot = service
+            .load_viewport_snapshot(window_id)
+            .expect("load exact active snapshot");
+        let projection = renderer_viewport_projection_from_snapshot(&snapshot, tab_id)
+            .expect("project exact active viewport");
+        runtime.seed_exact_active_for_test(projection, test_daemon_instance());
+    }
+
+    #[test]
+    fn exact_viewport_send_is_neutral_until_matching_published_and_stale_terminal_is_inert() {
+        let (_tmp, _paths, projection, _) = exact_viewport_fixture();
+        let (mut runtime, commands) = RendererTabRuntime::new();
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        runtime.bind_renderer_events(events_tx);
+
+        let request_id = runtime
+            .switch_to_exact(projection.clone())
+            .expect("queue exact viewport")
+            .expect("a new exact request is pending");
+        assert!(runtime.active_viewport().is_none(), "send is not adoption");
+        assert_eq!(
+            runtime
+                .pending_viewport()
+                .and_then(PendingRendererViewport::ordinary_request_id),
+            Some(request_id)
+        );
+        let request = match commands.recv().expect("one exact command") {
+            maestro_renderer::RendererCommand::AttachExactViewport { request } => request,
+            other => panic!("expected AttachExactViewport, got {other:?}"),
+        };
+        assert_eq!(request.request_id(), request_id);
+        assert!(commands.try_recv().is_err());
+
+        let instance = test_daemon_instance();
+        let settlement = runtime.controller.settle_exact_viewport_facts(
+            request_id,
+            projection.target().session_id.as_str(),
+            projection.generation(),
+            Some(&instance),
+            maestro_renderer::RendererExactViewportOutcome::Published,
+        );
+        assert!(matches!(
+            settlement,
+            RendererViewportSettlement::Adopted(ref active)
+                if active.projection() == &projection
+                    && active.daemon_instance_id() == &instance
+        ));
+        assert_eq!(
+            runtime.active_viewport().map(|active| active.projection()),
+            Some(&projection)
+        );
+        assert!(runtime.pending_viewport().is_none());
+
+        // The unit test cannot mint a renderer proof, so dropping its request-owned sink emits the
+        // conservative terminal. Once the matching Published facts were consumed, that later event
+        // is stale and must not revoke the adopted viewport.
+        drop(request);
+        let stale = match events_rx.recv().expect("request drop terminal") {
+            maestro_renderer::RendererEvent::ExactViewportDisposition(disposition) => disposition,
+            other => panic!("expected exact viewport terminal, got {other:?}"),
+        };
+        assert_eq!(
+            runtime.settle_exact_viewport_disposition(&stale),
+            RendererViewportSettlement::Stale
+        );
+        assert_eq!(
+            runtime.active_viewport().map(|active| active.projection()),
+            Some(&projection)
+        );
+    }
+
+    #[test]
+    fn exact_viewport_unavailable_and_clear_after_send_both_remain_neutral() {
+        let (_tmp, _paths, projection_a, projection_b) = exact_viewport_fixture();
+        let (mut runtime, commands) = RendererTabRuntime::new();
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        runtime.bind_renderer_events(events_tx);
+
+        let request_a = runtime
+            .switch_to_exact(projection_a.clone())
+            .expect("queue A")
+            .expect("A request");
+        let request = match commands.recv().expect("A command") {
+            maestro_renderer::RendererCommand::AttachExactViewport { request } => request,
+            other => panic!("expected exact A, got {other:?}"),
+        };
+        drop(request);
+        let unavailable = match events_rx.recv().expect("A unavailable") {
+            maestro_renderer::RendererEvent::ExactViewportDisposition(disposition) => disposition,
+            other => panic!("expected exact terminal, got {other:?}"),
+        };
+        assert_eq!(unavailable.request_id(), request_a);
+        assert!(matches!(
+            runtime.settle_exact_viewport_disposition(&unavailable),
+            RendererViewportSettlement::Neutralized(_)
+        ));
+        assert!(runtime.active_viewport().is_none());
+        assert!(runtime.pending_viewport().is_none());
+
+        let request_b = runtime
+            .switch_to_exact(projection_b.clone())
+            .expect("queue B")
+            .expect("B request");
+        let request = match commands.recv().expect("B command") {
+            maestro_renderer::RendererCommand::AttachExactViewport { request } => request,
+            other => panic!("expected exact B, got {other:?}"),
+        };
+        runtime.clear_viewport().expect("queue neutralizing Clear");
+        assert!(matches!(
+            commands.recv().expect("Clear follows exact B"),
+            maestro_renderer::RendererCommand::ClearViewport
+        ));
+        let instance = test_daemon_instance();
+        assert!(matches!(
+            runtime.controller.settle_exact_viewport_facts(
+                request_b,
+                projection_b.target().session_id.as_str(),
+                projection_b.generation(),
+                Some(&instance),
+                maestro_renderer::RendererExactViewportOutcome::Published,
+            ),
+            RendererViewportSettlement::Neutralized(_)
+        ));
+        assert!(runtime.active_viewport().is_none());
+        assert!(runtime.pending_viewport().is_none());
+        drop(request);
+    }
+
+    #[test]
+    fn exact_primary_replacement_sends_one_request_and_stays_pending_until_published() {
+        let (_tmp, _paths, projection_a, projection_b) = exact_viewport_fixture();
+        let (mut runtime, commands) = RendererTabRuntime::new();
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        runtime.bind_renderer_events(events_tx);
+        let instance = test_daemon_instance();
+
+        let request_a = runtime
+            .switch_to_exact(projection_a.clone())
+            .expect("queue A")
+            .expect("A request");
+        let delivered_a = match commands.recv().expect("A command") {
+            maestro_renderer::RendererCommand::AttachExactViewport { request } => request,
+            other => panic!("expected exact A, got {other:?}"),
+        };
+        assert!(matches!(
+            runtime.controller.settle_exact_viewport_facts(
+                request_a,
+                projection_a.target().session_id.as_str(),
+                projection_a.generation(),
+                Some(&instance),
+                maestro_renderer::RendererExactViewportOutcome::Published,
+            ),
+            RendererViewportSettlement::Adopted(_)
+        ));
+        drop(delivered_a);
+        let stale = match events_rx.recv().expect("stale A terminal") {
+            maestro_renderer::RendererEvent::ExactViewportDisposition(disposition) => disposition,
+            other => panic!("expected exact terminal, got {other:?}"),
+        };
+        assert_eq!(
+            runtime.settle_exact_viewport_disposition(&stale),
+            RendererViewportSettlement::Stale
+        );
+
+        let request_b = runtime
+            .switch_to_exact(projection_b.clone())
+            .expect("queue replacement B")
+            .expect("primary replacement needs a new exact request");
+        assert!(runtime.active_viewport().is_none());
+        assert_eq!(
+            runtime
+                .pending_viewport()
+                .and_then(PendingRendererViewport::ordinary_request_id),
+            Some(request_b)
+        );
+        let delivered_b = match commands.recv().expect("one replacement command") {
+            maestro_renderer::RendererCommand::AttachExactViewport { request } => request,
+            other => panic!("expected replacement AttachExactViewport, got {other:?}"),
+        };
+        assert_eq!(delivered_b.request_id(), request_b);
+        assert!(commands.try_recv().is_err());
+        assert!(events_rx.try_recv().is_err(), "send alone emits no proof");
+        drop(delivered_b);
+    }
+
+    #[test]
+    fn same_exact_primary_cosmetic_refresh_sends_only_compatible_strip_without_request() {
+        let (_tmp, paths, projection, projection_b) = exact_viewport_fixture();
+        let (mut runtime, commands) = RendererTabRuntime::new();
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        runtime.bind_renderer_events(events_tx);
+        let instance = test_daemon_instance();
+
+        let request_id = runtime
+            .switch_to_exact(projection.clone())
+            .expect("queue initial projection")
+            .expect("initial exact request");
+        let delivered = match commands.recv().expect("initial exact command") {
+            maestro_renderer::RendererCommand::AttachExactViewport { request } => request,
+            other => panic!("expected initial exact request, got {other:?}"),
+        };
+        assert!(matches!(
+            runtime.controller.settle_exact_viewport_facts(
+                request_id,
+                projection.target().session_id.as_str(),
+                projection.generation(),
+                Some(&instance),
+                maestro_renderer::RendererExactViewportOutcome::Published,
+            ),
+            RendererViewportSettlement::Adopted(_)
+        ));
+        drop(delivered);
+        let stale = match events_rx.recv().expect("stale initial terminal") {
+            maestro_renderer::RendererEvent::ExactViewportDisposition(disposition) => disposition,
+            other => panic!("expected exact terminal, got {other:?}"),
+        };
+        assert_eq!(
+            runtime.settle_exact_viewport_disposition(&stale),
+            RendererViewportSettlement::Stale
+        );
+
+        maestro_shell::WindowLayoutService::new(&paths)
+            .update_attention(
+                projection.target().window_id.as_str(),
+                projection_b.target().tab_id.as_str(),
+                maestro_shell::AttentionState {
+                    attention: maestro_shell::Attention::Activity,
+                    unseen: true,
+                    since_ms: 8,
+                    source: maestro_shell::AttentionSource::Process,
+                },
+                8,
+            )
+            .expect("update inactive presentation");
+        let snapshot = maestro_shell::WindowLayoutService::new(&paths)
+            .load_viewport_snapshot(projection.target().window_id.as_str())
+            .expect("reload coherent viewport");
+        let refreshed = renderer_viewport_projection_from_snapshot(
+            &snapshot,
+            projection.target().tab_id.as_str(),
+        )
+        .expect("refresh same exact primary");
+        assert_eq!(refreshed.exact_viewport(), projection.exact_viewport());
+        assert_ne!(refreshed.tab_strip(), projection.tab_strip());
+
+        assert_eq!(
+            runtime
+                .switch_to_exact(refreshed.clone())
+                .expect("compatible display refresh"),
+            None,
+            "same exact cohort does not create a lifecycle request"
+        );
+        assert!(matches!(
+            commands.recv().expect("one display refresh"),
+            maestro_renderer::RendererCommand::SetTabStrip { tab_strip: Some(_) }
+        ));
+        assert!(commands.try_recv().is_err());
+        assert!(events_rx.try_recv().is_err());
+        assert!(runtime.pending_viewport().is_none());
+        assert_eq!(
+            runtime
+                .active_viewport()
+                .map(ActiveRendererViewport::projection),
+            Some(&refreshed)
+        );
+    }
+
     /// A `TabRecord` with the given attention roll-up, for the pure `tab_record_json` conversion
     /// tests (no daemon/layout needed).
     fn tab_record_with_attention(
@@ -2216,6 +3487,29 @@ mod tests {
         assert_eq!(json.index, 7);
         assert_eq!(json.title, "My Tab");
         assert!(json.pinned);
+    }
+
+    #[test]
+    fn durable_new_tab_snapshot_reserves_stashed_identities() {
+        let live = tab_record_with_attention("live-tab", maestro_shell::AttentionState::default());
+        let mut stashed =
+            tab_record_with_attention("parked-tab", maestro_shell::AttentionState::default());
+        stashed.session_id = s("parked-session");
+        stashed.stashed = true;
+
+        let snapshot = new_tab_snapshot_from_tab_records(&[live, stashed], Some("live-tab"));
+
+        assert_eq!(
+            snapshot.existing_tab_ids,
+            vec![s("live-tab"), s("parked-tab")],
+            "parked durable rows still reserve their tab ids"
+        );
+        assert_eq!(
+            snapshot.existing_session_ids,
+            vec![s("live-tab-sess"), s("parked-session")],
+            "parked durable rows still reserve their session ids"
+        );
+        assert_eq!(snapshot.active_tab_id, Some(s("live-tab")));
     }
 
     fn attention(state: &str, unseen: bool) -> AttentionJson {
@@ -2823,13 +4117,6 @@ mod tests {
         }
     }
 
-    fn recv_attach_id(rx: &std::sync::mpsc::Receiver<maestro_renderer::RendererCommand>) -> String {
-        match rx.try_recv() {
-            Ok(maestro_renderer::RendererCommand::AttachSession { session_id }) => session_id,
-            other => panic!("expected one AttachSession, got {other:?}"),
-        }
-    }
-
     /// A recording sink that captures every command it receives and can be flipped to a
     /// "closed channel" so tests exercise the renderer-control-closed path without a real
     /// renderer event loop.
@@ -2907,17 +4194,17 @@ mod tests {
     }
 
     fn one_strip_model() -> TabStripModel {
-        let tabs = vec![strip_tab("t0", 0, attention("none", false))];
+        let mut tab = strip_tab("t0", 0, attention("none", false));
+        tab.session_id = "sess-0".to_string();
+        let tabs = vec![tab];
         build_tab_strip_model("w1", &tabs, Some("t0")).unwrap()
     }
 
     #[test]
     fn renderer_tab_runtime_set_tab_strip_some_sends_command_and_preserves_active_tab() {
-        let layout = vec![tab("t0", "sess-0")];
         let (mut rt, rx) = RendererTabRuntime::new();
         // Establish an active tab so we can prove set_tab_strip leaves it untouched.
-        assert_eq!(rt.switch_to("w1", &layout, "t0"), Ok(true));
-        assert_eq!(recv_attach_id(&rx), "sess-0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-0");
 
         let model = one_strip_model();
         assert_eq!(rt.set_tab_strip(Some(&model)), Ok(()));
@@ -2931,26 +4218,28 @@ mod tests {
             Some(&ActiveTab {
                 window_id: "w1".to_string(),
                 tab_id: "t0".to_string(),
+                session_id: "sess-0".to_string(),
             })
         );
     }
 
     #[test]
-    fn renderer_tab_runtime_set_tab_strip_none_sends_clear_and_preserves_active_tab() {
-        let layout = vec![tab("t0", "sess-0")];
+    fn renderer_tab_runtime_set_tab_strip_none_cannot_clear_an_exact_active_cohort() {
         let (mut rt, rx) = RendererTabRuntime::new();
-        assert_eq!(rt.switch_to("w1", &layout, "t0"), Ok(true));
-        assert_eq!(recv_attach_id(&rx), "sess-0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-0");
 
-        assert_eq!(rt.set_tab_strip(None), Ok(()));
-        assert_eq!(recv_set_tab_strip(&rx), None, "None clears the strip");
-        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            rt.set_tab_strip(None),
+            Err(TabSwitchError::ViewportAuthorityRequired)
+        );
+        assert!(rx.try_recv().is_err(), "no display-only clear is emitted");
         assert_eq!(rt.active_tab_id(), Some("t0"));
     }
 
     #[test]
     fn renderer_tab_runtime_set_tab_strip_dropped_receiver_is_control_closed() {
         let (mut rt, rx) = RendererTabRuntime::new();
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-0");
         drop(rx);
         let model = one_strip_model();
         assert_eq!(
@@ -2959,10 +4248,10 @@ mod tests {
         );
         assert_eq!(
             rt.set_tab_strip(None),
-            Err(TabSwitchError::RendererControlClosed)
+            Err(TabSwitchError::ViewportAuthorityRequired)
         );
-        // A closed channel never invents an active tab.
-        assert_eq!(rt.active_tab_key(), None);
+        // Neither failure invents a replacement lifetime.
+        assert_eq!(rt.active_tab_id(), Some("t0"));
     }
 
     fn recv_set_dashboard_panel(
@@ -2980,10 +4269,8 @@ mod tests {
     /// the panel lines, and mutates no active-tab/record state (it is not a switch).
     #[test]
     fn renderer_tab_runtime_set_dashboard_panel_some_sends_one_command() {
-        let layout = vec![tab("t0", "sess-0")];
         let (mut rt, rx) = RendererTabRuntime::new();
-        assert_eq!(rt.switch_to("w1", &layout, "t0"), Ok(true));
-        assert_eq!(recv_attach_id(&rx), "sess-0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-0");
 
         let panel = maestro_renderer::RendererDashboardPanel::settings(vec![
             "Settings".to_string(),
@@ -3000,10 +4287,8 @@ mod tests {
     /// `set_dashboard_panel(None)` sends exactly one clear command and leaves active-tab state intact.
     #[test]
     fn renderer_tab_runtime_set_dashboard_panel_none_sends_one_clear() {
-        let layout = vec![tab("t0", "sess-0")];
         let (mut rt, rx) = RendererTabRuntime::new();
-        assert_eq!(rt.switch_to("w1", &layout, "t0"), Ok(true));
-        assert_eq!(recv_attach_id(&rx), "sess-0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-0");
 
         assert_eq!(rt.set_dashboard_panel(None), Ok(()));
         assert_eq!(recv_set_dashboard_panel(&rx), None, "None clears the panel");
@@ -3044,10 +4329,8 @@ mod tests {
     /// bounded body, and mutates no active-tab/record state (it is not a switch).
     #[test]
     fn renderer_tab_runtime_set_file_preview_some_sends_one_command() {
-        let layout = vec![tab("t0", "sess-0")];
         let (mut rt, rx) = RendererTabRuntime::new();
-        assert_eq!(rt.switch_to("w1", &layout, "t0"), Ok(true));
-        assert_eq!(recv_attach_id(&rx), "sess-0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-0");
 
         let preview = one_file_preview();
         assert_eq!(rt.set_file_preview(Some(preview.clone())), Ok(()));
@@ -3065,10 +4348,8 @@ mod tests {
     /// `set_file_preview(None)` sends exactly one clear command and leaves active-tab state intact.
     #[test]
     fn renderer_tab_runtime_set_file_preview_none_sends_one_clear() {
-        let layout = vec![tab("t0", "sess-0")];
         let (mut rt, rx) = RendererTabRuntime::new();
-        assert_eq!(rt.switch_to("w1", &layout, "t0"), Ok(true));
-        assert_eq!(recv_attach_id(&rx), "sess-0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-0");
 
         assert_eq!(rt.set_file_preview(None), Ok(()));
         match rx.try_recv() {
@@ -3102,10 +4383,8 @@ mod tests {
     /// `set_file_path_input(None)` sends one clear; neither is a switch, so the active tab is untouched.
     #[test]
     fn renderer_tab_runtime_set_file_path_input_some_then_none_sends_two_commands() {
-        let layout = vec![tab("t0", "sess-0")];
         let (mut rt, rx) = RendererTabRuntime::new();
-        assert_eq!(rt.switch_to("w1", &layout, "t0"), Ok(true));
-        assert_eq!(recv_attach_id(&rx), "sess-0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-0");
 
         let input = maestro_renderer::RendererFilePathInput {
             path: "/tmp/x".to_string(),
@@ -3148,10 +4427,8 @@ mod tests {
     /// must not mutate runtime/record state (browse-only overlay). Mirrors the tab-strip clear path.
     #[test]
     fn renderer_tab_runtime_set_picker_overlay_none_sends_one_clear_and_mutates_nothing() {
-        let layout = vec![tab("t0", "sess-0")];
         let (mut rt, rx) = RendererTabRuntime::new();
-        assert_eq!(rt.switch_to("w1", &layout, "t0"), Ok(true));
-        assert_eq!(recv_attach_id(&rx), "sess-0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-0");
 
         assert_eq!(rt.set_picker_overlay(None), Ok(()));
         match rx.try_recv() {
@@ -3180,10 +4457,8 @@ mod tests {
     /// composed decline label and must not mutate runtime/record state (display-only).
     #[test]
     fn renderer_tab_runtime_set_status_label_some_sends_one_command_and_mutates_nothing() {
-        let layout = vec![tab("t0", "sess-0")];
         let (mut rt, rx) = RendererTabRuntime::new();
-        assert_eq!(rt.switch_to("w1", &layout, "t0"), Ok(true));
-        assert_eq!(recv_attach_id(&rx), "sess-0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-0");
 
         let label = new_tab_decline_status_label("Maestro \u{b7} w1/t1");
         assert_eq!(rt.set_status_label(Some(label.clone())), Ok(()));
@@ -3213,10 +4488,8 @@ mod tests {
     /// not mutate runtime/record state (color-only display chrome, not a switch).
     #[test]
     fn renderer_tab_runtime_set_theme_some_sends_one_command_and_mutates_nothing() {
-        let layout = vec![tab("t0", "sess-0")];
         let (mut rt, rx) = RendererTabRuntime::new();
-        assert_eq!(rt.switch_to("w1", &layout, "t0"), Ok(true));
-        assert_eq!(recv_attach_id(&rx), "sess-0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-0");
 
         assert_eq!(
             rt.set_theme(maestro_renderer::RendererTheme::HighContrastDark),
@@ -3251,8 +4524,7 @@ mod tests {
     fn theme_runtime_set_theme_sends_one_command_without_consuming_runtime() {
         let layout = vec![tab("t0", "sess-0")];
         let (mut rt, rx) = RendererTabRuntime::new();
-        assert_eq!(rt.switch_to("w1", &layout, "t0"), Ok(true));
-        assert_eq!(recv_attach_id(&rx), "sess-0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-0");
 
         let theme_runtime = rt.theme_runtime();
         assert_eq!(
@@ -3378,8 +4650,7 @@ mod tests {
     fn font_size_runtime_set_font_size_sends_one_command_without_consuming_runtime() {
         let layout = vec![tab("t0", "sess-0")];
         let (mut rt, rx) = RendererTabRuntime::new();
-        assert_eq!(rt.switch_to("w1", &layout, "t0"), Ok(true));
-        assert_eq!(recv_attach_id(&rx), "sess-0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-0");
 
         let font_size_runtime = rt.font_size_runtime();
         assert_eq!(font_size_runtime.set_font_size(22), Ok(()));
@@ -3476,10 +4747,60 @@ mod tests {
     /// dir (kept alive by the caller) and its `AppPaths`.
     fn seed_window_for_clear(
         unseen_attention: maestro_shell::Attention,
-    ) -> (tempfile::TempDir, maestro_shell::AppPaths) {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let paths = maestro_shell::AppPaths::with_base(tmp.path());
+    ) -> (ExactFixtureLease, maestro_shell::AppPaths) {
+        let (lease, paths) = exact_fixture_lease();
+        let suffix = next_exact_fixture_id("clear");
+        let project_id = format!("clear-project-{suffix}");
+        let workspace_id = format!("clear-workspace-{suffix}");
+        maestro_shell::ProjectService::new(&paths)
+            .create(
+                &project_id,
+                "Clear",
+                lease.cwd.path().to_string_lossy(),
+                maestro_shell::NewProject::default(),
+                1,
+            )
+            .expect("create clear project");
+        maestro_shell::store::write_record(
+            &paths,
+            maestro_shell::RecordKind::Workspace,
+            &workspace_id,
+            1,
+            &maestro_shell::Workspace {
+                workspace_id: workspace_id.clone(),
+                project_id,
+                root: lease.cwd.path().to_string_lossy().into_owned(),
+                policy: maestro_shell::WorkspacePolicy::ScratchCwd,
+                consent: maestro_shell::WorkspaceConsent::default(),
+            },
+        )
+        .expect("write clear workspace");
+        for (session_id, generation) in [
+            ("sess-clear", "clear-generation"),
+            ("sess-other", "other-generation"),
+        ] {
+            maestro_shell::store::write_record(
+                &paths,
+                maestro_shell::RecordKind::Session,
+                session_id,
+                1,
+                &maestro_shell::SessionRecord {
+                    session_id: session_id.into(),
+                    workspace_id: workspace_id.clone(),
+                    kind: maestro_shell::SessionKind::Shell,
+                    launch: maestro_shell::LaunchSpec::OptOut,
+                    cwd_resolved: lease.cwd.path().to_string_lossy().into_owned(),
+                    agent_task_id: None,
+                    created_at_ms: 1,
+                    last_attached_at_ms: 1,
+                    last_known_generation: Some(generation.into()),
+                    status: maestro_shell::SessionStatus::Live,
+                },
+            )
+            .expect("write clear Session");
+        }
         let service = maestro_shell::WindowLayoutService::new(&paths);
+        let _ = service.delete("w1");
         service.create_empty("w1", 0).expect("create window");
         let default_attention = maestro_shell::AttentionState::default();
         service
@@ -3517,7 +4838,20 @@ mod tests {
                 10,
             )
             .expect("seed unseen attention");
-        (tmp, paths)
+        (lease, paths)
+    }
+
+    fn seed_exact_active_from_window(
+        paths: &maestro_shell::AppPaths,
+        runtime: &mut RendererTabRuntime,
+        active_tab_id: &str,
+    ) {
+        let snapshot = maestro_shell::WindowLayoutService::new(paths)
+            .load_viewport_snapshot("w1")
+            .expect("load exact clear viewport");
+        let projection = renderer_viewport_projection_from_snapshot(&snapshot, active_tab_id)
+            .expect("project exact clear viewport");
+        runtime.seed_exact_active_for_test(projection, test_daemon_instance());
     }
 
     /// Write a `SessionRecord` + a linked `AgentTask` in the given state pointing at `session_id`, so
@@ -3614,6 +4948,7 @@ mod tests {
     fn clear_and_refresh_clears_persisted_attention_and_sends_one_set_tab_strip() {
         let (_tmp, paths) = seed_window_for_clear(maestro_shell::Attention::Activity);
         let (mut rt, rx) = RendererTabRuntime::new();
+        seed_exact_active_from_window(&paths, &mut rt, "t-clear");
 
         let out = clear_tab_attention_and_refresh_strip(
             &paths,
@@ -3658,6 +4993,8 @@ mod tests {
     #[test]
     fn clear_and_refresh_preserves_task_derived_needs_attention() {
         let (_tmp, paths) = seed_window_for_clear(maestro_shell::Attention::Activity);
+        let (mut rt, rx) = RendererTabRuntime::new();
+        seed_exact_active_from_window(&paths, &mut rt, "t-clear");
         // A waiting-on-user task on t-clear's session => task-derived needs_attention.
         write_task_for_session(
             &paths,
@@ -3665,8 +5002,6 @@ mod tests {
             "task-wait",
             maestro_shell::AgentTaskState::WaitingOnUser,
         );
-        let (mut rt, rx) = RendererTabRuntime::new();
-
         let out = clear_tab_attention_and_refresh_strip(
             &paths,
             &mut rt,
@@ -3809,6 +5144,7 @@ mod tests {
     fn clear_and_refresh_keeps_supplied_active_tab() {
         let (_tmp, paths) = seed_window_for_clear(maestro_shell::Attention::Activity);
         let (mut rt, rx) = RendererTabRuntime::new();
+        seed_exact_active_from_window(&paths, &mut rt, "t-other");
 
         // Clear t-clear but keep t-other active.
         let out = clear_tab_attention_and_refresh_strip(
@@ -3829,8 +5165,8 @@ mod tests {
     #[test]
     fn clear_and_refresh_update_failure_sends_no_command() {
         // No window on disk: update_attention fails before any reconcile/projection/renderer send.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let paths = maestro_shell::AppPaths::with_base(tmp.path());
+        let (_lease, paths) = exact_fixture_lease();
+        let _ = maestro_shell::WindowLayoutService::new(&paths).delete("ghost-w");
         let (mut rt, rx) = RendererTabRuntime::new();
 
         let err =
@@ -3889,6 +5225,7 @@ mod tests {
     fn clear_and_refresh_closed_channel_surfaces_renderer_control_closed() {
         let (_tmp, paths) = seed_window_for_clear(maestro_shell::Attention::Activity);
         let (mut rt, rx) = RendererTabRuntime::new();
+        seed_exact_active_from_window(&paths, &mut rt, "t-clear");
         drop(rx);
 
         let err = clear_tab_attention_and_refresh_strip(
@@ -3939,34 +5276,28 @@ mod tests {
     }
 
     #[test]
-    fn activation_non_active_tab_attaches_then_refreshes_strip_active() {
+    fn activation_non_active_tab_requires_fresh_exact_viewport_authority() {
         let (selection, strip_tabs) = activation_layout();
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-t0");
 
         // Click the non-active tab t1.
         assert_eq!(
             rt.on_tab_activated("w1", &selection, &strip_tabs, "t1"),
-            Ok(TabActivation::Switched)
+            Err(TabSwitchError::ViewportAuthorityRequired)
         );
-
-        // Exactly: one AttachSession for t1's session, then one SetTabStrip with t1 active.
-        assert_eq!(recv_attach_id(&rx), "sess-t1");
-        let model = build_tab_strip_model("w1", &strip_tabs, Some("t1")).unwrap();
-        assert_eq!(
-            recv_set_tab_strip(&rx),
-            Some(renderer_tab_strip(&model)),
-            "the refreshed strip marks the clicked tab active"
+        assert!(
+            rx.try_recv().is_err(),
+            "no raw Attach or strip update is sent"
         );
-        assert!(rx.try_recv().is_err(), "exactly two commands are sent");
-        assert_eq!(rt.active_tab_id(), Some("t1"));
+        assert_eq!(rt.active_tab_id(), Some("t0"));
     }
 
     #[test]
     fn activation_already_active_tab_is_noop_no_attach_no_strip() {
         let (selection, strip_tabs) = activation_layout();
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-t0");
 
         // Click the already-active tab t0: documented no-op — nothing is sent (no attach, no
         // strip refresh, since the active marker already matches).
@@ -3985,7 +5316,7 @@ mod tests {
     fn activation_missing_tab_is_non_fatal_and_sends_nothing() {
         let (selection, strip_tabs) = activation_layout();
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-t0");
 
         assert_eq!(
             rt.on_tab_activated("w1", &selection, &strip_tabs, "t-missing"),
@@ -4026,15 +5357,15 @@ mod tests {
     }
 
     #[test]
-    fn activation_closed_command_channel_is_control_closed_without_advancing() {
+    fn activation_without_authority_fails_before_observing_closed_channel() {
         let (selection, strip_tabs) = activation_layout();
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-t0");
         drop(rx); // the renderer event loop is gone
 
         assert_eq!(
             rt.on_tab_activated("w1", &selection, &strip_tabs, "t1"),
-            Err(TabSwitchError::RendererControlClosed)
+            Err(TabSwitchError::ViewportAuthorityRequired)
         );
         // Active state never advanced to t1 because the attach was not delivered.
         assert_eq!(rt.active_tab_id(), Some("t0"));
@@ -4054,7 +5385,7 @@ mod tests {
     fn close_inactive_tab_refreshes_strip_keeping_previous_active() {
         // Active tab is t0; close the inactive t1. The post-close projection drops t1.
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-t0");
         let new_strip_tabs = vec![strip_tab("t0", 0, attention("none", false))];
 
         assert_eq!(
@@ -4076,7 +5407,7 @@ mod tests {
     #[test]
     fn close_active_tab_is_deferred_and_sends_nothing() {
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-t0");
         // A projection is irrelevant for the active path; pass the pre-close tabs.
         let strip_tabs = vec![
             strip_tab("t0", 0, attention("none", false)),
@@ -4095,10 +5426,10 @@ mod tests {
     }
 
     #[test]
-    fn close_inactive_keeps_active_among_remaining_three_tabs() {
-        // Three tabs; active is t1; close inactive t2. t1 stays active in the rebuilt strip.
+    fn close_inactive_structural_change_requires_fresh_exact_projection() {
+        // A display-only strip cannot authorize the post-close two-pane membership.
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t1");
+        seed_exact_active_tab(&mut rt, "w1", "t1", "sess-t1");
         let new_strip_tabs = vec![
             strip_tab("t0", 0, attention("none", false)),
             strip_tab("t1", 1, attention("none", false)),
@@ -4106,10 +5437,8 @@ mod tests {
 
         assert_eq!(
             rt.on_tab_close_requested("w1", &new_strip_tabs, "t1", "t2"),
-            Ok(TabCloseOutcome::ClosedInactive)
+            Err(TabSwitchError::ViewportAuthorityRequired)
         );
-        let model = build_tab_strip_model("w1", &new_strip_tabs, Some("t1")).unwrap();
-        assert_eq!(recv_set_tab_strip(&rx), Some(renderer_tab_strip(&model)));
         assert!(rx.try_recv().is_err());
         assert_eq!(rt.active_tab_id(), Some("t1"));
     }
@@ -4119,7 +5448,7 @@ mod tests {
         // Impossible for a correct inactive close, but if the returned projection somehow lacks the
         // previous active tab, surface a typed TabNotFound and send NOTHING (no misleading strip).
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-t0");
         // Projection is missing the active tab t0 entirely.
         let new_strip_tabs = vec![strip_tab("t9", 0, attention("none", false))];
 
@@ -4141,7 +5470,7 @@ mod tests {
         // The record mutation happened in the caller; here the renderer command channel is gone, so
         // the strip refresh surfaces RendererControlClosed without panicking.
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-t0");
         drop(rx); // the renderer event loop is gone
         let new_strip_tabs = vec![strip_tab("t0", 0, attention("none", false))];
 
@@ -4182,11 +5511,11 @@ mod tests {
     }
 
     #[test]
-    fn close_inactive_then_activate_remaining_tab_uses_updated_projections() {
+    fn raw_close_then_activation_cannot_bypass_exact_projection_authority() {
         // Window has t0 (active), t1, t2. Close inactive t1, then activate t2. The hardened listener
         // resolves t2 through the UPDATED selection, so AttachSession carries t2's real session.
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-t0");
 
         // Post-close strip after removing t1.
         let new_strip_tabs = vec![
@@ -4195,10 +5524,8 @@ mod tests {
         ];
         assert_eq!(
             rt.on_tab_close_requested("w1", &new_strip_tabs, "t0", "t1"),
-            Ok(TabCloseOutcome::ClosedInactive)
+            Err(TabSwitchError::ViewportAuthorityRequired)
         );
-        // Drain the close strip refresh.
-        let _ = recv_set_tab_strip(&rx);
         assert!(rx.try_recv().is_err());
 
         // The listener adopts the updated projections (this is what main.rs does on ClosedInactive).
@@ -4207,18 +5534,10 @@ mod tests {
         // Activate t2 THROUGH the updated selection: a real switch sends AttachSession for sess-t2.
         assert_eq!(
             rt.on_tab_activated("w1", &updated_selection, &new_strip_tabs, "t2"),
-            Ok(TabActivation::Switched)
+            Err(TabSwitchError::ViewportAuthorityRequired)
         );
-        assert_eq!(
-            recv_attach_id(&rx),
-            "sess-t2",
-            "attaches the remaining tab's real session"
-        );
-        // Then a strip refresh marking t2 active.
-        let model = build_tab_strip_model("w1", &new_strip_tabs, Some("t2")).unwrap();
-        assert_eq!(recv_set_tab_strip(&rx), Some(renderer_tab_strip(&model)));
         assert!(rx.try_recv().is_err());
-        assert_eq!(rt.active_tab_id(), Some("t2"));
+        assert_eq!(rt.active_tab_id(), Some("t0"));
     }
 
     #[test]
@@ -4226,7 +5545,7 @@ mod tests {
         // After closing t1 and adopting the updated projections, an activation for the GONE t1
         // resolves against the updated selection, is missing, and sends no command.
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-t0");
         let new_strip_tabs = vec![
             strip_tab("t0", 0, attention("none", false)),
             strip_tab("t2", 1, attention("none", false)),
@@ -4247,12 +5566,12 @@ mod tests {
     }
 
     #[test]
-    fn active_close_deferred_leaves_listener_projections_unchanged() {
+    fn active_close_deferred_keeps_exact_active_until_authorized_replacement() {
         // Models the main.rs listener decision: only the ClosedInactive arm adopts new projections.
         // For an active close the outcome is ActiveCloseDeferred, so the listener keeps its existing
         // selection and strip_tabs untouched (no recompute from any post-close layout).
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-t0");
 
         let strip_tabs = vec![
             strip_tab("t0", 0, attention("none", false)),
@@ -4271,16 +5590,10 @@ mod tests {
         // A subsequent activation of t1 still resolves through the unchanged selection.
         assert_eq!(
             rt.on_tab_activated("w1", &selection, &strip_tabs, "t1"),
-            Ok(TabActivation::Switched)
+            Err(TabSwitchError::ViewportAuthorityRequired)
         );
-        assert_eq!(
-            recv_attach_id(&rx),
-            "sess-t1",
-            "the unchanged projection still resolves t1's real session"
-        );
-        let model = build_tab_strip_model("w1", &strip_tabs, Some("t1")).unwrap();
-        assert_eq!(recv_set_tab_strip(&rx), Some(renderer_tab_strip(&model)));
         assert!(rx.try_recv().is_err());
+        assert_eq!(rt.active_tab_id(), Some("t0"));
     }
 
     // The listener's close classification now reads the CURRENT active tab from the runtime
@@ -4288,11 +5601,9 @@ mod tests {
     // `RendererTabRuntime`: each `on_tab_activated` advances the runtime's active tab, and a close is
     // classified against `rt.active_tab_id()` exactly as `maestro-app/src/main.rs` does.
     #[test]
-    fn close_of_newly_activated_tab_is_classified_active_against_runtime_state() {
-        // Launch on t0, activate t2, then a close of t2 must be ACTIVE (deferred) — the stale-launch
-        // bug would have read t0 and misclassified this as inactive.
+    fn refused_raw_activation_keeps_close_classification_on_exact_active() {
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-t0");
         let strip_tabs = vec![
             strip_tab("t0", 0, attention("none", false)),
             strip_tab("t1", 1, attention("none", false)),
@@ -4303,30 +5614,13 @@ mod tests {
         // Activate t2: the runtime advances its active tab.
         assert_eq!(
             rt.on_tab_activated("w1", &selection, &strip_tabs, "t2"),
-            Ok(TabActivation::Switched)
+            Err(TabSwitchError::ViewportAuthorityRequired)
         );
-        assert_eq!(recv_attach_id(&rx), "sess-t2");
-        let _ = recv_set_tab_strip(&rx);
         assert!(rx.try_recv().is_err());
-        assert_eq!(rt.active_tab_id(), Some("t2"));
+        assert_eq!(rt.active_tab_id(), Some("t0"));
 
-        // Classification reads the CURRENT active tab from the runtime, exactly like the listener.
-        assert!(
-            is_active_tab_close(rt.active_tab_id(), "t2"),
-            "closing the freshly-activated tab is an active close"
-        );
-        // Driving the close with that current active id defers and sends nothing.
-        let current_active = rt.active_tab_id().map(str::to_owned).unwrap();
-        assert_eq!(
-            rt.on_tab_close_requested("w1", &strip_tabs, &current_active, "t2"),
-            Ok(TabCloseOutcome::ActiveCloseDeferred)
-        );
-        assert!(rx.try_recv().is_err(), "active close sends no command");
-        assert_eq!(
-            rt.active_tab_id(),
-            Some("t2"),
-            "deferred close leaves active state"
-        );
+        assert!(is_active_tab_close(rt.active_tab_id(), "t0"));
+        assert!(!is_active_tab_close(rt.active_tab_id(), "t2"));
     }
 
     #[test]
@@ -4334,7 +5628,7 @@ mod tests {
         // Launch on t0; a FAILED activation (missing tab) must not advance the active tab. A later
         // close of t0 is then still classified as active against the unchanged runtime state.
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-t0");
         let strip_tabs = vec![
             strip_tab("t0", 0, attention("none", false)),
             strip_tab("t1", 1, attention("none", false)),
@@ -4369,7 +5663,7 @@ mod tests {
         // Re-activating the already-active tab is a no-op and leaves the active tab in place, so close
         // classification is unaffected.
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-t0");
         let strip_tabs = vec![
             strip_tab("t0", 0, attention("none", false)),
             strip_tab("t1", 1, attention("none", false)),
@@ -4389,11 +5683,9 @@ mod tests {
     }
 
     #[test]
-    fn inactive_close_after_activation_keeps_new_active_tab_marked() {
-        // Launch t0, activate t2, then close the INACTIVE t1: it is classified inactive against the
-        // CURRENT active tab t2, and the refreshed strip keeps t2 active.
+    fn inactive_close_after_refused_activation_keeps_original_exact_active() {
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-t0");
         let strip_tabs = vec![
             strip_tab("t0", 0, attention("none", false)),
             strip_tab("t1", 1, attention("none", false)),
@@ -4403,15 +5695,13 @@ mod tests {
 
         assert_eq!(
             rt.on_tab_activated("w1", &selection, &strip_tabs, "t2"),
-            Ok(TabActivation::Switched)
+            Err(TabSwitchError::ViewportAuthorityRequired)
         );
-        assert_eq!(recv_attach_id(&rx), "sess-t2");
-        let _ = recv_set_tab_strip(&rx);
         assert!(rx.try_recv().is_err());
 
-        // Close inactive t1 against the current active tab t2 (read from the runtime).
+        // The refused switch leaves t0 as the exact active lifetime.
         let current_active = rt.active_tab_id().map(str::to_owned).unwrap();
-        assert_eq!(current_active, "t2");
+        assert_eq!(current_active, "t0");
         assert!(!is_active_tab_close(rt.active_tab_id(), "t1"));
         // Post-close strip (t0, t2) keeps t2 active.
         let new_strip_tabs = vec![
@@ -4420,15 +5710,13 @@ mod tests {
         ];
         assert_eq!(
             rt.on_tab_close_requested("w1", &new_strip_tabs, &current_active, "t1"),
-            Ok(TabCloseOutcome::ClosedInactive)
+            Err(TabSwitchError::ViewportAuthorityRequired)
         );
-        let model = build_tab_strip_model("w1", &new_strip_tabs, Some("t2")).unwrap();
-        assert_eq!(recv_set_tab_strip(&rx), Some(renderer_tab_strip(&model)));
         assert!(rx.try_recv().is_err());
         assert_eq!(
             rt.active_tab_id(),
-            Some("t2"),
-            "the new active tab stays active"
+            Some("t0"),
+            "the proven active lifetime stays active"
         );
     }
 
@@ -4514,11 +5802,11 @@ mod tests {
     // --- Active-tab close (with remaining tabs) — runtime/app behavior through RendererTabRuntime ---
 
     #[test]
-    fn active_first_tab_close_switches_to_right_neighbor_and_refreshes_strip() {
+    fn active_first_tab_close_requires_exact_replacement_authority() {
         // Active t0 in [t0,t1,t2]: plan right neighbor t1, then the runtime switches (AttachSession
         // sess-t1) and refreshes the strip with t1 active.
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-t0");
         let pre_close = vec![
             strip_tab("t0", 0, attention("none", false)),
             strip_tab("t1", 1, attention("none", false)),
@@ -4536,26 +5824,17 @@ mod tests {
 
         assert_eq!(
             rt.on_active_tab_close("w1", &plan, &new_selection, &new_strip_tabs),
-            Ok(ActiveTabCloseOutcome::SwitchedTo {
-                next_tab_id: s("t1")
-            })
+            Err(TabSwitchError::ViewportAuthorityRequired)
         );
-        assert_eq!(recv_attach_id(&rx), "sess-t1");
-        let model = build_tab_strip_model("w1", &new_strip_tabs, Some("t1")).unwrap();
-        assert_eq!(recv_set_tab_strip(&rx), Some(renderer_tab_strip(&model)));
         assert!(rx.try_recv().is_err());
-        assert_eq!(
-            rt.active_tab_id(),
-            Some("t1"),
-            "next active tab is now active"
-        );
+        assert_eq!(rt.active_tab_id(), Some("t0"));
     }
 
     #[test]
-    fn active_middle_tab_close_switches_to_right_neighbor() {
+    fn active_middle_tab_close_requires_exact_replacement_authority() {
         // Active t1 in [t0,t1,t2]: plan right neighbor t2; runtime attaches sess-t2.
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t1");
+        seed_exact_active_tab(&mut rt, "w1", "t1", "sess-t1");
         let pre_close = vec![
             strip_tab("t0", 0, attention("none", false)),
             strip_tab("t1", 1, attention("none", false)),
@@ -4569,21 +5848,17 @@ mod tests {
         let new_selection = selection_from_strip_tabs(&new_strip_tabs);
         assert_eq!(
             rt.on_active_tab_close("w1", &plan, &new_selection, &new_strip_tabs),
-            Ok(ActiveTabCloseOutcome::SwitchedTo {
-                next_tab_id: s("t2")
-            })
+            Err(TabSwitchError::ViewportAuthorityRequired)
         );
-        assert_eq!(recv_attach_id(&rx), "sess-t2");
-        let _ = recv_set_tab_strip(&rx);
         assert!(rx.try_recv().is_err());
-        assert_eq!(rt.active_tab_id(), Some("t2"));
+        assert_eq!(rt.active_tab_id(), Some("t1"));
     }
 
     #[test]
-    fn active_last_tab_close_switches_to_left_neighbor() {
+    fn active_last_tab_close_requires_exact_replacement_authority() {
         // Active t1 in [t0,t1] (last): plan left neighbor t0; runtime attaches sess-t0.
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t1");
+        seed_exact_active_tab(&mut rt, "w1", "t1", "sess-t1");
         let pre_close = vec![
             strip_tab("t0", 0, attention("none", false)),
             strip_tab("t1", 1, attention("none", false)),
@@ -4593,14 +5868,10 @@ mod tests {
         let new_selection = selection_from_strip_tabs(&new_strip_tabs);
         assert_eq!(
             rt.on_active_tab_close("w1", &plan, &new_selection, &new_strip_tabs),
-            Ok(ActiveTabCloseOutcome::SwitchedTo {
-                next_tab_id: s("t0")
-            })
+            Err(TabSwitchError::ViewportAuthorityRequired)
         );
-        assert_eq!(recv_attach_id(&rx), "sess-t0");
-        let _ = recv_set_tab_strip(&rx);
         assert!(rx.try_recv().is_err());
-        assert_eq!(rt.active_tab_id(), Some("t0"));
+        assert_eq!(rt.active_tab_id(), Some("t1"));
     }
 
     #[test]
@@ -4608,7 +5879,7 @@ mod tests {
         // Only-tab plan: the runtime sends nothing and leaves the active tab in place. The caller
         // must not have mutated the record in this case (verified at the listener layer).
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-t0");
         let pre_close = vec![strip_tab("t0", 0, attention("none", false))];
         let plan = plan_next_active_tab("w1", &pre_close, "t0").unwrap();
         assert_eq!(plan, NextActivePlan::OnlyTabDeferred);
@@ -4625,14 +5896,14 @@ mod tests {
         );
     }
 
-    // --- Only-tab active close — empty-window terminal state through RendererTabRuntime ---
+    // --- Only-live-tab active close — strip/controller ownership through RendererTabRuntime ---
 
     #[test]
-    fn only_tab_close_clears_strip_and_active_state_after_strip_clear() {
-        // [t0(active)] closing t0 (only tab): the runtime sends exactly one SetTabStrip(None) (no
-        // AttachSession) and then drops app active-tab ownership, returning ClearedEmptyWindow.
+    fn only_tab_close_sends_one_clear_viewport_then_drops_active_state() {
+        // [t0(active)] closing t0 (only tab): one ClearViewport owns terminal+strip neutralization;
+        // no SetTabStrip/AttachSession is sent before controller ownership is dropped.
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-t0");
         let pre_close = vec![strip_tab("t0", 0, attention("none", false))];
         let plan = plan_next_active_tab("w1", &pre_close, "t0").unwrap();
         assert_eq!(plan, NextActivePlan::OnlyTabDeferred);
@@ -4641,14 +5912,13 @@ mod tests {
             rt.on_only_tab_close(&plan),
             Ok(OnlyTabCloseOutcome::ClearedEmptyWindow)
         );
-        assert_eq!(
-            recv_set_tab_strip(&rx),
-            None,
-            "the visible strip is cleared"
-        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(maestro_renderer::RendererCommand::ClearViewport)
+        ));
         assert!(
             rx.try_recv().is_err(),
-            "exactly one SetTabStrip(None) and no AttachSession"
+            "exactly one ClearViewport and no SetTabStrip/AttachSession"
         );
         assert_eq!(
             rt.active_tab_id(),
@@ -4662,14 +5932,17 @@ mod tests {
         // After only-tab close success, the runtime no longer reports the closed tab as active, so a
         // later close/activation classification cannot misclassify the orphaned tab.
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-t0");
         let pre_close = vec![strip_tab("t0", 0, attention("none", false))];
         let plan = plan_next_active_tab("w1", &pre_close, "t0").unwrap();
         assert_eq!(
             rt.on_only_tab_close(&plan),
             Ok(OnlyTabCloseOutcome::ClearedEmptyWindow)
         );
-        let _ = recv_set_tab_strip(&rx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(maestro_renderer::RendererCommand::ClearViewport)
+        ));
         assert_eq!(rt.active_tab_id(), None);
         assert!(
             !is_active_tab_close(rt.active_tab_id(), "t0"),
@@ -4678,13 +5951,13 @@ mod tests {
     }
 
     #[test]
-    fn only_tab_close_with_closed_command_channel_is_typed_and_keeps_active_state() {
+    fn only_tab_close_with_closed_channel_is_typed_and_stays_neutral() {
         // The record is (notionally) already mutated when the renderer command channel is gone: the
         // strip-clear surfaces RendererControlClosed and the runtime does NOT drop active-tab
-        // ownership (the clear was never delivered), so the caller will not falsely adopt the empty
-        // terminal state.
+        // ownership (the clear was never delivered), so the caller will not falsely drop its
+        // strip/controller ownership.
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-t0");
         drop(rx); // renderer event loop gone -> sends fail.
         let pre_close = vec![strip_tab("t0", 0, attention("none", false))];
         let plan = plan_next_active_tab("w1", &pre_close, "t0").unwrap();
@@ -4694,8 +5967,8 @@ mod tests {
         assert!(matches!(err, TabSwitchError::RendererControlClosed));
         assert_eq!(
             rt.active_tab_id(),
-            Some("t0"),
-            "active state is left in place because the clear was not delivered"
+            None,
+            "neutral-first Clear revokes App adoption before observing delivery failure"
         );
     }
 
@@ -4705,7 +5978,7 @@ mod tests {
         // typed TabNotFound (caller bug) and sends nothing, so a misrouted close cannot clear a
         // window that still has tabs.
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-t0");
         let plan = NextActivePlan::SelectNext { tab_id: s("t1") };
         let err = rt
             .on_only_tab_close(&plan)
@@ -4723,11 +5996,11 @@ mod tests {
     }
 
     #[test]
-    fn active_tab_close_with_closed_command_channel_is_typed_after_mutation() {
+    fn raw_active_close_requires_exact_authority_before_observing_closed_channel() {
         // The record is (notionally) already mutated when the renderer command channel is gone: the
         // switch surfaces RendererControlClosed without panicking. The caller does not roll back.
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-t0");
         drop(rx); // renderer event loop gone -> sends fail.
         let pre_close = vec![
             strip_tab("t0", 0, attention("none", false)),
@@ -4739,7 +6012,7 @@ mod tests {
         let err = rt
             .on_active_tab_close("w1", &plan, &new_selection, &new_strip_tabs)
             .expect_err("a closed channel surfaces a typed error");
-        assert!(matches!(err, TabSwitchError::RendererControlClosed));
+        assert!(matches!(err, TabSwitchError::ViewportAuthorityRequired));
     }
 
     #[test]
@@ -4748,7 +6021,7 @@ mod tests {
         // record changed underneath). The switch surfaces a typed TabNotFound and sends no
         // AttachSession for a tab that is not there.
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        seed_exact_active_tab(&mut rt, "w1", "t0", "sess-t0");
         let pre_close = vec![
             strip_tab("t0", 0, attention("none", false)),
             strip_tab("t1", 1, attention("none", false)),
@@ -4820,44 +6093,64 @@ mod tests {
     }
 
     #[test]
-    fn switch_to_valid_tab_sends_exactly_one_attach_for_its_session() {
+    fn switch_to_valid_tab_requires_exact_viewport_authority_and_sends_nothing() {
         let layout = vec![tab("t-a", "sess-a"), tab("t-b", "sess-b")];
         let mut ctrl = TabSwitchController::new(RecordingSink::default());
-        assert_eq!(ctrl.switch_to("w1", &layout, "t-b"), Ok(true));
-        assert_eq!(attach_ids(&ctrl.sender), vec!["sess-b".to_string()]);
-        assert_eq!(ctrl.active_tab_id(), Some("t-b"));
+        assert_eq!(
+            ctrl.switch_to("w1", &layout, "t-b"),
+            Err(TabSwitchError::ViewportAuthorityRequired)
+        );
+        assert!(attach_ids(&ctrl.sender).is_empty());
+        assert_eq!(ctrl.active_tab_id(), None);
     }
 
     #[test]
-    fn switch_to_already_active_tab_is_a_noop_and_sends_nothing() {
+    fn repeated_textual_switch_never_invents_an_active_lifetime() {
         let layout = vec![tab("t-a", "sess-a"), tab("t-b", "sess-b")];
         let mut ctrl = TabSwitchController::new(RecordingSink::default());
-        assert_eq!(ctrl.switch_to("w1", &layout, "t-a"), Ok(true));
-        // Re-selecting the SAME window+tab: no command, returns Ok(false).
-        assert_eq!(ctrl.switch_to("w1", &layout, "t-a"), Ok(false));
-        assert_eq!(attach_ids(&ctrl.sender), vec!["sess-a".to_string()]);
-        assert_eq!(ctrl.active_tab_id(), Some("t-a"));
-        assert_eq!(ctrl.active_window_id(), Some("w1"));
         assert_eq!(
-            ctrl.active_tab_key(),
-            Some(&ActiveTab {
-                window_id: "w1".to_string(),
-                tab_id: "t-a".to_string(),
-            })
+            ctrl.switch_to("w1", &layout, "t-a"),
+            Err(TabSwitchError::ViewportAuthorityRequired)
         );
+        assert_eq!(
+            ctrl.switch_to("w1", &layout, "t-a"),
+            Err(TabSwitchError::ViewportAuthorityRequired)
+        );
+        assert!(attach_ids(&ctrl.sender).is_empty());
+        assert_eq!(ctrl.active_tab_key(), None);
     }
 
     #[test]
-    fn switch_a_then_b_sends_b_and_updates_active_state() {
+    fn textual_retarget_requires_exact_viewport_authority_for_both_lifetimes() {
+        let original = vec![tab("t-a", "sess-old")];
+        let retargeted = vec![tab("t-a", "sess-new")];
+        let mut ctrl = TabSwitchController::new(RecordingSink::default());
+
+        assert_eq!(
+            ctrl.switch_to("w1", &original, "t-a"),
+            Err(TabSwitchError::ViewportAuthorityRequired)
+        );
+        assert_eq!(
+            ctrl.switch_to("w1", &retargeted, "t-a"),
+            Err(TabSwitchError::ViewportAuthorityRequired)
+        );
+        assert!(attach_ids(&ctrl.sender).is_empty());
+    }
+
+    #[test]
+    fn textual_switch_a_then_b_sends_nothing_and_stays_neutral() {
         let layout = vec![tab("t-a", "sess-a"), tab("t-b", "sess-b")];
         let mut ctrl = TabSwitchController::new(RecordingSink::default());
-        assert_eq!(ctrl.switch_to("w1", &layout, "t-a"), Ok(true));
-        assert_eq!(ctrl.switch_to("w1", &layout, "t-b"), Ok(true));
         assert_eq!(
-            attach_ids(&ctrl.sender),
-            vec!["sess-a".to_string(), "sess-b".to_string()]
+            ctrl.switch_to("w1", &layout, "t-a"),
+            Err(TabSwitchError::ViewportAuthorityRequired)
         );
-        assert_eq!(ctrl.active_tab_id(), Some("t-b"));
+        assert_eq!(
+            ctrl.switch_to("w1", &layout, "t-b"),
+            Err(TabSwitchError::ViewportAuthorityRequired)
+        );
+        assert!(attach_ids(&ctrl.sender).is_empty());
+        assert_eq!(ctrl.active_tab_id(), None);
     }
 
     #[test]
@@ -4891,7 +6184,7 @@ mod tests {
     }
 
     #[test]
-    fn switch_to_with_closed_channel_is_typed_error_and_does_not_update_active() {
+    fn switch_to_without_authority_fails_before_observing_a_closed_channel() {
         let layout = vec![tab("t-a", "sess-a")];
         let sink = RecordingSink {
             closed: true,
@@ -4900,14 +6193,14 @@ mod tests {
         let mut ctrl = TabSwitchController::new(sink);
         assert_eq!(
             ctrl.switch_to("w1", &layout, "t-a"),
-            Err(TabSwitchError::RendererControlClosed)
+            Err(TabSwitchError::ViewportAuthorityRequired)
         );
         assert!(attach_ids(&ctrl.sender).is_empty());
         assert_eq!(ctrl.active_tab_id(), None);
     }
 
     #[test]
-    fn switch_to_uses_window_scoped_layout_projection() {
+    fn textual_window_scoped_layouts_cannot_authorize_any_attach() {
         // Window scoping is the caller's responsibility: each window's projection is
         // independent. The same tab title `t-1` lives in both windows but maps to that
         // window's own session, so resolution follows the layout passed in, never a
@@ -4915,110 +6208,99 @@ mod tests {
         let w1 = vec![tab("t-1", "sess-w1-1"), tab("t-2", "sess-w1-2")];
         let w2 = vec![tab("t-1", "sess-w2-1")];
         let mut ctrl = TabSwitchController::new(RecordingSink::default());
-        // Resolve t-1 under w1's projection -> w1's session.
-        assert_eq!(ctrl.switch_to("w1", &w1, "t-1"), Ok(true));
-        // Switch to a different tab so the next w2 selection isn't a no-op.
-        assert_eq!(ctrl.switch_to("w1", &w1, "t-2"), Ok(true));
-        // Resolve t-1 under w2's projection -> w2's session (not w1's).
-        assert_eq!(ctrl.switch_to("w2", &w2, "t-1"), Ok(true));
-        assert_eq!(
-            attach_ids(&ctrl.sender),
-            vec![
-                "sess-w1-1".to_string(),
-                "sess-w1-2".to_string(),
-                "sess-w2-1".to_string(),
-            ]
-        );
-        assert_eq!(ctrl.active_tab_id(), Some("t-1"));
+        for (window_id, layout, tab_id) in
+            [("w1", &w1, "t-1"), ("w1", &w1, "t-2"), ("w2", &w2, "t-1")]
+        {
+            assert_eq!(
+                ctrl.switch_to(window_id, layout, tab_id),
+                Err(TabSwitchError::ViewportAuthorityRequired)
+            );
+        }
+        assert!(attach_ids(&ctrl.sender).is_empty());
+        assert_eq!(ctrl.active_tab_id(), None);
     }
 
     #[test]
-    fn mpsc_sender_satisfies_the_sink_and_delivers_attach() {
+    fn mpsc_sender_receives_no_raw_attach_without_exact_authority() {
         let layout = vec![tab("t-a", "sess-a")];
         let (tx, rx) = std::sync::mpsc::channel();
         let mut ctrl = TabSwitchController::new(tx);
-        assert_eq!(ctrl.switch_to("w1", &layout, "t-a"), Ok(true));
-        match rx.try_recv() {
-            Ok(maestro_renderer::RendererCommand::AttachSession { session_id }) => {
-                assert_eq!(session_id, "sess-a");
-            }
-            other => panic!("expected one AttachSession, got {other:?}"),
-        }
+        assert_eq!(
+            ctrl.switch_to("w1", &layout, "t-a"),
+            Err(TabSwitchError::ViewportAuthorityRequired)
+        );
         assert!(rx.try_recv().is_err());
     }
 
     #[test]
-    fn switch_to_same_tab_id_in_different_window_is_not_a_noop() {
+    fn same_textual_tab_id_in_different_windows_is_not_lifetime_authority() {
         let w1 = vec![tab("t1", "sess-w1")];
         let w2 = vec![tab("t1", "sess-w2")];
         let mut ctrl = TabSwitchController::new(RecordingSink::default());
-        assert_eq!(ctrl.switch_to("w1", &w1, "t1"), Ok(true));
-        assert_eq!(ctrl.switch_to("w2", &w2, "t1"), Ok(true));
-        assert_eq!(attach_ids(&ctrl.sender), vec!["sess-w1", "sess-w2"]);
         assert_eq!(
-            ctrl.active_tab_key(),
-            Some(&ActiveTab {
-                window_id: "w2".to_string(),
-                tab_id: "t1".to_string(),
-            })
+            ctrl.switch_to("w1", &w1, "t1"),
+            Err(TabSwitchError::ViewportAuthorityRequired)
         );
+        assert_eq!(
+            ctrl.switch_to("w2", &w2, "t1"),
+            Err(TabSwitchError::ViewportAuthorityRequired)
+        );
+        assert!(attach_ids(&ctrl.sender).is_empty());
+        assert_eq!(ctrl.active_tab_key(), None);
     }
 
     #[test]
-    fn renderer_tab_runtime_receiver_gets_the_attach_command() {
+    fn renderer_tab_runtime_raw_switch_requires_exact_authority() {
         let layout = vec![tab("t-a", "sess-a")];
         let (mut rt, rx) = RendererTabRuntime::new();
-        assert_eq!(rt.switch_to("w1", &layout, "t-a"), Ok(true));
-        assert_eq!(recv_attach_id(&rx), "sess-a");
-        assert!(rx.try_recv().is_err());
-        assert_eq!(rt.active_tab_id(), Some("t-a"));
-        assert_eq!(rt.active_window_id(), Some("w1"));
         assert_eq!(
-            rt.active_tab_key(),
-            Some(&ActiveTab {
-                window_id: "w1".to_string(),
-                tab_id: "t-a".to_string(),
-            })
+            rt.switch_to("w1", &layout, "t-a"),
+            Err(TabSwitchError::ViewportAuthorityRequired)
         );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(rt.active_tab_key(), None);
     }
 
     #[test]
-    fn renderer_tab_runtime_same_tab_is_a_noop_and_leaves_receiver_empty() {
+    fn renderer_tab_runtime_repeated_raw_switch_remains_neutral() {
         let layout = vec![tab("t-a", "sess-a")];
         let (mut rt, rx) = RendererTabRuntime::new();
-        assert_eq!(rt.switch_to("w1", &layout, "t-a"), Ok(true));
-        assert_eq!(recv_attach_id(&rx), "sess-a");
-        assert_eq!(rt.switch_to("w1", &layout, "t-a"), Ok(false));
+        assert_eq!(
+            rt.switch_to("w1", &layout, "t-a"),
+            Err(TabSwitchError::ViewportAuthorityRequired)
+        );
+        assert_eq!(
+            rt.switch_to("w1", &layout, "t-a"),
+            Err(TabSwitchError::ViewportAuthorityRequired)
+        );
         assert!(rx.try_recv().is_err());
     }
 
     #[test]
-    fn renderer_tab_runtime_preserves_window_scoped_active_state() {
+    fn renderer_tab_runtime_rejects_raw_window_scoped_switches() {
         let w1 = vec![tab("t1", "sess-w1")];
         let w2 = vec![tab("t1", "sess-w2")];
         let (mut rt, rx) = RendererTabRuntime::new();
-        assert_eq!(rt.switch_to("w1", &w1, "t1"), Ok(true));
-        assert_eq!(rt.switch_to("w2", &w2, "t1"), Ok(true));
-        assert_eq!(recv_attach_id(&rx), "sess-w1");
-        assert_eq!(recv_attach_id(&rx), "sess-w2");
-        assert!(rx.try_recv().is_err());
         assert_eq!(
-            rt.active_tab_key(),
-            Some(&ActiveTab {
-                window_id: "w2".to_string(),
-                tab_id: "t1".to_string(),
-            })
+            rt.switch_to("w1", &w1, "t1"),
+            Err(TabSwitchError::ViewportAuthorityRequired)
         );
+        assert_eq!(
+            rt.switch_to("w2", &w2, "t1"),
+            Err(TabSwitchError::ViewportAuthorityRequired)
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(rt.active_tab_key(), None);
     }
 
     #[test]
-    fn renderer_tab_runtime_dropped_receiver_makes_switch_control_closed() {
+    fn renderer_tab_runtime_raw_switch_fails_before_observing_dropped_receiver() {
         let layout = vec![tab("t-a", "sess-a")];
         let (mut rt, rx) = RendererTabRuntime::new();
         drop(rx);
         assert_eq!(
             rt.switch_to("w1", &layout, "t-a"),
-            Err(TabSwitchError::RendererControlClosed)
+            Err(TabSwitchError::ViewportAuthorityRequired)
         );
         assert_eq!(rt.active_tab_id(), None);
         assert_eq!(rt.active_tab_key(), None);
@@ -5028,8 +6310,7 @@ mod tests {
     fn renderer_tab_runtime_noop_survives_dropped_receiver() {
         let layout = vec![tab("t-a", "sess-a")];
         let (mut rt, rx) = RendererTabRuntime::new();
-        assert_eq!(rt.switch_to("w1", &layout, "t-a"), Ok(true));
-        assert_eq!(recv_attach_id(&rx), "sess-a");
+        seed_exact_active_tab(&mut rt, "w1", "t-a", "sess-a");
         drop(rx);
         assert_eq!(rt.switch_to("w1", &layout, "t-a"), Ok(false));
         assert_eq!(rt.active_tab_id(), Some("t-a"));
@@ -5038,7 +6319,7 @@ mod tests {
     #[test]
     fn seed_active_tab_sets_active_coordinate_without_sending() {
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t1");
+        seed_exact_active_tab(&mut rt, "w1", "t1", "sess-t1");
         assert_eq!(rt.active_window_id(), Some("w1"));
         assert_eq!(rt.active_tab_id(), Some("t1"));
         assert_eq!(
@@ -5046,6 +6327,7 @@ mod tests {
             Some(&ActiveTab {
                 window_id: "w1".to_string(),
                 tab_id: "t1".to_string(),
+                session_id: "sess-t1".to_string(),
             })
         );
         assert!(rx.try_recv().is_err());
@@ -5055,20 +6337,23 @@ mod tests {
     fn seeded_same_tab_is_noop_even_with_dropped_receiver() {
         let layout = vec![tab("t1", "sess-1")];
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t1");
+        seed_exact_active_tab(&mut rt, "w1", "t1", "sess-1");
         drop(rx);
         assert_eq!(rt.switch_to("w1", &layout, "t1"), Ok(false));
         assert_eq!(rt.active_tab_id(), Some("t1"));
     }
 
     #[test]
-    fn seeded_then_different_tab_sends_normally() {
+    fn seeded_then_different_textual_tab_requires_new_exact_authority() {
         let layout = vec![tab("t1", "sess-1"), tab("t2", "sess-2")];
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t1");
-        assert_eq!(rt.switch_to("w1", &layout, "t2"), Ok(true));
-        assert_eq!(recv_attach_id(&rx), "sess-2");
-        assert_eq!(rt.active_tab_id(), Some("t2"));
+        seed_exact_active_tab(&mut rt, "w1", "t1", "sess-1");
+        assert_eq!(
+            rt.switch_to("w1", &layout, "t2"),
+            Err(TabSwitchError::ViewportAuthorityRequired)
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(rt.active_tab_id(), Some("t1"));
     }
 
     // ---- close-to-kill session lifecycle ----------------------------------------------------
@@ -5208,6 +6493,28 @@ mod tests {
     }
 
     #[test]
+    fn only_live_close_keeps_session_referenced_by_a_stashed_durable_row() {
+        let pre = vec![lifecycle_sel("live", "sess-shared")];
+        let mut parked =
+            tab_record_with_attention("parked", maestro_shell::AttentionState::default());
+        parked.session_id = s("sess-shared");
+        parked.stashed = true;
+
+        assert!(
+            live_tab_records_json(std::slice::from_ref(&parked)).is_empty(),
+            "the renderer strip is empty after closing the only live row"
+        );
+        let durable_post = vec![tab_record_json(&parked)];
+        assert_eq!(
+            plan_closed_tab_session_lifecycle(&pre, &durable_post, "live"),
+            ClosedTabSessionLifecycle::KeepShared {
+                session_id: s("sess-shared")
+            },
+            "session ownership is guarded by all durable rows, including parked ones"
+        );
+    }
+
+    #[test]
     fn close_lifecycle_reports_missing_tab_when_absent_from_pre_close() {
         let pre = vec![lifecycle_sel("t1", "sess-1")];
         let post = vec![lifecycle_tab("t1", "sess-1", 0)];
@@ -5220,7 +6527,7 @@ mod tests {
     #[test]
     fn close_lifecycle_only_tab_empty_projection_plans_kill() {
         let pre = vec![lifecycle_sel("t0", "sess-0")];
-        // Only-tab close leaves ZERO remaining tabs.
+        // This only-live-tab close has no remaining durable rows.
         let post: Vec<WindowTabJson> = Vec::new();
         assert_eq!(
             plan_closed_tab_session_lifecycle(&pre, &post, "t0"),

@@ -24,7 +24,7 @@ use super::recovery::{
     WebKitFailureReason, WebKitRecoveryEvent, WebKitSurface, MAX_WEBKIT_RECOVERY_ATTEMPTS,
 };
 use super::wake::{webkit_recovery_sender, LinuxLoopEvent};
-use crate::{ReactChromeScriptKind, RendererEvent};
+use crate::{ReactChromeScriptKind, RendererEvent, ViewportEventSink};
 
 fn overlay_event_mask() -> gtk::gdk::EventMask {
     gtk::gdk::EventMask::BUTTON_PRESS_MASK
@@ -1778,7 +1778,7 @@ pub struct LinuxOverlayHost {
     overlay_url: String,
     initialization_script: String,
     input_trace_enabled: bool,
-    events: Option<std::sync::mpsc::Sender<RendererEvent>>,
+    events: Option<ViewportEventSink>,
     wake_proxy: tao::event_loop::EventLoopProxy<LinuxLoopEvent>,
     state: Rc<RefCell<OverlayRuntime>>,
     recovery_tracker: Rc<RefCell<RecoverySignalTracker>>,
@@ -1799,7 +1799,7 @@ impl LinuxOverlayHost {
         underlay_containers: Vec<gtk::Widget>,
         overlay_url: String,
         initialization_script: String,
-        events: Option<std::sync::mpsc::Sender<RendererEvent>>,
+        events: Option<ViewportEventSink>,
         wake_proxy: tao::event_loop::EventLoopProxy<LinuxLoopEvent>,
         persistent_input_gate: Rc<PersistentInputGate>,
     ) -> Result<Self, String> {

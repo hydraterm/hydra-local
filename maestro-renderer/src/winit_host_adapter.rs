@@ -32,6 +32,10 @@ pub fn host_event_from_winit(event: &WindowEvent) -> Option<HostEvent> {
         },
         WindowEvent::RedrawRequested => HostEvent::RedrawRequested,
         WindowEvent::Focused(f) => HostEvent::Focused(*f),
+        WindowEvent::DroppedFile(path) => HostEvent::DroppedFiles {
+            paths: vec![path.clone()],
+            position: None,
+        },
         WindowEvent::CursorLeft { .. } => HostEvent::CursorLeft,
         WindowEvent::CursorMoved { position, .. } => HostEvent::CursorMoved {
             x: position.x,
@@ -192,6 +196,18 @@ mod tests {
         assert_eq!(
             host_event_from_winit(&ev),
             Some(HostEvent::CursorMoved { x: 12.5, y: 34.0 })
+        );
+    }
+
+    #[test]
+    fn file_drop_maps_without_inventing_a_cursor_position() {
+        let path = std::path::PathBuf::from("/tmp/a b");
+        assert_eq!(
+            host_event_from_winit(&WindowEvent::DroppedFile(path.clone())),
+            Some(HostEvent::DroppedFiles {
+                paths: vec![path],
+                position: None,
+            })
         );
     }
 

@@ -7,6 +7,13 @@ license.workspace = true
 rust-version.workspace = true
 description = "Shell-owned product metadata for Maestro: projects, workspaces, durable session/task records, versioned storage, and pure workspace-policy resolution without daemon, PTY, git, or renderer coupling."
 
+[features]
+default = []
+# Unit-test binaries create many isolated AppPaths in one process. Production keeps one cached
+# connection per real app-support base; this opt-in test feature may retire cache-only handles
+# between distinct bases so macOS's default 256-FD limit remains a meaningful test gate.
+test-connection-cache-pruning = []
+
 # A minimal contributor smoke CLI over `ShellRuntime`: resolve+connect to an ALREADY-RUNNING
 # daemon and start/attach or reconcile one session. It owns no daemon lifecycle.
 [[bin]]
@@ -17,6 +24,7 @@ path = "src/bin/maestro_shell_smoke.rs"
 maestro-protocol = { path = "../maestro-protocol" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 uuid = { workspace = true }
 libc = { workspace = true }
 # Embedded SQLite (single-file local store; FK cascade). `bundled` vendors SQLite's C source so there is NO system

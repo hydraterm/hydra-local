@@ -12,9 +12,13 @@ use serde::{Deserialize, Serialize};
 // `crate::protocol::{...}` unchanged. `MAX_LINE_BYTES` is the per-line framing cap (still enforced
 // by the daemon's request reader, the renderer's event reader, and the app-shell client). The
 // daemon still owns the event-side and grid-coupled types below (`DaemonEvent`, `DamageFrame`,
-// etc.), which depend on `grid`/`revision` internals and therefore remain daemon-owned.
+// etc.), which depend on `grid`/`revision` internals and are NOT moved in this pass.
+pub use maestro_protocol::request::{AttachmentHandoff, AttachmentHandoffToken};
 pub use maestro_protocol::{
-    ChannelEvent, ChannelEventKind, ClientRequest, DAEMON_PROTOCOL_VERSION, MAX_LINE_BYTES,
+    ChannelEvent, ChannelEventKind, ClientRequest, ConditionalSessionStartOutcome,
+    DaemonInstanceId, SessionAttachRefusal, SessionStartOperationReserveOutcome,
+    SessionStartOperationRetireOutcome, SessionStartOperationStatus, SessionStartOperationToken,
+    DAEMON_PROTOCOL_VERSION, MAX_LINE_BYTES,
 };
 
 /// Metadata for one live daemon session. Kept next to `ids` in the `Sessions` event so old clients can keep
@@ -55,10 +59,10 @@ pub const MAX_DAMAGE_CELLS: usize = 1_000_000;
 /// Practical cap on the serialized byte length of a single damage frame's wire line.
 /// This bounds deserialization allocation independently of cell/op counts (a single
 /// `RowSpan` cell can carry a long `text` grapheme cluster). A frame's JSON over this
-/// is rejected at the framing layer before a full parse is attempted. 8 MiB covers a
-/// dense full-screen frame with rich styling and multi-codepoint cells with margin.
+/// is rejected at the framing layer before a full parse is attempted. 9 MiB covers a
+/// dense full-screen frame plus the globally capped optional OSC 8 fields with margin.
 #[allow(dead_code)]
-pub const MAX_DAMAGE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_DAMAGE_BYTES: usize = 9 * 1024 * 1024;
 
 /// Largest grid dimension a damage frame may claim — mirrors `grid::MAX_DIMENSION`.
 /// The daemon clamps real grids to this; a frame claiming more is malformed.
@@ -86,6 +90,10 @@ pub const MAX_SCROLLBACK_ROWS_PER_REQUEST: u16 = 256;
 /// below would fail loudly if the snapshot budget shrank below what we assume).
 #[allow(dead_code)]
 const SCROLLBACK_WORST_CASE_CELL_BYTES: usize = 256;
+#[allow(dead_code)]
+const SCROLLBACK_WORST_CASE_HYPERLINK_BYTES: usize =
+    maestro_protocol::MAX_TERMINAL_LINK_CELLS_PER_FRAME
+        * (maestro_protocol::MAX_TERMINAL_URL_BYTES + 32);
 
 /// Fixed per-line overhead for the `ScrollbackRows` envelope outside the cell array
 /// (the `ev`/`id`/generation UUID/revision/history_len/offset_from_top/`rows` nesting).
@@ -102,7 +110,9 @@ const SCROLLBACK_HEADER_BYTES: usize = 4 * 1024;
 const _: () = {
     assert!(MAX_SCROLLBACK_ROWS_PER_REQUEST > 0);
     assert!(
-        MAX_SNAPSHOT_CELLS * SCROLLBACK_WORST_CASE_CELL_BYTES + SCROLLBACK_HEADER_BYTES
+        MAX_SNAPSHOT_CELLS * SCROLLBACK_WORST_CASE_CELL_BYTES
+            + SCROLLBACK_HEADER_BYTES
+            + SCROLLBACK_WORST_CASE_HYPERLINK_BYTES
             <= MAX_LINE_BYTES
     );
 };
@@ -365,6 +375,8 @@ pub enum DaemonEvent {
     DaemonInfo {
         protocol_version: u32,
         build_version: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        daemon_instance_id: Option<DaemonInstanceId>,
         /// This daemon echoes an Attach request's optional `output_generation` on exactly that
         /// Attach's restore Grid and tags its live forwarder events, giving proxies exact ownership
         /// even if an aborted old forwarder races past a newer baseline.
@@ -372,6 +384,55 @@ pub enum DaemonEvent {
         output_generation_echo: bool,
         #[serde(default)]
         child_environment: bool,
+        /// Every Write/Resize/Kill carries an exact grid/process generation and is compared with
+        /// the map entry under the same daemon lock used to resolve/remove that entry.
+        #[serde(default)]
+        generation_conditional_mutations: bool,
+        /// Conditional Kill refuses an exact lifetime while it has any active attachment guard or
+        /// pending one-shot attachment handoff token.
+        #[serde(default)]
+        attachment_aware_conditional_kill: bool,
+        #[serde(default)]
+        generation_conditional_start: bool,
+        #[serde(default)]
+        start_operation_ledger: bool,
+        #[serde(default)]
+        generation_conditional_attach: bool,
+    },
+    SessionAttachRefused {
+        id: SessionId,
+        expected_generation: String,
+        daemon_instance_id: DaemonInstanceId,
+        reason: SessionAttachRefusal,
+    },
+    ConditionalSessionStart {
+        id: SessionId,
+        operation_token: SessionStartOperationToken,
+        daemon_instance_id: DaemonInstanceId,
+        outcome: ConditionalSessionStartOutcome,
+    },
+    StartOperationReserved {
+        id: SessionId,
+        operation_token: SessionStartOperationToken,
+        daemon_instance_id: DaemonInstanceId,
+        outcome: SessionStartOperationReserveOutcome,
+    },
+    StartOperationStatus {
+        id: SessionId,
+        operation_token: SessionStartOperationToken,
+        daemon_instance_id: DaemonInstanceId,
+        status: SessionStartOperationStatus,
+    },
+    StartOperationRetired {
+        id: SessionId,
+        operation_token: SessionStartOperationToken,
+        daemon_instance_id: DaemonInstanceId,
+        outcome: SessionStartOperationRetireOutcome,
+    },
+    AttachmentHandoffCancelled {
+        id: SessionId,
+        token: AttachmentHandoffToken,
+        daemon_instance_id: DaemonInstanceId,
     },
     TerminalBell {
         id: SessionId,
@@ -491,12 +552,18 @@ mod damage_tests {
         let event = DaemonEvent::DaemonInfo {
             protocol_version: DAEMON_PROTOCOL_VERSION,
             build_version: "0.1.0".into(),
+            daemon_instance_id: Some("22222222222242228222222222222222".parse().unwrap()),
             output_generation_echo: true,
             child_environment: true,
+            generation_conditional_mutations: true,
+            attachment_aware_conditional_kill: true,
+            generation_conditional_start: true,
+            start_operation_ledger: true,
+            generation_conditional_attach: true,
         };
         assert_eq!(
             serde_json::to_string(&event).unwrap(),
-            r#"{"ev":"daemon_info","protocol_version":2,"build_version":"0.1.0","output_generation_echo":true,"child_environment":true}"#
+            r#"{"ev":"daemon_info","protocol_version":3,"build_version":"0.1.0","daemon_instance_id":"22222222222242228222222222222222","output_generation_echo":true,"child_environment":true,"generation_conditional_mutations":true,"attachment_aware_conditional_kill":true,"generation_conditional_start":true,"start_operation_ledger":true,"generation_conditional_attach":true}"#
         );
     }
 
@@ -516,6 +583,7 @@ mod damage_tests {
             strikeout: false,
             dim: false,
             hidden: false,
+            hyperlink: None,
             width: 1,
         }
     }
@@ -932,7 +1000,7 @@ mod damage_tests {
     /// daemon-serialized JSON deserializes identically in the renderer mirror.
     /// If the daemon's serde shape drifts, `cross_wire_daemon_emits_canonical_json`
     /// fails here and the renderer fixture must be updated in lockstep.
-    pub(crate) const CROSS_WIRE_DAMAGE_JSON: &str = r#"{"ev":"damage","frame":{"schema":1,"id":"s1","generation":"11111111-1111-1111-1111-111111111111","base_revision":4,"revision":5,"cols":10,"rows":4,"cursor":{"line":1,"col":2,"visible":true,"shape":"block"},"modes":{"alt_screen":false,"app_cursor":true,"bracketed_paste":false,"focus_reporting":true,"mouse_report":false,"mouse_drag":false,"mouse_motion":false,"mouse_sgr":false},"ops":[{"op":"row_span","row":1,"start":2,"cells":[{"text":"a","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"width":1}]},{"op":"clear_all","cell":{"text":" ","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"width":1}}]}}"#;
+    pub(crate) const CROSS_WIRE_DAMAGE_JSON: &str = r#"{"ev":"damage","frame":{"schema":1,"id":"s1","generation":"11111111-1111-1111-1111-111111111111","base_revision":4,"revision":5,"cols":10,"rows":4,"cursor":{"line":1,"col":2,"visible":true,"shape":"block"},"modes":{"alt_screen":false,"app_cursor":true,"bracketed_paste":false,"focus_reporting":true,"mouse_report":false,"mouse_drag":false,"mouse_motion":false,"mouse_sgr":false},"ops":[{"op":"row_span","row":1,"start":2,"cells":[{"text":"a","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"hyperlink":"https://damage.example.test/a","width":1}]},{"op":"clear_all","cell":{"text":" ","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"width":1}}]}}"#;
 
     #[test]
     fn cross_wire_daemon_emits_canonical_json() {
@@ -944,7 +1012,16 @@ mod damage_tests {
         assert_eq!(reser, CROSS_WIRE_DAMAGE_JSON);
         // And the decoded frame is structurally valid.
         match ev {
-            DaemonEvent::Damage { frame } => assert_eq!(frame.validate(), Ok(())),
+            DaemonEvent::Damage { frame } => {
+                assert_eq!(frame.validate(), Ok(()));
+                match &frame.ops[0] {
+                    DamageOp::RowSpan { cells, .. } => assert_eq!(
+                        cells[0].hyperlink.as_deref(),
+                        Some("https://damage.example.test/a")
+                    ),
+                    other => panic!("expected RowSpan, got {other:?}"),
+                }
+            }
             other => panic!("expected Damage, got {other:?}"),
         }
     }
@@ -1071,7 +1148,7 @@ mod damage_tests {
     /// prove daemon-serialized JSON deserializes identically in the renderer mirror; if
     /// the daemon's serde shape drifts, `cross_wire_daemon_emits_canonical_scrollback`
     /// fails here and the renderer fixture must be updated in lockstep.
-    pub(crate) const CROSS_WIRE_SCROLLBACK_JSON: &str = r#"{"ev":"scrollback_rows","id":"s1","generation":"11111111-1111-1111-1111-111111111111","revision":7,"history_len":5000,"offset_from_top":3,"rows":[[{"text":"a","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"width":1}]]}"#;
+    pub(crate) const CROSS_WIRE_SCROLLBACK_JSON: &str = r#"{"ev":"scrollback_rows","id":"s1","generation":"11111111-1111-1111-1111-111111111111","revision":7,"history_len":5000,"offset_from_top":3,"rows":[[{"text":"a","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"hyperlink":"https://scrollback.example.test/a","width":1}]]}"#;
 
     /// The exact wire bytes the daemon emits for a representative `Grid` event — the
     /// attach/resync baseline payload and the largest, most field-heavy event on the wire.
@@ -1088,7 +1165,7 @@ mod damage_tests {
     /// so a future rename/drop/reorder of any cursor, mode, or mouse field — e.g. the
     /// `mouse_report`/`mouse_drag`/`mouse_motion`/`mouse_sgr` set — fails one of the paired
     /// tests instead of silently decoding to a wrong (defaulted-`false`) value.
-    pub(crate) const CROSS_WIRE_GRID_JSON: &str = r#"{"ev":"grid","id":"s1","grid":{"version":2,"generation":"11111111-1111-1111-1111-111111111111","revision":5,"base_revision":4,"cols":3,"rows":1,"rows_cells":[[{"text":"界","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"width":2},{"text":"","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"width":0},{"text":"x","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"width":1}]],"cursor_line":0,"cursor_col":2,"cursor_visible":true,"cursor_shape":"beam","alt_screen":true,"app_cursor":true,"bracketed_paste":true,"focus_reporting":true,"mouse_report":true,"mouse_drag":true,"mouse_motion":true,"mouse_sgr":true}}"#;
+    pub(crate) const CROSS_WIRE_GRID_JSON: &str = r#"{"ev":"grid","id":"s1","grid":{"version":2,"generation":"11111111-1111-1111-1111-111111111111","revision":5,"base_revision":4,"cols":3,"rows":1,"rows_cells":[[{"text":"界","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"width":2},{"text":"","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"width":0},{"text":"x","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"hyperlink":"https://grid.example.test/x","width":1}]],"cursor_line":0,"cursor_col":2,"cursor_visible":true,"cursor_shape":"beam","alt_screen":true,"app_cursor":true,"bracketed_paste":true,"focus_reporting":true,"mouse_report":true,"mouse_drag":true,"mouse_motion":true,"mouse_sgr":true}}"#;
 
     #[test]
     fn cross_wire_daemon_emits_canonical_grid() {
@@ -1112,6 +1189,10 @@ mod damage_tests {
                 // Wide pair preserved across the wire: width-2 lead, width-0 spacer.
                 assert_eq!(grid.rows_cells[0][0].width, 2);
                 assert_eq!(grid.rows_cells[0][1].width, 0);
+                assert_eq!(
+                    grid.rows_cells[0][2].hyperlink.as_deref(),
+                    Some("https://grid.example.test/x")
+                );
                 assert_eq!(grid.cursor_line, 0);
                 assert_eq!(grid.cursor_col, 2);
                 assert!(grid.cursor_visible);
@@ -1147,6 +1228,10 @@ mod damage_tests {
                 assert_eq!(history_len, 5000);
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0].len(), 1);
+                assert_eq!(
+                    rows[0][0].hyperlink.as_deref(),
+                    Some("https://scrollback.example.test/a")
+                );
             }
             other => panic!("expected ScrollbackRows, got {other:?}"),
         }

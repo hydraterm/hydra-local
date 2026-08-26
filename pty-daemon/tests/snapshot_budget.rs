@@ -10,11 +10,11 @@ use common::{connect, read_until, send, socket_path, start_daemon_on, Killer};
 use std::io::BufReader;
 use std::time::Duration;
 
-/// The largest supported square grid. `MAX_SNAPSHOT_CELLS` is 32752; the largest square
-/// that fits is 180x180 = 32400 <= budget. Kept in sync with `grid::MAX_SNAPSHOT_CELLS`;
+/// The largest supported square grid. `MAX_SNAPSHOT_CELLS` is 30672; the largest square
+/// that fits is 175x175 = 30625 <= budget. Kept in sync with `grid::MAX_SNAPSHOT_CELLS`;
 /// if that derivation changes, update this (the over-budget test below still guards the
 /// upper bound independently).
-const MAX_SQUARE_SIDE: u16 = 180;
+const MAX_SQUARE_SIDE: u16 = 175;
 
 #[test]
 fn largest_supported_snapshot_crosses_the_socket() {

@@ -37,6 +37,7 @@ mod dashboard;
 mod dashboard_ui;
 pub mod desktop_access_onboarding;
 mod file_preview;
+mod launch_preflight;
 mod lifecycle;
 /// Remote model catalog: refreshes the per-agent model dropdown lists from the published
 /// downloads manifest without requiring an app release.
@@ -193,14 +194,17 @@ pub use picker::{
 pub use window::{
     apply_active_tab_close, apply_inactive_tab_close, apply_only_tab_close, apply_tab_activation,
     build_tab_strip_model, build_tab_strip_model_from_window_view, classify_focused_pane_close,
-    execute_closed_tab_session_lifecycle, is_active_tab_close, maybe_send_font_size_update,
-    maybe_send_theme_update, new_tab_snapshot_from_strip_tabs, plan_closed_tab_session_lifecycle,
-    plan_next_active_tab, renderer_tab_strip, resolve_window_record, select_window_tab_session,
-    selection_from_strip_tabs, split_subtree_close_order, surviving_active_tab_id, tab_record_json,
-    tab_strip_model_changed, ActiveTab, ActiveTabCloseOutcome, ClosedTabKillOutcome,
-    ClosedTabSessionLifecycle, FocusedPaneCloseClass, NextActivePlan, OnlyTabCloseOutcome,
-    PaneRectJson, RendererCommandSink, RendererFontSizeRuntime, RendererTabRuntime,
-    RendererThemeRuntime, SplitFromJson, TabActivation, TabCloseOutcome, TabSelection,
+    execute_closed_tab_session_lifecycle, is_active_tab_close, live_tab_records_json,
+    maybe_send_font_size_update, maybe_send_theme_update, new_tab_snapshot_from_strip_tabs,
+    new_tab_snapshot_from_tab_records, plan_closed_tab_session_lifecycle, plan_next_active_tab,
+    renderer_tab_strip, renderer_viewport_projection_from_snapshot, resolve_window_record,
+    select_window_tab_session, selection_from_strip_tabs, split_subtree_close_order,
+    surviving_active_tab_id, tab_record_json, tab_strip_model_changed, ActiveRendererViewport,
+    ActiveTab, ActiveTabCloseOutcome, ClosedTabKillOutcome, ClosedTabSessionLifecycle,
+    FocusedPaneCloseClass, NextActivePlan, OnlyTabCloseOutcome, PaneRectJson,
+    PendingRendererViewport, RendererCommandSink, RendererFontSizeRuntime, RendererTabRuntime,
+    RendererThemeRuntime, RendererViewportProjection, RendererViewportProjectionError,
+    RendererViewportSettlement, SplitFromJson, TabActivation, TabCloseOutcome, TabSelection,
     TabSelectionError, TabStripItem, TabStripModel, TabStripModelError, TabSwitchController,
     TabSwitchError, WindowRecordParams, WindowTabJson, WindowViewTabJson, DEFAULT_WINDOW_ID,
 };
@@ -216,37 +220,33 @@ pub use window::{
 // in `constants.rs` (re-exported from the crate root) and the attention/session wire-string helpers
 // stay in `lib.rs`; the moved code resolves all of them via `crate::`.
 pub use new_tab::{
-    classify_new_tab_foreground_failure, execute_new_tab_recovery_plan, execute_preset_restore,
-    execute_resolved_new_tab_recovery_plan, foreground_new_tab_recovery_context,
-    kill_session_recovery_effect, new_tab_decline_status_label, new_tab_failure_scratch_to_remove,
-    new_tab_prepared_start_params, new_tab_strip_projection, plan_new_tab,
-    plan_new_tab_failure_recovery, prepare_new_tab_scratch_workspace,
-    reconcile_renderer_state_recovery_effect, record_new_tab_in_window_layout,
-    remove_new_tab_scratch, remove_scratch_recovery_effect,
-    render_resolved_recovery_execution_log_line, render_resolved_recovery_log_line,
-    resolve_new_tab_recovery, resolve_new_tab_recovery_plan, revert_renderer_strip_recovery_effect,
-    rollback_tab_record_recovery_effect, run_new_tab_foreground_pipeline,
+    classify_new_tab_foreground_failure, execute_preset_restore,
+    execute_production_new_tab_recovery, foreground_new_tab_recovery_context,
+    new_tab_decline_status_label, new_tab_failure_scratch_to_remove, new_tab_prepared_start_params,
+    new_tab_strip_projection, plan_new_tab, plan_new_tab_failure_recovery,
+    preflight_preset_restore, prepare_new_tab_scratch_workspace,
+    reconcile_renderer_state_recovery_effect, render_resolved_recovery_execution_log_line,
+    render_resolved_recovery_log_line, resolve_new_tab_recovery, resolve_new_tab_recovery_plan,
+    revert_renderer_strip_recovery_effect, run_new_tab_foreground_pipeline,
     run_new_tab_foreground_pipeline_with_consent, send_new_tab_attach_session,
-    send_new_tab_set_tab_strip, start_new_tab_prepared_session, DaemonClientRecoverySessionKiller,
-    ForegroundRendererStateController, IdGen, KillSessionRecoveryEffectResult, NewTabAbortReason,
-    NewTabAttachSession, NewTabAttachSessionError, NewTabCwdBasis, NewTabFailureDiagnostic,
-    NewTabFailureStage, NewTabForegroundError, NewTabForegroundRequest, NewTabForegroundSuccess,
+    send_new_tab_set_tab_strip, ForegroundRendererStateController, IdGen, NewTabAbortReason,
+    NewTabAttachSession, NewTabAttachSessionError, NewTabCreatedTabRollbackAuthority,
+    NewTabCwdBasis, NewTabFailureDiagnostic, NewTabFailureStage, NewTabForegroundAdoption,
+    NewTabForegroundError, NewTabForegroundHandoffResolution, NewTabForegroundLaunch,
+    NewTabForegroundPendingHandoff, NewTabForegroundRequest, NewTabForegroundSuccess,
     NewTabLaunchPolicy, NewTabLaunchSource, NewTabLayoutRecord, NewTabLayoutRecordError,
-    NewTabPlan, NewTabPreparedStart, NewTabRecoveryAction, NewTabRecoveryActionOutcome,
-    NewTabRecoveryContext, NewTabRecoveryEffects, NewTabRecoveryExecutionReport,
-    NewTabRecoveryPlan, NewTabRecoveryRendererStateController, NewTabRecoverySessionKiller,
+    NewTabPlan, NewTabPreparedCompensationStatus, NewTabPreparedRollbackAuthority,
+    NewTabPreparedSessionError, NewTabPreparedStart, NewTabRecoveryAction,
+    NewTabRecoveryActionOutcome, NewTabRecoveryContext, NewTabRecoveryExecutionReport,
+    NewTabRecoveryPlan, NewTabRecoveryRendererStateController, NewTabSessionRollbackAuthority,
     NewTabSessionStart, NewTabSessionStartError, NewTabSetTabStrip, NewTabSetTabStripError,
     NewTabSnapshot, NewTabSplitFrom, NewTabStartParamsError, NewTabStripProjection,
     NewTabStripProjectionError, NewTabWorkspacePrepareError, PresetRestoreError,
     PresetRestoreRequest, PresetRestoreSlotKind, PresetRestoreSlotOutcome,
     RendererStateRecoveryEffectResult, ResolvedNewTabRecoveryAction,
     ResolvedNewTabRecoveryActionOutcome, ResolvedNewTabRecoveryActionStatus,
-    ResolvedNewTabRecoveryCompleteEffectError, ResolvedNewTabRecoveryCompleteEffects,
-    ResolvedNewTabRecoveryEffectResult, ResolvedNewTabRecoveryEffects,
-    ResolvedNewTabRecoveryExecutionReport, ResolvedNewTabRecoveryFilesystemEffects,
-    ResolvedNewTabRecoveryLocalEffectError, ResolvedNewTabRecoveryLocalEffects,
-    ResolvedNewTabRecoveryPlan, ResolvedNewTabRecoveryRecordLocalEffects, UuidIdGen,
-    NEW_TAB_DECLINE_HINT,
+    ResolvedNewTabRecoveryEffectResult, ResolvedNewTabRecoveryExecutionReport,
+    ResolvedNewTabRecoveryPlan, UuidIdGen, NEW_TAB_DECLINE_HINT,
 };
 
 // Re-export the top-level CLI surface (the [`Command`] enum, its parsed argument DTOs, the
@@ -303,8 +303,9 @@ pub use settings::{
 // Re-export shared app constants so library/binary/package tests use one set of product identities.
 pub use constants::{
     DEFAULT_COLS, DEFAULT_ROWS, DEFAULT_SESSION_ID, ID_MINT_ATTEMPTS, PRODUCT_RECOVERY_PROJECT_ID,
-    SYSTEM_TERMINAL_PROJECT_ID, SYSTEM_TERMINAL_SESSION_ID, SYSTEM_TERMINAL_TAB_ID,
-    SYSTEM_TERMINAL_WINDOW_ID, SYSTEM_TERMINAL_WORKSPACE_ID, TITLE_MAX_LEN,
+    PRODUCT_RECOVERY_SESSION_ID, PRODUCT_RECOVERY_TAB_ID, PRODUCT_RECOVERY_WINDOW_ID,
+    PRODUCT_RECOVERY_WORKSPACE_ID, SYSTEM_TERMINAL_PROJECT_ID, SYSTEM_TERMINAL_SESSION_ID,
+    SYSTEM_TERMINAL_TAB_ID, SYSTEM_TERMINAL_WINDOW_ID, SYSTEM_TERMINAL_WORKSPACE_ID, TITLE_MAX_LEN,
 };
 
 // ---- new-tab planner foundation -------------------------------------------------------------

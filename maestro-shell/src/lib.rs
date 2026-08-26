@@ -23,6 +23,8 @@
 pub mod agent_task_reconcile;
 pub mod agent_task_runtime;
 pub mod agent_task_signal;
+pub mod agent_task_start_journal;
+pub mod agent_task_start_recovery;
 pub mod agent_tasks;
 pub mod daemon_client;
 pub mod daemon_endpoint;
@@ -33,6 +35,7 @@ pub mod envelope;
 pub mod focus_request_signal;
 pub mod ids;
 pub mod invariants;
+pub mod launch_environment;
 pub mod layout_preset;
 mod local_store_security;
 pub mod migrate;
@@ -45,8 +48,10 @@ pub mod policy;
 pub mod project;
 pub mod records;
 pub mod redact;
+pub mod reserved_product_shell;
 pub mod restart_recipe;
 pub mod schema;
+pub mod session_release;
 pub mod session_service;
 pub mod shell_runtime;
 pub mod store;
@@ -56,6 +61,8 @@ pub mod workspace_consent;
 pub mod workspace_exec;
 pub mod write_trace;
 
+pub use maestro_protocol::{AttachmentHandoff, AttachmentHandoffToken, DaemonInstanceId};
+
 pub use agent_task_reconcile::{
     AgentTaskReconcileReport, AgentTaskReconciler, DanglingSessionTaskRef, QuarantinedRecord,
     ReconciledAgentTask,
@@ -64,10 +71,25 @@ pub use agent_task_runtime::{AgentTaskRuntime, AgentTaskRuntimeError, StartAgent
 pub use agent_task_signal::{
     classify_task_signal, TaskStateAssertion, TaskStateEvidence, TaskStateSignal,
 };
+pub use agent_task_start_journal::{
+    AgentTaskStartAppliedMarkOutcome, AgentTaskStartBindingState,
+    AgentTaskStartChangedCleanupDeleteOutcome, AgentTaskStartChangedUnappliedDeleteOutcome,
+    AgentTaskStartCompensationOutcome, AgentTaskStartDisposition, AgentTaskStartJournalError,
+    AgentTaskStartJournalService, AgentTaskStartPublicationOutcome,
+    AgentTaskStartReleaseDeleteOutcome, AppliedAgentTaskStartState, ClaimedAgentTaskStart,
+    ClaimedAgentTaskStartGraph, CleanedAndRetiredAgentTaskStartOperation,
+    ProvenUnappliedAgentTaskStart, RetiredAgentTaskStartOperation,
+    AGENT_TASK_START_RECOVERY_LEASE_MS,
+};
+pub use agent_task_start_recovery::{
+    AgentTaskStartRecoveryError, AgentTaskStartRecoveryOutcome, AgentTaskStartRecoveryService,
+};
 pub use agent_tasks::{AgentTaskService, AgentTaskServiceError};
 pub use daemon_client::{
-    AttachedSession, DaemonClient, DaemonClientError, Direction, KilledSession, DEFAULT_TIMEOUT,
-    MAX_REPLY_BYTES_PER_OPERATION, MAX_REPLY_EVENTS_PER_OPERATION,
+    AttachedSession, AttachmentHandoffAuthority, ConditionalStartPeerIdentity,
+    ConditionalStartRecovery, ConditionalStartRecoveryAuthority, DaemonClient, DaemonClientError,
+    Direction, GenerationMutationSnapshot, KillSessionPublicationError, KilledSession,
+    DEFAULT_TIMEOUT,
 };
 pub use daemon_endpoint::{
     default_socket_path, default_socket_path_for_uid, load_endpoint, resolve_socket_path,
@@ -83,6 +105,11 @@ pub use focus_request_signal::{
     MAX_FOCUS_REQUEST_FUTURE_SKEW_MS,
 };
 pub use ids::{validate_id, IdError};
+pub use launch_environment::{
+    known_safe_provider_login_shell_argv, login_shell_argv, login_shell_argv_with,
+    login_shell_program, shell_quote_login_arg, LaunchEnvLookup, ProcessLaunchEnv,
+    LOGIN_SHELL_COMMAND_FLAGS,
+};
 pub use layout_preset::{
     plan_preset_restore, LayoutPresetError, LayoutPresetService, PresetRestoreAction,
     PresetRestoreSlot,
@@ -91,8 +118,8 @@ pub use names::unique_name;
 pub use paths::{AppPaths, RecordKind};
 pub use policy::{resolved_cwd, ResolvedCwd, WorkspacePolicy};
 pub use project::{
-    NewProject, ProjectDeletionPlan, ProjectDeletionResult, ProjectService, ProjectServiceError,
-    ProjectUpdate,
+    ConditionalCreatedProjectDelete, CreatedProject, NewProject, ProjectCreationReceipt,
+    ProjectDeletionPlan, ProjectDeletionResult, ProjectService, ProjectServiceError, ProjectUpdate,
 };
 pub use records::{
     AgentTask, AgentTaskState, Attention, AttentionSource, AttentionState, LaunchSpec,
@@ -101,23 +128,61 @@ pub use records::{
     Workspace, WorkspaceConsent, WorktreeProvenance,
 };
 pub use redact::{redact_args, RedactedLaunch};
+pub use reserved_product_shell::{
+    ReservedProductShellKind, ReservedProductShellStart, PRODUCT_RECOVERY_PROJECT_ID,
+    PRODUCT_RECOVERY_SESSION_ID, PRODUCT_RECOVERY_TAB_ID, PRODUCT_RECOVERY_WINDOW_ID,
+    PRODUCT_RECOVERY_WORKSPACE_ID, SYSTEM_TERMINAL_PROJECT_ID, SYSTEM_TERMINAL_SESSION_ID,
+    SYSTEM_TERMINAL_TAB_ID, SYSTEM_TERMINAL_WINDOW_ID, SYSTEM_TERMINAL_WORKSPACE_ID,
+};
 pub use restart_recipe::{
     canonical_launch_for_restart, canonicalize_all_session_restart_recipes,
-    canonicalize_session_restart_recipe, known_safe_provider_has_exact_resume,
+    canonicalize_session_restart_recipe, is_known_provider_id, is_strict_prepared_provider_launch,
+    is_valid_prepared_provider_custom_adhoc, known_safe_provider_has_exact_resume,
+};
+pub use session_release::{
+    pre_resolve_session_generations, CasPublication, ConfirmedSessionRelease, DaemonReleaseAttempt,
+    ForwardReleaseClaim, PendingReleaseReceipt, PreResolvedSessionGenerations,
+    PreResolvedSessionState, ProvenSessionReleaseTarget, ReleaseFailure, ReleaseOperationOutcome,
+    SessionReleaseError, SessionReleaseService, SessionReleaseTarget, SessionRowPolicy,
+    UnpublishedCompensationReceipt, MAX_PENDING_RELEASE_TARGETS, MAX_RELEASE_TARGETS_PER_OPERATION,
+    SESSION_RELEASE_LEASE_MS,
 };
 pub use session_service::{
+    ExistingSessionAttach, ExistingSessionMissingStart, ExistingSessionStart,
+    FreshDaemonSessionStart, PreparedNewSessionStartError, PreparedNewSessionStarted,
     ReconcileReport, ReconciledSession, RecoveredSession, SessionExitObservation, SessionService,
-    SessionServiceError, StartParams, UnrepresentedSessionRelease,
+    SessionServiceError, StartParams,
 };
-pub use shell_runtime::{ReconcileOutcome, ShellRuntime, ShellRuntimeError, StartSessionOutcome};
-pub use store::{load_one, write_record, LoadOutcome, StoreError};
-pub use window_layout::{WindowLayoutError, WindowLayoutService, WindowTabView};
+pub use shell_runtime::{
+    PreparedNewSessionRuntimeError, PreparedNewSessionRuntimeOutcome, ReconcileOutcome,
+    ShellRuntime, ShellRuntimeError, StartSessionOutcome,
+};
+pub use store::{
+    create_session_record_if_absent, load_one, write_record, CreateSessionRecordOutcome,
+    LoadOutcome, StoreError,
+};
+pub use window_layout::{
+    ConditionalCreatedSessionDelete, ConditionalCreatedTabSessionRollback,
+    ConditionalFreshWindowGraphDelete, ConditionalPreparedNewSessionCompensation,
+    ConditionalWindowDelete, ConditionalWindowProjectAssignment, ConditionalWindowRestore,
+    ConditionalWindowStash, CreatedFreshWindowGraph, CreatedPreparedFreshWindowGraph,
+    CreatedTabSessionRollback, FreshWindowGraphConflict, FreshWindowGraphCreateOutcome,
+    FreshWindowGraphReceipt, FreshWindowGraphSpec, GuardedConditionalWindowDelete,
+    GuardedWindowTabClose, PreparedFreshWindowGraphCreateOutcome, PreparedFreshWindowGraphSpec,
+    PreparedNewSessionCompensationReceipt, PreparedNewSessionStart, ProjectWindowGraphSnapshot,
+    WindowCloseSnapshot, WindowDeletionReceipt, WindowDeletionReceiptState, WindowLayoutError,
+    WindowLayoutService, WindowLayoutSnapshot, WindowProjectAssignment,
+    WindowProjectAssignmentProof, WindowProjectAssignmentProofOutcome, WindowTabClose,
+    WindowTabView, WindowViewportPane, WindowViewportSnapshot, WindowViewportSnapshotError,
+};
 pub use workspace_consent::{
     check_policy_consent, grant_consent, has_consent, require_consent, required_consent_for_policy,
     WorkspaceConsentError, WorkspaceConsentKind,
 };
 pub use workspace_exec::{
-    inspect_worktree, parse_worktree_porcelain, prepare_scratch_cwd, prepare_workspace,
-    prepare_workspace_with_consent, remove_worktree_with_consent, PorcelainWorktree,
+    cleanup_fresh_scratch_cwd, inspect_worktree, parse_worktree_porcelain,
+    prepare_fresh_scratch_cwd, prepare_scratch_cwd, prepare_workspace,
+    prepare_workspace_with_consent, remove_worktree_with_consent, FreshScratchCwdCleanupOutcome,
+    FreshScratchCwdPreparation, FreshScratchCwdReceipt, PorcelainWorktree, PreparedSessionSpec,
     PreparedWorkspace, RemovedWorkspace, WorkspaceExecError, WorktreeInspection,
 };

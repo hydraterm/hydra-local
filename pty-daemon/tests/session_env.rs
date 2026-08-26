@@ -338,6 +338,13 @@ fn typed_child_environment_overrides_daemon_environment_and_restart() {
         );
     }
     wait_for_session_exit(&mut stream, &mut reader, first_id, Duration::from_secs(10));
+    // The exited snapshot remains protected by this connection's attachment guard until an
+    // explicit Detach. Release that exact owner before requesting a replacement generation; a
+    // restart must never reap a still-attached final grid implicitly.
+    send_value(
+        &mut stream,
+        serde_json::json!({"op":"detach", "id":first_id}),
+    );
 
     let restart_home_marker = format!("HOME={}", restarted_home.display());
     send_value(

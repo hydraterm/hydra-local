@@ -1,6 +1,6 @@
 [package]
 name = "maestro-app"
-version = "0.2.13"
+version = "0.2.15"
 publish = false
 edition.workspace = true
 license.workspace = true
@@ -34,3 +34,6 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# Cargo unifies this only for maestro-app's test targets. It does not alter the production/default
+# maestro-shell build; it bounds idle per-temp-base SQLite handles in the long-lived test process.
+maestro-shell = { path = "../maestro-shell", features = ["test-connection-cache-pruning"] }

@@ -27,7 +27,9 @@ use crate::viewport::{
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-pub const MAX_ENROLLMENT_CODE_BYTES: usize = 256;
+pub const ENROLLMENT_CODE_LENGTH: usize = 8;
+pub const ENROLLMENT_CODE_ALPHABET: &str = "ABCDEFGHJKMNPQRSTVWXYZ0123456789";
+pub const MAX_ENROLLMENT_CODE_BYTES: usize = ENROLLMENT_CODE_LENGTH;
 pub const MAX_REMOTE_DESKTOP_ID_BYTES: usize = 128;
 pub const MAX_REMOTE_DESKTOP_ERROR_BYTES: usize = 1_024;
 pub const MAX_REMOTE_DESKTOP_VIEWPORTS: usize = 64;
@@ -73,12 +75,19 @@ pub struct EnrollmentCode(String);
 
 impl EnrollmentCode {
     pub fn new(value: impl Into<String>) -> Result<Self, RemoteDesktopMessageError> {
-        bounded_visible_value(
-            value.into(),
-            MAX_ENROLLMENT_CODE_BYTES,
-            RemoteDesktopMessageError::InvalidEnrollmentCode,
-        )
-        .map(Self)
+        let mut value = value.into();
+        while value.ends_with(['\r', '\n']) {
+            value.pop();
+        }
+        value.make_ascii_uppercase();
+        if value.len() != ENROLLMENT_CODE_LENGTH
+            || !value
+                .bytes()
+                .all(|byte| ENROLLMENT_CODE_ALPHABET.as_bytes().contains(&byte))
+        {
+            return Err(RemoteDesktopMessageError::InvalidEnrollmentCode);
+        }
+        Ok(Self(value))
     }
 
     pub fn as_str(&self) -> &str {
@@ -124,6 +133,13 @@ pub enum RemoteDesktopErrorCode {
     NotEnrolled,
     AlreadyEnrolled,
     EnrollmentRejected,
+    EnrollmentCodeInvalid,
+    EnrollmentOwnerMismatch,
+    EnrollmentAuthorityStale,
+    EnrollmentIncompatible,
+    EnrollmentTemporarilyUnavailable,
+    EnrollmentLocalFailure,
+    EnrollmentOutcomeUnconfirmed,
     RemoteUnavailable,
     ViewportUnavailable,
     Busy,
@@ -665,6 +681,23 @@ impl RemoteDesktopExtensionResponse {
             Self::FilesystemModeMigration { .. } | Self::FilesystemModeMigrationAcknowledged { .. }
         )
     }
+
+    fn requires_enrollment_failure_capability(&self) -> bool {
+        matches!(
+            self,
+            Self::Error { error, .. }
+                if matches!(
+                    error.code(),
+                    RemoteDesktopErrorCode::EnrollmentCodeInvalid
+                        | RemoteDesktopErrorCode::EnrollmentOwnerMismatch
+                        | RemoteDesktopErrorCode::EnrollmentAuthorityStale
+                        | RemoteDesktopErrorCode::EnrollmentIncompatible
+                        | RemoteDesktopErrorCode::EnrollmentTemporarilyUnavailable
+                        | RemoteDesktopErrorCode::EnrollmentLocalFailure
+                        | RemoteDesktopErrorCode::EnrollmentOutcomeUnconfirmed
+                )
+        )
+    }
 }
 
 /// Validate the second half of the one-shot exchange before an adapter applies any response.
@@ -679,6 +712,11 @@ pub fn validate_remote_desktop_response(
             expected: request.request_id(),
             got: response.request_id(),
         });
+    }
+    if response.requires_enrollment_failure_capability()
+        && !matches!(request, RemoteDesktopHostRequest::Enroll { .. })
+    {
+        return Err(RemoteDesktopExchangeError::UnexpectedResponse);
     }
     if let (
         RemoteDesktopHostRequest::ApplyFilesystemModeMigration { notice_id, .. },
@@ -1008,6 +1046,13 @@ enum WireRemoteDesktopErrorCode {
     NotEnrolled,
     AlreadyEnrolled,
     EnrollmentRejected,
+    EnrollmentCodeInvalid,
+    EnrollmentOwnerMismatch,
+    EnrollmentAuthorityStale,
+    EnrollmentIncompatible,
+    EnrollmentTemporarilyUnavailable,
+    EnrollmentLocalFailure,
+    EnrollmentOutcomeUnconfirmed,
     RemoteUnavailable,
     ViewportUnavailable,
     Busy,
@@ -1021,6 +1066,17 @@ impl From<WireRemoteDesktopErrorCode> for RemoteDesktopErrorCode {
             WireRemoteDesktopErrorCode::NotEnrolled => Self::NotEnrolled,
             WireRemoteDesktopErrorCode::AlreadyEnrolled => Self::AlreadyEnrolled,
             WireRemoteDesktopErrorCode::EnrollmentRejected => Self::EnrollmentRejected,
+            WireRemoteDesktopErrorCode::EnrollmentCodeInvalid => Self::EnrollmentCodeInvalid,
+            WireRemoteDesktopErrorCode::EnrollmentOwnerMismatch => Self::EnrollmentOwnerMismatch,
+            WireRemoteDesktopErrorCode::EnrollmentAuthorityStale => Self::EnrollmentAuthorityStale,
+            WireRemoteDesktopErrorCode::EnrollmentIncompatible => Self::EnrollmentIncompatible,
+            WireRemoteDesktopErrorCode::EnrollmentTemporarilyUnavailable => {
+                Self::EnrollmentTemporarilyUnavailable
+            }
+            WireRemoteDesktopErrorCode::EnrollmentLocalFailure => Self::EnrollmentLocalFailure,
+            WireRemoteDesktopErrorCode::EnrollmentOutcomeUnconfirmed => {
+                Self::EnrollmentOutcomeUnconfirmed
+            }
             WireRemoteDesktopErrorCode::RemoteUnavailable => Self::RemoteUnavailable,
             WireRemoteDesktopErrorCode::ViewportUnavailable => Self::ViewportUnavailable,
             WireRemoteDesktopErrorCode::Busy => Self::Busy,
@@ -1300,6 +1356,14 @@ impl NegotiatedExtension {
         }
     }
 
+    fn require_enrollment_failure_capability(&self) -> Result<(), RemoteDesktopDecodeError> {
+        if self.supports(KnownCapability::EnrollmentFailureV1) {
+            Ok(())
+        } else {
+            Err(RemoteDesktopDecodeError::EnrollmentFailureCapabilityNotNegotiated)
+        }
+    }
+
     pub fn decode_remote_desktop_host_frame(
         &self,
         bytes: &[u8],
@@ -1333,6 +1397,9 @@ impl NegotiatedExtension {
         if response.requires_filesystem_mode_migration_capability() {
             self.require_filesystem_mode_migration_capability()?;
         }
+        if response.requires_enrollment_failure_capability() {
+            self.require_enrollment_failure_capability()?;
+        }
         Ok(response)
     }
 }
@@ -1342,6 +1409,7 @@ pub enum RemoteDesktopDecodeError {
     CapabilityNotNegotiated,
     ViewportCapabilityNotNegotiated,
     FilesystemModeMigrationCapabilityNotNegotiated,
+    EnrollmentFailureCapabilityNotNegotiated,
     Frame(FrameDecodeError),
     Message(RemoteDesktopMessageError),
 }
@@ -1357,6 +1425,9 @@ impl fmt::Display for RemoteDesktopDecodeError {
             }
             Self::FilesystemModeMigrationCapabilityNotNegotiated => {
                 formatter.write_str("filesystem mode migration capability was not negotiated")
+            }
+            Self::EnrollmentFailureCapabilityNotNegotiated => {
+                formatter.write_str("enrollment failure capability was not negotiated")
             }
             Self::Frame(error) => error.fmt(formatter),
             Self::Message(error) => error.fmt(formatter),
@@ -1454,6 +1525,15 @@ mod tests {
         viewport: bool,
         filesystem_mode_migration: bool,
     ) -> NegotiatedExtension {
+        negotiated_with_features(lifecycle, viewport, filesystem_mode_migration, false)
+    }
+
+    fn negotiated_with_features(
+        lifecycle: bool,
+        viewport: bool,
+        filesystem_mode_migration: bool,
+        enrollment_failure: bool,
+    ) -> NegotiatedExtension {
         let mut capabilities = Vec::new();
         if lifecycle {
             capabilities.push(Capability::remote_desktop_lifecycle_v1());
@@ -1463,6 +1543,9 @@ mod tests {
         }
         if filesystem_mode_migration {
             capabilities.push(Capability::filesystem_mode_migration_v1());
+        }
+        if enrollment_failure {
+            capabilities.push(Capability::enrollment_failure_v1());
         }
         let hello = ExtensionHello::host(capabilities).unwrap();
         negotiate(&hello, &hello).unwrap()
@@ -1477,7 +1560,7 @@ mod tests {
 
     #[test]
     fn lifecycle_requests_are_capability_gated_and_bounded() {
-        let enroll = br#"{"type":"enroll","request_id":1,"code":"ABCD-1234"}"#;
+        let enroll = br#"{"type":"enroll","request_id":1,"code":"A2B3C4D5"}"#;
         assert!(matches!(
             negotiated(false, false).decode_remote_desktop_host_frame(enroll),
             Err(RemoteDesktopDecodeError::CapabilityNotNegotiated)
@@ -1507,6 +1590,83 @@ mod tests {
                 FrameDecodeError::TooLarge { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn enrollment_code_uses_the_exact_cloud_issuer_contract() {
+        let normalized = EnrollmentCode::new("a2b3c4d5\r\n").unwrap();
+        assert_eq!(normalized.as_str(), "A2B3C4D5");
+        assert!(EnrollmentCode::new(" A2B3C4D5").is_err());
+        assert!(EnrollmentCode::new("A2B3C4D5 ").is_err());
+        assert!(EnrollmentCode::new("AF2B-9YH").is_err());
+        assert!(EnrollmentCode::new("AF2B\n9YH").is_err());
+        assert!(EnrollmentCode::new("IIIIIIII").is_err());
+        assert!(EnrollmentCode::new("UUUUUUUU").is_err());
+
+        for byte in 0_u8..=127 {
+            let value = String::from_utf8(vec![byte; ENROLLMENT_CODE_LENGTH]).unwrap();
+            assert_eq!(
+                EnrollmentCode::new(value).is_ok(),
+                ENROLLMENT_CODE_ALPHABET
+                    .as_bytes()
+                    .contains(&byte.to_ascii_uppercase()),
+                "ASCII byte {byte} drifted from the canonical alphabet"
+            );
+        }
+        assert!(EnrollmentCode::new("éééééééé").is_err());
+    }
+
+    #[test]
+    fn typed_enrollment_failures_require_their_independent_capability() {
+        let typed = br#"{"type":"error","request_id":1,"error":{"code":"enrollment_outcome_unconfirmed","message":"unconfirmed","retryable":false}}"#;
+        assert!(matches!(
+            negotiated_with_features(true, false, false, false)
+                .decode_remote_desktop_extension_frame(typed),
+            Err(RemoteDesktopDecodeError::EnrollmentFailureCapabilityNotNegotiated)
+        ));
+        assert!(negotiated_with_features(true, false, false, true)
+            .decode_remote_desktop_extension_frame(typed)
+            .is_ok());
+
+        let legacy = br#"{"type":"error","request_id":1,"error":{"code":"enrollment_rejected","message":"rejected","retryable":false}}"#;
+        assert!(negotiated_with_features(true, false, false, false)
+            .decode_remote_desktop_extension_frame(legacy)
+            .is_ok());
+        assert!(negotiated_with_features(true, false, false, true)
+            .decode_remote_desktop_extension_frame(legacy)
+            .is_ok());
+    }
+
+    #[test]
+    fn typed_enrollment_failures_are_bound_to_enroll_requests() {
+        let request_id = RemoteDesktopRequestId::new(1).unwrap();
+        let response = RemoteDesktopExtensionResponse::Error {
+            request_id,
+            error: RemoteDesktopResponseError::new(
+                RemoteDesktopErrorCode::EnrollmentOutcomeUnconfirmed,
+                "unconfirmed",
+                false,
+            )
+            .unwrap(),
+        };
+        for request in [
+            RemoteDesktopHostRequest::Status { request_id },
+            RemoteDesktopHostRequest::SetRemoteOpen {
+                request_id,
+                open: true,
+            },
+            RemoteDesktopHostRequest::RemoveEnrollment { request_id },
+        ] {
+            assert_eq!(
+                validate_remote_desktop_response(&request, &response),
+                Err(RemoteDesktopExchangeError::UnexpectedResponse)
+            );
+        }
+        let enroll = RemoteDesktopHostRequest::Enroll {
+            request_id,
+            code: EnrollmentCode::new("A2B3C4D5").unwrap(),
+        };
+        validate_remote_desktop_response(&enroll, &response).unwrap();
     }
 
     #[test]
@@ -1784,7 +1944,7 @@ mod tests {
 
     #[test]
     fn enrollment_code_is_redacted_through_the_enclosing_request_debug() {
-        let secret = "NEVER-LOG-THIS-CODE";
+        let secret = "Z9Y8X7W6";
         let request = RemoteDesktopHostRequest::Enroll {
             request_id: RemoteDesktopRequestId::new(1).unwrap(),
             code: EnrollmentCode::new(secret).unwrap(),

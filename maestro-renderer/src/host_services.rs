@@ -60,6 +60,11 @@ pub trait HostServices {
     fn request_attention(&self);
     /// Allow or disallow IME composition for this window.
     fn set_ime_allowed(&self, allowed: bool);
+    /// Open one already-proven absolute HTTP(S) URL with the platform's fixed
+    /// native opener.  The default is inert for test/non-shipping hosts.
+    fn open_http_url(&self, _url: &str) -> bool {
+        false
+    }
     /// What the WGPU surface spans relative to React chrome. Governs whether the terminal reserves the React
     /// sidebar/top-bar insets itself (`FullWindowWithChrome`) or not (`TerminalSlot`, where the host layout
     /// already owns those bounds). macOS returns `FullWindowWithChrome`; the Linux GTK host returns
@@ -79,6 +84,62 @@ pub trait HostServices {
     #[cfg(target_os = "linux")]
     fn try_begin_terminal_surface_resize(&self, _width: u32, _height: u32) -> bool {
         true
+    }
+}
+
+/// Spawn macOS's fixed native opener off the owner thread. No shell is involved,
+/// no executable is resolved through `PATH`, and terminal-controlled URL content
+/// is neither logged nor inherited as process stdio. Linux uses GIO directly in
+/// its GTK host adapter instead of the shell-dispatching `xdg-open` program.
+pub(crate) fn start_native_http_open(url: &str) -> bool {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = url;
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let Some(mut command) = native_http_open_command(url) else {
+            return false;
+        };
+        std::thread::Builder::new()
+            .name("hydra-open-http".to_owned())
+            .spawn(move || {
+                let _ = command.status();
+            })
+            .is_ok()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn native_http_open_command(url: &str) -> Option<std::process::Command> {
+    if !maestro_protocol::is_safe_terminal_http_url(url) {
+        return None;
+    }
+    let mut command = std::process::Command::new("/usr/bin/open");
+    use std::process::Stdio;
+    command
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    Some(command)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod terminal_link_opener_tests {
+    use super::native_http_open_command;
+
+    #[test]
+    fn native_opener_is_absolute_shell_free_and_refuses_other_schemes() {
+        let command = native_http_open_command("https://example.test/path").unwrap();
+        assert_eq!(command.get_program(), "/usr/bin/open");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![std::ffi::OsStr::new("https://example.test/path")]
+        );
+        assert!(native_http_open_command("file:///tmp/no").is_none());
+        assert!(native_http_open_command("https://bad.test/\nnext").is_none());
     }
 }
 

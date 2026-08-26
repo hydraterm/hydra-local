@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { act, create, type ReactTestRenderer } from 'react-test-renderer'
-import { App } from './App'
+import { App, preferredVisibleWindowId } from './App'
 import { mockDashboardModel } from './data/mock'
 import type { DashboardModel } from './types/model'
 
@@ -124,6 +124,24 @@ afterEach(() => {
 })
 
 describe('native sidebar geometry and focus', () => {
+  it('keeps a remembered visible window and otherwise uses the first durable visible window', () => {
+    const template = structuredClone(mockDashboardModel.details.sample.windows[0])
+    const windows = (['exited', 'unknown', 'live'] as const).map((status) => {
+      const window = structuredClone(template)
+      window.window_id = `rank-${status}`
+      window.tabs.forEach((tab) => {
+        tab.window_id = window.window_id
+        tab.session_status = status
+      })
+      return window
+    })
+
+    expect(preferredVisibleWindowId(windows, 'rank-live')).toBe('rank-live')
+    expect(preferredVisibleWindowId(windows, 'missing-window')).toBe('rank-exited')
+    windows[0].stashed = true
+    expect(preferredVisibleWindowId(windows, 'rank-exited')).toBe('rank-unknown')
+  })
+
   it('renders the Hydra brand as a code-native mark without an image asset', async () => {
     installWindow('?chrome=sidebar', [])
     await mount()
@@ -144,6 +162,323 @@ describe('native sidebar geometry and focus', () => {
     expect(renderer!.root.findAllByProps({ className: 'recovered-sessions' })).toHaveLength(0)
     expect(JSON.stringify(renderer!.toJSON())).not.toContain('s-orphan-7a3f')
     expect(intents).toHaveLength(0)
+  })
+
+  it('reopens the first durable visible window instead of skipping it for a later live window', async () => {
+    const intents: Array<Record<string, unknown>> = []
+    const initialModel = structuredClone(mockDashboardModel)
+    const template = initialModel.details.sample.windows[0]
+    const exited = structuredClone(template)
+    exited.window_id = 'w-sample-exited'
+    exited.tabs.forEach((tab) => {
+      tab.window_id = exited.window_id
+      tab.session_status = 'exited'
+    })
+    const live = structuredClone(template)
+    live.window_id = 'w-sample-live'
+    live.tabs.forEach((tab) => {
+      tab.window_id = live.window_id
+      tab.session_status = 'live'
+      tab.session_record_missing = false
+    })
+    initialModel.details.sample.windows = [exited, live]
+    installWindow('?chrome=sidebar', intents, initialModel)
+    await mount()
+
+    const projectName = renderer!.root.find(
+      (node) =>
+        node.props.className === 'tree-project__name' &&
+        node.children.join('') === 'Sample Analytics',
+    )
+    act(() => projectName.parent!.props.onClick())
+
+    expect(intents.slice(-2)).toEqual([
+      { type: 'openWorkspace', project_id: 'sample', workspace_id: undefined },
+      { type: 'reviveWindow', window_id: 'w-sample-exited' },
+    ])
+    expect(intents.some((intent) => intent.type === 'focusWindow')).toBe(false)
+  })
+
+  it('remembers each project active window while switching without destructive intents', async () => {
+    const intents: Array<Record<string, unknown>> = []
+    const initialModel = structuredClone(mockDashboardModel)
+    initialModel.active_window_id = 'w-2'
+    initialModel.active_tab_id = 'tab-w2-claude'
+    installWindow('?chrome=sidebar', intents, initialModel)
+    await mount()
+
+    const projectRow = (name: string) =>
+      renderer!.root.find(
+        (node) =>
+          node.props.className === 'tree-project__name' && node.children.join('') === name,
+      ).parent!
+
+    act(() => projectRow('Sample Analytics').props.onClick())
+    act(() => projectRow('Sample Workspace').props.onClick())
+
+    expect(intents).toEqual([
+      { type: 'openWorkspace', project_id: 'sample', workspace_id: undefined },
+      { type: 'focusWindow', project_id: 'sample', window_id: 'w-sample' },
+      { type: 'openWorkspace', project_id: 'sample_workspace', workspace_id: undefined },
+      { type: 'focusWindow', project_id: 'sample_workspace', window_id: 'w-2' },
+    ])
+    expect(intents.some((intent) =>
+      ['deleteProject', 'removeWindow', 'stashWindow'].includes(String(intent.type)),
+    )).toBe(false)
+  })
+
+  it("enables a project's sole window Close and Remove while another project is visible", async () => {
+    const intents: Array<Record<string, unknown>> = []
+    const initialModel = structuredClone(mockDashboardModel)
+    initialModel.details.sample_workspace.windows = initialModel.details.sample_workspace.windows
+      .filter((window) => window.window_id === 'w-main')
+    installWindow('?chrome=sidebar', intents, initialModel)
+    await mount()
+
+    const windowName = renderer!.root.find(
+      (node) =>
+        node.props.className === 'tree-window__name' &&
+        node.children.join('') === 'Dashboard build',
+    )
+    const windowRow = windowName.parent!.parent!
+    act(() => windowRow.findByProps({ title: 'Window actions' }).props.onClick())
+
+    const menuItems = windowRow.findAll((node) => node.props.role === 'menuitem')
+    expect(menuItems.find((node) => node.children.join('') === 'Close (stash)')?.props.disabled)
+      .toBe(false)
+    expect(menuItems.find((node) => node.children.join('') === 'Remove from shelf')?.props.disabled)
+      .toBe(false)
+    expect(intents).toHaveLength(0)
+  })
+
+  it('keeps pane stash local to its window while allowing guarded removal across windows', async () => {
+    const initialModel = structuredClone(mockDashboardModel)
+    const main = initialModel.details.sample_workspace.windows.find(
+      (window) => window.window_id === 'w-main',
+    )!
+    const sibling = initialModel.details.sample_workspace.windows.find(
+      (window) => window.window_id === 'w-2',
+    )!
+    main.tabs = [main.tabs[0]]
+    sibling.tabs = [sibling.tabs[0]]
+    installWindow('?chrome=sidebar', [], initialModel)
+    await mount()
+
+    const paneLabel = renderer!.root.findByProps({ 'aria-label': `Focus ${main.tabs[0].title}` })
+    const paneRow = paneLabel.parent!
+    act(() => paneRow.findByProps({ title: 'Pane actions' }).props.onClick())
+
+    const menuItems = paneRow.findAll((node) => node.props.role === 'menuitem')
+    expect(menuItems.find((node) => node.children.join('') === 'Close (stash)')?.props.disabled)
+      .toBe(true)
+    expect(menuItems.find((node) => node.children.join('') === 'Remove from shelf')?.props.disabled)
+      .toBe(false)
+  })
+
+  it('disables both window close actions for the globally sole visible window', async () => {
+    const initialModel = structuredClone(mockDashboardModel)
+    const project = initialModel.projects[0]
+    const onlyWindow = initialModel.details[project.project_id].windows.find(
+      (window) => window.window_id === 'w-main',
+    )!
+    onlyWindow.tabs = [onlyWindow.tabs[0]]
+    initialModel.projects = [project]
+    initialModel.details = {
+      [project.project_id]: {
+        ...initialModel.details[project.project_id],
+        windows: [onlyWindow],
+      },
+    }
+    initialModel.active_project = project
+    initialModel.active_window_id = onlyWindow.window_id
+    initialModel.active_tab_id = onlyWindow.tabs[0].tab_id
+    installWindow('?chrome=sidebar', [], initialModel)
+    await mount()
+
+    const projectActions = renderer!.root.findByProps({ title: 'Project actions' })
+    act(() => projectActions.props.onClick())
+    expect(
+      renderer!.root
+        .findAll((node) => node.props.role === 'menuitem')
+        .find((node) => node.children.join('') === 'Delete project…')?.props.disabled,
+    ).toBe(true)
+    act(() => projectActions.props.onClick())
+
+    const windowName = renderer!.root.find(
+      (node) =>
+        node.props.className === 'tree-window__name' &&
+        node.children.join('') === onlyWindow.name,
+    )
+    const windowRow = windowName.parent!.parent!
+    act(() => windowRow.findByProps({ title: 'Window actions' }).props.onClick())
+
+    const menuItems = windowRow.findAll((node) => node.props.role === 'menuitem')
+    expect(menuItems.find((node) => node.children.join('') === 'Close (stash)')?.props.disabled)
+      .toBe(true)
+    expect(menuItems.find((node) => node.children.join('') === 'Remove from shelf')?.props.disabled)
+      .toBe(true)
+
+    act(() => windowRow.findByProps({ title: 'Window actions' }).props.onClick())
+    const paneLabel = renderer!.root.findByProps({
+      'aria-label': `Focus ${onlyWindow.tabs[0].title}`,
+    })
+    const paneRow = paneLabel.parent!
+    act(() => paneRow.findByProps({ title: 'Pane actions' }).props.onClick())
+    const paneMenuItems = paneRow.findAll((node) => node.props.role === 'menuitem')
+    expect(
+      paneMenuItems.find((node) => node.children.join('') === 'Close (stash)')?.props.disabled,
+    ).toBe(true)
+    expect(
+      paneMenuItems.find((node) => node.children.join('') === 'Remove from shelf')?.props.disabled,
+    ).toBe(true)
+  })
+
+  it('falls back from a remembered stashed window to the first visible window', async () => {
+    const intents: Array<Record<string, unknown>> = []
+    const initialModel = structuredClone(mockDashboardModel)
+    initialModel.active_window_id = 'w-2'
+    initialModel.active_tab_id = 'tab-w2-claude'
+    const browserWindow = installWindow('?chrome=sidebar', intents, initialModel)
+    await mount()
+
+    const nextModel = structuredClone(initialModel)
+    const remembered = nextModel.details.sample_workspace.windows.find(
+      (window) => window.window_id === 'w-2',
+    )!
+    remembered.stashed = true
+    remembered.tabs.forEach((tab) => {
+      tab.stashed = true
+    })
+    nextModel.active_window_id = 'w-sample'
+    nextModel.active_tab_id = 'tab-report'
+    act(() => browserWindow.__TEST_PUSH_DASHBOARD_MODEL__?.(nextModel))
+
+    const workspaceProject = renderer!.root.find(
+      (node) =>
+        node.props.className === 'tree-project__name' &&
+        node.children.join('') === 'Sample Workspace',
+    )
+    act(() => workspaceProject.parent!.props.onClick())
+
+    expect(intents.slice(-2)).toEqual([
+      { type: 'openWorkspace', project_id: 'sample_workspace', workspace_id: undefined },
+      { type: 'reviveWindow', window_id: 'w-main' },
+    ])
+  })
+
+  it('revives the top durable window when no remembered visible window exists', async () => {
+    vi.useFakeTimers()
+    const intents: Array<Record<string, unknown>> = []
+    const initialModel = structuredClone(mockDashboardModel)
+    const first = structuredClone(initialModel.details.sample.windows[0])
+    first.window_id = 'sample-top-stashed'
+    first.stashed = true
+    first.tabs.forEach((tab) => {
+      tab.window_id = first.window_id
+      tab.stashed = true
+    })
+    const laterVisible = structuredClone(initialModel.details.sample.windows[0])
+    laterVisible.window_id = 'sample-later-visible'
+    laterVisible.tabs.forEach((tab) => {
+      tab.window_id = laterVisible.window_id
+      tab.stashed = false
+    })
+    initialModel.details.sample.windows = [first, laterVisible]
+    installWindow('?chrome=sidebar', intents, initialModel)
+    await mount()
+
+    const project = renderer!.root.find(
+      (node) =>
+        node.props.className === 'tree-project__name' &&
+        node.children.join('') === 'Sample Analytics',
+    )
+    act(() => project.parent!.props.onClick())
+    act(() => {
+      vi.runAllTimers()
+    })
+
+    expect(intents[0]).toEqual({
+      type: 'openWorkspace',
+      project_id: 'sample',
+      workspace_id: undefined,
+    })
+    expect(intents.filter((intent) => intent.type === 'reviveSession')).toEqual(
+      first.tabs.map((tab) => ({
+        type: 'reviveSession',
+        session_id: tab.session_id,
+        window_id: first.window_id,
+        tab_id: tab.tab_id,
+      })),
+    )
+    expect(intents.some((intent) => intent.window_id === laterVisible.window_id)).toBe(false)
+  })
+
+  it('revives every pane of the first stashed window in a project with no visible windows', async () => {
+    vi.useFakeTimers()
+    const intents: Array<Record<string, unknown>> = []
+    const initialModel = structuredClone(mockDashboardModel)
+    const stashedWindow = structuredClone(initialModel.details.sample.windows[0])
+    stashedWindow.window_id = 'w-sample-stashed'
+    stashedWindow.stashed = true
+    stashedWindow.tabs.forEach((tab) => {
+      tab.window_id = stashedWindow.window_id
+      tab.stashed = true
+    })
+    const secondPane = structuredClone(stashedWindow.tabs[0])
+    secondPane.tab_id = 'tab-sample-stashed-2'
+    secondPane.session_id = 'session-sample-stashed-2'
+    stashedWindow.tabs.push(secondPane)
+    initialModel.details.sample.windows = [stashedWindow]
+    installWindow('?chrome=sidebar', intents, initialModel)
+    await mount()
+
+    const sampleProject = renderer!.root.find(
+      (node) =>
+        node.props.className === 'tree-project__name' &&
+        node.children.join('') === 'Sample Analytics',
+    )
+    act(() => sampleProject.parent!.props.onClick())
+    expect(intents).toEqual([
+      { type: 'openWorkspace', project_id: 'sample', workspace_id: undefined },
+    ])
+
+    act(() => {
+      vi.runAllTimers()
+    })
+    expect(intents).toEqual([
+      { type: 'openWorkspace', project_id: 'sample', workspace_id: undefined },
+      {
+        type: 'reviveSession',
+        session_id: stashedWindow.tabs[0].session_id,
+        window_id: stashedWindow.window_id,
+        tab_id: stashedWindow.tabs[0].tab_id,
+      },
+      {
+        type: 'reviveSession',
+        session_id: secondPane.session_id,
+        window_id: stashedWindow.window_id,
+        tab_id: secondPane.tab_id,
+      },
+    ])
+    expect(intents.some((intent) =>
+      ['focusWindow', 'reviveWindow', 'stashWindow', 'removeWindow'].includes(String(intent.type)),
+    )).toBe(false)
+  })
+
+  it('selects an empty project without inventing a window action', async () => {
+    const intents: Array<Record<string, unknown>> = []
+    installWindow('?chrome=sidebar', intents)
+    await mount()
+
+    const docsProject = renderer!.root.find(
+      (node) =>
+        node.props.className === 'tree-project__name' && node.children.join('') === 'Docs Site',
+    )
+    act(() => docsProject.parent!.props.onClick())
+
+    expect(intents).toEqual([
+      { type: 'openWorkspace', project_id: 'docs', workspace_id: undefined },
+    ])
   })
 
   it('shows an exact available version above New project and emits only the typed native action', async () => {
@@ -1222,13 +1557,13 @@ describe('native sidebar geometry and focus', () => {
     expect(intents.some((intent) => intent.type === 'focusSessionOrPane')).toBe(false)
   })
 
-  it('reopens every visible exited pane when the user clicks an exited window', async () => {
-    vi.useFakeTimers()
+  it('sends one cohort revive when the user clicks a mixed exited window', async () => {
     const intents: Array<Record<string, unknown>> = []
     const initialModel = structuredClone(mockDashboardModel)
     const window = initialModel.details.sample_workspace.windows.find((item) => item.window_id === 'w-main')!
-    window.tabs.forEach((tab) => {
-      if (!tab.stashed) tab.session_status = 'exited'
+    const visible = window.tabs.filter((tab) => !tab.stashed)
+    visible.forEach((tab, index) => {
+      tab.session_status = index === 0 ? 'exited' : 'live'
     })
     installWindow('?chrome=sidebar', intents, initialModel)
     await mount()
@@ -1238,18 +1573,14 @@ describe('native sidebar geometry and focus', () => {
     expect(label.parent?.props.className).toContain('is-restartable')
     expect(label.findByProps({ className: 'tree-window__count' }).children).toEqual(['Reopen'])
     act(() => label.props.onClick())
-    act(() => {
-      vi.runAllTimers()
-    })
 
-    expect(intents.filter((intent) => intent.type === 'reviveSession')).toEqual(
-      window.tabs.map((tab) => ({
-        type: 'reviveSession',
-        session_id: tab.session_id,
+    expect(intents.filter((intent) => intent.type === 'reviveWindow')).toEqual([
+      {
+        type: 'reviveWindow',
         window_id: window.window_id,
-        tab_id: tab.tab_id,
-      })),
-    )
+      },
+    ])
+    expect(intents.some((intent) => intent.type === 'reviveSession')).toBe(false)
     expect(intents.some((intent) => intent.type === 'focusWindow')).toBe(false)
   })
 

@@ -15,6 +15,132 @@ use serde_json::Value;
 
 use crate::paths::RecordKind;
 
+#[cfg(test)]
+type WindowLayoutTestHook = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+#[cfg(test)]
+static WINDOW_LAYOUT_TEST_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<(String, WindowLayoutTestHook)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static WINDOW_LAYOUT_TEST_HOOK_SERIAL: std::sync::OnceLock<std::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+static WINDOW_LAYOUT_TEST_FAILURE: std::sync::OnceLock<std::sync::Mutex<Option<(String, String)>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+static WINDOW_LAYOUT_TEST_FAILURE_SERIAL: std::sync::OnceLock<std::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn run_window_layout_test_hook(stage: &str, id: &str) {
+    let hook = WINDOW_LAYOUT_TEST_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .and_then(|(target_id, hook)| (target_id == id).then(|| std::sync::Arc::clone(hook)));
+    if let Some(hook) = hook {
+        hook(stage, id);
+    }
+}
+
+/// Deterministic transaction failure injection shared by the fresh-graph engine and the
+/// multi-statement WindowLayout mapper. It is test-only and fires once at an exact stage/id pair,
+/// letting tests prove rollback after every SQL write without timing or process-global sleeps.
+#[cfg(test)]
+pub(crate) fn check_window_layout_test_failure(stage: &str, id: &str) -> Result<(), MapError> {
+    let mut slot = WINDOW_LAYOUT_TEST_FAILURE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot
+        .as_ref()
+        .is_some_and(|(target_id, target_stage)| target_id == id && target_stage == stage)
+    {
+        slot.take();
+        return Err(shape(format!(
+            "injected window-layout transaction failure at {stage}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+pub(crate) fn check_window_layout_test_failure(_stage: &str, _id: &str) -> Result<(), MapError> {
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) struct WindowLayoutTestHookGuard {
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+pub(crate) struct WindowLayoutTestFailureGuard {
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+pub(crate) fn install_window_layout_test_failure(
+    target_id: impl Into<String>,
+    stage: impl Into<String>,
+) -> WindowLayoutTestFailureGuard {
+    let serial = WINDOW_LAYOUT_TEST_FAILURE_SERIAL
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut slot = WINDOW_LAYOUT_TEST_FAILURE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(slot.is_none(), "nested window-layout failure injection");
+    *slot = Some((target_id.into(), stage.into()));
+    WindowLayoutTestFailureGuard { _serial: serial }
+}
+
+#[cfg(test)]
+impl Drop for WindowLayoutTestFailureGuard {
+    fn drop(&mut self) {
+        *WINDOW_LAYOUT_TEST_FAILURE
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_window_layout_test_hook(
+    target_id: impl Into<String>,
+    hook: impl Fn(&str, &str) + Send + Sync + 'static,
+) -> WindowLayoutTestHookGuard {
+    let serial = WINDOW_LAYOUT_TEST_HOOK_SERIAL
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut slot = WINDOW_LAYOUT_TEST_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(slot.is_none(), "nested window-layout write test hook");
+    *slot = Some((target_id.into(), std::sync::Arc::new(hook)));
+    drop(slot);
+    WindowLayoutTestHookGuard { _serial: serial }
+}
+
+#[cfg(test)]
+impl Drop for WindowLayoutTestHookGuard {
+    fn drop(&mut self) {
+        *WINDOW_LAYOUT_TEST_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
 /// A row-mapping failure: a JSON column that won't parse, or a Value missing an expected field. Surfaced to the store
 /// so a bad row is skipped + reported (the SQLite analog of the old file quarantine) rather than crashing a load.
 #[derive(Debug)]
@@ -84,9 +210,10 @@ fn parse_col(col: Option<String>) -> Result<Value, MapError> {
     }
 }
 
-/// UPSERT a record (already serialized to `record`) for `kind`/`id`. For most kinds this is one INSERT OR REPLACE; for
-/// WindowLayout it also replaces the tab rows. `window_project` supplies the owning project id for a window when known
-/// (windows carry no project_id in the JSON model; the caller passes it for cascade — None leaves it NULL/unassigned).
+/// Map one already-serialized record into its relational row(s). Project, Workspace, AgentTask,
+/// Session, and Window identities update in place; leaf compatibility records may use REPLACE.
+/// WindowLayout also replaces its tab cohort, so its caller must provide the encompassing writer
+/// transaction and window-epoch bump.
 pub fn upsert(
     conn: &Connection,
     kind: RecordKind,
@@ -163,10 +290,20 @@ pub fn upsert(
             )?;
         }
         RecordKind::Session => {
+            // Logical session updates must be in-place: identity creation/metadata updates are
+            // intentionally quiet in the global window epoch, while an actual delete is the ABA
+            // fence. INSERT OR REPLACE would physically delete the old identity on every heartbeat
+            // or generation write and blur that contract.
             conn.execute(
-                "INSERT OR REPLACE INTO sessions (session_id, workspace_id, kind, launch_json, cwd_resolved, \
+                "INSERT INTO sessions (session_id, workspace_id, kind, launch_json, cwd_resolved, \
                  agent_task_id, created_at_ms, last_attached_at_ms, last_known_generation, status) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
+                 ON CONFLICT(session_id) DO UPDATE SET workspace_id=excluded.workspace_id, \
+                 kind=excluded.kind, launch_json=excluded.launch_json, \
+                 cwd_resolved=excluded.cwd_resolved, agent_task_id=excluded.agent_task_id, \
+                 created_at_ms=excluded.created_at_ms, \
+                 last_attached_at_ms=excluded.last_attached_at_ms, \
+                 last_known_generation=excluded.last_known_generation, status=excluded.status",
                 rusqlite::params![
                     id,
                     s(record, "workspace_id")?,
@@ -190,7 +327,11 @@ pub fn upsert(
                  project_id=COALESCE(excluded.project_id, windows.project_id)",
                 rusqlite::params![id, project_id, os(record, "name")],
             )?;
+            check_window_layout_test_failure("after-window-row", id)?;
             conn.execute("DELETE FROM tabs WHERE window_id = ?1", [id])?;
+            #[cfg(test)]
+            run_window_layout_test_hook("after-delete-before-inserts", id);
+            check_window_layout_test_failure("after-window-before-tabs", id)?;
             if let Some(tabs) = record.get("tabs").and_then(Value::as_array) {
                 for tab in tabs {
                     conn.execute(
@@ -210,6 +351,7 @@ pub fn upsert(
                             sub(tab, "stashed_from"),
                         ],
                     )?;
+                    check_window_layout_test_failure("after-tab-row", id)?;
                 }
             }
         }
@@ -250,22 +392,208 @@ pub fn upsert(
     Ok(())
 }
 
-/// Stamp a window's owning `project_id` (the FK the cascade needs). WindowLayout carries no project_id in the record
-/// model, so the app sets it here from the ownership signal (window_order). No-op if the window row doesn't exist yet.
+/// Dedicated insert-only Project writer for the atomic fresh-window graph seam. A same-id row is
+/// reported as `Ok(false)` and is never updated, even when every supplied byte is identical.
+pub(crate) fn insert_fresh_project(
+    conn: &Connection,
+    id: &str,
+    record: &Value,
+) -> Result<bool, MapError> {
+    let changed = conn.execute(
+        "INSERT INTO projects (project_id, name, root, default_workspace_policy, created_at_ms, \
+         last_active_at_ms, icon, accent_color, launch_defaults_json, directories_json, window_order_json, \
+         system, hidden) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) \
+         ON CONFLICT(project_id) DO NOTHING",
+        rusqlite::params![
+            id,
+            s(record, "name")?,
+            s(record, "root")?,
+            policy_str(record, "default_workspace_policy")?,
+            i(record, "created_at_ms")?,
+            i(record, "last_active_at_ms")?,
+            os(record, "icon"),
+            os(record, "accent_color"),
+            sub(record, "launch_defaults"),
+            sub_or(record, "directories", "[]"),
+            sub_or(record, "window_order", "[]"),
+            b(record, "system"),
+            b(record, "hidden"),
+        ],
+    )?;
+    Ok(changed == 1)
+}
+
+/// Replace an existing Project only while every relational column still equals the exact row
+/// loaded by the encompassing writer transaction. This is the sole Project write used by the
+/// existing-project fresh-graph path; a stale/mismatched row returns `Ok(false)`.
+pub(crate) fn update_project_if_exact(
+    conn: &Connection,
+    id: &str,
+    expected: &Value,
+    replacement: &Value,
+) -> Result<bool, MapError> {
+    let changed = conn.execute(
+        "UPDATE projects SET name=?2, root=?3, default_workspace_policy=?4, created_at_ms=?5, \
+         last_active_at_ms=?6, icon=?7, accent_color=?8, launch_defaults_json=?9, \
+         directories_json=?10, window_order_json=?11, system=?12, hidden=?13 \
+         WHERE project_id=?1 \
+           AND name IS ?14 AND root IS ?15 AND default_workspace_policy IS ?16 \
+           AND created_at_ms IS ?17 AND last_active_at_ms IS ?18 AND icon IS ?19 \
+           AND accent_color IS ?20 AND launch_defaults_json IS ?21 \
+           AND directories_json IS ?22 AND window_order_json IS ?23 \
+           AND system IS ?24 AND hidden IS ?25",
+        rusqlite::params![
+            id,
+            s(replacement, "name")?,
+            s(replacement, "root")?,
+            policy_str(replacement, "default_workspace_policy")?,
+            i(replacement, "created_at_ms")?,
+            i(replacement, "last_active_at_ms")?,
+            os(replacement, "icon"),
+            os(replacement, "accent_color"),
+            sub(replacement, "launch_defaults"),
+            sub_or(replacement, "directories", "[]"),
+            sub_or(replacement, "window_order", "[]"),
+            b(replacement, "system"),
+            b(replacement, "hidden"),
+            s(expected, "name")?,
+            s(expected, "root")?,
+            policy_str(expected, "default_workspace_policy")?,
+            i(expected, "created_at_ms")?,
+            i(expected, "last_active_at_ms")?,
+            os(expected, "icon"),
+            os(expected, "accent_color"),
+            sub(expected, "launch_defaults"),
+            sub_or(expected, "directories", "[]"),
+            sub_or(expected, "window_order", "[]"),
+            b(expected, "system"),
+            b(expected, "hidden"),
+        ],
+    )?;
+    Ok(changed == 1)
+}
+
+/// Dedicated insert-only Workspace writer for one atomic fresh graph.
+pub(crate) fn insert_fresh_workspace(
+    conn: &Connection,
+    id: &str,
+    record: &Value,
+) -> Result<bool, MapError> {
+    let changed = conn.execute(
+        "INSERT INTO workspaces (workspace_id, project_id, root, policy, consent_json) \
+         VALUES (?1,?2,?3,?4,?5) ON CONFLICT(workspace_id) DO NOTHING",
+        rusqlite::params![
+            id,
+            s(record, "project_id")?,
+            s(record, "root")?,
+            policy_str(record, "policy")?,
+            sub_or(record, "consent", "null"),
+        ],
+    )?;
+    Ok(changed == 1)
+}
+
+/// Dedicated insert-only Session writer for one atomic fresh graph.
+pub(crate) fn insert_fresh_session(
+    conn: &Connection,
+    id: &str,
+    record: &Value,
+) -> Result<bool, MapError> {
+    let changed = conn.execute(
+        "INSERT INTO sessions (session_id, workspace_id, kind, launch_json, cwd_resolved, \
+         agent_task_id, created_at_ms, last_attached_at_ms, last_known_generation, status) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
+         ON CONFLICT(session_id) DO NOTHING",
+        rusqlite::params![
+            id,
+            s(record, "workspace_id")?,
+            kind_str(record, "kind")?,
+            sub_or(record, "launch", "null"),
+            s(record, "cwd_resolved").unwrap_or(""),
+            os(record, "agent_task_id"),
+            i(record, "created_at_ms")?,
+            i(record, "last_attached_at_ms").unwrap_or(0),
+            os(record, "last_known_generation"),
+            status_str(record, "status")?,
+        ],
+    )?;
+    Ok(changed == 1)
+}
+
+/// Dedicated insert-only Window + exact first Tab writer. Unlike the compatibility `upsert`, this
+/// never updates a Window row and never DELETE/replaces a tab cohort.
+pub(crate) fn insert_fresh_window_with_first_tab(
+    conn: &Connection,
+    id: &str,
+    project_id: &str,
+    record: &Value,
+) -> Result<bool, MapError> {
+    let inserted = conn.execute(
+        "INSERT INTO windows (window_id, project_id, name) VALUES (?1,?2,?3) \
+         ON CONFLICT(window_id) DO NOTHING",
+        rusqlite::params![id, project_id, os(record, "name")],
+    )?;
+    if inserted == 0 {
+        return Ok(false);
+    }
+    check_window_layout_test_failure("after-window-row", id)?;
+    check_window_layout_test_failure("after-window-before-tabs", id)?;
+    let tabs = record
+        .get("tabs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| shape("fresh WindowLayout is missing its first Tab"))?;
+    if tabs.len() != 1 {
+        return Err(shape(format!(
+            "fresh WindowLayout requires exactly one Tab, got {}",
+            tabs.len()
+        )));
+    }
+    let tab = &tabs[0];
+    conn.execute(
+        "INSERT INTO tabs (tab_id, window_id, session_id, idx, title, pinned, stashed, attention_json, \
+         pane_rect_json, split_from_json, stashed_from_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        rusqlite::params![
+            s(tab, "tab_id")?,
+            id,
+            os(tab, "session_id"),
+            i(tab, "index").unwrap_or(0),
+            s(tab, "title").unwrap_or(""),
+            b(tab, "pinned"),
+            b(tab, "stashed"),
+            sub_or(tab, "attention", "null"),
+            sub(tab, "pane_rect"),
+            sub(tab, "split_from"),
+            sub(tab, "stashed_from"),
+        ],
+    )?;
+    check_window_layout_test_failure("after-tab-row", id)?;
+    Ok(true)
+}
+
+/// Low-level unconditional owner-column writer for an already fenced transaction. Production
+/// callers must first establish their exact/NULL-or-same authority and update project order in the
+/// same transaction; the public compatibility wrapper is migration/bootstrap/test-only.
 pub fn set_window_project(
     conn: &Connection,
     window_id: &str,
     project_id: &str,
-) -> Result<(), MapError> {
-    conn.execute(
-        "UPDATE windows SET project_id = ?2 WHERE window_id = ?1",
+) -> Result<bool, MapError> {
+    let changed = conn.execute(
+        "UPDATE windows SET project_id = ?2 WHERE window_id = ?1 AND project_id IS NOT ?2",
         rusqlite::params![window_id, project_id],
     )?;
-    Ok(())
+    Ok(changed > 0)
 }
 
-/// Delete a record by id. FK `ON DELETE CASCADE` removes children (a project's workspaces/sessions/windows/tabs/tasks/
-/// presets; a window's tabs). Returns whether a row was actually removed (idempotent bool for the callers).
+/// Low-level delete primitive for a caller-owned transaction. FK `ON DELETE CASCADE` removes
+/// children (a project's workspaces/sessions/windows/tabs/tasks/presets; a workspace's sessions;
+/// a window's tabs). Returns whether a row was actually removed.
+///
+/// This function deliberately does not begin/commit a transaction, advance the global window
+/// epoch, or emit a trace. Ordinary production callers must use [`crate::store::delete_record`] or
+/// a domain service. Migration and domain services that call this primitive directly own one
+/// encompassing transaction and must advance the epoch exactly once for the complete logical
+/// Project/Workspace/Session/Window ownership mutation.
 pub fn delete(conn: &Connection, kind: RecordKind, id: &str) -> Result<bool, MapError> {
     let (table_name, pk) = table(kind);
     let n = conn.execute(&format!("DELETE FROM {table_name} WHERE {pk} = ?1"), [id])?;
@@ -292,18 +620,23 @@ pub fn load_one(conn: &Connection, kind: RecordKind, id: &str) -> Result<Option<
 /// Load ALL records of a kind as JSON Values.
 pub fn load_all(conn: &Connection, kind: RecordKind) -> Result<Vec<Value>, MapError> {
     if kind == RecordKind::WindowLayout {
-        let ids: Vec<String> = {
-            let mut stmt = conn.prepare("SELECT window_id FROM windows")?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            rows.collect::<Result<_, _>>()?
-        };
-        let mut out = Vec::new();
-        for id in ids {
-            if let Some(v) = load_window(conn, &id)? {
-                out.push(v);
+        return with_deferred_read_snapshot(conn, |snapshot| {
+            let ids: Vec<String> = {
+                let mut stmt =
+                    snapshot.prepare("SELECT window_id FROM windows ORDER BY window_id")?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                rows.collect::<Result<_, _>>()?
+            };
+            let mut out = Vec::new();
+            for id in ids {
+                if let Some(v) = load_window_in_snapshot(snapshot, &id)? {
+                    out.push(v);
+                }
+                #[cfg(test)]
+                run_window_layout_test_hook("after-load-window", &id);
             }
-        }
-        return Ok(out);
+            Ok(out)
+        });
     }
     let sql = all_select(kind);
     let mut stmt = conn.prepare(&sql)?;
@@ -320,6 +653,31 @@ pub fn load_all(conn: &Connection, kind: RecordKind) -> Result<Vec<Value>, MapEr
 // ---- window (multi-table) load ----
 
 fn load_window(conn: &Connection, id: &str) -> Result<Option<Value>, MapError> {
+    with_deferred_read_snapshot(conn, |snapshot| load_window_in_snapshot(snapshot, id))
+}
+
+/// Run one logical multi-table read against a single SQLite snapshot. Migration verification and
+/// other callers may already hold an outer transaction; in that case its snapshot/rollback
+/// semantics remain authoritative and we do not attempt to nest another transaction.
+fn with_deferred_read_snapshot<T>(
+    conn: &Connection,
+    read: impl FnOnce(&Connection) -> Result<T, MapError>,
+) -> Result<T, MapError> {
+    if !conn.is_autocommit() {
+        return read(conn);
+    }
+
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Deferred)?;
+    match read(&tx) {
+        Ok(value) => {
+            tx.commit()?;
+            Ok(value)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn load_window_in_snapshot(conn: &Connection, id: &str) -> Result<Option<Value>, MapError> {
     let win: Option<(Option<String>, Option<String>)> = conn
         .query_row(
             "SELECT project_id, name FROM windows WHERE window_id = ?1",
@@ -331,6 +689,8 @@ fn load_window(conn: &Connection, id: &str) -> Result<Option<Value>, MapError> {
         None => return Ok(None),
         Some(w) => w,
     };
+    #[cfg(test)]
+    run_window_layout_test_hook("after-window-before-tabs", id);
     let mut stmt = conn.prepare(
         "SELECT tab_id, session_id, idx, title, pinned, stashed, attention_json, pane_rect_json, split_from_json, \
          stashed_from_json FROM tabs WHERE window_id = ?1 ORDER BY idx",
@@ -369,6 +729,8 @@ fn load_window(conn: &Connection, id: &str) -> Result<Option<Value>, MapError> {
             },
         )
         .collect::<Result<Vec<_>, MapError>>()?;
+    #[cfg(test)]
+    run_window_layout_test_hook("after-window-load", id);
     Ok(Some(serde_json::json!({
         "window_id": id,
         "project_id": project_id,

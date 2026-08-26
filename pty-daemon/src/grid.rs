@@ -134,6 +134,13 @@ fn clamp_dim(v: u16) -> usize {
 /// additive fields). Intentionally pessimistic — it only shrinks the guaranteed grid.
 const WORST_CASE_CELL_BYTES: usize = 256;
 
+/// OSC 8 metadata is rare and globally capped per frame.  Account for its complete
+/// worst-case serialized footprint separately instead of charging every ordinary cell
+/// for a 2 KiB optional field (which would unnecessarily collapse valid grid sizes).
+const WORST_CASE_HYPERLINK_FIELD_BYTES: usize = maestro_protocol::MAX_TERMINAL_URL_BYTES + 32;
+const WORST_CASE_FRAME_HYPERLINK_BYTES: usize =
+    maestro_protocol::MAX_TERMINAL_LINK_CELLS_PER_FRAME * WORST_CASE_HYPERLINK_FIELD_BYTES;
+
 /// Fixed per-line overhead budget for snapshot envelope/header bytes outside the cell
 /// array (version, generation UUID, revisions, cursor, mode flags, the `rows_cells`
 /// nesting, the `"ev"`/`"grid"`/`"id"` wrapping). 4 KiB is far more than the header
@@ -147,9 +154,12 @@ const SNAPSHOT_HEADER_BYTES: usize = 4 * 1024;
 /// framing violation. We therefore bound the grid that the daemon will ACCEPT to this
 /// budget at `StartSession`/`Resize`, so the authoritative grid is always wire-shippable.
 /// Derivation: `(MAX_LINE_BYTES / 2 - SNAPSHOT_HEADER_BYTES) / WORST_CASE_CELL_BYTES`.
-/// Larger grids require a future length-prefixed or chunked binary snapshot transport.
-pub const MAX_SNAPSHOT_CELLS: usize =
-    (crate::protocol::MAX_LINE_BYTES / 2 - SNAPSHOT_HEADER_BYTES) / WORST_CASE_CELL_BYTES;
+/// Larger grids are a future protocol upgrade (length-prefixed / chunked binary
+/// snapshot transport), explicitly out of scope for C3.
+pub const MAX_SNAPSHOT_CELLS: usize = (crate::protocol::MAX_LINE_BYTES / 2
+    - SNAPSHOT_HEADER_BYTES
+    - WORST_CASE_FRAME_HYPERLINK_BYTES)
+    / WORST_CASE_CELL_BYTES;
 
 // Compile-time proof of the derivation: the budget is positive and its worst-case
 // serialized footprint stays within the line cap with the 2x safety margin. If a future
@@ -158,7 +168,9 @@ pub const MAX_SNAPSHOT_CELLS: usize =
 const _: () = {
     assert!(MAX_SNAPSHOT_CELLS > 0);
     assert!(
-        MAX_SNAPSHOT_CELLS * WORST_CASE_CELL_BYTES + SNAPSHOT_HEADER_BYTES
+        MAX_SNAPSHOT_CELLS * WORST_CASE_CELL_BYTES
+            + SNAPSHOT_HEADER_BYTES
+            + WORST_CASE_FRAME_HYPERLINK_BYTES
             <= crate::protocol::MAX_LINE_BYTES / 2
     );
 };
@@ -437,6 +449,15 @@ pub struct Cell {
     pub dim: bool,
     #[serde(default)]
     pub hidden: bool,
+    /// Bounded OSC 8 target for this cell.  Additive/default-safe: older daemons
+    /// deserialize a missing field and older renderers ignore it.  Only validated
+    /// absolute HTTP(S) URLs are emitted.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_cell_hyperlink"
+    )]
+    pub hyperlink: Option<CompactString>,
     pub width: u8,
 }
 
@@ -479,6 +500,70 @@ where
         }
     }
     de.deserialize_str(TextVisitor)
+}
+
+fn deserialize_cell_hyperlink<'de, D>(de: D) -> Result<Option<CompactString>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{Error, Visitor};
+    use std::fmt;
+
+    struct OptionalHyperlinkVisitor;
+    impl<'de> Visitor<'de> for OptionalHyperlinkVisitor {
+        type Value = Option<CompactString>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(
+                f,
+                "null or a terminal hyperlink up to {} bytes",
+                maestro_protocol::MAX_TERMINAL_URL_BYTES
+            )
+        }
+
+        fn visit_none<E: Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2>(self, de: D2) -> Result<Self::Value, D2::Error>
+        where
+            D2: serde::Deserializer<'de>,
+        {
+            struct HyperlinkVisitor;
+            impl Visitor<'_> for HyperlinkVisitor {
+                type Value = CompactString;
+
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    write!(
+                        f,
+                        "a terminal hyperlink up to {} bytes",
+                        maestro_protocol::MAX_TERMINAL_URL_BYTES
+                    )
+                }
+
+                fn visit_str<E: Error>(self, value: &str) -> Result<Self::Value, E> {
+                    if value.len() > maestro_protocol::MAX_TERMINAL_URL_BYTES {
+                        return Err(E::custom("terminal hyperlink exceeds byte cap"));
+                    }
+                    Ok(CompactString::from(value))
+                }
+
+                fn visit_string<E: Error>(self, value: String) -> Result<Self::Value, E> {
+                    if value.len() > maestro_protocol::MAX_TERMINAL_URL_BYTES {
+                        return Err(E::custom("terminal hyperlink exceeds byte cap"));
+                    }
+                    Ok(CompactString::from(value))
+                }
+            }
+            de.deserialize_str(HyperlinkVisitor).map(Some)
+        }
+    }
+
+    de.deserialize_option(OptionalHyperlinkVisitor)
 }
 
 /// One screen of the authoritative grid, as rich cells, for the wire. Rows are
@@ -592,7 +677,12 @@ pub enum TerminalNotification {
 }
 
 impl TermGrid {
+    #[cfg(test)]
     pub fn new(cols: u16, rows: u16) -> Self {
+        Self::new_with_generation(cols, rows, SessionGeneration::new())
+    }
+
+    pub(crate) fn new_with_generation(cols: u16, rows: u16, generation: SessionGeneration) -> Self {
         let cols = clamp_dim(cols);
         let rows = clamp_dim(rows);
         // Cap history by total cells, not just rows: a wide grid keeps fewer history
@@ -622,7 +712,7 @@ impl TermGrid {
             pending_events,
             cols,
             rows,
-            generation: SessionGeneration::new(),
+            generation,
             revision: Revision::ZERO,
             base_revision: Revision::ZERO,
             // A brand-new grid starts fully blank; stamp 0 across all rows. The first
@@ -866,8 +956,14 @@ impl TermGrid {
         let cursor_shape: CursorShape = self.term.cursor_style().shape.into();
 
         let mut rows_cells = Vec::with_capacity(self.rows);
+        let mut hyperlink_cells_remaining = maestro_protocol::MAX_TERMINAL_LINK_CELLS_PER_FRAME;
         for row in 0..self.rows {
-            rows_cells.push(line_to_cells(grid, Line(row as i32), self.cols));
+            rows_cells.push(line_to_cells(
+                grid,
+                Line(row as i32),
+                self.cols,
+                &mut hyperlink_cells_remaining,
+            ));
         }
         let cursor = grid.cursor.point;
         GridSnapshot {
@@ -944,9 +1040,15 @@ impl TermGrid {
         let row_count = max_rows.min(available);
 
         let mut rows = Vec::with_capacity(row_count);
+        let mut hyperlink_cells_remaining = maestro_protocol::MAX_TERMINAL_LINK_CELLS_PER_FRAME;
         for i in 0..row_count {
             let line = Line(-(offset as i32) + i as i32);
-            rows.push(line_to_cells(grid, line, cols));
+            rows.push(line_to_cells(
+                grid,
+                line,
+                cols,
+                &mut hyperlink_cells_remaining,
+            ));
         }
 
         ScrollbackRead {
@@ -1042,6 +1144,7 @@ fn line_to_cells(
     grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
     line: Line,
     cols: usize,
+    hyperlink_cells_remaining: &mut usize,
 ) -> Vec<Cell> {
     let mut cells = Vec::with_capacity(cols);
     for col in 0..cols {
@@ -1113,6 +1216,17 @@ fn line_to_cells(
                 }
             }
         };
+        let hidden = flags.contains(Flags::HIDDEN);
+        let hyperlink = (!hidden && !malformed_wide_boundary && *hyperlink_cells_remaining > 0)
+            .then(|| cell.hyperlink())
+            .flatten()
+            .and_then(|link| {
+                let uri = link.uri();
+                maestro_protocol::is_safe_terminal_http_url(uri).then(|| {
+                    *hyperlink_cells_remaining -= 1;
+                    CompactString::from(uri)
+                })
+            });
         cells.push(Cell {
             text,
             fg: cell.fg.into(),
@@ -1123,7 +1237,8 @@ fn line_to_cells(
             inverse: flags.contains(Flags::INVERSE),
             strikeout: flags.contains(Flags::STRIKEOUT),
             dim: flags.contains(Flags::DIM),
-            hidden: flags.contains(Flags::HIDDEN),
+            hidden,
+            hyperlink,
             width,
         });
     }
@@ -1741,6 +1856,7 @@ fn blank_cell() -> Cell {
         strikeout: false,
         dim: false,
         hidden: false,
+        hyperlink: None,
         width: 1,
     }
 }
@@ -1834,6 +1950,56 @@ mod budget_tests {
         let (c, r) = clamp_to_snapshot_budget(2000, 200);
         assert!(fits_snapshot_budget(c, r));
         assert!(c > r, "expected wide grid to stay wide: {c}x{r}");
+    }
+}
+
+#[cfg(test)]
+mod terminal_hyperlink_tests {
+    use super::*;
+
+    fn osc8(uri: &str, label: &str) -> Vec<u8> {
+        format!("\x1b]8;;{uri}\x1b\\{label}\x1b]8;;\x1b\\").into_bytes()
+    }
+
+    #[test]
+    fn snapshot_exposes_safe_osc8_metadata_and_omits_other_schemes() {
+        let mut safe = TermGrid::new(40, 2);
+        safe.advance(&osc8("https://example.test/path", "link"));
+        let snap = safe.snapshot();
+        assert!(snap.rows_cells[0][0..4]
+            .iter()
+            .all(|cell| { cell.hyperlink.as_deref() == Some("https://example.test/path") }));
+
+        let mut hostile = TermGrid::new(40, 2);
+        hostile.advance(&osc8("javascript:alert(1)", "link"));
+        let snap = hostile.snapshot();
+        assert!(snap.rows_cells[0][0..4]
+            .iter()
+            .all(|cell| cell.hyperlink.is_none()));
+    }
+
+    #[test]
+    fn osc8_metadata_cells_are_capped_per_frame() {
+        let mut grid = TermGrid::new(300, 2);
+        grid.advance(&osc8("https://example.test", &"x".repeat(300)));
+        let linked = grid
+            .snapshot()
+            .rows_cells
+            .iter()
+            .flatten()
+            .filter(|cell| cell.hyperlink.is_some())
+            .count();
+        assert_eq!(linked, maestro_protocol::MAX_TERMINAL_LINK_CELLS_PER_FRAME);
+    }
+
+    #[test]
+    fn overlong_hyperlink_is_rejected_by_daemon_wire_mirror() {
+        let mut cell = blank_cell();
+        cell.hyperlink = Some(CompactString::from(
+            "x".repeat(maestro_protocol::MAX_TERMINAL_URL_BYTES + 1),
+        ));
+        let json = serde_json::to_string(&cell).unwrap();
+        assert!(serde_json::from_str::<Cell>(&json).is_err());
     }
 }
 
@@ -2728,11 +2894,21 @@ mod scrollback_tests {
         );
         let alac = grid.term.grid();
         // Line(-1) = row just above screen = "line3".
-        assert_eq!(row_text(&line_to_cells(alac, Line(-1), 20)), "line3");
+        let mut link_budget = maestro_protocol::MAX_TERMINAL_LINK_CELLS_PER_FRAME;
+        assert_eq!(
+            row_text(&line_to_cells(alac, Line(-1), 20, &mut link_budget)),
+            "line3"
+        );
         // Line(-4) = the oldest of our scrolled lines = "line0".
-        assert_eq!(row_text(&line_to_cells(alac, Line(-4), 20)), "line0");
+        assert_eq!(
+            row_text(&line_to_cells(alac, Line(-4), 20, &mut link_budget)),
+            "line0"
+        );
         // Line(0) = top visible row = "line4".
-        assert_eq!(row_text(&line_to_cells(alac, Line(0), 20)), "line4");
+        assert_eq!(
+            row_text(&line_to_cells(alac, Line(0), 20, &mut link_budget)),
+            "line4"
+        );
     }
 
     /// Long output, then a scrollback read returns the EARLIER structured rows that

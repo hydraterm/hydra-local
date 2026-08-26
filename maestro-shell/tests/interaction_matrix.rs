@@ -21,7 +21,11 @@ use maestro_shell::records::{
     SessionStatus, SplitAxis, Workspace, WorkspaceConsent,
 };
 use maestro_shell::window_layout::WindowLayoutService;
-use maestro_shell::{store, write_trace};
+use maestro_shell::{
+    store, write_trace, CasPublication, ConditionalWindowDelete, PendingReleaseReceipt,
+    PreResolvedSessionGenerations, PreResolvedSessionState, ReleaseOperationOutcome,
+    SessionReleaseService,
+};
 use tempfile::TempDir;
 
 struct Fixture {
@@ -83,7 +87,22 @@ impl Fixture {
     fn delete_project(&mut self, id: &str) {
         self.create_project(id);
         let plan = self.projects().plan_delete(id).unwrap();
-        self.projects().commit_delete(&plan, |_| Ok(())).unwrap();
+        let pre_resolved = plan
+            .unresolved_release_session_ids()
+            .into_iter()
+            .map(|session_id| {
+                (
+                    session_id.to_string(),
+                    PreResolvedSessionState::ConfirmedAbsent,
+                )
+            })
+            .collect::<PreResolvedSessionGenerations>();
+        let now = self.tick();
+        let result = self
+            .projects()
+            .commit_delete(&plan, &pre_resolved, now)
+            .unwrap();
+        self.drain_release(result.release_receipt);
     }
 
     /// The full app-like window chain: Workspace + Session records, empty layout, first pane,
@@ -154,7 +173,7 @@ impl Fixture {
             agent_task_id: None,
             created_at_ms: 1,
             last_attached_at_ms: 1,
-            last_known_generation: None,
+            last_known_generation: Some(format!("gen-{sid}")),
             status: SessionStatus::Live,
         };
         let now = self.tick();
@@ -192,6 +211,54 @@ impl Fixture {
                     .any(|t| t.tab_id == tab_id && stashed.is_none_or(|s| t.stashed == s))
             })
             .unwrap_or(false)
+    }
+
+    fn drain_release(&self, receipt: Option<PendingReleaseReceipt>) {
+        let Some(receipt) = receipt else {
+            return;
+        };
+        assert!(matches!(
+            SessionReleaseService::new(&self.paths).attempt_owned::<()>(
+                receipt,
+                |_| Ok(()),
+                |_| CasPublication::Confirmed,
+            ),
+            ReleaseOperationOutcome::Complete { .. }
+        ));
+    }
+
+    /// Reuse one schema/connection for the 144 pair cases. `maestro-shell` intentionally caches a
+    /// connection plus schema-lease fd per app-support base for the process lifetime; allocating a
+    /// new temp base for every matrix cell exceeds macOS's default 256-fd test limit before the
+    /// behavioral matrix completes.
+    fn reset_to_baseline(&mut self) {
+        let connection = maestro_shell::db::conn_for(self.paths.base()).unwrap();
+        let mut guard = connection.lock().unwrap();
+        let tx = guard
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        tx.execute_batch(
+            "DELETE FROM pending_session_releases;
+             DELETE FROM session_release_operations;
+             DELETE FROM tabs;
+             DELETE FROM worktree_provenance;
+             DELETE FROM layout_presets;
+             DELETE FROM agent_tasks;
+             DELETE FROM sessions;
+             DELETE FROM windows;
+             DELETE FROM workspaces;
+             DELETE FROM projects;
+             DELETE FROM daemon_endpoint;
+             DELETE FROM session_names;",
+        )
+        .unwrap();
+        tx.pragma_update(None, "user_version", 0).unwrap();
+        tx.commit().unwrap();
+        drop(guard);
+
+        self.now = 1_000;
+        self.create_project("p1");
+        self.create_window("p1", "w1");
     }
 }
 
@@ -236,7 +303,15 @@ impl Op {
             Op::CreateWindow => fx.create_window("p1", "w2"),
             Op::RemoveWindow => {
                 fx.create_window("p1", "w2");
-                fx.windows().delete("w2").unwrap();
+                let expected = fx.windows().load_snapshot("w2").unwrap().unwrap();
+                let now = fx.tick();
+                let mut receipt = match fx.windows().delete_if_unchanged(&expected, now).unwrap() {
+                    ConditionalWindowDelete::Deleted(receipt) => receipt,
+                    outcome => panic!("prepared matrix window delete was refused: {outcome:?}"),
+                };
+                assert!(receipt.unresolved_release_session_ids().is_empty());
+                let release = receipt.take_release_receipt();
+                fx.drain_release(release);
                 // The stale window_order entry is tolerated by contract (snapshot ignores it).
             }
             Op::OpenPane => fx.open_pane("w1", "pane-2"),
@@ -260,7 +335,12 @@ impl Op {
             Op::ClosePane => {
                 fx.open_pane("w1", "pane-2");
                 let now = fx.tick();
-                fx.windows().close_pane("w1", "pane-2", now).unwrap();
+                let closed = fx
+                    .windows()
+                    .close_pane_with_removed("w1", "pane-2", now)
+                    .unwrap();
+                assert!(closed.unresolved_release_session_ids.is_empty());
+                fx.drain_release(closed.release_receipt);
             }
             Op::StashPane => {
                 fx.open_pane("w1", "pane-2");
@@ -309,9 +389,10 @@ fn assert_healthy(fx: &Fixture, context: &str) {
 /// 12×12 = 144 cases (+ oracle-after-first = 288 checkpoints).
 #[test]
 fn every_ordered_pair_of_lifecycle_ops_keeps_the_store_coherent() {
+    let mut fx = Fixture::new();
     for a in Op::ALL {
         for b in Op::ALL {
-            let mut fx = Fixture::new();
+            fx.reset_to_baseline();
             assert_healthy(&fx, "baseline");
             a.apply(&mut fx);
             assert_healthy(&fx, &format!("{a:?} (then {b:?})"));
@@ -345,7 +426,33 @@ fn deleting_the_owning_project_cascades_and_stays_coherent() {
     let plan = fx.projects().plan_delete("p1").unwrap();
     assert!(plan.kill_session_ids.contains(&"s-w1-pane-1".to_string()));
     assert!(plan.kill_session_ids.contains(&"s-w1-pane-2".to_string()));
-    fx.projects().commit_delete(&plan, |_| Ok(())).unwrap();
+    let pre_resolved = plan
+        .unresolved_release_session_ids()
+        .into_iter()
+        .map(|session_id| {
+            (
+                session_id.to_string(),
+                PreResolvedSessionState::ConfirmedAbsent,
+            )
+        })
+        .collect::<PreResolvedSessionGenerations>();
+    let now = fx.tick();
+    let result = fx
+        .projects()
+        .commit_delete(&plan, &pre_resolved, now)
+        .unwrap();
+    assert!(
+        result.release_receipt.is_some(),
+        "the exact owned Session generations must be journaled with the project cascade"
+    );
+    fx.drain_release(result.release_receipt);
+    assert!(
+        SessionReleaseService::new(&fx.paths)
+            .claim_next()
+            .unwrap()
+            .is_none(),
+        "the matrix drains the committed project-release journal"
+    );
     assert_healthy(&fx, "delete p1");
     assert!(
         fx.windows().load("w1").unwrap().is_none(),

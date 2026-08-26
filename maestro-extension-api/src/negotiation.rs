@@ -9,12 +9,14 @@ pub const MAX_CAPABILITY_NAME_BYTES: usize = 64;
 const EXTERNAL_VIEWPORT_LEASE_V1: &str = "external_viewport_lease_v1";
 const REMOTE_DESKTOP_LIFECYCLE_V1: &str = "remote_desktop_lifecycle_v1";
 const FILESYSTEM_MODE_MIGRATION_V1: &str = "filesystem_mode_migration_v1";
+const ENROLLMENT_FAILURE_V1: &str = "enrollment_failure_v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum KnownCapability {
     ExternalViewportLeaseV1,
     RemoteDesktopLifecycleV1,
     FilesystemModeMigrationV1,
+    EnrollmentFailureV1,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -49,6 +51,10 @@ impl Capability {
         Self(FILESYSTEM_MODE_MIGRATION_V1.to_string())
     }
 
+    pub fn enrollment_failure_v1() -> Self {
+        Self(ENROLLMENT_FAILURE_V1.to_string())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -58,6 +64,7 @@ impl Capability {
             EXTERNAL_VIEWPORT_LEASE_V1 => Some(KnownCapability::ExternalViewportLeaseV1),
             REMOTE_DESKTOP_LIFECYCLE_V1 => Some(KnownCapability::RemoteDesktopLifecycleV1),
             FILESYSTEM_MODE_MIGRATION_V1 => Some(KnownCapability::FilesystemModeMigrationV1),
+            ENROLLMENT_FAILURE_V1 => Some(KnownCapability::EnrollmentFailureV1),
             _ => None,
         }
     }
@@ -325,6 +332,7 @@ mod tests {
             Capability::external_viewport_lease_v1(),
             Capability::remote_desktop_lifecycle_v1(),
             Capability::filesystem_mode_migration_v1(),
+            Capability::enrollment_failure_v1(),
         ])
         .unwrap();
         let lifecycle_only =
@@ -333,6 +341,7 @@ mod tests {
         assert!(negotiated.supports(KnownCapability::RemoteDesktopLifecycleV1));
         assert!(!negotiated.supports(KnownCapability::ExternalViewportLeaseV1));
         assert!(!negotiated.supports(KnownCapability::FilesystemModeMigrationV1));
+        assert!(!negotiated.supports(KnownCapability::EnrollmentFailureV1));
 
         let migration_only = ExtensionHello::host([
             Capability::remote_desktop_lifecycle_v1(),
@@ -343,6 +352,18 @@ mod tests {
         assert!(negotiated.supports(KnownCapability::RemoteDesktopLifecycleV1));
         assert!(negotiated.supports(KnownCapability::FilesystemModeMigrationV1));
         assert!(!negotiated.supports(KnownCapability::ExternalViewportLeaseV1));
+        assert!(!negotiated.supports(KnownCapability::EnrollmentFailureV1));
+
+        let failure_only = ExtensionHello::host([
+            Capability::remote_desktop_lifecycle_v1(),
+            Capability::enrollment_failure_v1(),
+        ])
+        .unwrap();
+        let negotiated = negotiate(&host, &failure_only).unwrap();
+        assert!(negotiated.supports(KnownCapability::RemoteDesktopLifecycleV1));
+        assert!(negotiated.supports(KnownCapability::EnrollmentFailureV1));
+        assert!(!negotiated.supports(KnownCapability::ExternalViewportLeaseV1));
+        assert!(!negotiated.supports(KnownCapability::FilesystemModeMigrationV1));
     }
 
     #[test]

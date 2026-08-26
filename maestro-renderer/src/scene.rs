@@ -44,6 +44,7 @@ fn cell(text: &str) -> Cell {
         strikeout: false,
         dim: false,
         hidden: false,
+        hyperlink: None,
         width: 1,
     }
 }

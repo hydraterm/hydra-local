@@ -44,9 +44,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::ids::{validate_id, IdError};
+use crate::launch_environment::LaunchEnvLookup;
 use crate::paths::{AppPaths, RecordKind};
 use crate::policy::{resolved_cwd, WorkspacePolicy};
-use crate::records::{SessionKind, Workspace, WorktreeProvenance};
+use crate::records::{LaunchSpec, SessionKind, Workspace, WorktreeProvenance};
 use crate::session_service::StartParams;
 use crate::store::{write_record, StoreError};
 use crate::workspace_consent::{
@@ -75,6 +76,15 @@ pub enum WorkspaceExecError {
     /// the app-support tree) — refused so Maestro never creates state "inside" a repo, even
     /// nominally. Nothing was created.
     ScratchUnderRepoRoot { cwd: PathBuf, repo_root: PathBuf },
+    /// The fresh-session-only scratch preparer found that its exact session directory already
+    /// exists. It must not adopt that directory: another attempt or a live lifetime may own it.
+    FreshScratchCwdAlreadyExists { cwd: PathBuf },
+    /// A consume-once fresh scratch cleanup receipt was presented with different AppPaths than
+    /// the paths that minted it. Nothing was removed.
+    FreshScratchCwdReceiptMismatch,
+    /// A prepared-session constructor could not bind a nonempty live argv to one of the sealed
+    /// Shell/Agent launch modes. No daemon or durable graph mutation was attempted.
+    InvalidPreparedSessionSpec,
     /// The git executable could not be spawned at all (not installed / not on PATH).
     GitSpawn { command: String, source: io::Error },
     /// A git command ran but exited non-zero; `stderr` carries git's own diagnostic.
@@ -94,6 +104,8 @@ pub enum WorkspaceExecError {
     WorktreeMissing { path: PathBuf },
     /// Directory creation or permission setting failed.
     Io(io::Error),
+    /// The durable namespace fence needed by fresh scratch cleanup could not be evaluated.
+    Store(StoreError),
 }
 
 impl std::fmt::Display for WorkspaceExecError {
@@ -109,6 +121,19 @@ impl std::fmt::Display for WorkspaceExecError {
                 "refusing to create scratch cwd {} under the supplied repo root {}",
                 cwd.display(),
                 repo_root.display()
+            ),
+            WorkspaceExecError::FreshScratchCwdAlreadyExists { cwd } => write!(
+                f,
+                "fresh scratch cwd {} already exists; refusing to adopt it",
+                cwd.display()
+            ),
+            WorkspaceExecError::FreshScratchCwdReceiptMismatch => write!(
+                f,
+                "fresh scratch cleanup receipt does not belong to these app paths"
+            ),
+            WorkspaceExecError::InvalidPreparedSessionSpec => write!(
+                f,
+                "prepared session launch is empty, mismatched, or outside the sealed launch set"
             ),
             WorkspaceExecError::Consent(e) => write!(f, "workspace consent gate: {e}"),
             WorkspaceExecError::RepoRootNotDirectory { root } => write!(
@@ -144,6 +169,7 @@ impl std::fmt::Display for WorkspaceExecError {
                 path.display()
             ),
             WorkspaceExecError::Io(e) => write!(f, "workspace exec io error: {e}"),
+            WorkspaceExecError::Store(e) => write!(f, "workspace exec store error: {e}"),
         }
     }
 }
@@ -155,6 +181,7 @@ impl std::error::Error for WorkspaceExecError {
             WorkspaceExecError::Consent(e) => Some(e),
             WorkspaceExecError::GitSpawn { source, .. } => Some(source),
             WorkspaceExecError::Io(e) => Some(e),
+            WorkspaceExecError::Store(e) => Some(e),
             _ => None,
         }
     }
@@ -178,20 +205,312 @@ impl From<WorkspaceConsentError> for WorkspaceExecError {
     }
 }
 
+impl From<StoreError> for WorkspaceExecError {
+    fn from(error: StoreError) -> Self {
+        WorkspaceExecError::Store(error)
+    }
+}
+
 /// A workspace cwd that has actually been PREPARED on disk (directory exists, `0700`), as
 /// opposed to the pure [`ResolvedCwd`](crate::policy::ResolvedCwd) which is only computed.
 /// Carries the ids it was prepared for so [`PreparedWorkspace::adhoc_start_params`] cannot pair
 /// the cwd with the wrong session.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct PreparedWorkspace {
     pub policy: WorkspacePolicy,
     pub workspace_id: String,
     pub session_id: String,
     /// The existing, owner-only directory the session should run in.
     pub cwd: PathBuf,
+    /// Unforgeable outside this module: only a successful/reused `prepare_worktree` attempt mints
+    /// it. Public callers may describe an existing cwd through [`PreparedWorkspace::unsealed`],
+    /// but that value can never authorize a durable provenance marker.
+    worktree_provenance:
+        Option<std::sync::Arc<std::sync::Mutex<Option<PreparedWorktreeProvenanceSeal>>>>,
+}
+
+impl std::fmt::Debug for PreparedWorkspace {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedWorkspace")
+            .field("policy", &self.policy)
+            .field("workspace_id", &self.workspace_id)
+            .field("session_id", &self.session_id)
+            .field("cwd", &self.cwd)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for PreparedWorkspace {
+    fn eq(&self, other: &Self) -> bool {
+        self.policy == other.policy
+            && self.workspace_id == other.workspace_id
+            && self.session_id == other.session_id
+            && self.cwd == other.cwd
+    }
+}
+
+impl Eq for PreparedWorkspace {}
+
+/// Opaque, non-clone launch authority for transaction-prepared sessions. The live daemon argv,
+/// pre-Grid non-replayable metadata, and optional post-Grid successor are derived together by
+/// Shell-owned constructors; graph callers cannot substitute a `StartParams` or publication row.
+pub struct PreparedSessionSpec {
+    params: StartParams,
+    publication_launch: LaunchSpec,
+    binding: PreparedSessionBinding,
+    /// Exact Worktree preparation evidence carried only by specs derived from a prepared
+    /// `WorkspacePolicy::Worktree` cwd. The spec itself is consume-once, so callers cannot reuse
+    /// this allowance for a second Session preparation.
+    worktree_provenance: Option<PreparedWorktreeProvenanceSeal>,
+}
+
+/// Partial Worktree provenance sealed at the filesystem-preparation boundary. The exact repo root
+/// is deliberately completed later from the transaction-revalidated [`Workspace`] row; everything
+/// that comes from the prepared cwd itself is fixed here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedWorktreeProvenanceSeal {
+    session_id: String,
+    workspace_id: String,
+    repo_root: String,
+    target_path: String,
+    branch: String,
+}
+
+/// Complete marker cohort admitted beside one prepared Session. `created_at_ms` is intentionally
+/// absent: the provenance writer is best-effort and its wall-clock stamp is informational, while
+/// every ownership-bearing identity/path field must match exactly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedWorktreeProvenanceCohort {
+    pub(crate) session_id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) repo_root: String,
+    pub(crate) target_path: String,
+    pub(crate) branch: String,
+}
+
+fn canonicalized_or_lexical(path: &Path) -> String {
+    fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+impl PreparedWorktreeProvenanceSeal {
+    fn mint(workspace: &Workspace, session_id: &str, target: &Path, branch: &str) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            workspace_id: workspace.workspace_id.clone(),
+            repo_root: canonicalized_or_lexical(Path::new(&workspace.root)),
+            target_path: canonicalized_or_lexical(target),
+            branch: branch.to_string(),
+        }
+    }
+
+    /// Complete the exact cohort only when the transaction-reviewed Workspace and canonical
+    /// Session inputs still describe the same Worktree preparation. `None` is a closed refusal,
+    /// never permission to ignore a marker.
+    pub(crate) fn complete(
+        &self,
+        workspace: &Workspace,
+        session_id: &str,
+        workspace_id: &str,
+        cwd: &str,
+    ) -> Option<PreparedWorktreeProvenanceCohort> {
+        if workspace.policy != WorkspacePolicy::Worktree
+            || workspace.workspace_id != self.workspace_id
+            || workspace_id != self.workspace_id
+            || session_id != self.session_id
+        {
+            return None;
+        }
+        let target_path = canonicalized_or_lexical(Path::new(cwd));
+        let branch = worktree_branch(workspace_id, session_id);
+        if target_path != self.target_path || branch != self.branch {
+            return None;
+        }
+        let repo_root = canonicalized_or_lexical(Path::new(&workspace.root));
+        if repo_root != self.repo_root {
+            return None;
+        }
+        Some(PreparedWorktreeProvenanceCohort {
+            session_id: self.session_id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            repo_root,
+            target_path,
+            branch,
+        })
+    }
+}
+
+impl PreparedWorktreeProvenanceCohort {
+    pub(crate) fn matches(&self, marker: &WorktreeProvenance) -> bool {
+        marker.session_id == self.session_id
+            && marker.workspace_id == self.workspace_id
+            && marker.repo_root == self.repo_root
+            && marker.target_path == self.target_path
+            && marker.branch == self.branch
+    }
+}
+
+pub(crate) fn noncanonicalizable_agent_launch(argv: &[String]) -> LaunchSpec {
+    let mut launch = crate::redact::adhoc_launch_spec(argv);
+    if let LaunchSpec::AdHocRedacted { redacted, .. } = &mut launch {
+        // `true` means either a secret was redacted OR these bytes are intentionally untrusted for
+        // automatic recipe promotion. Prepared Agent A rows must survive startup canonicalizers
+        // byte-for-byte until their own final publication transaction writes B.
+        *redacted = true;
+    }
+    launch
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PreparedSessionBinding {
+    /// Compatibility surface for public raw `StartParams` APIs. It never grants Agent authority.
+    LegacyShellAdHoc,
+    /// Shell-minted exact source argv; Shell or custom Agent, with no AgentTask association.
+    ExactAdHoc,
+    /// A custom Agent command whose exact first token is a provider executable. Source metadata is
+    /// token-redacted, while live bytes are derived through the user's login shell; A and B remain
+    /// the same non-replayable AdHoc recipe.
+    AgentAdHocLoginShell,
+    /// An exact reviewed provider conversation. A and B use the same canonical KnownSafe recipe.
+    ProviderExact,
+    /// A provider launch explicitly selecting latest/import/search/index. A is token-redacted and
+    /// non-replayable; B retains the bounded non-exact recipe only after Grid. It is never automatic
+    /// recovery authority, but an explicit user Reopen may replay what the user selected.
+    ProviderExplicitNonExact,
+    /// A caller-assigned fresh provider identity. A is token-redacted and non-replayable; B is the
+    /// exact canonical resume successor written only after Grid under the final writer fence.
+    ProviderTransition,
+}
+
+impl std::fmt::Debug for PreparedSessionSpec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedSessionSpec")
+            .field("session_id", &self.params.session_id)
+            .field("kind", &self.params.kind)
+            .field("publication_launch", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedSessionSpec {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        StartParams,
+        LaunchSpec,
+        PreparedSessionBinding,
+        Option<PreparedWorktreeProvenanceSeal>,
+    ) {
+        (
+            self.params,
+            self.publication_launch,
+            self.binding,
+            self.worktree_provenance,
+        )
+    }
+
+    pub(crate) fn from_legacy_shell(params: StartParams) -> Self {
+        Self {
+            publication_launch: params.launch.clone(),
+            params,
+            binding: PreparedSessionBinding::LegacyShellAdHoc,
+            worktree_provenance: None,
+        }
+    }
+}
+
+/// Consume-once authority to remove a scratch session directory that this exact preparation
+/// created with an exclusive final-component `create_dir`.
+///
+/// The fields are private, the type is not `Clone`, and its `Debug` output is redacted. A
+/// pre-existing directory can never produce this receipt.
+pub struct FreshScratchCwdReceipt {
+    scratch_base: PathBuf,
+    cwd: PathBuf,
+    session_id: String,
+}
+
+impl std::fmt::Debug for FreshScratchCwdReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FreshScratchCwdReceipt")
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A fresh ScratchCwd plus its sole cleanup authority. This bundle is not `Clone`; callers must
+/// explicitly split ownership before they can launch the session.
+pub struct FreshScratchCwdPreparation {
+    prepared: PreparedWorkspace,
+    cleanup: FreshScratchCwdReceipt,
+}
+
+impl FreshScratchCwdPreparation {
+    pub fn into_parts(self) -> (PreparedWorkspace, FreshScratchCwdReceipt) {
+        (self.prepared, self.cleanup)
+    }
+}
+
+impl std::fmt::Debug for FreshScratchCwdPreparation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FreshScratchCwdPreparation")
+            .field("workspace_id", &self.prepared.workspace_id)
+            .field("session_id", &self.prepared.session_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FreshScratchCwdCleanupOutcome {
+    Removed,
+    AlreadyMissing,
+    /// The exclusively-created directory is no longer empty, so another actor may own its
+    /// contents. Cleanup consumed the receipt but retained the directory byte-for-byte.
+    RetainedNotEmpty,
+    /// The exact Session id or one of its durable soft-owner references existed under an
+    /// IMMEDIATE writer fence. Cleanup consumed the receipt and retained the directory.
+    RetainedNamespaceInUse,
 }
 
 impl PreparedWorkspace {
+    /// Describe an already-existing cwd without claiming that this call created or revalidated a
+    /// git worktree. This keeps compatibility adapters explicit: even with `policy = Worktree`, a
+    /// value made here cannot admit a present `WorktreeProvenance` row during Session preparation.
+    pub fn unsealed(
+        policy: WorkspacePolicy,
+        workspace_id: impl Into<String>,
+        session_id: impl Into<String>,
+        cwd: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            policy,
+            workspace_id: workspace_id.into(),
+            session_id: session_id.into(),
+            cwd: cwd.into(),
+            worktree_provenance: None,
+        }
+    }
+
+    fn take_worktree_provenance(
+        &self,
+    ) -> Result<Option<PreparedWorktreeProvenanceSeal>, WorkspaceExecError> {
+        let Some(authority) = &self.worktree_provenance else {
+            return Ok(None);
+        };
+        authority
+            .lock()
+            .map_err(|_| WorkspaceExecError::InvalidPreparedSessionSpec)?
+            .take()
+            .map(Some)
+            .ok_or(WorkspaceExecError::InvalidPreparedSessionSpec)
+    }
+
     /// Build ad-hoc (redaction-safe) [`StartParams`] running in this prepared cwd. Pure
     /// convenience — it does NOT talk to the daemon; hand the result to
     /// [`ShellRuntime::start_session`](crate::shell_runtime::ShellRuntime::start_session).
@@ -214,11 +533,170 @@ impl PreparedWorkspace {
             now_ms,
         )
     }
+
+    /// Seal an exact ad-hoc Shell or Agent launch. Metadata is recomputed from the same live argv;
+    /// AgentTask association is intentionally impossible in this generic pane constructor.
+    pub fn adhoc_session_spec(
+        &self,
+        kind: SessionKind,
+        argv: &[String],
+        cols: u16,
+        rows: u16,
+        now_ms: u64,
+    ) -> Result<PreparedSessionSpec, WorkspaceExecError> {
+        self.adhoc_session_spec_with_env(kind, argv, &crate::ProcessLaunchEnv, cols, rows, now_ms)
+    }
+
+    pub fn adhoc_session_spec_with_env(
+        &self,
+        kind: SessionKind,
+        argv: &[String],
+        env: &impl LaunchEnvLookup,
+        cols: u16,
+        rows: u16,
+        now_ms: u64,
+    ) -> Result<PreparedSessionSpec, WorkspaceExecError> {
+        if !matches!(kind, SessionKind::Shell | SessionKind::Agent)
+            || argv.first().is_none_or(|command| command.trim().is_empty())
+        {
+            return Err(WorkspaceExecError::InvalidPreparedSessionSpec);
+        }
+        let source_launch = if kind == SessionKind::Agent {
+            noncanonicalizable_agent_launch(argv)
+        } else {
+            crate::redact::adhoc_launch_spec(argv)
+        };
+        let login_shell_agent = kind == SessionKind::Agent
+            && argv
+                .first()
+                .is_some_and(|command| crate::restart_recipe::is_known_provider_id(command));
+        let wire_argv = if login_shell_agent {
+            crate::launch_environment::login_shell_argv(argv, env)
+        } else {
+            argv.to_vec()
+        };
+        let (command, args) = wire_argv
+            .split_first()
+            .filter(|(command, _)| !command.trim().is_empty())
+            .ok_or(WorkspaceExecError::InvalidPreparedSessionSpec)?;
+        let params = StartParams {
+            session_id: self.session_id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            kind,
+            launch: source_launch,
+            cwd: self.cwd.to_string_lossy().into_owned(),
+            command: command.clone(),
+            args: args.to_vec(),
+            cols,
+            rows,
+            agent_task_id: None,
+            now_ms,
+        };
+        Ok(PreparedSessionSpec {
+            publication_launch: params.launch.clone(),
+            params,
+            binding: if login_shell_agent {
+                PreparedSessionBinding::AgentAdHocLoginShell
+            } else {
+                PreparedSessionBinding::ExactAdHoc
+            },
+            worktree_provenance: self.take_worktree_provenance()?,
+        })
+    }
+
+    /// Seal one Hydra-selected provider launch.
+    ///
+    /// The selected provider id must be the exact first source token and every remaining source
+    /// byte must belong to that provider's closed fresh/latest/exact grammar. Shell derives the
+    /// login-shell wire argv privately. It never accepts caller-built KnownSafe metadata and never
+    /// redacts the packed login-shell script (which could hide a nested secret flag).
+    pub fn provider_session_spec(
+        &self,
+        selected_provider: &str,
+        source_argv: &[String],
+        env: &impl LaunchEnvLookup,
+        cols: u16,
+        rows: u16,
+        now_ms: u64,
+    ) -> Result<PreparedSessionSpec, WorkspaceExecError> {
+        let (mode, canonical_publication) =
+            crate::restart_recipe::strict_prepared_provider_launch(selected_provider, source_argv)
+                .ok_or(WorkspaceExecError::InvalidPreparedSessionSpec)?;
+        let wire_argv = crate::launch_environment::login_shell_argv(source_argv, env);
+        let (command, args) = wire_argv
+            .split_first()
+            .filter(|(command, _)| !command.trim().is_empty())
+            .ok_or(WorkspaceExecError::InvalidPreparedSessionSpec)?;
+        let source_launch = noncanonicalizable_agent_launch(source_argv);
+        let (launch, publication_launch, binding) = match mode {
+            crate::restart_recipe::PreparedProviderLaunchMode::ExactResume => (
+                canonical_publication.clone(),
+                canonical_publication,
+                PreparedSessionBinding::ProviderExact,
+            ),
+            crate::restart_recipe::PreparedProviderLaunchMode::FreshUnassigned => (
+                source_launch.clone(),
+                source_launch,
+                PreparedSessionBinding::AgentAdHocLoginShell,
+            ),
+            crate::restart_recipe::PreparedProviderLaunchMode::ExplicitNonExact => (
+                source_launch,
+                canonical_publication,
+                PreparedSessionBinding::ProviderExplicitNonExact,
+            ),
+            crate::restart_recipe::PreparedProviderLaunchMode::FreshWithAssignedIdentity => (
+                source_launch,
+                canonical_publication,
+                PreparedSessionBinding::ProviderTransition,
+            ),
+        };
+        let params = StartParams {
+            session_id: self.session_id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            kind: SessionKind::Agent,
+            launch,
+            cwd: self.cwd.to_string_lossy().into_owned(),
+            command: command.clone(),
+            args: args.to_vec(),
+            cols,
+            rows,
+            agent_task_id: None,
+            now_ms,
+        };
+        Ok(PreparedSessionSpec {
+            params,
+            publication_launch,
+            binding,
+            worktree_provenance: self.take_worktree_provenance()?,
+        })
+    }
+
+    /// Seal an explicit custom command whose first token happens to be a known provider word.
+    /// Selector-shaped invalid input is never downgraded through this path: it must pass the
+    /// strict provider constructor or fail. Other custom subcommands remain A=B AdHoc and execute
+    /// through the login shell without gaining KnownSafe restart authority.
+    pub fn provider_custom_adhoc_session_spec(
+        &self,
+        selected_provider: &str,
+        source_argv: &[String],
+        env: &impl LaunchEnvLookup,
+        cols: u16,
+        rows: u16,
+        now_ms: u64,
+    ) -> Result<PreparedSessionSpec, WorkspaceExecError> {
+        if !crate::restart_recipe::is_valid_prepared_provider_custom_adhoc(
+            selected_provider,
+            source_argv,
+        ) {
+            return Err(WorkspaceExecError::InvalidPreparedSessionSpec);
+        }
+        self.adhoc_session_spec_with_env(SessionKind::Agent, source_argv, env, cols, rows, now_ms)
+    }
 }
 
-/// Prepare the `ScratchCwd` workspace for one session: validate ids, compute
-/// `<app-support>/scratch/<session_id>` via the pure resolver, create it (and the scratch
-/// parents) with `0700`, and return it.
+/// Prepare the `ScratchCwd` workspace for one new session: validate ids, compute
+/// `<app-support>/scratch/<session_id>` via the pure resolver, exclusively create it (and the
+/// scratch parents) with `0700`, and return it.
 ///
 /// `repo_root` is the project root the session is associated with. `ScratchCwd` never resolves
 /// into it; it is used here only for the refusal check documented on
@@ -232,7 +710,28 @@ pub fn prepare_scratch_cwd(
     session_id: &str,
     repo_root: &str,
 ) -> Result<PreparedWorkspace, WorkspaceExecError> {
-    // Pure resolution first: validates `session_id`, computes the path, creates nothing.
+    // Drop the cleanup authority deliberately: this compatibility signature cannot return it,
+    // so its successful directory is retained. It still shares the exclusive/non-adopting leaf
+    // claim with every other production Scratch preparer.
+    prepare_fresh_scratch_cwd(paths, workspace_id, session_id, repo_root)
+        .map(FreshScratchCwdPreparation::into_parts)
+        .map(|(prepared, _cleanup)| prepared)
+}
+
+/// Prepare a ScratchCwd for a brand-new session attempt and mint cleanup authority only when this
+/// call exclusively created the final session directory.
+///
+/// If the exact session directory already exists it returns
+/// [`WorkspaceExecError::FreshScratchCwdAlreadyExists`] without chmodding, deleting, or adopting
+/// that directory. This prevents a losing same-id retry from using a directory while the winning
+/// preparer still owns its cleanup receipt.
+pub fn prepare_fresh_scratch_cwd(
+    paths: &AppPaths,
+    workspace_id: &str,
+    session_id: &str,
+    repo_root: &str,
+) -> Result<FreshScratchCwdPreparation, WorkspaceExecError> {
+    // Resolve and reject before creating any directory, matching `prepare_scratch_cwd`.
     let resolved = resolved_cwd(
         paths,
         WorkspacePolicy::ScratchCwd,
@@ -243,10 +742,6 @@ pub fn prepare_scratch_cwd(
     let scratch_base = paths.scratch_base();
     debug_assert!(resolved.cwd.starts_with(&scratch_base));
 
-    // Never create scratch state that sits under the supplied repo root. Lexical (no
-    // canonicalization — the cwd does not exist yet); over-refusal is acceptable, writing
-    // under a repo is not. The one allowed containment: a repo root INSIDE the scratch base
-    // (then "under the repo root" is just "under scratch", which is ours).
     let repo_root_path = Path::new(repo_root);
     if !repo_root.is_empty()
         && resolved.cwd.starts_with(repo_root_path)
@@ -258,19 +753,85 @@ pub fn prepare_scratch_cwd(
         });
     }
 
-    // Create base -> scratch base -> session dir, each owner-only. Setting the mode on
-    // pre-existing dirs too keeps the invariant on every prepare (idempotent).
-    fs::create_dir_all(&resolved.cwd)?;
-    for dir in [paths.base(), scratch_base.as_path(), resolved.cwd.as_path()] {
+    // Only the parent hierarchy is idempotent. The session leaf is an atomic ownership claim.
+    fs::create_dir_all(&scratch_base)?;
+    for dir in [paths.base(), scratch_base.as_path()] {
         set_dir_mode(dir)?;
     }
+    match fs::create_dir(&resolved.cwd) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(WorkspaceExecError::FreshScratchCwdAlreadyExists { cwd: resolved.cwd });
+        }
+        Err(error) => return Err(WorkspaceExecError::Io(error)),
+    }
+    if let Err(error) = set_dir_mode(&resolved.cwd) {
+        // The leaf is still empty and no authority has escaped. Best effort avoids leaving an
+        // unusable directory that all later fresh attempts must correctly refuse to adopt.
+        let _ = fs::remove_dir(&resolved.cwd);
+        return Err(WorkspaceExecError::Io(error));
+    }
 
-    Ok(PreparedWorkspace {
-        policy: WorkspacePolicy::ScratchCwd,
-        workspace_id: workspace_id.to_string(),
-        session_id: session_id.to_string(),
-        cwd: resolved.cwd,
+    Ok(FreshScratchCwdPreparation {
+        prepared: PreparedWorkspace {
+            policy: WorkspacePolicy::ScratchCwd,
+            workspace_id: workspace_id.to_string(),
+            session_id: session_id.to_string(),
+            cwd: resolved.cwd.clone(),
+            worktree_provenance: None,
+        },
+        cleanup: FreshScratchCwdReceipt {
+            scratch_base,
+            cwd: resolved.cwd,
+            session_id: session_id.to_string(),
+        },
     })
+}
+
+/// Consume a fresh-directory receipt and remove exactly the directory it created.
+///
+/// Passing different [`AppPaths`] fails closed and still consumes the receipt. A directory that
+/// was already removed is reported as an idempotent outcome rather than an IO failure.
+pub fn cleanup_fresh_scratch_cwd(
+    paths: &AppPaths,
+    receipt: FreshScratchCwdReceipt,
+) -> Result<FreshScratchCwdCleanupOutcome, WorkspaceExecError> {
+    let expected_base = paths.scratch_base();
+    let expected_cwd = expected_base.join(&receipt.session_id);
+    if receipt.scratch_base != expected_base || receipt.cwd != expected_cwd {
+        return Err(WorkspaceExecError::FreshScratchCwdReceiptMismatch);
+    }
+
+    // A legacy same-id writer does not participate in the filesystem leaf claim. Fence that
+    // compatibility path at the durable namespace: raw legacy start records Unknown before it
+    // can launch, and every soft owner is checked too. Keep the IMMEDIATE transaction alive
+    // through the filesystem operation so no cross-process writer can claim the id between the
+    // absence proof and `remove_dir`.
+    let arc = crate::db::conn_for(paths.base())
+        .map_err(|error| WorkspaceExecError::Store(StoreError::Db(error.to_string())))?;
+    let mut conn = arc.lock().unwrap();
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| WorkspaceExecError::Store(StoreError::Db(error.to_string())))?;
+    if !crate::window_layout::prepared_absent_session_namespace_is_clean(&tx, &receipt.session_id)?
+    {
+        return Ok(FreshScratchCwdCleanupOutcome::RetainedNamespaceInUse);
+    }
+
+    // Pre-wire / definitely-unpublished cleanup should only ever see the empty leaf that prepare
+    // created. Never recursively delete: unexpected content is evidence of another owner.
+    let outcome = match fs::remove_dir(&receipt.cwd) {
+        Ok(()) => Ok(FreshScratchCwdCleanupOutcome::Removed),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok(FreshScratchCwdCleanupOutcome::AlreadyMissing)
+        }
+        Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => {
+            Ok(FreshScratchCwdCleanupOutcome::RetainedNotEmpty)
+        }
+        Err(error) => Err(WorkspaceExecError::Io(error)),
+    };
+    drop(tx);
+    outcome
 }
 
 /// Generic NON-consent-aware entrypoint, deliberately conservative: only `ScratchCwd` is
@@ -369,13 +930,14 @@ fn prepare_repo_write(
         workspace_id: workspace.workspace_id.clone(),
         session_id: session_id.to_string(),
         cwd: root.to_path_buf(),
+        worktree_provenance: None,
     })
 }
 
 /// Deterministic branch a session's worktree is created on. Both ids are already validated to
 /// `[A-Za-z0-9_-]` (see `ids::validate_id`) before this is used, which is also a safe subset
 /// for git refname components.
-fn worktree_branch(workspace_id: &str, session_id: &str) -> String {
+pub(crate) fn worktree_branch(workspace_id: &str, session_id: &str) -> String {
     format!("maestro/{workspace_id}/{session_id}")
 }
 
@@ -401,29 +963,20 @@ fn wall_clock_ms() -> u64 {
 /// the marker is still written rather than skipped.
 fn write_worktree_provenance(
     paths: &AppPaths,
-    workspace: &Workspace,
-    session_id: &str,
-    target: &Path,
-    branch: &str,
+    seal: &PreparedWorktreeProvenanceSeal,
 ) -> Result<(), StoreError> {
-    let repo_root = fs::canonicalize(&workspace.root)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| workspace.root.clone());
-    let target_path = fs::canonicalize(target)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| target.to_string_lossy().into_owned());
     let record = WorktreeProvenance {
-        workspace_id: workspace.workspace_id.clone(),
-        session_id: session_id.to_string(),
-        repo_root,
-        target_path,
-        branch: branch.to_string(),
+        workspace_id: seal.workspace_id.clone(),
+        session_id: seal.session_id.clone(),
+        repo_root: seal.repo_root.clone(),
+        target_path: seal.target_path.clone(),
+        branch: seal.branch.clone(),
         created_at_ms: wall_clock_ms(),
     };
     write_record(
         paths,
         RecordKind::WorktreeProvenance,
-        session_id,
+        &seal.session_id,
         record.created_at_ms,
         &record,
     )
@@ -489,12 +1042,17 @@ fn prepare_worktree(
             // Same repo, same branch: prepare is idempotent. Refresh the provenance marker
             // best-effort — a write failure here must NOT abort the (already successful) reuse.
             set_dir_mode(&resolved.cwd)?;
-            let _ = write_worktree_provenance(paths, workspace, session_id, &resolved.cwd, &branch);
+            let worktree_provenance =
+                PreparedWorktreeProvenanceSeal::mint(workspace, session_id, &resolved.cwd, &branch);
+            let _ = write_worktree_provenance(paths, &worktree_provenance);
             return Ok(PreparedWorkspace {
                 policy: WorkspacePolicy::Worktree,
                 workspace_id: workspace.workspace_id.clone(),
                 session_id: session_id.to_string(),
                 cwd: resolved.cwd,
+                worktree_provenance: Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
+                    worktree_provenance,
+                )))),
             });
         }
         // Only a pre-existing EMPTY directory may be handed to `git worktree add`; any other
@@ -539,13 +1097,18 @@ fn prepare_worktree(
 
     // Worktree created: write the provenance marker best-effort. A marker failure must NOT roll
     // back or fail the already-created worktree, so the result is deliberately ignored.
-    let _ = write_worktree_provenance(paths, workspace, session_id, &resolved.cwd, &branch);
+    let worktree_provenance =
+        PreparedWorktreeProvenanceSeal::mint(workspace, session_id, &resolved.cwd, &branch);
+    let _ = write_worktree_provenance(paths, &worktree_provenance);
 
     Ok(PreparedWorkspace {
         policy: WorkspacePolicy::Worktree,
         workspace_id: workspace.workspace_id.clone(),
         session_id: session_id.to_string(),
         cwd: resolved.cwd,
+        worktree_provenance: Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
+            worktree_provenance,
+        )))),
     })
 }
 
@@ -927,14 +1490,463 @@ mod tests {
     }
 
     #[test]
-    fn repeated_prepare_is_idempotent() {
+    fn repeated_prepare_refuses_to_adopt_existing_session_directory() {
         let (_tmp, paths) = temp_paths();
         let first = prepare_scratch_cwd(&paths, "ws1", "sess1", "").unwrap();
-        let again = prepare_scratch_cwd(&paths, "ws1", "sess1", "").unwrap();
-        assert_eq!(first, again);
-        assert!(again.cwd.is_dir());
+        let again = prepare_scratch_cwd(&paths, "ws1", "sess1", "");
+        assert!(matches!(
+            again,
+            Err(WorkspaceExecError::FreshScratchCwdAlreadyExists { cwd })
+                if cwd == first.cwd
+        ));
+        assert!(first.cwd.is_dir());
         #[cfg(unix)]
-        assert_eq!(mode_of(&again.cwd), 0o700);
+        assert_eq!(mode_of(&first.cwd), 0o700);
+    }
+
+    #[test]
+    fn fresh_prepare_is_exclusive_and_receipt_is_non_clone_redacted() {
+        trait AmbiguousIfClone<Marker> {
+            fn assert_not_clone() {}
+        }
+        impl<T> AmbiguousIfClone<()> for T {}
+        impl<T: Clone> AmbiguousIfClone<u8> for T {}
+        let _ = <FreshScratchCwdReceipt as AmbiguousIfClone<_>>::assert_not_clone;
+        let _ = <FreshScratchCwdPreparation as AmbiguousIfClone<_>>::assert_not_clone;
+        let _ = <PreparedSessionSpec as AmbiguousIfClone<_>>::assert_not_clone;
+
+        let (_tmp, paths) = temp_paths();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let paths = paths.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                prepare_fresh_scratch_cwd(&paths, "ws1", "sess1", "")
+            }));
+        }
+        barrier.wait();
+
+        let mut winner = None;
+        let mut conflict_count = 0;
+        for handle in handles {
+            match handle.join().expect("fresh prepare thread") {
+                Ok(preparation) => {
+                    assert!(winner.replace(preparation).is_none(), "only one winner");
+                }
+                Err(WorkspaceExecError::FreshScratchCwdAlreadyExists { cwd }) => {
+                    assert_eq!(cwd, paths.scratch_base().join("sess1"));
+                    conflict_count += 1;
+                }
+                Err(other) => panic!("unexpected fresh prepare result: {other:?}"),
+            }
+        }
+        assert_eq!(conflict_count, 1);
+        let (prepared, receipt) = winner.expect("one exclusive winner").into_parts();
+        let debug = format!("{receipt:?}");
+        assert!(debug.contains("sess1"));
+        assert!(!debug.contains(prepared.cwd.to_string_lossy().as_ref()));
+        assert_eq!(
+            cleanup_fresh_scratch_cwd(&paths, receipt).unwrap(),
+            FreshScratchCwdCleanupOutcome::Removed
+        );
+        assert!(!prepared.cwd.exists());
+    }
+
+    struct PreparedLaunchEnv;
+
+    impl LaunchEnvLookup for PreparedLaunchEnv {
+        fn shell_utf8(&self) -> Option<String> {
+            Some("/bin/prepared-shell".into())
+        }
+
+        fn home_os(&self) -> Option<std::ffi::OsString> {
+            None
+        }
+    }
+
+    #[test]
+    fn provider_session_spec_keeps_source_metadata_separate_from_private_wire_bytes() {
+        let cwd = TempDir::new().unwrap();
+        let prepared = PreparedWorkspace::unsealed(
+            WorkspacePolicy::ScratchCwd,
+            "provider-ws",
+            "provider-session",
+            cwd.path(),
+        );
+        let source = vec!["claude".into(), "--model".into(), "opus".into()];
+        let spec = prepared
+            .provider_session_spec("claude", &source, &PreparedLaunchEnv, 80, 24, 10)
+            .unwrap();
+        assert_eq!(spec.params.kind, SessionKind::Agent);
+        assert_eq!(spec.params.command, "/bin/prepared-shell");
+        assert_eq!(spec.params.args.first().map(String::as_str), Some("-lic"));
+        assert!(matches!(
+            &spec.params.launch,
+            LaunchSpec::AdHocRedacted {
+                argv,
+                redacted: true,
+                restart_requires_user: true,
+            } if argv == &source
+        ));
+        assert_eq!(spec.binding, PreparedSessionBinding::AgentAdHocLoginShell);
+        assert_eq!(spec.publication_launch, spec.params.launch);
+        assert!(!crate::known_safe_provider_has_exact_resume(
+            &spec.publication_launch
+        ));
+        let debug = format!("{spec:?}");
+        assert!(!debug.contains("opus"));
+        assert!(!debug.contains("prepared-shell"));
+
+        assert!(matches!(
+            prepared.provider_session_spec(
+                "claude",
+                &[
+                    "claude".into(),
+                    "--resume=bad".into(),
+                    "--api-key".into(),
+                    "secret-value".into(),
+                ],
+                &PreparedLaunchEnv,
+                80,
+                24,
+                10,
+            ),
+            Err(WorkspaceExecError::InvalidPreparedSessionSpec)
+        ));
+    }
+
+    #[test]
+    fn explicit_nonexact_provider_selector_publishes_only_user_restart_authority() {
+        let cwd = TempDir::new().unwrap();
+        let prepared = PreparedWorkspace::unsealed(
+            WorkspacePolicy::ScratchCwd,
+            "provider-latest-ws",
+            "provider-latest-session",
+            cwd.path(),
+        );
+        let source = vec![
+            "claude".into(),
+            "--continue".into(),
+            "--model".into(),
+            "opus".into(),
+        ];
+        let spec = prepared
+            .provider_session_spec("claude", &source, &PreparedLaunchEnv, 80, 24, 10)
+            .expect("explicit latest selector must retain bounded user restart authority");
+        assert_eq!(
+            spec.binding,
+            PreparedSessionBinding::ProviderExplicitNonExact
+        );
+        assert_eq!(
+            spec.publication_launch,
+            LaunchSpec::KnownSafe {
+                launch_spec_id: "claude".into(),
+                params: vec!["--continue".into(), "--model".into(), "opus".into()],
+            }
+        );
+        assert!(!crate::known_safe_provider_has_exact_resume(
+            &spec.publication_launch
+        ));
+        assert_ne!(spec.params.launch, spec.publication_launch);
+    }
+
+    #[test]
+    fn claude_assigned_identity_transitions_create_argv_to_exact_resume_publication() {
+        const UUID: &str = "01234567-89ab-4def-8123-456789abcdef";
+        let cwd = TempDir::new().unwrap();
+        let prepared = PreparedWorkspace::unsealed(
+            WorkspacePolicy::ScratchCwd,
+            "claude-assigned-ws",
+            "claude-assigned-session",
+            cwd.path(),
+        );
+        let source = vec![
+            "claude".into(),
+            "--model".into(),
+            "opus".into(),
+            "--dangerously-skip-permissions".into(),
+            "--session-id".into(),
+            UUID.into(),
+        ];
+        let spec = prepared
+            .provider_session_spec("claude", &source, &PreparedLaunchEnv, 80, 24, 10)
+            .expect("Hydra-assigned Claude identity must seal as a provider transition");
+
+        assert_eq!(spec.binding, PreparedSessionBinding::ProviderTransition);
+        assert!(matches!(
+            &spec.params.launch,
+            LaunchSpec::AdHocRedacted {
+                argv,
+                redacted: true,
+                restart_requires_user: true,
+            } if argv == &[
+                "claude".to_string(),
+                "--model".to_string(),
+                "opus".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                "--session-id".to_string(),
+                "<redacted>".to_string(),
+            ]
+        ));
+        assert!(spec.params.args.iter().any(|arg| arg.contains(UUID)));
+        assert_eq!(
+            spec.publication_launch,
+            LaunchSpec::KnownSafe {
+                launch_spec_id: "claude".into(),
+                params: vec![
+                    "--model".into(),
+                    "opus".into(),
+                    "--dangerously-skip-permissions".into(),
+                    "--resume".into(),
+                    UUID.into(),
+                ],
+            }
+        );
+        assert!(crate::known_safe_provider_has_exact_resume(
+            &spec.publication_launch
+        ));
+        assert_ne!(spec.params.launch, spec.publication_launch);
+    }
+
+    #[test]
+    fn gemini_assigned_identity_transitions_create_argv_to_exact_resume_publication() {
+        const UUID: &str = "01234567-89ab-4def-8123-456789abcdef";
+        let cwd = TempDir::new().unwrap();
+        let prepared = PreparedWorkspace::unsealed(
+            WorkspacePolicy::ScratchCwd,
+            "gemini-assigned-ws",
+            "gemini-assigned-session",
+            cwd.path(),
+        );
+        let source = vec![
+            "gemini".into(),
+            "--model".into(),
+            "pro".into(),
+            "--yolo".into(),
+            "--session-id".into(),
+            UUID.into(),
+        ];
+        let spec = prepared
+            .provider_session_spec("gemini", &source, &PreparedLaunchEnv, 80, 24, 10)
+            .expect("Hydra-assigned Gemini identity must seal as a provider transition");
+
+        assert_eq!(spec.binding, PreparedSessionBinding::ProviderTransition);
+        assert!(spec.params.args.iter().any(|arg| arg.contains(UUID)));
+        assert_eq!(
+            spec.publication_launch,
+            LaunchSpec::KnownSafe {
+                launch_spec_id: "gemini".into(),
+                params: vec![
+                    "--model".into(),
+                    "pro".into(),
+                    "--yolo".into(),
+                    "--resume".into(),
+                    UUID.into(),
+                ],
+            }
+        );
+        assert!(crate::known_safe_provider_has_exact_resume(
+            &spec.publication_launch
+        ));
+        assert_ne!(spec.params.launch, spec.publication_launch);
+    }
+
+    #[test]
+    fn exact_provider_spec_uses_one_canonical_known_safe_recipe_for_a_and_b() {
+        const UUID: &str = "01234567-89ab-4def-8123-456789abcdef";
+        let cwd = TempDir::new().unwrap();
+        let prepared = PreparedWorkspace::unsealed(
+            WorkspacePolicy::ScratchCwd,
+            "provider-exact-ws",
+            "provider-exact-session",
+            cwd.path(),
+        );
+        let spec = prepared
+            .provider_session_spec(
+                "claude",
+                &["claude".into(), "--resume".into(), UUID.into()],
+                &PreparedLaunchEnv,
+                80,
+                24,
+                10,
+            )
+            .unwrap();
+        assert_eq!(spec.binding, PreparedSessionBinding::ProviderExact);
+        assert_eq!(spec.params.launch, spec.publication_launch);
+        assert!(crate::known_safe_provider_has_exact_resume(
+            &spec.publication_launch
+        ));
+    }
+
+    #[test]
+    fn custom_provider_word_agent_stays_redacted_adhoc_across_startup_canonicalization() {
+        let cwd = TempDir::new().unwrap();
+        let prepared = PreparedWorkspace::unsealed(
+            WorkspacePolicy::ScratchCwd,
+            "provider-custom-ws",
+            "provider-custom-session",
+            cwd.path(),
+        );
+        let source = vec![
+            "claude".into(),
+            "mcp".into(),
+            "--api-key".into(),
+            "secret-value-123456789".into(),
+        ];
+        let spec = prepared
+            .provider_custom_adhoc_session_spec("claude", &source, &PreparedLaunchEnv, 80, 24, 10)
+            .unwrap();
+        assert_eq!(spec.binding, PreparedSessionBinding::AgentAdHocLoginShell);
+        assert_eq!(spec.params.command, "/bin/prepared-shell");
+        assert_eq!(spec.params.args.first().map(String::as_str), Some("-lic"));
+        assert_eq!(spec.params.launch, spec.publication_launch);
+        let LaunchSpec::AdHocRedacted {
+            argv,
+            redacted,
+            restart_requires_user,
+        } = &spec.params.launch
+        else {
+            panic!("custom provider-word launch must remain AdHoc")
+        };
+        assert!(*redacted && *restart_requires_user);
+        assert_eq!(argv[0], "claude");
+        assert!(argv.iter().any(|value| value == "<redacted>"));
+        assert!(!format!("{argv:?}").contains("secret-value"));
+        assert_eq!(
+            crate::canonical_launch_for_restart(&spec.params.launch),
+            spec.params.launch
+        );
+        let debug = format!("{spec:?}");
+        assert!(!debug.contains("secret-value"));
+        assert!(!debug.contains("prepared-shell"));
+    }
+
+    #[test]
+    fn malformed_provider_selector_shapes_never_downgrade_to_custom_adhoc() {
+        let cwd = TempDir::new().unwrap();
+        let prepared = PreparedWorkspace::unsealed(
+            WorkspacePolicy::ScratchCwd,
+            "provider-selector-ws",
+            "provider-selector-session",
+            cwd.path(),
+        );
+        for (provider, malformed) in [
+            ("claude", "--continue=foreign"),
+            ("claude", "--session-id=foreign"),
+            ("codex", "resume=foreign"),
+            ("codex", "--continue=foreign"),
+            ("opencode", "--continue=foreign"),
+            ("copilot", "--continue=foreign"),
+            ("copilot", "-r=foreign"),
+            ("copilot", "--connect=foreign"),
+            ("agy", "--continue=foreign"),
+            ("kimi", "--continue=foreign"),
+            ("kiro-cli", "--resume=foreign"),
+            ("agent", "--continue=foreign"),
+            ("devin", "--continue=foreign"),
+            ("amp", "threads=foreign"),
+        ] {
+            let source = vec![provider.to_string(), malformed.to_string()];
+            assert!(
+                prepared
+                    .provider_custom_adhoc_session_spec(
+                        provider,
+                        &source,
+                        &PreparedLaunchEnv,
+                        80,
+                        24,
+                        10,
+                    )
+                    .is_err(),
+                "selector-shaped malformed source must not downgrade: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_prepare_never_adopts_or_deletes_preexisting_content() {
+        let (_tmp, paths) = temp_paths();
+        let cwd = paths.scratch_base().join("sess1");
+        fs::create_dir_all(&cwd).unwrap();
+        let sentinel = cwd.join("keep.txt");
+        fs::write(&sentinel, b"owned by an earlier lifetime").unwrap();
+
+        let result = prepare_fresh_scratch_cwd(&paths, "ws1", "sess1", "");
+        assert!(matches!(
+            result,
+            Err(WorkspaceExecError::FreshScratchCwdAlreadyExists { cwd: found })
+                if found == cwd
+        ));
+        assert_eq!(
+            fs::read(&sentinel).unwrap(),
+            b"owned by an earlier lifetime"
+        );
+    }
+
+    #[test]
+    fn fresh_cleanup_is_exact_non_recursive_and_consumes_wrong_paths() {
+        let (_tmp, paths) = temp_paths();
+        let preparation = prepare_fresh_scratch_cwd(&paths, "ws1", "sess1", "").unwrap();
+        let (prepared, receipt) = preparation.into_parts();
+        let sentinel = prepared.cwd.join("keep.txt");
+        fs::write(&sentinel, b"unexpected owner").unwrap();
+        assert_eq!(
+            cleanup_fresh_scratch_cwd(&paths, receipt).unwrap(),
+            FreshScratchCwdCleanupOutcome::RetainedNotEmpty
+        );
+        assert_eq!(fs::read(&sentinel).unwrap(), b"unexpected owner");
+
+        let other = AppPaths::with_base(paths.base().with_extension("other"));
+        let (_, wrong_paths_receipt) = prepare_fresh_scratch_cwd(&paths, "ws1", "sess2", "")
+            .unwrap()
+            .into_parts();
+        assert!(matches!(
+            cleanup_fresh_scratch_cwd(&other, wrong_paths_receipt),
+            Err(WorkspaceExecError::FreshScratchCwdReceiptMismatch)
+        ));
+        assert!(paths.scratch_base().join("sess2").is_dir());
+    }
+
+    #[test]
+    fn fresh_cleanup_retains_directory_when_same_id_durable_namespace_is_in_use() {
+        let (_tmp, paths) = temp_paths();
+        let (prepared, receipt) = prepare_fresh_scratch_cwd(&paths, "ws1", "sess1", "")
+            .unwrap()
+            .into_parts();
+        {
+            let arc = crate::db::conn_for(paths.base()).unwrap();
+            let conn = arc.lock().unwrap();
+            conn.execute(
+                "INSERT INTO projects (
+                     project_id, name, root, default_workspace_policy, created_at_ms,
+                     last_active_at_ms, directories_json, window_order_json, system, hidden
+                 ) VALUES ('p1','P','/tmp','scratch_cwd',1,1,'[]','[]',0,0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO workspaces (workspace_id, project_id, root, policy, consent_json)
+                 VALUES ('ws1','p1','/tmp','scratch_cwd','{}')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (
+                     session_id, workspace_id, kind, launch_json, cwd_resolved, agent_task_id,
+                     created_at_ms, last_attached_at_ms, last_known_generation, status
+                 ) VALUES ('sess1','ws1','shell','\"opt_out\"',?1,NULL,1,1,NULL,'unknown')",
+                [prepared.cwd.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            cleanup_fresh_scratch_cwd(&paths, receipt).unwrap(),
+            FreshScratchCwdCleanupOutcome::RetainedNamespaceInUse
+        );
+        assert!(prepared.cwd.is_dir());
     }
 
     #[test]
@@ -1478,6 +2490,38 @@ mod tests {
                 .to_string_lossy()
                 .into_owned()
         );
+    }
+
+    #[test]
+    fn only_actual_worktree_preparation_mints_session_provenance_authority() {
+        let (_tmp, paths) = temp_paths();
+        let repo = init_temp_repo();
+        let ws = worktree_workspace(repo.path(), worktree_consent());
+        let prepared =
+            prepare_workspace_with_consent(&paths, WorkspacePolicy::Worktree, &ws, "sess1")
+                .unwrap();
+        let cwd = prepared.cwd.clone();
+        let cloned_attempt = prepared.clone();
+        let (_, _, _, actual_seal) = prepared
+            .adhoc_session_spec(SessionKind::Shell, &["/bin/sh".into()], 80, 24, 1)
+            .unwrap()
+            .into_parts();
+        assert!(actual_seal.is_some());
+        assert!(matches!(
+            cloned_attempt.adhoc_session_spec(SessionKind::Shell, &["/bin/sh".into()], 80, 24, 1,),
+            Err(WorkspaceExecError::InvalidPreparedSessionSpec)
+        ));
+
+        let (_, _, _, unsealed) = PreparedWorkspace::unsealed(
+            WorkspacePolicy::Worktree,
+            ws.workspace_id.clone(),
+            "sess1",
+            cwd,
+        )
+        .adhoc_session_spec(SessionKind::Shell, &["/bin/sh".into()], 80, 24, 1)
+        .unwrap()
+        .into_parts();
+        assert!(unsealed.is_none());
     }
 
     #[test]

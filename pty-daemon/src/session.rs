@@ -7,12 +7,13 @@ use crate::grid::{
     TerminalNotification,
 };
 use crate::ids::{ChannelId, SessionId};
-use crate::revision::Revision;
-use anyhow::Result;
-use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
-use std::collections::VecDeque;
+use crate::revision::{Revision, SessionGeneration};
+use anyhow::{anyhow, Result};
+use maestro_protocol::request::{AttachmentHandoff, AttachmentHandoffToken};
+use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use tokio::sync::broadcast;
 
 /// Max bytes of scrollback retained per session for replay-on-reattach. Bounded
@@ -20,6 +21,88 @@ use tokio::sync::broadcast;
 /// to repaint a screen plus recent history; deeper history is the agent's own
 /// concern (it resumes via --continue on a cold start).
 const SCROLLBACK_CAP: usize = 1024 * 1024;
+
+/// One session accepts only a small bounded cohort of pending handoff capabilities.
+pub(crate) const MAX_ATTACHMENT_HANDOFF_TOKENS: usize = 64;
+/// Bounded recent one-shot replay fence. This is separate from the pending-token budget: retired
+/// values never permanently consume offer capacity. Callers must still generate a fresh random
+/// 128-bit token for every offer; the LRU catches immediate/delayed protocol replay without making
+/// a long-lived Session fail every future handoff after a fixed number of successful claims.
+pub(crate) const MAX_RETIRED_ATTACHMENT_HANDOFF_TOKENS: usize = 256;
+
+#[derive(Default)]
+struct AttachmentFence {
+    active_guards: usize,
+    /// Internal connection owner nonce. It makes a repeat offer from the same client idempotent
+    /// while rejecting a second client trying to share/overwrite that pending capability.
+    pending_handoffs: HashMap<AttachmentHandoffToken, u64>,
+    retired_handoffs: VecDeque<AttachmentHandoffToken>,
+}
+
+impl AttachmentFence {
+    fn is_retired(&self, token: &AttachmentHandoffToken) -> bool {
+        self.retired_handoffs.iter().any(|retired| retired == token)
+    }
+
+    fn retire(&mut self, token: AttachmentHandoffToken) {
+        if self.is_retired(&token) {
+            return;
+        }
+        if self.retired_handoffs.len() == MAX_RETIRED_ATTACHMENT_HANDOFF_TOKENS {
+            self.retired_handoffs.pop_front();
+        }
+        self.retired_handoffs.push_back(token);
+    }
+}
+
+/// Non-cloneable RAII proof that one client currently owns an attachment to this exact Session
+/// object. Raw guard Drop releases the active owner but deliberately leaves an offered token
+/// pending so same-client guard replacement can acquire the new owner before releasing the old
+/// one. The protocol owner must therefore call [`AttachmentGuard::detach`] when the client state is
+/// torn down: connection EOF, framing/read error, outbound failure, and task cancellation retire a
+/// still-pending offer before the original client disappears.
+pub struct AttachmentGuard {
+    fence: Arc<Mutex<AttachmentFence>>,
+    offered_token: Option<AttachmentHandoffToken>,
+    owner_nonce: u64,
+    active: bool,
+}
+
+impl AttachmentGuard {
+    /// Release due to protocol Detach or owning-client teardown. Unlike raw guard replacement,
+    /// this also retires a still-pending token offered by this attachment. If another client already
+    /// claimed it, there is no pending entry left to affect.
+    pub fn detach(mut self) {
+        self.release(true);
+    }
+
+    fn release(&mut self, explicit: bool) {
+        if !self.active {
+            return;
+        }
+        let mut fence = self
+            .fence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(fence.active_guards > 0);
+        fence.active_guards = fence.active_guards.saturating_sub(1);
+        if explicit {
+            if let Some(token) = self.offered_token.as_ref() {
+                if fence.pending_handoffs.get(token) == Some(&self.owner_nonce) {
+                    fence.pending_handoffs.remove(token);
+                    fence.retire(token.clone());
+                }
+            }
+        }
+        self.active = false;
+    }
+}
+
+impl Drop for AttachmentGuard {
+    fn drop(&mut self) {
+        self.release(false);
+    }
+}
 
 /// One broadcast unit of live output: the raw bytes plus the grid revision they
 /// produced. The revision lets an attaching client discard any frame already
@@ -184,6 +267,10 @@ pub struct Session {
     /// can live in the daemon map for a long time; without this seam a late Kill/Shutdown could
     /// signal a recycled pid in the tiny window after waitpid reaped it but before the latch set.
     killer: Arc<Mutex<ChildKillerState>>,
+    /// Session-object-local attachment ownership. The Arc is held by non-cloneable guards, so a
+    /// guard can retire itself after the daemon map lock and even the Session mapping are gone; it
+    /// can never affect a same-id replacement's fresh fence.
+    attachment_fence: Arc<Mutex<AttachmentFence>>,
 }
 
 struct ChildKillerState {
@@ -191,6 +278,15 @@ struct ChildKillerState {
     /// False once waitpid has reaped the child or the wait backend returned an ambiguous hard
     /// error. In either case a cloned numeric-pid killer is no longer safe to invoke.
     signal_safe: bool,
+}
+
+enum PumpWorkerStart {
+    Pending,
+    Started {
+        child: Box<dyn Child + Send + Sync>,
+        killer: Arc<Mutex<ChildKillerState>>,
+    },
+    Aborted,
 }
 
 impl ChildKillerState {
@@ -292,6 +388,29 @@ impl Session {
         cols: u16,
         rows: u16,
     ) -> Result<Self> {
+        Self::spawn_with_generation(
+            id,
+            cwd,
+            command,
+            args,
+            child_environment,
+            cols,
+            rows,
+            SessionGeneration::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_with_generation(
+        id: SessionId,
+        cwd: &str,
+        command: &str,
+        args: &[String],
+        child_environment: Option<&maestro_protocol::ChildEnvironment>,
+        cols: u16,
+        rows: u16,
+        generation: SessionGeneration,
+    ) -> Result<Self> {
         // Normalize ONCE, here at the boundary, so the PTY and the authoritative
         // grid are sized from one identical pair. Previously the PTY got
         // the raw client cols/rows while TermGrid clamped internally — a client
@@ -330,29 +449,24 @@ impl Session {
         for (k, v) in env_adds {
             cmd.env(k, v);
         }
-        // The child must not be killed when its PTY handle drops; the daemon
-        // owns lifetime explicitly via Kill. We keep the child (to reap its exit
-        // code) and a cloned killer (to terminate it on demand).
-        let mut child = pair.slave.spawn_command(cmd)?;
-        let killer = Arc::new(Mutex::new(ChildKillerState {
-            killer: child.clone_killer(),
-            signal_safe: true,
-        }));
-        drop(pair.slave);
-
+        // Acquire every fallible daemon-side resource before publishing the child process. A
+        // conditional Start refusal must mean the command never ran, not merely that the Session
+        // failed to enter the map after exec.
         let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
         let mut reader = pair.master.try_clone_reader()?;
 
         let scrollback = Arc::new(Mutex::new(VecDeque::with_capacity(SCROLLBACK_CAP)));
-        let grid = Arc::new(Mutex::new(TermGrid::new(cols, rows)));
+        let grid = Arc::new(Mutex::new(TermGrid::new_with_generation(
+            cols, rows, generation,
+        )));
         let (output_tx, _rx) = broadcast::channel::<OutputFrame>(1024);
         let (exit_tx, _exit_rx) = broadcast::channel::<Option<i32>>(8);
         let exited = Arc::new(Mutex::new(None));
+        let worker_start = Arc::new((Mutex::new(PumpWorkerStart::Pending), Condvar::new()));
 
-        // PTY reader: pump output into the grid (authority) + scrollback ring +
-        // broadcast to any attached clients. Runs on a blocking thread (PTY
-        // read is blocking). On EOF it reaps the child to learn the exit code
-        // and signals exit so forwarders can emit SessionExited.
+        // Start the pump worker before child publication. It waits behind a local gate until spawn
+        // succeeds; Builder failure therefore has zero command side effect, and spawn failure wakes
+        // the already-created worker with `Aborted` so no blocked thread leaks.
         {
             let scrollback = scrollback.clone();
             let grid = grid.clone();
@@ -360,8 +474,26 @@ impl Session {
             let output_tx = output_tx.clone();
             let exit_tx = exit_tx.clone();
             let exited = exited.clone();
-            let killer = killer.clone();
-            std::thread::spawn(move || {
+            let worker_start = worker_start.clone();
+            let _pump_thread = std::thread::Builder::new()
+                .name("pty-session-pump".into())
+                .spawn(move || {
+                let (mut child, killer) = {
+                    let (start_lock, start_ready) = &*worker_start;
+                    let mut start = start_lock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    while matches!(&*start, PumpWorkerStart::Pending) {
+                        start = start_ready
+                            .wait(start)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                    match std::mem::replace(&mut *start, PumpWorkerStart::Aborted) {
+                        PumpWorkerStart::Started { child, killer } => (child, killer),
+                        PumpWorkerStart::Aborted => return,
+                        PumpWorkerStart::Pending => unreachable!("pump gate left pending"),
+                    }
+                };
                 let mut buf = [0u8; 8192];
                 loop {
                     match reader.read(&mut buf) {
@@ -463,8 +595,38 @@ impl Session {
                     std::thread::sleep(reap_backoff.next_delay());
                 };
                 let _ = exit_tx.send(code);
-            });
+                })?;
         }
+
+        // The child must not be killed when its PTY handle drops; the daemon owns lifetime
+        // explicitly via Kill. The pump thread receives the child for reaping, while Session keeps
+        // a cloned killer for explicit lifecycle mutation.
+        let child = match pair.slave.spawn_command(cmd) {
+            Ok(child) => child,
+            Err(error) => {
+                let (start_lock, start_ready) = &*worker_start;
+                *start_lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = PumpWorkerStart::Aborted;
+                start_ready.notify_one();
+                return Err(error);
+            }
+        };
+        let killer = Arc::new(Mutex::new(ChildKillerState {
+            killer: child.clone_killer(),
+            signal_safe: true,
+        }));
+        {
+            let (start_lock, start_ready) = &*worker_start;
+            *start_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = PumpWorkerStart::Started {
+                child,
+                killer: killer.clone(),
+            };
+            start_ready.notify_one();
+        }
+        drop(pair.slave);
 
         Ok(Session {
             id,
@@ -478,7 +640,109 @@ impl Session {
             exit_tx,
             exited,
             killer,
+            attachment_fence: Arc::new(Mutex::new(AttachmentFence::default())),
         })
+    }
+
+    /// Install one attachment owner on this exact Session lifetime. The daemon calls this while it
+    /// holds its global map mutex, which linearizes acquisition with generation-conditional Kill
+    /// and same-id restart. Claim consumes a pending token and increments the ordinary guard count
+    /// under this one leaf mutex, so there is never a zero-owner instant between the two states.
+    pub fn acquire_attachment(
+        &self,
+        handoff: Option<&AttachmentHandoff>,
+        owner_nonce: u64,
+    ) -> Result<AttachmentGuard> {
+        let mut fence = self
+            .attachment_fence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next_active_guards = fence
+            .active_guards
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("attachment owner count overflow"))?;
+        let mut offered_token = None;
+        match handoff {
+            None => {}
+            Some(AttachmentHandoff::Offer { token }) => {
+                if fence.is_retired(token) {
+                    return Err(anyhow!("attachment handoff token was already retired"));
+                }
+                match fence.pending_handoffs.get(token) {
+                    Some(existing_owner) if *existing_owner == owner_nonce => {
+                        // Same-client repeat offer: preserve the original pending capability.
+                    }
+                    Some(_) => {
+                        return Err(anyhow!(
+                            "attachment handoff token is already pending for another client"
+                        ));
+                    }
+                    None if fence.pending_handoffs.len() >= MAX_ATTACHMENT_HANDOFF_TOKENS => {
+                        return Err(anyhow!(
+                            "attachment handoff token limit reached ({MAX_ATTACHMENT_HANDOFF_TOKENS})"
+                        ));
+                    }
+                    None => {
+                        fence.pending_handoffs.insert(token.clone(), owner_nonce);
+                    }
+                }
+                offered_token = Some(token.clone());
+            }
+            Some(AttachmentHandoff::Claim { token }) => {
+                if fence.pending_handoffs.remove(token).is_none() {
+                    return Err(anyhow!("attachment handoff token is not claimable"));
+                }
+                fence.retire(token.clone());
+            }
+        }
+        fence.active_guards = next_active_guards;
+        drop(fence);
+        Ok(AttachmentGuard {
+            fence: self.attachment_fence.clone(),
+            offered_token,
+            owner_nonce,
+            active: true,
+        })
+    }
+
+    /// Retire one exact pending token without touching any active attachment. Unknown/already
+    /// consumed tokens are an idempotent no-op and never expose whether another opaque value exists.
+    pub fn cancel_attachment_handoff(&self, token: &AttachmentHandoffToken) {
+        let mut fence = self
+            .attachment_fence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if fence.pending_handoffs.remove(token).is_some() {
+            fence.retire(token.clone());
+        }
+    }
+
+    /// Fail-closed ownership predicate used while the daemon map mutex is held. Active guards and
+    /// unclaimed pending offers protect the Session.
+    pub fn attachment_in_use(&self) -> bool {
+        let fence = self
+            .attachment_fence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fence.active_guards > 0 || !fence.pending_handoffs.is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn attachment_fence_counts(&self) -> (usize, usize) {
+        let fence = self
+            .attachment_fence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (fence.active_guards, fence.pending_handoffs.len())
+    }
+
+    #[cfg(test)]
+    pub fn retired_attachment_handoff_count(&self) -> usize {
+        self.attachment_fence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retired_handoffs
+            .len()
     }
 
     /// Raw recent output bytes. Unused on every live path: attach restores from the

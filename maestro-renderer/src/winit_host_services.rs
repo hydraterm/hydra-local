@@ -63,6 +63,10 @@ impl HostServices for WinitHostServices {
         self.window.set_ime_allowed(allowed);
     }
 
+    fn open_http_url(&self, url: &str) -> bool {
+        crate::host_services::start_native_http_open(url)
+    }
+
     fn terminal_surface_scope(&self) -> crate::host_services::TerminalSurfaceScope {
         // macOS renders the terminal into the FULL window surface; the sidebar WebView overlays its left, so
         // the terminal reserves the sidebar width itself. Unchanged behavior.

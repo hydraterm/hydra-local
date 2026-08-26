@@ -129,6 +129,35 @@ function isVisibleWindow(win: DashboardWindow): boolean {
   return !win.stashed && win.tabs.some((tab) => !tab.stashed)
 }
 
+/** Project selection preserves that project's last exact focus while it still exists. Once that
+ * window is gone/stashed, durable window order is authoritative and the first visible row wins. */
+export function preferredVisibleWindowId(
+  windows: DashboardWindow[],
+  rememberedWindowId: string | null = null,
+): string | null {
+  const visible = windows.filter(isVisibleWindow)
+  return (
+    visible.find((win) => win.window_id === rememberedWindowId)?.window_id ??
+    visible[0]?.window_id ??
+    null
+  )
+}
+
+function reviveStashedWindowPanes(targetWindow: DashboardWindow): void {
+  targetWindow.tabs
+    .filter((tab) => tab.stashed)
+    .forEach((pane, index) => {
+      globalThis.setTimeout(
+        () => bridge.reviveSession(pane.session_id, targetWindow.window_id, pane.tab_id),
+        index * 35,
+      )
+    })
+}
+
+function visibleWindowHasExitedPane(targetWindow: DashboardWindow): boolean {
+  return targetWindow.tabs.some((tab) => !tab.stashed && tab.session_status === 'exited')
+}
+
 type OverlayAgent = OverlayAgentKind
 type OverlayResumeMode = 'continue' | 'resume' | 'none'
 
@@ -372,6 +401,7 @@ function actionableFilesystemMigrationNoticeKey(model: DashboardModel): string |
 export function App(): JSX.Element {
   const [state, setState] = useState<LoadState>({ kind: 'loading' })
   const latestModelRef = useRef<DashboardModel | null>(null)
+  const focusedWindowByProjectRef = useRef<Map<string, string>>(new Map())
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [focusedWindowId, setFocusedWindowId] = useState<string | null>(null)
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT)
@@ -419,22 +449,36 @@ export function App(): JSX.Element {
       setSelectedId((prevSelectedId) => {
         const activeWindowProjectId = model.active_window_id
           ? Object.values(model.details).find((detail) =>
-              detail.windows.some((w) => w.window_id === model.active_window_id),
+              detail.windows.some(
+                (window) =>
+                  window.window_id === model.active_window_id && isVisibleWindow(window),
+              ),
             )?.project_id
           : null
+        if (activeWindowProjectId && model.active_window_id) {
+          focusedWindowByProjectRef.current.set(activeWindowProjectId, model.active_window_id)
+        }
         const selectedStillExists = model.projects.some((p) => p.project_id === prevSelectedId)
-        const nextSelectedId = selectedStillExists
-          ? (activeWindowProjectId ?? prevSelectedId)
-          : (model.active_project?.project_id ?? model.projects[0]?.project_id ?? null)
+        const nextSelectedId =
+          activeWindowProjectId ??
+          (selectedStillExists
+            ? prevSelectedId
+            : (model.active_project?.project_id ?? model.projects[0]?.project_id ?? null))
 
         setFocusedWindowId((prevWindowId) => {
           if (!nextSelectedId) return null
           const windows = (model.details[nextSelectedId]?.windows ?? []).filter(isVisibleWindow)
           const activeWindowStillVisible =
             model.active_window_id && windows.some((w) => w.window_id === model.active_window_id)
-          if (activeWindowStillVisible) return model.active_window_id ?? null
-          const focusedStillExists = windows.some((w) => w.window_id === prevWindowId)
-          return focusedStillExists ? prevWindowId : (windows[0]?.window_id ?? null)
+          if (activeWindowStillVisible) {
+            focusedWindowByProjectRef.current.set(nextSelectedId, model.active_window_id!)
+            return model.active_window_id ?? null
+          }
+          const rememberedWindowId =
+            focusedWindowByProjectRef.current.get(nextSelectedId) ?? prevWindowId
+          const nextWindowId = preferredVisibleWindowId(windows, rememberedWindowId)
+          if (nextWindowId) focusedWindowByProjectRef.current.set(nextSelectedId, nextWindowId)
+          return nextWindowId
         })
 
         return nextSelectedId
@@ -499,8 +543,14 @@ export function App(): JSX.Element {
     model.projects[0]
   const detail = selected ? model.details[selected.project_id] : undefined
   const visibleWindows = detail?.windows.filter(isVisibleWindow) ?? []
+  const preferredWindowId = preferredVisibleWindowId(
+    visibleWindows,
+    selected ? (focusedWindowByProjectRef.current.get(selected.project_id) ?? null) : null,
+  )
   const focusedWindow =
-    visibleWindows.find((w) => w.window_id === focusedWindowId) ?? visibleWindows[0] ?? null
+    visibleWindows.find((w) => w.window_id === focusedWindowId) ??
+    visibleWindows.find((w) => w.window_id === preferredWindowId) ??
+    null
   const selectedAccent = normalizeHexColor(selected?.accent_color)
   const selectedAccent2 = rotateHexColor(selectedAccent, 38)
   const selectedAccent3 = rotateHexColor(selectedAccent, -42)
@@ -512,15 +562,39 @@ export function App(): JSX.Element {
 
   const selectProject = (id: string): void => {
     setSelectedId(id)
-    const firstWin = (model.details[id]?.windows ?? []).find(isVisibleWindow)?.window_id ?? null
-    setFocusedWindowId(firstWin)
+    const projectWindows = model.details[id]?.windows ?? []
+    const rememberedWindowId = focusedWindowByProjectRef.current.get(id) ?? null
+    const targetWindow =
+      projectWindows.find(
+        (window) => window.window_id === rememberedWindowId && isVisibleWindow(window),
+      ) ?? projectWindows[0]
+    const preferredWindow = targetWindow && isVisibleWindow(targetWindow)
+      ? targetWindow.window_id
+      : null
+    setFocusedWindowId(targetWindow?.window_id ?? null)
     bridge.openWorkspace(id)
-    if (firstWin) bridge.focusWindow(id, firstWin)
+    if (!targetWindow) return
+    if (!preferredWindow) {
+      reviveStashedWindowPanes(targetWindow)
+      return
+    }
+    focusedWindowByProjectRef.current.set(id, preferredWindow)
+    if (visibleWindowHasExitedPane(targetWindow)) {
+      bridge.reviveWindow(preferredWindow)
+    } else {
+      bridge.focusWindow(id, preferredWindow)
+    }
   }
 
-  const focusWindow = (windowId: string): void => {
+  const focusWindow = (projectId: string, windowId: string): void => {
+    setSelectedId(projectId)
     setFocusedWindowId(windowId)
-    if (selected) bridge.focusWindow(selected.project_id, windowId)
+    focusedWindowByProjectRef.current.set(projectId, windowId)
+    // Project activation owns durable recency/is_active state; window focus owns the exact
+    // renderer projection. A cross-project topbar/sidebar click therefore preserves both native
+    // authorities in the same order as an ordinary project-row selection.
+    if (projectId !== selected?.project_id) bridge.openWorkspace(projectId)
+    bridge.focusWindow(projectId, windowId)
   }
 
   const applySidebarWidth = (width: number): void => {
@@ -653,7 +727,8 @@ export function App(): JSX.Element {
         ) : (
           <Topbar
             project={selected}
-            detail={detail}
+            projects={model.projects}
+            details={model.details}
             focusedWindowId={focusedWindow?.window_id ?? null}
             activeTabId={model.active_tab_id ?? null}
             onFocusWindow={focusWindow}
@@ -716,7 +791,8 @@ export function App(): JSX.Element {
           <>
             <Topbar
               project={selected}
-              detail={detail}
+              projects={model.projects}
+              details={model.details}
               focusedWindowId={focusedWindow?.window_id ?? null}
               activeTabId={model.active_tab_id ?? null}
               onFocusWindow={focusWindow}
@@ -1264,8 +1340,9 @@ function OverlayChrome({
           resume_session_file: isTerminal ? null : selected?.file_path ?? null,
           resolved_launch_command: resolvedLaunchCommand,
           pane_name: paneName.trim() || undefined,
-          // null → omit cwd so the backend inherits the split source pane's folder; a chosen folder overrides.
-          ...(splitCwd ? { cwd: splitCwd } : {}),
+          // Omit the unchanged source-window default so the backend inherits the source Workspace policy.
+          // Only an actual picker override is explicit; native remains authoritative over whether it is allowed.
+          ...(splitCwd && splitCwd !== splitWindowCwd ? { cwd: splitCwd } : {}),
         }),
     )
   }

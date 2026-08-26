@@ -64,7 +64,7 @@ type Props = {
   onSelect: (projectId: string) => void
   onReorder: (orderedIds: string[]) => void
   onWindowReorder: (projectId: string, orderedWindowIds: string[]) => void
-  onFocusWindow: (windowId: string) => void
+  onFocusWindow: (projectId: string, windowId: string) => void
 }
 
 function statusDotClass(status: SessionStatus | null, stashed: boolean): string {
@@ -81,6 +81,10 @@ function windowStatus(win: DashboardWindow): SessionStatus {
   if (live.some((t) => t.session_status === 'live')) return 'live'
   if (live.some((t) => t.session_status === 'exited')) return 'exited'
   return 'unknown'
+}
+
+function isVisibleWindow(win: DashboardWindow): boolean {
+  return !win.stashed && win.tabs.some((tab) => !tab.stashed)
 }
 
 // Running/total + distinct agents, for the project-row summary chip.
@@ -163,6 +167,12 @@ export function Sidebar({
   const projectRenameInputRef = useRef<HTMLInputElement | null>(null)
   const windowRenameInputRef = useRef<HTMLInputElement | null>(null)
   const [stashedDragKey, setStashedDragKey] = useState<string | null>(null)
+  const globalVisibleWindowCount = model.projects.reduce(
+    (count, project) =>
+      count +
+      (model.details[project.project_id]?.windows ?? []).filter(isVisibleWindow).length,
+    0,
+  )
 
   const closeOpenMenus = (): void => {
     setOpenProjectMenuId(null)
@@ -509,14 +519,7 @@ export function Sidebar({
   }
 
   const reopenExitedWindowPanes = (targetWindow: DashboardWindow): void => {
-    targetWindow.tabs
-      .filter((tab) => !tab.stashed && tab.session_status === 'exited')
-      .forEach((pane, index) => {
-        globalThis.setTimeout(
-          () => bridge.reviveSession(pane.session_id, targetWindow.window_id, pane.tab_id),
-          index * 35,
-        )
-      })
+    bridge.reviveWindow(targetWindow.window_id)
   }
 
   const startRenameWindow = (projectId: string, windowId: string): void => {
@@ -638,6 +641,9 @@ export function Sidebar({
           const sum = projectSummary(detail)
           const projStatus: SessionStatus =
             sum.running > 0 ? 'live' : sum.total > 0 ? 'exited' : 'unknown'
+          const deletesGlobalLastVisible =
+            globalVisibleWindowCount > 0 &&
+            (detail?.windows.filter(isVisibleWindow).length ?? 0) >= globalVisibleWindowCount
 
           return (
             <div
@@ -816,6 +822,12 @@ export function Sidebar({
 	                        type="button"
 	                        role="menuitem"
 	                        className="is-danger"
+	                        disabled={deletesGlobalLastVisible}
+	                        title={
+	                          deletesGlobalLastVisible
+	                            ? 'Keep one window open globally before deleting this project'
+	                            : undefined
+	                        }
 	                        onClick={() => startDeleteProject(p, detail)}
 	                      >
                         Delete project…
@@ -830,9 +842,6 @@ export function Sidebar({
 	                hasWindows &&
 	                (detail?.windows ?? []).map((w) => {
                   const projectWindows = detail?.windows ?? []
-                  const visibleWindowCount = projectWindows.filter(
-                    (window) => !window.stashed && window.tabs.some((tab) => !tab.stashed),
-                  ).length
                   const winKey = `${p.project_id}:${w.window_id}`
                   const hasPanes = w.tabs.length > 0
                   const isFocused = w.window_id === focusedWindowId
@@ -846,10 +855,10 @@ export function Sidebar({
                     Boolean(w.stashed) || (w.tabs.length > 0 && w.tabs.every((tab) => tab.stashed))
                   const firstStashedPane = w.tabs.find((tab) => tab.stashed)
                   const visiblePanes = w.tabs.filter((tab) => !tab.stashed)
-                  const allVisiblePanesExited =
-                    visiblePanes.length > 0 &&
-                    visiblePanes.every((tab) => tab.session_status === 'exited')
-                  const canCloseWindow = !isWindowStashed && visibleWindowCount > 1
+                  const hasVisibleExitedPanes = visiblePanes.some(
+                    (tab) => tab.session_status === 'exited',
+                  )
+                  const canCloseWindow = !isWindowStashed && globalVisibleWindowCount > 1
                   const windowDropBefore =
                     windowDropTarget?.windowId === w.window_id &&
                     windowDropTarget.edge === 'before'
@@ -914,7 +923,7 @@ export function Sidebar({
                       }}
                     >
                       <div
-                        className={`tree-row tree-row--window ${isFocused ? 'is-focused' : ''} ${isWindowStashed ? 'is-stashed' : ''} ${allVisiblePanesExited ? 'is-restartable' : ''} ${openWindowMenuKey === menuKey ? 'is-menu-open' : ''}`}
+                        className={`tree-row tree-row--window ${isFocused ? 'is-focused' : ''} ${isWindowStashed ? 'is-stashed' : ''} ${hasVisibleExitedPanes ? 'is-restartable' : ''} ${openWindowMenuKey === menuKey ? 'is-menu-open' : ''}`}
                         draggable
                         onDragStart={(e) => {
                           e.stopPropagation()
@@ -949,10 +958,10 @@ export function Sidebar({
                           onClick={() => {
                             if (isWindowStashed && firstStashedPane) {
                               reviveWindowPanes(w)
-                            } else if (allVisiblePanesExited) {
+                            } else if (hasVisibleExitedPanes) {
                               reopenExitedWindowPanes(w)
                             } else {
-                              onFocusWindow(w.window_id)
+                              onFocusWindow(p.project_id, w.window_id)
                             }
                           }}
                           onDoubleClick={(e) => {
@@ -963,14 +972,14 @@ export function Sidebar({
                           title={
                             isWindowStashed
                               ? 'Click to revive window'
-                              : allVisiblePanesExited
+                              : hasVisibleExitedPanes
                                 ? 'Exited — click to reopen window'
                                 : 'Click to focus window'
                           }
                           aria-label={
                             isWindowStashed
                               ? `Revive ${w.name || w.window_id}`
-                              : allVisiblePanesExited
+                              : hasVisibleExitedPanes
                                 ? `Reopen ${w.name || w.window_id}`
                                 : `Focus ${w.name || w.window_id}`
                           }
@@ -1004,7 +1013,7 @@ export function Sidebar({
                             <span className="tree-window__name">{w.name || w.window_id}</span>
                           )}
                           <span className="tree-window__count">
-                            {allVisiblePanesExited
+                            {hasVisibleExitedPanes
                               ? 'Reopen'
                               : w.tabs.filter((t) => !t.stashed).length}
                           </span>
@@ -1064,7 +1073,7 @@ export function Sidebar({
                                 type="button"
                                 role="menuitem"
                                 className="is-danger"
-                                disabled={visibleWindowCount <= 1 && !isWindowStashed}
+                                disabled={globalVisibleWindowCount <= 1 && !isWindowStashed}
                                 onClick={() => {
                                   setOpenWindowMenuKey(null)
                                   bridge.removeWindow(p.project_id, w.window_id)
@@ -1080,11 +1089,9 @@ export function Sidebar({
                       {winOpen &&
                         w.tabs.map((t) => {
                           const pMenuKey = paneMenuKey(p.project_id, t.window_id, t.tab_id)
-                          const livePaneCount =
-                            detail?.windows.reduce(
-                              (sum, window) => sum + window.tabs.filter((tab) => !tab.stashed).length,
-                              0,
-                            ) ?? 0
+                          const livePaneCount = visiblePanes.length
+                          const canRemovePane =
+                            t.stashed || livePaneCount > 1 || globalVisibleWindowCount > 1
                           return (
                             <div
                               key={t.tab_id}
@@ -1205,7 +1212,7 @@ export function Sidebar({
                                     } else if (t.session_status === 'exited') {
                                       bridge.reviveSession(t.session_id, t.window_id, t.tab_id)
                                     } else {
-                                      onFocusWindow(t.window_id)
+                                      onFocusWindow(p.project_id, t.window_id)
                                       bridge.focusSessionOrPane(
                                         p.project_id,
                                         t.window_id,
@@ -1290,7 +1297,7 @@ export function Sidebar({
                                       type="button"
                                       role="menuitem"
                                       className="is-danger"
-                                      disabled={!t.stashed && livePaneCount <= 1}
+                                      disabled={!canRemovePane}
                                       onClick={() => {
                                         setOpenPaneMenuKey(null)
                                         bridge.removePane(p.project_id, t.window_id, t.tab_id)

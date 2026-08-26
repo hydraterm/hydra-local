@@ -4,12 +4,16 @@
 //! machinery. Moved verbatim out of `lib.rs`; every item keeps the visibility it had there and is
 //! re-exported from the crate root so existing `maestro_app::<Item>` paths keep working.
 
+// Foreground failures deliberately retain consume-once handoff, rollback, and recovery receipts.
+#![allow(clippy::large_enum_variant, clippy::result_large_err)]
+
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use crate::{
-    build_tab_strip_model, renderer_tab_strip, selection_from_strip_tabs, tab_record_json,
-    RendererTabRuntime, TabSelection, TabStripModel, TabStripModelError, TabSwitchError,
-    WindowTabJson, ID_MINT_ATTEMPTS,
+    build_tab_strip_model, live_tab_records_json, renderer_tab_strip, RendererTabRuntime,
+    TabSelection, TabStripModel, TabStripModelError, TabSwitchError, WindowTabJson,
+    ID_MINT_ATTEMPTS,
 };
 
 /// Where a new tab's launch command/argv is re-resolved from. Carries NO raw argv and NO secrets:
@@ -22,6 +26,9 @@ pub enum NewTabLaunchSource {
     /// Start a default shell. Only valid for an explicit, pre-declared dev/test launch policy — it
     /// is never selected by the `+` glyph alone (the final product routes `+` through the launcher).
     DefaultShellDev,
+    /// A reviewed explicit custom Agent launch. The raw source argv remains live-only and is sealed
+    /// as non-replayable AdHoc metadata after the exact workspace/cwd is prepared.
+    PreparedAgentAdHoc,
 }
 
 /// How a new tab's cwd is derived. A `Worktree`/`RepoWrite` cwd is never blindly
@@ -224,6 +231,196 @@ pub struct NewTabPreparedStart {
     pub params: maestro_shell::StartParams,
 }
 
+/// Launch input owned by one foreground new-tab/split attempt. The ordinary shell arm is sealed as
+/// exact ad-hoc metadata at the prepared cwd. Provider/custom Agent callers use the consume-once
+/// source arm so no caller-built `StartParams` or repeatable prepared spec crosses the transaction
+/// boundary.
+pub struct NewTabForegroundLaunch {
+    kind: NewTabForegroundLaunchKind,
+}
+
+enum NewTabForegroundLaunchKind {
+    ShellAdHoc {
+        argv: Vec<String>,
+    },
+    AgentAdHoc {
+        source_argv: Vec<String>,
+        selected_agent: Option<String>,
+    },
+    Provider {
+        provider_id: String,
+        source_argv: Vec<String>,
+        selected_agent: String,
+    },
+    ProviderCustomAdHoc {
+        provider_id: String,
+        source_argv: Vec<String>,
+        selected_agent: String,
+    },
+}
+
+impl NewTabForegroundLaunch {
+    pub fn shell_adhoc(argv: &[String]) -> Self {
+        Self {
+            kind: NewTabForegroundLaunchKind::ShellAdHoc {
+                argv: argv.to_vec(),
+            },
+        }
+    }
+
+    pub fn agent_adhoc(source_argv: Vec<String>, selected_agent: Option<String>) -> Option<Self> {
+        let command = source_argv.first()?;
+        (!command.trim().is_empty()).then_some(Self {
+            kind: NewTabForegroundLaunchKind::AgentAdHoc {
+                source_argv,
+                selected_agent,
+            },
+        })
+    }
+
+    pub fn provider(
+        provider_id: String,
+        source_argv: Vec<String>,
+        selected_agent: String,
+    ) -> Option<Self> {
+        maestro_shell::is_strict_prepared_provider_launch(&provider_id, &source_argv).then_some(
+            Self {
+                kind: NewTabForegroundLaunchKind::Provider {
+                    provider_id,
+                    source_argv,
+                    selected_agent,
+                },
+            },
+        )
+    }
+
+    pub fn provider_custom_adhoc(
+        provider_id: String,
+        source_argv: Vec<String>,
+        selected_agent: String,
+    ) -> Option<Self> {
+        maestro_shell::is_valid_prepared_provider_custom_adhoc(&provider_id, &source_argv)
+            .then_some(Self {
+                kind: NewTabForegroundLaunchKind::ProviderCustomAdHoc {
+                    provider_id,
+                    source_argv,
+                    selected_agent,
+                },
+            })
+    }
+
+    fn matches_plan_source(&self, source: &NewTabLaunchSource) -> bool {
+        match (&self.kind, source) {
+            (
+                NewTabForegroundLaunchKind::ShellAdHoc { .. },
+                NewTabLaunchSource::DefaultShellDev,
+            ) => true,
+            (
+                NewTabForegroundLaunchKind::AgentAdHoc { .. },
+                NewTabLaunchSource::PreparedAgentAdHoc,
+            ) => true,
+            (
+                NewTabForegroundLaunchKind::ProviderCustomAdHoc { .. },
+                NewTabLaunchSource::PreparedAgentAdHoc,
+            ) => true,
+            (
+                NewTabForegroundLaunchKind::Provider { provider_id, .. },
+                NewTabLaunchSource::KnownSafeSpec { launch_spec_id },
+            ) => provider_id == launch_spec_id,
+            _ => false,
+        }
+    }
+
+    fn is_valid_for_preparation(&self) -> bool {
+        match &self.kind {
+            NewTabForegroundLaunchKind::ShellAdHoc { argv }
+            | NewTabForegroundLaunchKind::AgentAdHoc {
+                source_argv: argv, ..
+            } => argv
+                .first()
+                .is_some_and(|command| !command.trim().is_empty()),
+            NewTabForegroundLaunchKind::Provider {
+                provider_id,
+                source_argv,
+                ..
+            } => maestro_shell::is_strict_prepared_provider_launch(provider_id, source_argv),
+            NewTabForegroundLaunchKind::ProviderCustomAdHoc {
+                provider_id,
+                source_argv,
+                ..
+            } => maestro_shell::is_valid_prepared_provider_custom_adhoc(provider_id, source_argv),
+        }
+    }
+
+    fn into_session_spec_with_reprobe<R>(
+        self,
+        prepared: &maestro_shell::PreparedWorkspace,
+        cols: u16,
+        rows: u16,
+        now_ms: u64,
+        mut reprobe: R,
+    ) -> Result<maestro_shell::PreparedSessionSpec, NewTabStartParamsError>
+    where
+        R: FnMut(&[String], Option<&str>, &Path) -> Result<(), NewTabStartParamsError>,
+    {
+        match self.kind {
+            NewTabForegroundLaunchKind::ShellAdHoc { argv } => prepared
+                .adhoc_session_spec(maestro_shell::SessionKind::Shell, &argv, cols, rows, now_ms)
+                .map_err(|_| NewTabStartParamsError::PreparedLaunch),
+            NewTabForegroundLaunchKind::AgentAdHoc {
+                source_argv,
+                selected_agent,
+            } => {
+                reprobe(&source_argv, selected_agent.as_deref(), &prepared.cwd)?;
+                prepared
+                    .adhoc_session_spec_with_env(
+                        maestro_shell::SessionKind::Agent,
+                        &source_argv,
+                        &maestro_shell::ProcessLaunchEnv,
+                        cols,
+                        rows,
+                        now_ms,
+                    )
+                    .map_err(|_| NewTabStartParamsError::PreparedLaunch)
+            }
+            NewTabForegroundLaunchKind::Provider {
+                provider_id,
+                source_argv,
+                selected_agent,
+            } => {
+                reprobe(&source_argv, Some(&selected_agent), &prepared.cwd)?;
+                prepared
+                    .provider_session_spec(
+                        &provider_id,
+                        &source_argv,
+                        &maestro_shell::ProcessLaunchEnv,
+                        cols,
+                        rows,
+                        now_ms,
+                    )
+                    .map_err(|_| NewTabStartParamsError::PreparedLaunch)
+            }
+            NewTabForegroundLaunchKind::ProviderCustomAdHoc {
+                provider_id,
+                source_argv,
+                selected_agent,
+            } => {
+                reprobe(&source_argv, Some(&selected_agent), &prepared.cwd)?;
+                prepared
+                    .provider_custom_adhoc_session_spec(
+                        &provider_id,
+                        &source_argv,
+                        &maestro_shell::ProcessLaunchEnv,
+                        cols,
+                        rows,
+                        now_ms,
+                    )
+                    .map_err(|_| NewTabStartParamsError::PreparedLaunch)
+            }
+        }
+    }
+}
+
 /// Why [`new_tab_prepared_start_params`] could not build start params. Typed so the caller can log a
 /// precise reason rather than guessing, and so a prepared/planned mismatch fails loudly instead of
 /// silently pairing a cwd with the wrong session.
@@ -243,6 +440,77 @@ pub enum NewTabStartParamsError {
     PreparedWorkspaceWorkspaceIdMismatch { expected: String, actual: String },
     /// The prepared workspace was prepared for a different session id than the plan minted.
     PreparedWorkspaceSessionIdMismatch { expected: String, actual: String },
+    /// A reviewed provider/custom launch could not be reprobed or sealed at the actual prepared
+    /// cwd. This occurs before the Unknown+placement transaction and before any daemon byte.
+    PreparedLaunch,
+    /// The launch carrier and secret-free plan source disagree. Refused before graph/wire.
+    PreparedLaunchSourceMismatch,
+}
+
+fn validate_new_tab_prepared_identity(
+    plan: &NewTabPlan,
+    prepared: &maestro_shell::PreparedWorkspace,
+    launch: Option<&NewTabForegroundLaunch>,
+) -> Result<(String, String), NewTabStartParamsError> {
+    let NewTabPlan::Create {
+        tab_id,
+        session_id,
+        source,
+        workspace,
+        workspace_id,
+        cwd_basis: _,
+        title,
+    } = plan
+    else {
+        return Err(NewTabStartParamsError::NotCreate);
+    };
+
+    if let Some(launch) = launch {
+        if !launch.matches_plan_source(source) {
+            return Err(NewTabStartParamsError::PreparedLaunchSourceMismatch);
+        }
+    } else if !matches!(source, NewTabLaunchSource::DefaultShellDev) {
+        return Err(NewTabStartParamsError::UnsupportedLaunchSource {
+            source: source.clone(),
+        });
+    }
+    if prepared.policy != *workspace {
+        return Err(NewTabStartParamsError::PreparedWorkspacePolicyMismatch {
+            expected: *workspace,
+            actual: prepared.policy,
+        });
+    }
+    if prepared.workspace_id != *workspace_id {
+        return Err(
+            NewTabStartParamsError::PreparedWorkspaceWorkspaceIdMismatch {
+                expected: workspace_id.clone(),
+                actual: prepared.workspace_id.clone(),
+            },
+        );
+    }
+    if prepared.session_id != *session_id {
+        return Err(NewTabStartParamsError::PreparedWorkspaceSessionIdMismatch {
+            expected: session_id.clone(),
+            actual: prepared.session_id.clone(),
+        });
+    }
+    Ok((tab_id.clone(), title.clone()))
+}
+
+fn validate_new_tab_launch_source(
+    plan: &NewTabPlan,
+    launch: &NewTabForegroundLaunch,
+) -> Result<(), NewTabStartParamsError> {
+    let NewTabPlan::Create { source, .. } = plan else {
+        return Err(NewTabStartParamsError::NotCreate);
+    };
+    if !launch.is_valid_for_preparation() {
+        Err(NewTabStartParamsError::PreparedLaunch)
+    } else if launch.matches_plan_source(source) {
+        Ok(())
+    } else {
+        Err(NewTabStartParamsError::PreparedLaunchSourceMismatch)
+    }
 }
 
 /// Turn a planned new-tab [`NewTabPlan::Create`] plus an already-prepared workspace into the
@@ -264,51 +532,13 @@ pub fn new_tab_prepared_start_params(
     rows: u16,
     now_ms: u64,
 ) -> Result<NewTabPreparedStart, NewTabStartParamsError> {
-    let NewTabPlan::Create {
-        tab_id,
-        session_id,
-        source,
-        workspace,
-        workspace_id,
-        cwd_basis: _,
-        title,
-    } = plan
-    else {
-        return Err(NewTabStartParamsError::NotCreate);
-    };
-
-    if let NewTabLaunchSource::KnownSafeSpec { .. } = source {
-        return Err(NewTabStartParamsError::UnsupportedLaunchSource {
-            source: source.clone(),
-        });
-    }
-
-    if prepared.policy != *workspace {
-        return Err(NewTabStartParamsError::PreparedWorkspacePolicyMismatch {
-            expected: *workspace,
-            actual: prepared.policy,
-        });
-    }
-    if prepared.workspace_id != *workspace_id {
-        return Err(
-            NewTabStartParamsError::PreparedWorkspaceWorkspaceIdMismatch {
-                expected: workspace_id.clone(),
-                actual: prepared.workspace_id.clone(),
-            },
-        );
-    }
-    if prepared.session_id != *session_id {
-        return Err(NewTabStartParamsError::PreparedWorkspaceSessionIdMismatch {
-            expected: session_id.clone(),
-            actual: prepared.session_id.clone(),
-        });
-    }
+    let (tab_id, title) = validate_new_tab_prepared_identity(plan, prepared, None)?;
 
     let params =
         prepared.adhoc_start_params(maestro_shell::SessionKind::Shell, argv, cols, rows, now_ms);
     Ok(NewTabPreparedStart {
-        tab_id: tab_id.clone(),
-        title: title.clone(),
+        tab_id,
+        title,
         params,
     })
 }
@@ -319,6 +549,9 @@ pub fn new_tab_prepared_start_params(
 /// (`WorkspaceExec`).
 #[derive(Debug)]
 pub enum NewTabWorkspacePrepareError {
+    /// A previous renderer handoff has not produced its correlated terminal disposition. No
+    /// workspace/session/layout side effect has begun.
+    RendererHandoffPending,
     /// The plan was `Decline` or `Abort`, not `Create`: there is no workspace to prepare. No
     /// filesystem effect.
     NotCreate,
@@ -336,6 +569,12 @@ pub enum NewTabWorkspacePrepareError {
 impl std::fmt::Display for NewTabWorkspacePrepareError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            NewTabWorkspacePrepareError::RendererHandoffPending => {
+                write!(
+                    f,
+                    "renderer handoff is still pending; new-tab creation is busy"
+                )
+            }
             NewTabWorkspacePrepareError::NotCreate => {
                 write!(f, "new-tab plan was not Create: nothing to prepare")
             }
@@ -393,6 +632,41 @@ pub fn prepare_new_tab_scratch_workspace(
         .map_err(NewTabWorkspacePrepareError::WorkspaceExec)
 }
 
+/// Fresh-session variant used by the production PreparedNew pipeline. Unlike the public
+/// preparation adapter above, it retains the Shell-minted consume-once cleanup receipt.
+fn prepare_fresh_new_tab_scratch_workspace(
+    paths: &maestro_shell::AppPaths,
+    plan: &NewTabPlan,
+    repo_root: &str,
+) -> Result<
+    (
+        maestro_shell::PreparedWorkspace,
+        NewTabScratchRemovalAuthority,
+    ),
+    NewTabWorkspacePrepareError,
+> {
+    let NewTabPlan::Create {
+        workspace,
+        workspace_id,
+        session_id,
+        ..
+    } = plan
+    else {
+        return Err(NewTabWorkspacePrepareError::NotCreate);
+    };
+    if *workspace != maestro_shell::WorkspacePolicy::ScratchCwd {
+        return Err(NewTabWorkspacePrepareError::UnsupportedWorkspacePolicy { policy: *workspace });
+    }
+    let (prepared, receipt) =
+        maestro_shell::prepare_fresh_scratch_cwd(paths, workspace_id, session_id, repo_root)
+            .map_err(NewTabWorkspacePrepareError::WorkspaceExec)?
+            .into_parts();
+    Ok((
+        prepared,
+        NewTabScratchRemovalAuthority::from_fresh_receipt(receipt),
+    ))
+}
+
 /// The result of starting a planned new tab's daemon session: the planned tab identity carried
 /// alongside the [`maestro_shell::StartSessionOutcome`] (socket path + durable session record) that
 /// `maestro-shell` produced. The planned `tab_id`/`title` come from the original
@@ -417,6 +691,9 @@ pub struct NewTabSessionStart {
 pub enum NewTabSessionStartError {
     /// The shell runtime failed to resolve/connect/persist/start. Propagated unchanged.
     Shell(maestro_shell::ShellRuntimeError),
+    /// The production recovery state machine already consumed the owned error authority. A second
+    /// execution is intentionally inert.
+    AuthorityHandled,
 }
 
 impl std::fmt::Display for NewTabSessionStartError {
@@ -424,6 +701,9 @@ impl std::fmt::Display for NewTabSessionStartError {
         match self {
             NewTabSessionStartError::Shell(e) => {
                 write!(f, "new-tab session start failed: {e}")
+            }
+            NewTabSessionStartError::AuthorityHandled => {
+                f.write_str("new-tab session start authority was already handled")
             }
         }
     }
@@ -433,6 +713,16 @@ impl std::error::Error for NewTabSessionStartError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             NewTabSessionStartError::Shell(e) => Some(e),
+            NewTabSessionStartError::AuthorityHandled => None,
+        }
+    }
+}
+
+impl NewTabSessionStartError {
+    fn take_shell_error(&mut self) -> Option<maestro_shell::ShellRuntimeError> {
+        match std::mem::replace(self, Self::AuthorityHandled) {
+            Self::Shell(error) => Some(error),
+            Self::AuthorityHandled => None,
         }
     }
 }
@@ -441,7 +731,7 @@ impl std::error::Error for NewTabSessionStartError {
 /// [`new_tab_prepared_start_params`]. It takes the [`NewTabPreparedStart`] that adapter produced
 /// (which already carries the validated [`maestro_shell::StartParams`] bound to the prepared cwd and
 /// the planned ids) and hands the start params straight to
-/// [`maestro_shell::ShellRuntime::start_session`]:
+/// [`maestro_shell::ShellRuntime::start_session_for_renderer`]:
 ///
 /// ```text
 /// plan_new_tab -> prepare_new_tab_scratch_workspace -> new_tab_prepared_start_params
@@ -454,20 +744,21 @@ impl std::error::Error for NewTabSessionStartError {
 /// a window layout, write an app-owned tab record, send a renderer command, or apply any
 /// cleanup/kill policy.
 ///
-/// SIDE EFFECTS are exactly what `ShellRuntime::start_session` already performs: connect to the
-/// daemon; persist/update the daemon endpoint only AFTER a successful connect; start/attach the
-/// session; and persist the session record per the existing grid-proof semantics. App code
-/// reimplements none of that — daemon protocol, endpoint persistence, and session-record durability
-/// stay owned by `maestro-shell`. On failure the typed [`maestro_shell::ShellRuntimeError`] is
-/// propagated through [`NewTabSessionStartError::Shell`].
-pub fn start_new_tab_prepared_session(
+/// SIDE EFFECTS are exactly what `ShellRuntime::start_session_for_renderer` performs: connect to
+/// the daemon; persist/update the daemon endpoint only AFTER a successful connect; start/attach the
+/// session; atomically publish its durable Grid generation; and reserve one opaque one-shot
+/// attachment handoff for the renderer. App code reimplements none of that. On failure the typed
+/// [`maestro_shell::ShellRuntimeError`] is propagated through
+/// [`NewTabSessionStartError::Shell`].
+#[cfg(test)]
+fn start_new_tab_prepared_session(
     paths: &maestro_shell::AppPaths,
     explicit_socket: Option<std::path::PathBuf>,
     env: &impl maestro_shell::EnvLookup,
     prepared: &NewTabPreparedStart,
 ) -> Result<NewTabSessionStart, NewTabSessionStartError> {
     let outcome = maestro_shell::ShellRuntime::new(paths)
-        .start_session(explicit_socket, env, &prepared.params)
+        .start_session_for_renderer(explicit_socket, env, &prepared.params)
         .map_err(NewTabSessionStartError::Shell)?;
     Ok(NewTabSessionStart {
         tab_id: prepared.tab_id.clone(),
@@ -477,7 +768,6 @@ pub fn start_new_tab_prepared_session(
 }
 
 /// The updated layout plus the tab/session identity recorded by [`record_new_tab_in_window_layout`].
-#[derive(Debug)]
 pub struct NewTabLayoutRecord {
     /// The tab id that was appended (the planned tab id from the started session).
     pub tab_id: String,
@@ -485,6 +775,17 @@ pub struct NewTabLayoutRecord {
     pub session_id: String,
     /// The window layout after the tab was appended (post-normalize, as the service returns it).
     pub layout: maestro_shell::WindowLayout,
+}
+
+impl std::fmt::Debug for NewTabLayoutRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NewTabLayoutRecord")
+            .field("tab_id", &self.tab_id)
+            .field("session_id", &self.session_id)
+            .field("tab_count", &self.layout.tabs.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Why [`record_new_tab_in_window_layout`] could not record the tab. The
@@ -540,7 +841,8 @@ impl std::error::Error for NewTabLayoutRecordError {
 /// NOT connect to or start a daemon/session, prepare a workspace, send a renderer `AttachSession` /
 /// `SetTabStrip`, mutate a `RendererTabRuntime`, or apply any cleanup/kill policy. It consumes an
 /// already-started [`NewTabSessionStart`]; it does not start the session itself.
-pub fn record_new_tab_in_window_layout(
+#[cfg(test)]
+fn record_new_tab_in_window_layout(
     paths: &maestro_shell::AppPaths,
     window_id: &str,
     started: &NewTabSessionStart,
@@ -549,8 +851,8 @@ pub fn record_new_tab_in_window_layout(
 ) -> Result<NewTabLayoutRecord, NewTabLayoutRecordError> {
     let session_id = started.outcome.record.session_id.clone();
     let service = maestro_shell::WindowLayoutService::new(paths);
-    let layout = match split_from {
-        Some(split) => service.split_tab(
+    let rollback_snapshot = match split_from {
+        Some(split) => service.split_tab_snapshot(
             window_id,
             &split.from_tab_id,
             &started.tab_id,
@@ -559,7 +861,7 @@ pub fn record_new_tab_in_window_layout(
             split.axis,
             now_ms,
         ),
-        None => service.open_tab(
+        None => service.open_tab_snapshot(
             window_id,
             &started.tab_id,
             &session_id,
@@ -570,6 +872,7 @@ pub fn record_new_tab_in_window_layout(
         ),
     }
     .map_err(NewTabLayoutRecordError::WindowLayout)?;
+    let layout = rollback_snapshot.layout.clone();
     Ok(NewTabLayoutRecord {
         tab_id: started.tab_id.clone(),
         session_id,
@@ -593,7 +896,13 @@ pub struct NewTabStripProjection {
 pub enum NewTabStripProjectionError {
     /// The recorded `tab_id` was not present in `record.layout.tabs`. We refuse to silently produce a
     /// strip with no active tab when the layout should already contain the recorded tab.
-    ActiveTabNotFound { tab_id: String },
+    ActiveTabNotFound {
+        tab_id: String,
+    },
+    /// The committed layout could not be reloaded as one all-pane exact lifetime cohort. No partial
+    /// renderer membership is sent.
+    ExactViewport(crate::RendererViewportProjectionError),
+    ExactViewportSnapshot(String),
 }
 
 impl std::fmt::Display for NewTabStripProjectionError {
@@ -605,6 +914,8 @@ impl std::fmt::Display for NewTabStripProjectionError {
                     "recorded tab id {tab_id:?} is not in the recorded layout"
                 )
             }
+            NewTabStripProjectionError::ExactViewport(error) => error.fmt(f),
+            NewTabStripProjectionError::ExactViewportSnapshot(error) => f.write_str(error),
         }
     }
 }
@@ -614,9 +925,11 @@ impl std::error::Error for NewTabStripProjectionError {}
 /// Project a just-recorded [`NewTabLayoutRecord`] into the app tab-strip model and the renderer
 /// tab-strip payload, with the newly recorded tab active. This is the PURE, no-I/O bridge between
 /// durable layout recording ([`record_new_tab_in_window_layout`]) and a future renderer command
-/// send: it converts the updated `record.layout.tabs` into [`WindowTabJson`] via [`tab_record_json`],
-/// builds a [`TabStripModel`] with `record.tab_id` active via [`build_tab_strip_model`], and converts
-/// that to a [`maestro_renderer::RendererTabStrip`] via [`renderer_tab_strip`].
+/// send: it converts only the updated layout's LIVE rows into [`WindowTabJson`] via
+/// [`live_tab_records_json`], builds a [`TabStripModel`] with `record.tab_id` active via
+/// [`build_tab_strip_model`], and converts that to a [`maestro_renderer::RendererTabStrip`] via
+/// [`renderer_tab_strip`]. Durable parked rows remain in `record.layout` for inspection and identity
+/// reservation but never re-enter the native renderer projection.
 ///
 /// It performs NO filesystem, daemon connect, session start, workspace preparation, window-layout
 /// mutation, renderer command send, `RendererTabRuntime` mutation, event-loop wiring, or git. If the
@@ -626,7 +939,7 @@ pub fn new_tab_strip_projection(
     window_id: &str,
     record: &NewTabLayoutRecord,
 ) -> Result<NewTabStripProjection, NewTabStripProjectionError> {
-    let tabs: Vec<WindowTabJson> = record.layout.tabs.iter().map(tab_record_json).collect();
+    let tabs = live_tab_records_json(&record.layout.tabs);
     let model =
         build_tab_strip_model(window_id, &tabs, Some(&record.tab_id)).map_err(|e| match e {
             TabStripModelError::ActiveTabNotFound { tab_id } => {
@@ -657,6 +970,7 @@ pub enum NewTabSetTabStripError {
     /// The renderer command receiver is closed (event loop gone); the `SetTabStrip` was not
     /// delivered. Mapped from [`TabSwitchError::RendererControlClosed`]; never swallowed or retried.
     RendererControlClosed,
+    HandoffPending,
 }
 
 impl std::fmt::Display for NewTabSetTabStripError {
@@ -666,6 +980,12 @@ impl std::fmt::Display for NewTabSetTabStripError {
                 write!(
                     f,
                     "renderer command channel is closed; tab strip not updated"
+                )
+            }
+            NewTabSetTabStripError::HandoffPending => {
+                write!(
+                    f,
+                    "renderer handoff is still pending; tab strip not updated"
                 )
             }
         }
@@ -694,11 +1014,15 @@ pub fn send_new_tab_set_tab_strip(
         .set_tab_strip(Some(&projection.model))
         .map_err(|e| match e {
             TabSwitchError::RendererControlClosed => NewTabSetTabStripError::RendererControlClosed,
+            TabSwitchError::HandoffPending => NewTabSetTabStripError::HandoffPending,
             // `set_tab_strip` performs no tab lookup, so it can only fail on a closed channel; the
             // lookup-based variants are unreachable for this send path.
             TabSwitchError::TabNotFound { .. } | TabSwitchError::AmbiguousTab { .. } => {
                 NewTabSetTabStripError::RendererControlClosed
             }
+            TabSwitchError::RendererEventChannelUnavailable
+            | TabSwitchError::ViewportAuthorityRequired
+            | TabSwitchError::ViewportProjection(_) => NewTabSetTabStripError::HandoffPending,
         })?;
     Ok(NewTabSetTabStrip {
         tab_id: projection.tab_id.clone(),
@@ -724,6 +1048,12 @@ pub enum NewTabAttachSessionError {
     /// delivered and active-tab state is left unchanged. Mapped from
     /// [`TabSwitchError::RendererControlClosed`]; never swallowed or retried.
     RendererControlClosed,
+    /// A different renderer handoff is still awaiting its correlated disposition. This refusal is
+    /// observable before any new create pipeline side effect begins.
+    HandoffPending,
+    /// A legacy textual projection cannot authorize a renderer Attach. Production callers must
+    /// supply one coherent Shell snapshot projection and (for new sessions) the owned handoff.
+    ViewportAuthorityRequired,
     /// The projected `tab_id` was not found in the single-item selection. Unreachable for the
     /// one-element selection this helper builds, but mapped rather than panicked to keep the
     /// helper honest.
@@ -731,6 +1061,12 @@ pub enum NewTabAttachSessionError {
     /// The projected `tab_id` resolved ambiguously. Also unreachable for the one-element
     /// selection, mapped for honesty.
     AmbiguousTab { tab_id: String },
+    /// Renderer command delivery succeeded, but its correlated terminal disposition was not
+    /// `Claimed`. The renderer is neutral; the newly-created graph requires forward recovery.
+    HandoffNotClaimed {
+        outcome: maestro_renderer::RendererAttachmentHandoffOutcome,
+        request_id: maestro_renderer::RendererAttachmentHandoffRequestId,
+    },
 }
 
 impl std::fmt::Display for NewTabAttachSessionError {
@@ -742,11 +1078,23 @@ impl std::fmt::Display for NewTabAttachSessionError {
                     "renderer command channel is closed; session not attached"
                 )
             }
+            NewTabAttachSessionError::HandoffPending => {
+                write!(
+                    f,
+                    "renderer handoff is still pending; session attach refused"
+                )
+            }
+            NewTabAttachSessionError::ViewportAuthorityRequired => {
+                write!(f, "renderer attach requires an exact viewport authority")
+            }
             NewTabAttachSessionError::ActiveTabNotFound { tab_id } => {
                 write!(f, "projected tab {tab_id:?} not found in its own selection")
             }
             NewTabAttachSessionError::AmbiguousTab { tab_id } => {
                 write!(f, "projected tab {tab_id:?} resolved ambiguously")
+            }
+            NewTabAttachSessionError::HandoffNotClaimed { outcome, .. } => {
+                write!(f, "renderer handoff completed without Claim: {outcome:?}")
             }
         }
     }
@@ -756,9 +1104,9 @@ impl std::error::Error for NewTabAttachSessionError {}
 
 /// Attach a just-projected new tab's session to the renderer viewport, sending at most one
 /// `maestro_renderer::RendererCommand::AttachSession` through the existing
-/// [`RendererTabRuntime::switch_to`] path. This is the second I/O-bearing consumer after
-/// [`new_tab_strip_projection`]: [`send_new_tab_set_tab_strip`] sends the strip chrome, this
-/// helper sends the viewport session attach.
+/// [`RendererTabRuntime::switch_to`] path. The production handoff variant below instead sends one
+/// atomic `AttachSessionWithHandoff` carrying the exact full strip projection plus the opaque
+/// Claim; no two-command partial state is exposed.
 ///
 /// It builds the minimal one-item [`TabSelection`] from the projection identity
 /// (`tab_id`/`session_id`), uses `projection.model.window_id` as the window, and switches to
@@ -772,52 +1120,433 @@ impl std::error::Error for NewTabAttachSessionError {}
 /// `on_tab_activated`, start sessions, prepare workspaces, mutate layouts, connect/spawn a daemon,
 /// touch the filesystem, wire foreground `RendererEvent::NewTabRequested`, or touch git.
 pub fn send_new_tab_attach_session(
-    runtime: &mut RendererTabRuntime,
-    projection: &NewTabStripProjection,
+    _runtime: &mut RendererTabRuntime,
+    _projection: &NewTabStripProjection,
 ) -> Result<NewTabAttachSession, NewTabAttachSessionError> {
-    let window_id = projection.model.window_id.clone();
-    let selection = [TabSelection {
-        tab_id: projection.tab_id.clone(),
-        session_id: projection.session_id.clone(),
-    }];
+    Err(NewTabAttachSessionError::ViewportAuthorityRequired)
+}
+
+fn send_new_tab_attach_session_with_handoff(
+    runtime: &mut RendererTabRuntime,
+    projection: &crate::RendererViewportProjection,
+    handoff: maestro_renderer::RendererAttachmentHandoff,
+) -> Result<NewTabAttachSession, NewTabAttachSessionError> {
     let attached = runtime
-        .switch_to(&window_id, &selection, &projection.tab_id)
-        .map_err(|e| match e {
+        .switch_to_with_handoff(projection.clone(), handoff)
+        .map_err(|error| match error {
             TabSwitchError::RendererControlClosed => {
                 NewTabAttachSessionError::RendererControlClosed
             }
+            TabSwitchError::HandoffPending => NewTabAttachSessionError::HandoffPending,
             TabSwitchError::TabNotFound { tab_id, .. } => {
                 NewTabAttachSessionError::ActiveTabNotFound { tab_id }
             }
             TabSwitchError::AmbiguousTab { tab_id, .. } => {
                 NewTabAttachSessionError::AmbiguousTab { tab_id }
             }
+            TabSwitchError::RendererEventChannelUnavailable
+            | TabSwitchError::ViewportAuthorityRequired
+            | TabSwitchError::ViewportProjection(_) => {
+                NewTabAttachSessionError::ViewportAuthorityRequired
+            }
         })?;
     Ok(NewTabAttachSession {
-        tab_id: projection.tab_id.clone(),
-        session_id: projection.session_id.clone(),
+        tab_id: projection.target().tab_id.clone(),
+        session_id: projection.target().session_id.clone(),
         attached,
     })
 }
 
+const MAX_RETAINED_NEW_TAB_AUTHORITIES: usize = 4096;
+static RETAINED_NEW_TAB_HANDOFFS: OnceLock<Mutex<Vec<maestro_shell::AttachmentHandoffAuthority>>> =
+    OnceLock::new();
+static RETAINED_NEW_TAB_CONDITIONAL_STARTS: OnceLock<
+    Mutex<Vec<maestro_shell::ConditionalStartRecoveryAuthority>>,
+> = OnceLock::new();
+
+fn retain_new_tab_handoff(authority: maestro_shell::AttachmentHandoffAuthority) {
+    let retained = RETAINED_NEW_TAB_HANDOFFS.get_or_init(|| Mutex::new(Vec::new()));
+    let mut retained = retained
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if retained.len() < MAX_RETAINED_NEW_TAB_AUTHORITIES {
+        retained.push(authority);
+    }
+}
+
+fn retain_new_tab_conditional_start(authority: maestro_shell::ConditionalStartRecoveryAuthority) {
+    let retained = RETAINED_NEW_TAB_CONDITIONAL_STARTS.get_or_init(|| Mutex::new(Vec::new()));
+    let mut retained = retained
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if retained.len() < MAX_RETAINED_NEW_TAB_AUTHORITIES {
+        retained.push(authority);
+    }
+}
+
+fn cancel_new_tab_attachment_handoff(authority: maestro_shell::AttachmentHandoffAuthority) {
+    if authority.cancel().is_err() {
+        retain_new_tab_handoff(authority);
+    }
+}
+
+fn settle_new_tab_shell_runtime_error(error: maestro_shell::ShellRuntimeError) {
+    match error {
+        maestro_shell::ShellRuntimeError::Session(
+            maestro_shell::SessionServiceError::ConditionalStartPossiblyApplied {
+                authority, ..
+            },
+        ) => {
+            let _ = authority.cancel_pending_handoff();
+            retain_new_tab_conditional_start(authority);
+        }
+        maestro_shell::ShellRuntimeError::Session(
+            maestro_shell::SessionServiceError::AttachmentHandoffPossiblyPending {
+                authority, ..
+            },
+        ) => cancel_new_tab_attachment_handoff(authority),
+        maestro_shell::ShellRuntimeError::Store(_)
+        | maestro_shell::ShellRuntimeError::Daemon(_)
+        | maestro_shell::ShellRuntimeError::Session(_) => {}
+    }
+}
+
 /// The post-success foreground listener state for a created new tab. The foreground event loop
-/// adopts these projections only after both renderer commands (`SetTabStrip`, then `AttachSession`)
-/// have been delivered successfully.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// adopts these projections only after the atomic renderer projection + handoff command has been
+/// delivered successfully.
 pub struct NewTabForegroundSuccess {
+    pub tab_id: String,
+    pub session_id: String,
+    pub strip_tabs: Vec<WindowTabJson>,
+    pub selection: Vec<TabSelection>,
+    pub pending_handoff: NewTabForegroundPendingHandoff,
+}
+
+impl std::fmt::Debug for NewTabForegroundSuccess {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NewTabForegroundSuccess")
+            .field("tab_id", &self.tab_id)
+            .field("session_id", &self.session_id)
+            .field("strip_tabs", &self.strip_tabs)
+            .field("selection", &self.selection)
+            .field("pending_handoff", &"<redacted>")
+            .finish()
+    }
+}
+
+pub struct NewTabForegroundPendingHandoff {
+    handoff: maestro_renderer::RendererAttachmentHandoff,
+    expected_generation: String,
+    rollback_authority: Option<NewTabPreparedRollbackAuthority>,
+}
+
+impl NewTabForegroundPendingHandoff {
+    pub fn request_id(&self) -> maestro_renderer::RendererAttachmentHandoffRequestId {
+        self.handoff.request_id()
+    }
+
+    pub fn expected_generation(&self) -> &str {
+        &self.expected_generation
+    }
+
+    pub fn expected_daemon_instance(&self) -> &maestro_shell::DaemonInstanceId {
+        self.handoff.authority().expected_daemon_instance()
+    }
+
+    pub fn session_id(&self) -> &str {
+        self.handoff.authority().session_id().0.as_str()
+    }
+}
+
+impl std::fmt::Debug for NewTabForegroundPendingHandoff {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("NewTabForegroundPendingHandoff(<redacted>)")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewTabForegroundAdoption {
     pub tab_id: String,
     pub session_id: String,
     pub strip_tabs: Vec<WindowTabJson>,
     pub selection: Vec<TabSelection>,
 }
 
+pub enum NewTabForegroundHandoffResolution {
+    Claimed(NewTabForegroundAdoption),
+    Recover(NewTabForegroundError),
+    /// A correlated `Claimed` event whose instance/generation proof contradicts the shell
+    /// authority. Preserve the durable graph and leave App neutral; never compensate.
+    Contradicted {
+        reason: String,
+    },
+}
+
+impl NewTabForegroundSuccess {
+    pub fn resolve_handoff(
+        mut self,
+        disposition: maestro_renderer::RendererAttachmentHandoffDisposition,
+    ) -> Result<
+        NewTabForegroundHandoffResolution,
+        (Self, maestro_renderer::RendererAttachmentHandoffDisposition),
+    > {
+        if disposition.request_id() != self.pending_handoff.request_id()
+            || disposition.session_id() != self.session_id
+        {
+            return Err((self, disposition));
+        }
+        let outcome = disposition.outcome();
+        let request_id = disposition.request_id();
+        if outcome == maestro_renderer::RendererAttachmentHandoffOutcome::Claimed {
+            let exact_instance = disposition.daemon_instance_id()
+                == Some(self.pending_handoff.expected_daemon_instance());
+            let exact_generation =
+                disposition.generation() == Some(self.pending_handoff.expected_generation());
+            if !exact_instance || !exact_generation {
+                return Ok(NewTabForegroundHandoffResolution::Contradicted {
+                    reason:
+                        "renderer Claimed disposition contradicted exact daemon/generation proof"
+                            .to_string(),
+                });
+            }
+            return Ok(NewTabForegroundHandoffResolution::Claimed(
+                NewTabForegroundAdoption {
+                    tab_id: self.tab_id,
+                    session_id: self.session_id,
+                    strip_tabs: self.strip_tabs,
+                    selection: self.selection,
+                },
+            ));
+        }
+
+        if let Some(authority) = disposition.into_retry_authority() {
+            retain_new_tab_handoff(authority);
+        }
+        Ok(NewTabForegroundHandoffResolution::Recover(
+            NewTabForegroundError::PreparedGenerationBoundAttachSession {
+                session_id: self.session_id,
+                session_generation: self.pending_handoff.expected_generation,
+                rollback_authority: self.pending_handoff.rollback_authority.take(),
+                error: NewTabAttachSessionError::HandoffNotClaimed {
+                    outcome,
+                    request_id,
+                },
+            },
+        ))
+    }
+
+    /// Convert renderer teardown without a correlated disposition into the only safe runtime
+    /// classification. Command admission may have crossed the writer FIFO, so recovery is
+    /// forward-only and the original reviewed authority is retained for exact retry/cancellation.
+    pub fn into_renderer_exit_recovery(mut self) -> NewTabForegroundError {
+        let request_id = self.pending_handoff.request_id();
+        let expected_generation = self.pending_handoff.expected_generation.clone();
+        retain_new_tab_handoff(self.pending_handoff.handoff.authority().clone());
+        NewTabForegroundError::PreparedGenerationBoundAttachSession {
+            session_id: self.session_id,
+            session_generation: expected_generation,
+            rollback_authority: self.pending_handoff.rollback_authority.take(),
+            error: NewTabAttachSessionError::HandoffNotClaimed {
+                outcome: maestro_renderer::RendererAttachmentHandoffOutcome::ClaimPossiblyApplied,
+                request_id,
+            },
+        }
+    }
+}
+
 /// Why the foreground `NewTabRequested` create pipeline failed. The caller logs the error and keeps
-/// the foreground renderer listener alive; this pipeline deliberately performs no rollback/cleanup.
+/// the foreground renderer listener alive; rollback/cleanup is deliberately not part of this slice.
+pub struct NewTabSessionRollbackAuthority {
+    expected_layout_without_tab: maestro_shell::WindowLayoutSnapshot,
+    expected_session: maestro_shell::SessionRecord,
+    expected_generation: String,
+    created_tab_id: String,
+    scratch_cwd: Option<PathBuf>,
+    attachment_handoff: Option<maestro_shell::AttachmentHandoffAuthority>,
+}
+
+impl std::fmt::Debug for NewTabSessionRollbackAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NewTabSessionRollbackAuthority")
+            .field("has_scratch", &self.scratch_cwd.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+pub struct NewTabCreatedTabRollbackAuthority {
+    expected_post_layout: maestro_shell::WindowLayoutSnapshot,
+    expected_session: maestro_shell::SessionRecord,
+    expected_generation: String,
+    created_tab_id: String,
+    scratch_cwd: Option<PathBuf>,
+    attachment_handoff: Option<maestro_shell::AttachmentHandoffAuthority>,
+}
+
+/// Exact, consume-once compensation authority for the transaction-prepared production path.
+///
+/// The Shell receipt binds the canonical prepared placement and the finalized Live lifetime.  The
+/// App carries only the renderer-recovery facts it must order around compensation; it cannot
+/// inspect or rebuild the Session/Workspace/layout proof.  This type deliberately does not
+/// implement `Clone`.
+pub struct NewTabPreparedRollbackAuthority {
+    compensation: maestro_shell::PreparedNewSessionCompensationReceipt,
+    session_id: String,
+    expected_generation: String,
+    tab_id: String,
+    window_id: String,
+    attachment_handoff: Option<maestro_shell::AttachmentHandoffAuthority>,
+}
+
+impl std::fmt::Debug for NewTabPreparedRollbackAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NewTabPreparedRollbackAuthority")
+            .field("has_attachment_handoff", &self.attachment_handoff.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NewTabPreparedCompensationStatus {
+    RolledBack,
+    Missing,
+    Changed,
+    Referenced,
+    Failed { detail: String },
+}
+
+/// Typed certainty for failures while consuming a transaction-prepared new-session authority.
+/// `DefinitelyUnpublished` and `Refused` have already consumed their exact compensation authority;
+/// `PossiblyApplied` intentionally exposes no retry or rollback capability.
 #[derive(Debug)]
+pub enum NewTabPreparedSessionError {
+    GraphAuthority {
+        detail: String,
+    },
+    DefinitelyUnpublished {
+        error: maestro_shell::ShellRuntimeError,
+        compensation: NewTabPreparedCompensationStatus,
+    },
+    Refused {
+        error: maestro_shell::ShellRuntimeError,
+        compensation: NewTabPreparedCompensationStatus,
+    },
+    PossiblyApplied {
+        detail: String,
+    },
+    FinalizedInvariant {
+        detail: String,
+        compensation: NewTabPreparedCompensationStatus,
+    },
+}
+
+impl std::fmt::Display for NewTabPreparedSessionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GraphAuthority { detail } => formatter.write_str(detail),
+            Self::DefinitelyUnpublished {
+                error,
+                compensation,
+            } => write!(
+                formatter,
+                "prepared new-session start was definitely unpublished ({error}); compensation={compensation:?}"
+            ),
+            Self::Refused {
+                error,
+                compensation,
+            } => write!(
+                formatter,
+                "prepared new-session start was refused ({error}); compensation={compensation:?}"
+            ),
+            Self::PossiblyApplied { detail } => write!(
+                formatter,
+                "prepared new-session start may have applied; graph retained for forward recovery: {detail}"
+            ),
+            Self::FinalizedInvariant {
+                detail,
+                compensation,
+            } => write!(
+                formatter,
+                "prepared new-session finalization invariant failed ({detail}); compensation={compensation:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NewTabPreparedSessionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DefinitelyUnpublished { error, .. } | Self::Refused { error, .. } => Some(error),
+            Self::GraphAuthority { .. }
+            | Self::PossiblyApplied { .. }
+            | Self::FinalizedInvariant { .. } => None,
+        }
+    }
+}
+
+impl NewTabPreparedSessionError {
+    fn permits_scratch_removal(&self) -> bool {
+        match self {
+            Self::GraphAuthority { .. } => true,
+            Self::DefinitelyUnpublished { compensation, .. } => {
+                *compensation == NewTabPreparedCompensationStatus::RolledBack
+            }
+            // Absent refusal may mean a same-id daemon lifetime already owns this per-session cwd.
+            Self::Refused { .. } | Self::PossiblyApplied { .. } => false,
+            // This branch is post-Grid/post-Live-rebase. Durable graph compensation may have
+            // queued a forward daemon release, so even `RolledBack` is not process-unpublished.
+            Self::FinalizedInvariant { .. } => false,
+        }
+    }
+}
+
+impl std::fmt::Debug for NewTabCreatedTabRollbackAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NewTabCreatedTabRollbackAuthority")
+            .field("has_scratch", &self.scratch_cwd.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Opaque cleanup capability minted only for the exact per-session ScratchCwd prepared by the
+/// shell layer. Diagnostic cwd strings and consented checkout roots cannot be converted into this
+/// type, and it deliberately does not implement `Clone`.
+pub struct NewTabScratchRemovalAuthority {
+    receipt: maestro_shell::FreshScratchCwdReceipt,
+}
+
+impl NewTabScratchRemovalAuthority {
+    fn from_fresh_receipt(receipt: maestro_shell::FreshScratchCwdReceipt) -> Self {
+        Self { receipt }
+    }
+
+    fn cleanup(
+        self,
+        paths: &maestro_shell::AppPaths,
+    ) -> Result<maestro_shell::FreshScratchCwdCleanupOutcome, maestro_shell::WorkspaceExecError>
+    {
+        maestro_shell::cleanup_fresh_scratch_cwd(paths, self.receipt)
+    }
+}
+
+impl std::fmt::Debug for NewTabScratchRemovalAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NewTabScratchRemovalAuthority")
+            .finish_non_exhaustive()
+    }
+}
+
 pub enum NewTabForegroundError {
     WorkspacePrepare(NewTabWorkspacePrepareError),
     StartParams {
         cwd: PathBuf,
+        /// Cleanup authority minted only for a shell-prepared ScratchCwd. Generic worktree and
+        /// RepoWrite roots are diagnostic cwd values, never recursive-delete authority.
+        scratch: Option<NewTabScratchRemovalAuthority>,
         error: NewTabStartParamsError,
     },
     SessionStart {
@@ -831,23 +1560,220 @@ pub enum NewTabForegroundError {
     Projection(NewTabStripProjectionError),
     SetTabStrip(NewTabSetTabStripError),
     AttachSession(NewTabAttachSessionError),
+    PreparedSessionStart {
+        cwd: PathBuf,
+        scratch: Option<NewTabScratchRemovalAuthority>,
+        error: NewTabPreparedSessionError,
+    },
+    PreparedGenerationBoundProjection {
+        session_id: String,
+        session_generation: String,
+        rollback_authority: Option<NewTabPreparedRollbackAuthority>,
+        error: NewTabStripProjectionError,
+    },
+    PreparedGenerationBoundAttachSession {
+        session_id: String,
+        session_generation: String,
+        rollback_authority: Option<NewTabPreparedRollbackAuthority>,
+        error: NewTabAttachSessionError,
+    },
+    PreparedStartedHandoffMissing {
+        session_id: String,
+        session_generation: String,
+        rollback_authority: Option<NewTabPreparedRollbackAuthority>,
+    },
+    /// Generation-bearing production variants for failures after a successful Grid-proven start.
+    /// Legacy tuple variants above remain accepted by the pure diagnostic API, but grant no kill
+    /// authority because they carry no PTY lifetime.
+    GenerationBoundLayoutRecord {
+        cwd: PathBuf,
+        session_id: String,
+        session_generation: String,
+        rollback_authority: Option<NewTabSessionRollbackAuthority>,
+        error: NewTabLayoutRecordError,
+    },
+    GenerationBoundProjection {
+        session_id: String,
+        session_generation: String,
+        rollback_authority: Option<NewTabCreatedTabRollbackAuthority>,
+        error: NewTabStripProjectionError,
+    },
+    GenerationBoundSetTabStrip {
+        session_id: String,
+        session_generation: String,
+        rollback_authority: Option<NewTabCreatedTabRollbackAuthority>,
+        error: NewTabSetTabStripError,
+    },
+    GenerationBoundAttachSession {
+        session_id: String,
+        session_generation: String,
+        rollback_authority: Option<NewTabCreatedTabRollbackAuthority>,
+        error: NewTabAttachSessionError,
+    },
+    StartedSessionGenerationMissing {
+        session_id: String,
+    },
+    StartedSessionHandoffMissing {
+        session_id: String,
+        session_generation: String,
+        rollback_authority: Option<NewTabSessionRollbackAuthority>,
+    },
+}
+
+impl std::fmt::Debug for NewTabForegroundError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let variant = match self {
+            Self::WorkspacePrepare(_) => "WorkspacePrepare",
+            Self::StartParams { .. } => "StartParams",
+            Self::SessionStart { .. } => "SessionStart",
+            Self::LayoutRecord { .. } => "LayoutRecord",
+            Self::Projection(_) => "Projection",
+            Self::SetTabStrip(_) => "SetTabStrip",
+            Self::AttachSession(_) => "AttachSession",
+            Self::PreparedSessionStart { .. } => "PreparedSessionStart",
+            Self::PreparedGenerationBoundProjection { .. } => "PreparedGenerationBoundProjection",
+            Self::PreparedGenerationBoundAttachSession { .. } => {
+                "PreparedGenerationBoundAttachSession"
+            }
+            Self::PreparedStartedHandoffMissing { .. } => "PreparedStartedHandoffMissing",
+            Self::GenerationBoundLayoutRecord { .. } => "GenerationBoundLayoutRecord",
+            Self::GenerationBoundProjection { .. } => "GenerationBoundProjection",
+            Self::GenerationBoundSetTabStrip { .. } => "GenerationBoundSetTabStrip",
+            Self::GenerationBoundAttachSession { .. } => "GenerationBoundAttachSession",
+            Self::StartedSessionGenerationMissing { .. } => "StartedSessionGenerationMissing",
+            Self::StartedSessionHandoffMissing { .. } => "StartedSessionHandoffMissing",
+        };
+        formatter
+            .debug_struct("NewTabForegroundError")
+            .field("variant", &variant)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NewTabRendererRecoveryKind {
+    None,
+    RevertStrip,
+    ReconcileState,
+}
+
+enum NewTabRollbackAuthority {
+    StartedSession(NewTabSessionRollbackAuthority),
+    CreatedTab {
+        authority: NewTabCreatedTabRollbackAuthority,
+        renderer: NewTabRendererRecoveryKind,
+    },
+    Prepared {
+        authority: NewTabPreparedRollbackAuthority,
+        renderer: NewTabRendererRecoveryKind,
+    },
+}
+
+impl NewTabForegroundError {
+    fn take_rollback_authority(&mut self) -> Option<NewTabRollbackAuthority> {
+        match self {
+            Self::GenerationBoundLayoutRecord {
+                rollback_authority, ..
+            } => rollback_authority
+                .take()
+                .map(NewTabRollbackAuthority::StartedSession),
+            Self::GenerationBoundProjection {
+                rollback_authority, ..
+            } => rollback_authority
+                .take()
+                .map(|authority| NewTabRollbackAuthority::CreatedTab {
+                    authority,
+                    renderer: NewTabRendererRecoveryKind::None,
+                }),
+            Self::GenerationBoundSetTabStrip {
+                rollback_authority, ..
+            } => rollback_authority
+                .take()
+                .map(|authority| NewTabRollbackAuthority::CreatedTab {
+                    authority,
+                    renderer: NewTabRendererRecoveryKind::RevertStrip,
+                }),
+            Self::GenerationBoundAttachSession {
+                rollback_authority, ..
+            } => rollback_authority
+                .take()
+                .map(|authority| NewTabRollbackAuthority::CreatedTab {
+                    authority,
+                    renderer: NewTabRendererRecoveryKind::ReconcileState,
+                }),
+            Self::StartedSessionHandoffMissing {
+                rollback_authority, ..
+            } => rollback_authority
+                .take()
+                .map(NewTabRollbackAuthority::StartedSession),
+            Self::PreparedGenerationBoundProjection {
+                rollback_authority, ..
+            } => rollback_authority
+                .take()
+                .map(|authority| NewTabRollbackAuthority::Prepared {
+                    authority,
+                    renderer: NewTabRendererRecoveryKind::None,
+                }),
+            Self::PreparedGenerationBoundAttachSession {
+                rollback_authority, ..
+            } => rollback_authority
+                .take()
+                .map(|authority| NewTabRollbackAuthority::Prepared {
+                    authority,
+                    renderer: NewTabRendererRecoveryKind::ReconcileState,
+                }),
+            Self::PreparedStartedHandoffMissing {
+                rollback_authority, ..
+            } => rollback_authority
+                .take()
+                .map(|authority| NewTabRollbackAuthority::Prepared {
+                    authority,
+                    renderer: NewTabRendererRecoveryKind::None,
+                }),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for NewTabForegroundError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NewTabForegroundError::WorkspacePrepare(e) => write!(f, "{e}"),
-            NewTabForegroundError::StartParams { cwd, error } => {
-                write!(
-                    f,
-                    "new-tab start params failed for prepared cwd {cwd:?}: {error:?}"
-                )
+            NewTabForegroundError::StartParams { error, .. } => {
+                write!(f, "new-tab start params failed: {error:?}")
             }
             NewTabForegroundError::SessionStart { error, .. } => write!(f, "{error}"),
             NewTabForegroundError::LayoutRecord { error, .. } => write!(f, "{error}"),
             NewTabForegroundError::Projection(e) => write!(f, "{e}"),
             NewTabForegroundError::SetTabStrip(e) => write!(f, "{e}"),
             NewTabForegroundError::AttachSession(e) => write!(f, "{e}"),
+            NewTabForegroundError::PreparedSessionStart { error, .. } => write!(f, "{error}"),
+            NewTabForegroundError::PreparedGenerationBoundProjection { error, .. } => {
+                write!(f, "{error}")
+            }
+            NewTabForegroundError::PreparedGenerationBoundAttachSession { error, .. } => {
+                write!(f, "{error}")
+            }
+            NewTabForegroundError::PreparedStartedHandoffMissing { session_id, .. } => write!(
+                f,
+                "prepared new-tab session {session_id:?} supplied no renderer handoff"
+            ),
+            NewTabForegroundError::GenerationBoundLayoutRecord { error, .. } => {
+                write!(f, "{error}")
+            }
+            NewTabForegroundError::GenerationBoundProjection { error, .. } => write!(f, "{error}"),
+            NewTabForegroundError::GenerationBoundSetTabStrip { error, .. } => write!(f, "{error}"),
+            NewTabForegroundError::GenerationBoundAttachSession { error, .. } => {
+                write!(f, "{error}")
+            }
+            NewTabForegroundError::StartedSessionGenerationMissing { session_id } => write!(
+                f,
+                "started new-tab session {session_id:?} supplied no PTY generation"
+            ),
+            NewTabForegroundError::StartedSessionHandoffMissing { session_id, .. } => write!(
+                f,
+                "started new-tab session {session_id:?} supplied no renderer handoff"
+            ),
         }
     }
 }
@@ -862,6 +1788,18 @@ impl std::error::Error for NewTabForegroundError {
             NewTabForegroundError::Projection(e) => Some(e),
             NewTabForegroundError::SetTabStrip(e) => Some(e),
             NewTabForegroundError::AttachSession(e) => Some(e),
+            NewTabForegroundError::PreparedSessionStart { error, .. } => Some(error),
+            NewTabForegroundError::PreparedGenerationBoundProjection { error, .. } => Some(error),
+            NewTabForegroundError::PreparedGenerationBoundAttachSession { error, .. } => {
+                Some(error)
+            }
+            NewTabForegroundError::PreparedStartedHandoffMissing { .. } => None,
+            NewTabForegroundError::GenerationBoundLayoutRecord { error, .. } => Some(error),
+            NewTabForegroundError::GenerationBoundProjection { error, .. } => Some(error),
+            NewTabForegroundError::GenerationBoundSetTabStrip { error, .. } => Some(error),
+            NewTabForegroundError::GenerationBoundAttachSession { error, .. } => Some(error),
+            NewTabForegroundError::StartedSessionGenerationMissing { .. } => None,
+            NewTabForegroundError::StartedSessionHandoffMissing { .. } => None,
         }
     }
 }
@@ -949,6 +1887,86 @@ pub fn classify_new_tab_foreground_failure(err: &NewTabForegroundError) -> NewTa
             layout_record_persisted: true,
             deferred_cleanup: "scratch dir, started session, and persisted TabRecord left in place; cleanup deferred",
         },
+        NewTabForegroundError::PreparedSessionStart { error, .. } => {
+            let possibly_applied = matches!(
+                error,
+                NewTabPreparedSessionError::PossiblyApplied { .. }
+            );
+            NewTabFailureDiagnostic {
+                stage: NewTabFailureStage::SessionStart,
+                session_started: possibly_applied,
+                layout_record_persisted: possibly_applied,
+                deferred_cleanup: if possibly_applied {
+                    "conditional start may have applied; prepared graph retained for forward recovery"
+                } else {
+                    "prepared graph was conditionally compensated before returning"
+                },
+            }
+        }
+        NewTabForegroundError::PreparedGenerationBoundProjection { .. } => {
+            NewTabFailureDiagnostic {
+                stage: NewTabFailureStage::Projection,
+                session_started: true,
+                layout_record_persisted: true,
+                deferred_cleanup:
+                    "prepared Live session and tab await exact compensation/release recovery",
+            }
+        }
+        NewTabForegroundError::PreparedGenerationBoundAttachSession { .. } => {
+            NewTabFailureDiagnostic {
+                stage: NewTabFailureStage::AttachSession,
+                session_started: true,
+                layout_record_persisted: true,
+                deferred_cleanup:
+                    "prepared Live session and tab await exact compensation/release recovery",
+            }
+        }
+        NewTabForegroundError::PreparedStartedHandoffMissing { .. } => {
+            NewTabFailureDiagnostic {
+                stage: NewTabFailureStage::AttachSession,
+                session_started: true,
+                layout_record_persisted: true,
+                deferred_cleanup:
+                    "prepared Live session lacked renderer handoff; exact compensation deferred",
+            }
+        }
+        NewTabForegroundError::GenerationBoundLayoutRecord { .. } => NewTabFailureDiagnostic {
+            stage: NewTabFailureStage::LayoutRecord,
+            session_started: true,
+            layout_record_persisted: false,
+            deferred_cleanup: "prepared scratch dir may be removed; generation-bound started session cleanup deferred; no clean TabRecord persisted",
+        },
+        NewTabForegroundError::GenerationBoundProjection { .. } => NewTabFailureDiagnostic {
+            stage: NewTabFailureStage::Projection,
+            session_started: true,
+            layout_record_persisted: true,
+            deferred_cleanup: "generation-bound started session and persisted TabRecord left in place; cleanup deferred",
+        },
+        NewTabForegroundError::GenerationBoundSetTabStrip { .. } => NewTabFailureDiagnostic {
+            stage: NewTabFailureStage::SetTabStrip,
+            session_started: true,
+            layout_record_persisted: true,
+            deferred_cleanup: "generation-bound started session and persisted TabRecord left in place; cleanup deferred",
+        },
+        NewTabForegroundError::GenerationBoundAttachSession { .. } => NewTabFailureDiagnostic {
+            stage: NewTabFailureStage::AttachSession,
+            session_started: true,
+            layout_record_persisted: true,
+            deferred_cleanup: "generation-bound started session and persisted TabRecord left in place; cleanup deferred",
+        },
+        NewTabForegroundError::StartedSessionGenerationMissing { .. } => NewTabFailureDiagnostic {
+            stage: NewTabFailureStage::SessionStart,
+            session_started: true,
+            layout_record_persisted: false,
+            deferred_cleanup: "started session lacked a PTY generation; mutation cleanup refused",
+        },
+        NewTabForegroundError::StartedSessionHandoffMissing { .. } => NewTabFailureDiagnostic {
+            stage: NewTabFailureStage::LayoutRecord,
+            session_started: true,
+            layout_record_persisted: false,
+            deferred_cleanup:
+                "generation-bound started session lacked renderer handoff; exact cleanup deferred",
+        },
     }
 }
 
@@ -956,13 +1974,29 @@ pub fn classify_new_tab_foreground_failure(err: &NewTabForegroundError) -> NewTa
 /// failures. Pure: this decides only, and never touches the filesystem.
 pub fn new_tab_failure_scratch_to_remove(err: &NewTabForegroundError) -> Option<&Path> {
     match err {
-        NewTabForegroundError::StartParams { cwd, .. }
-        | NewTabForegroundError::SessionStart { cwd, .. }
-        | NewTabForegroundError::LayoutRecord { cwd, .. } => Some(cwd.as_path()),
-        NewTabForegroundError::WorkspacePrepare(_)
-        | NewTabForegroundError::Projection(_)
-        | NewTabForegroundError::SetTabStrip(_)
-        | NewTabForegroundError::AttachSession(_) => None,
+        NewTabForegroundError::StartParams { cwd, scratch, .. } if scratch.is_some() => {
+            Some(cwd.as_path())
+        }
+        NewTabForegroundError::PreparedSessionStart {
+            cwd,
+            scratch: Some(_),
+            error,
+        } if error.permits_scratch_removal() => Some(cwd.as_path()),
+        _ => None,
+    }
+}
+
+fn take_new_tab_failure_scratch_authority(
+    err: &mut NewTabForegroundError,
+) -> Option<NewTabScratchRemovalAuthority> {
+    match err {
+        NewTabForegroundError::StartParams { scratch, .. } => scratch.take(),
+        NewTabForegroundError::PreparedSessionStart { scratch, error, .. }
+            if error.permits_scratch_removal() =>
+        {
+            scratch.take()
+        }
+        _ => None,
     }
 }
 
@@ -996,9 +2030,40 @@ pub struct NewTabRecoveryContext {
     pub window_id: Option<String>,
     pub tab_id: Option<String>,
     pub session_id: Option<String>,
+    pub session_generation: Option<String>,
     pub previous_strip_tabs: Option<Vec<WindowTabJson>>,
     pub previous_selection: Option<Vec<TabSelection>>,
     pub scratch_cwd: Option<PathBuf>,
+}
+
+fn foreground_error_session_generation(err: &NewTabForegroundError) -> Option<&str> {
+    match err {
+        NewTabForegroundError::GenerationBoundLayoutRecord {
+            session_generation, ..
+        }
+        | NewTabForegroundError::GenerationBoundProjection {
+            session_generation, ..
+        }
+        | NewTabForegroundError::GenerationBoundSetTabStrip {
+            session_generation, ..
+        }
+        | NewTabForegroundError::GenerationBoundAttachSession {
+            session_generation, ..
+        }
+        | NewTabForegroundError::StartedSessionHandoffMissing {
+            session_generation, ..
+        }
+        | NewTabForegroundError::PreparedGenerationBoundProjection {
+            session_generation, ..
+        }
+        | NewTabForegroundError::PreparedGenerationBoundAttachSession {
+            session_generation, ..
+        }
+        | NewTabForegroundError::PreparedStartedHandoffMissing {
+            session_generation, ..
+        } => Some(session_generation),
+        _ => None,
+    }
 }
 
 /// Build the recovery context available to the foreground new-tab listener on failure.
@@ -1018,6 +2083,7 @@ pub fn foreground_new_tab_recovery_context(
         window_id: Some(window_id.to_string()),
         tab_id: Some(planned_tab_id.to_string()),
         session_id: Some(planned_session_id.to_string()),
+        session_generation: foreground_error_session_generation(err).map(str::to_owned),
         previous_strip_tabs: Some(previous_strip_tabs.to_vec()),
         previous_selection: Some(previous_selection.to_vec()),
         scratch_cwd: new_tab_failure_scratch_to_remove(err).map(Path::to_path_buf),
@@ -1028,8 +2094,9 @@ pub fn foreground_new_tab_recovery_context(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResolvedNewTabRecoveryAction {
     RemoveScratch(PathBuf),
-    KillSession {
+    KillSessionIfGeneration {
         session_id: String,
+        expected_generation: String,
     },
     MissingSessionForKill,
     RollbackTabRecord {
@@ -1063,11 +2130,10 @@ pub fn plan_new_tab_failure_recovery(err: &NewTabForegroundError) -> NewTabRecov
     let actions = match diagnostic.stage {
         NewTabFailureStage::WorkspacePrepare => Vec::new(),
         NewTabFailureStage::StartParams => scratch_cleanup.into_iter().collect(),
-        NewTabFailureStage::SessionStart => {
-            let mut actions = vec![NewTabRecoveryAction::KillStartedSession];
-            actions.extend(scratch_cleanup);
-            actions
-        }
+        // A failed start produced no accepted Grid and therefore no PTY generation proof. Scratch
+        // cleanup is safe, but an id-only Kill is forbidden even if the daemon may have partially
+        // started a process.
+        NewTabFailureStage::SessionStart => scratch_cleanup.into_iter().collect(),
         NewTabFailureStage::LayoutRecord => {
             let mut actions = vec![NewTabRecoveryAction::KillStartedSession];
             actions.extend(scratch_cleanup);
@@ -1115,8 +2181,12 @@ pub fn resolve_new_tab_recovery_plan(
             NewTabRecoveryAction::KillStartedSession => context
                 .session_id
                 .as_ref()
-                .map(|session_id| ResolvedNewTabRecoveryAction::KillSession {
-                    session_id: session_id.clone(),
+                .zip(context.session_generation.as_ref())
+                .map(|(session_id, expected_generation)| {
+                    ResolvedNewTabRecoveryAction::KillSessionIfGeneration {
+                        session_id: session_id.clone(),
+                        expected_generation: expected_generation.clone(),
+                    }
                 })
                 .unwrap_or(ResolvedNewTabRecoveryAction::MissingSessionForKill),
             NewTabRecoveryAction::RollbackTabRecord => {
@@ -1188,7 +2258,7 @@ fn resolved_recovery_action_label(action: &ResolvedNewTabRecoveryAction) -> Stri
         ResolvedNewTabRecoveryAction::RemoveScratch(cwd) => {
             format!("remove_scratch({})", cwd.display())
         }
-        ResolvedNewTabRecoveryAction::KillSession { session_id } => {
+        ResolvedNewTabRecoveryAction::KillSessionIfGeneration { session_id, .. } => {
             format!("kill_session({session_id})")
         }
         ResolvedNewTabRecoveryAction::MissingSessionForKill => {
@@ -1280,6 +2350,7 @@ pub fn render_resolved_recovery_execution_log_line(
 /// records an idempotent no-op such as an already-gone session or already-restored renderer state.
 /// The executor below never calls these methods for `Missing*` resolved actions; those are reported
 /// as skipped directly.
+#[cfg(test)]
 pub trait ResolvedNewTabRecoveryEffects {
     type Error: std::fmt::Display;
 
@@ -1290,6 +2361,7 @@ pub trait ResolvedNewTabRecoveryEffects {
     fn kill_session(
         &mut self,
         session_id: &str,
+        expected_generation: &str,
     ) -> Result<ResolvedNewTabRecoveryEffectResult, Self::Error>;
     fn rollback_tab_record(
         &mut self,
@@ -1409,6 +2481,7 @@ impl ResolvedNewTabRecoveryExecutionReport {
 ///
 /// This is a seam only: callers provide the concrete effects. Missing-target resolved actions are
 /// treated as skipped/idempotent outcomes. Effect failures are recorded and later actions continue.
+#[cfg(test)]
 pub fn execute_resolved_new_tab_recovery_plan<E: ResolvedNewTabRecoveryEffects>(
     plan: &ResolvedNewTabRecoveryPlan,
     effects: &mut E,
@@ -1419,9 +2492,13 @@ pub fn execute_resolved_new_tab_recovery_plan<E: ResolvedNewTabRecoveryEffects>(
             ResolvedNewTabRecoveryAction::RemoveScratch(cwd) => {
                 resolved_recovery_effect_outcome(action, effects.remove_scratch(cwd.as_path()))
             }
-            ResolvedNewTabRecoveryAction::KillSession { session_id } => {
-                resolved_recovery_effect_outcome(action, effects.kill_session(session_id))
-            }
+            ResolvedNewTabRecoveryAction::KillSessionIfGeneration {
+                session_id,
+                expected_generation,
+            } => resolved_recovery_effect_outcome(
+                action,
+                effects.kill_session(session_id, expected_generation),
+            ),
             ResolvedNewTabRecoveryAction::RollbackTabRecord { window_id, tab_id } => {
                 resolved_recovery_effect_outcome(
                     action,
@@ -1496,6 +2573,7 @@ fn resolved_recovery_effect_outcome<E: std::fmt::Display>(
 ///
 /// Implementations own all side effects. The executor below only dispatches these callbacks in the
 /// plan's order and records callback outcomes.
+#[cfg(test)]
 pub trait NewTabRecoveryEffects {
     type Error: std::fmt::Display;
 
@@ -1549,6 +2627,7 @@ impl NewTabRecoveryExecutionReport {
 
 /// Execute a recovery plan through injected effects, preserving order and treating failures as
 /// non-fatal.
+#[cfg(test)]
 pub fn execute_new_tab_recovery_plan<E: NewTabRecoveryEffects>(
     plan: &NewTabRecoveryPlan,
     effects: &mut E,
@@ -1573,8 +2652,35 @@ pub fn execute_new_tab_recovery_plan<E: NewTabRecoveryEffects>(
     }
 }
 
-/// Best-effort effect for removing an orphan ScratchCwd new-tab directory.
-pub fn remove_new_tab_scratch(cwd: &Path) -> std::io::Result<()> {
+/// Consume the Shell-minted fresh-directory receipt. Unexpected content or a durable same-id
+/// namespace is retained and reported as a safe skip.
+fn cleanup_new_tab_scratch(
+    paths: &maestro_shell::AppPaths,
+    authority: NewTabScratchRemovalAuthority,
+) -> Result<ResolvedNewTabRecoveryEffectResult, maestro_shell::WorkspaceExecError> {
+    authority.cleanup(paths).map(|outcome| match outcome {
+        maestro_shell::FreshScratchCwdCleanupOutcome::Removed => {
+            ResolvedNewTabRecoveryEffectResult::Succeeded
+        }
+        maestro_shell::FreshScratchCwdCleanupOutcome::AlreadyMissing => {
+            ResolvedNewTabRecoveryEffectResult::skipped("fresh scratch dir is already absent")
+        }
+        maestro_shell::FreshScratchCwdCleanupOutcome::RetainedNotEmpty => {
+            ResolvedNewTabRecoveryEffectResult::skipped(
+                "fresh scratch dir acquired content; retained byte-for-byte",
+            )
+        }
+        maestro_shell::FreshScratchCwdCleanupOutcome::RetainedNamespaceInUse => {
+            ResolvedNewTabRecoveryEffectResult::skipped(
+                "exact Session namespace is in use; fresh scratch dir retained",
+            )
+        }
+    })
+}
+
+/// Test-only legacy effect for recovery-plan fixtures that predate opaque cleanup receipts.
+#[cfg(test)]
+fn remove_new_tab_scratch(cwd: &Path) -> std::io::Result<()> {
     std::fs::remove_dir_all(cwd)
 }
 
@@ -1583,7 +2689,8 @@ pub fn remove_new_tab_scratch(cwd: &Path) -> std::io::Result<()> {
 /// an idempotent no-op (`Skipped`), not a failure; any other IO error is propagated so the caller's
 /// effects implementation decides fatality. The complete live recovery adapter below uses this
 /// helper for its `RemoveScratch` action.
-pub fn remove_scratch_recovery_effect(
+#[cfg(test)]
+fn remove_scratch_recovery_effect(
     cwd: &Path,
 ) -> std::io::Result<ResolvedNewTabRecoveryEffectResult> {
     match remove_new_tab_scratch(cwd) {
@@ -1596,38 +2703,52 @@ pub fn remove_scratch_recovery_effect(
 }
 
 /// Result vocabulary for an injected session-kill capability.
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KillSessionRecoveryEffectResult {
     Killed,
     AlreadyGone,
+    Represented,
+    #[allow(dead_code)]
+    GenerationChanged,
 }
 
 /// Injected session-kill capability for resolved new-tab recovery.
 ///
 /// Tests can fake this trait without a live daemon. Production adapters can wrap the existing
 /// `maestro-shell` daemon client.
+#[cfg(test)]
 pub trait NewTabRecoverySessionKiller {
     type Error: std::fmt::Display;
 
     fn kill_session(
         &mut self,
         session_id: &str,
+        expected_generation: &str,
     ) -> Result<KillSessionRecoveryEffectResult, Self::Error>;
 }
 
 /// Translate an injected session-kill result into the resolved recovery seam vocabulary.
 ///
 /// This helper does not connect to a daemon by itself; all side effects are owned by `killer`.
+#[cfg(test)]
 pub fn kill_session_recovery_effect<K: NewTabRecoverySessionKiller>(
     session_id: &str,
+    expected_generation: &str,
     killer: &mut K,
 ) -> Result<ResolvedNewTabRecoveryEffectResult, K::Error> {
-    match killer.kill_session(session_id)? {
+    match killer.kill_session(session_id, expected_generation)? {
         KillSessionRecoveryEffectResult::Killed => {
             Ok(ResolvedNewTabRecoveryEffectResult::Succeeded)
         }
         KillSessionRecoveryEffectResult::AlreadyGone => Ok(
             ResolvedNewTabRecoveryEffectResult::skipped("session already gone"),
+        ),
+        KillSessionRecoveryEffectResult::Represented => Ok(
+            ResolvedNewTabRecoveryEffectResult::skipped("session is represented by a durable pane"),
+        ),
+        KillSessionRecoveryEffectResult::GenerationChanged => Ok(
+            ResolvedNewTabRecoveryEffectResult::skipped("session generation changed"),
         ),
     }
 }
@@ -1639,6 +2760,7 @@ pub fn kill_session_recovery_effect<K: NewTabRecoverySessionKiller>(
 /// [`maestro_shell::WindowLayoutService::close_tab`]. Already-absent targets are idempotent skips;
 /// storage/future-version/corrupt/id errors are propagated for the executor to record as failures.
 /// The complete live recovery adapter below uses this helper for its `RollbackTabRecord` action.
+#[cfg(test)]
 pub fn rollback_tab_record_recovery_effect(
     paths: &maestro_shell::AppPaths,
     window_id: &str,
@@ -1662,6 +2784,9 @@ pub fn rollback_tab_record_recovery_effect(
 pub enum RendererStateRecoveryEffectResult {
     Restored,
     AlreadyCurrent,
+    /// The prior lifetime could not be reacquired from a fresh exact snapshot in this adapter. The
+    /// failed target is neutral and no id-only Attach was attempted.
+    Neutralized,
 }
 
 /// Injected renderer-state recovery capability.
@@ -1699,6 +2824,11 @@ pub fn revert_renderer_strip_recovery_effect<C: NewTabRecoveryRendererStateContr
         RendererStateRecoveryEffectResult::AlreadyCurrent => Ok(
             ResolvedNewTabRecoveryEffectResult::skipped("renderer strip already current"),
         ),
+        RendererStateRecoveryEffectResult::Neutralized => {
+            Ok(ResolvedNewTabRecoveryEffectResult::skipped(
+                "renderer remained neutral; exact prior lifetime was not reacquired",
+            ))
+        }
     }
 }
 
@@ -1715,35 +2845,11 @@ pub fn reconcile_renderer_state_recovery_effect<C: NewTabRecoveryRendererStateCo
         RendererStateRecoveryEffectResult::AlreadyCurrent => Ok(
             ResolvedNewTabRecoveryEffectResult::skipped("renderer state already reconciled"),
         ),
-    }
-}
-
-/// `maestro-shell` daemon-client-backed session killer.
-///
-/// The shell client intentionally treats an already-absent session as `Ok(KilledSession { id })`.
-/// Because that API does not expose whether the daemon actually killed the session or confirmed it
-/// was already absent, this adapter maps every `Ok` to [`KillSessionRecoveryEffectResult::Killed`].
-/// Tests cover the explicit `AlreadyGone` branch through the injected trait seam.
-pub struct DaemonClientRecoverySessionKiller<'a> {
-    client: &'a mut maestro_shell::DaemonClient,
-}
-
-impl<'a> DaemonClientRecoverySessionKiller<'a> {
-    pub fn new(client: &'a mut maestro_shell::DaemonClient) -> Self {
-        Self { client }
-    }
-}
-
-impl NewTabRecoverySessionKiller for DaemonClientRecoverySessionKiller<'_> {
-    type Error = maestro_shell::DaemonClientError;
-
-    fn kill_session(
-        &mut self,
-        session_id: &str,
-    ) -> Result<KillSessionRecoveryEffectResult, Self::Error> {
-        self.client
-            .kill_session(maestro_protocol::SessionId(session_id.to_string()))
-            .map(|_| KillSessionRecoveryEffectResult::Killed)
+        RendererStateRecoveryEffectResult::Neutralized => {
+            Ok(ResolvedNewTabRecoveryEffectResult::skipped(
+                "renderer remained neutral; exact prior lifetime was not reacquired",
+            ))
+        }
     }
 }
 
@@ -1763,19 +2869,18 @@ impl NewTabRecoverySessionKiller for DaemonClientRecoverySessionKiller<'_> {
 ///   pre-attempt strip, so a benign active/strip mismatch degrades to an unmarked strip rather than a
 ///   hard error.
 ///
-/// The live controller deliberately has NO derived already-current / ambiguous skip. The foreground
-/// new-tab pipeline sends `SetTabStrip` BEFORE `AttachSession`, and `send_new_tab_set_tab_strip` does
-/// not advance active-tab state. So on an `AttachSession` failure the visible renderer strip may
-/// already show the failed new tab while `active_window_id`/`active_tab_id` still point at the old
-/// tab — exactly the partial failure `revert`/`reconcile` exist to repair. `RendererTabRuntime`
-/// tracks active session/window ownership, NOT the last-delivered strip payload, so its active
-/// coordinate is not a sound "strip already current" signal. The production controller therefore
-/// always restores the pre-attempt strip on the live recovery path; the idempotent-skip
+/// The live controller deliberately has NO derived already-current / ambiguous skip. Legacy and
+/// diagnostic error variants may still describe a renderer projection that needs repair, while the
+/// production handoff command now admits strip+Claim atomically. `RendererTabRuntime` tracks active
+/// session/window ownership, NOT the last-delivered strip payload, so its active coordinate alone
+/// is not a sound "strip already current" signal. The production controller therefore always
+/// restores the pre-attempt strip when recovery requests it; the idempotent-skip
 /// ([`RendererStateRecoveryEffectResult::AlreadyCurrent`]) contract is proven separately by
 /// `ContractRendererStateController`, whose skip modes are driven by an explicit reviewed signal.
 pub struct ForegroundRendererStateController<'a> {
     runtime: &'a mut RendererTabRuntime,
     window_id: String,
+    expected_handoff: Option<(maestro_renderer::RendererAttachmentHandoffRequestId, String)>,
 }
 
 impl<'a> ForegroundRendererStateController<'a> {
@@ -1783,6 +2888,20 @@ impl<'a> ForegroundRendererStateController<'a> {
         Self {
             runtime,
             window_id: window_id.into(),
+            expected_handoff: None,
+        }
+    }
+
+    fn for_handoff(
+        runtime: &'a mut RendererTabRuntime,
+        window_id: impl Into<String>,
+        request_id: maestro_renderer::RendererAttachmentHandoffRequestId,
+        session_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            runtime,
+            window_id: window_id.into(),
+            expected_handoff: Some((request_id, session_id.into())),
         }
     }
 
@@ -1790,6 +2909,25 @@ impl<'a> ForegroundRendererStateController<'a> {
         &mut self,
         strip_tabs: &[WindowTabJson],
     ) -> Result<RendererStateRecoveryEffectResult, TabSwitchError> {
+        let pending = self.runtime.pending_handoff().cloned();
+        match (&self.expected_handoff, &pending) {
+            (Some((request_id, session_id)), Some(pending))
+                if pending.handoff_request_id() == Some(*request_id)
+                    && pending.target().target().session_id == *session_id => {}
+            (Some(_), _) | (None, Some(_)) => return Err(TabSwitchError::HandoffPending),
+            (None, None) => {}
+        }
+        if let Some(pending) = pending {
+            let request_id = pending
+                .handoff_request_id()
+                .expect("pending_handoff contains only handoff requests");
+            let session_id = pending.target().target().session_id.clone();
+            let _ = self
+                .runtime
+                .take_nonclaimed_handoff(request_id, &session_id);
+            self.runtime.clear_viewport()?;
+            return Ok(RendererStateRecoveryEffectResult::Neutralized);
+        }
         let active_tab_id = self
             .runtime
             .active_tab_id()
@@ -1803,8 +2941,17 @@ impl<'a> ForegroundRendererStateController<'a> {
                     tab_id,
                 }
             })?;
-        self.runtime.set_tab_strip(Some(&model))?;
-        Ok(RendererStateRecoveryEffectResult::Restored)
+        match self.runtime.set_tab_strip(Some(&model)) {
+            Ok(()) => Ok(RendererStateRecoveryEffectResult::Restored),
+            // The legacy recovery payload carries presentation only. When no already-proven exact
+            // cohort is active, it cannot authorize a replacement Attach or strip publication.
+            // Staying neutral is a successful fail-closed recovery state; the caller may continue
+            // its generation-bound forward release without resurrecting a textual prior lifetime.
+            Err(TabSwitchError::ViewportAuthorityRequired) => {
+                Ok(RendererStateRecoveryEffectResult::Neutralized)
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -1828,14 +2975,586 @@ impl NewTabRecoveryRendererStateController for ForegroundRendererStateController
     }
 }
 
+struct CommittedNewTabRollback {
+    release_receipt: Option<maestro_shell::PendingReleaseReceipt>,
+    unresolved_release_session_ids: Vec<String>,
+    session_id: String,
+    expected_generation: String,
+    scratch_cwd: Option<PathBuf>,
+    window_id: String,
+    renderer: NewTabRendererRecoveryKind,
+    handoff_cancel: NewTabHandoffCancelGuard,
+}
+
+struct NewTabHandoffCancelGuard {
+    authority: Option<maestro_shell::AttachmentHandoffAuthority>,
+}
+
+impl NewTabHandoffCancelGuard {
+    fn new(authority: Option<maestro_shell::AttachmentHandoffAuthority>) -> Self {
+        Self { authority }
+    }
+
+    fn cancel_now(&mut self) {
+        if let Some(authority) = self.authority.take() {
+            cancel_new_tab_attachment_handoff(authority);
+        }
+    }
+}
+
+impl Drop for NewTabHandoffCancelGuard {
+    fn drop(&mut self) {
+        self.cancel_now();
+    }
+}
+
+fn new_tab_release_action(
+    session_id: &str,
+    expected_generation: &str,
+) -> ResolvedNewTabRecoveryAction {
+    ResolvedNewTabRecoveryAction::KillSessionIfGeneration {
+        session_id: session_id.to_string(),
+        expected_generation: expected_generation.to_string(),
+    }
+}
+
+fn compensate_prepared_new_tab_status(
+    paths: &maestro_shell::AppPaths,
+    receipt: maestro_shell::PreparedNewSessionCompensationReceipt,
+    now_ms: u64,
+) -> NewTabPreparedCompensationStatus {
+    match maestro_shell::WindowLayoutService::new(paths)
+        .compensate_prepared_new_session(receipt, now_ms)
+    {
+        Ok(maestro_shell::ConditionalPreparedNewSessionCompensation::ExistingWindow(
+            maestro_shell::ConditionalCreatedTabSessionRollback::RolledBack(_),
+        )) => NewTabPreparedCompensationStatus::RolledBack,
+        Ok(maestro_shell::ConditionalPreparedNewSessionCompensation::ExistingWindow(
+            maestro_shell::ConditionalCreatedTabSessionRollback::Missing,
+        )) => NewTabPreparedCompensationStatus::Missing,
+        Ok(maestro_shell::ConditionalPreparedNewSessionCompensation::ExistingWindow(
+            maestro_shell::ConditionalCreatedTabSessionRollback::Changed,
+        )) => NewTabPreparedCompensationStatus::Changed,
+        Ok(maestro_shell::ConditionalPreparedNewSessionCompensation::ExistingWindow(
+            maestro_shell::ConditionalCreatedTabSessionRollback::Referenced,
+        )) => NewTabPreparedCompensationStatus::Referenced,
+        Ok(maestro_shell::ConditionalPreparedNewSessionCompensation::FreshWindowGraph(_)) => {
+            NewTabPreparedCompensationStatus::Failed {
+                detail: "existing-window new-tab compensation returned a fresh-graph receipt"
+                    .into(),
+            }
+        }
+        Ok(maestro_shell::ConditionalPreparedNewSessionCompensation::Unplaced(_)) => {
+            NewTabPreparedCompensationStatus::Failed {
+                detail: "existing-window new-tab compensation returned an unplaced receipt".into(),
+            }
+        }
+        Err(error) => NewTabPreparedCompensationStatus::Failed {
+            detail: error.to_string(),
+        },
+    }
+}
+
+fn cancel_prepared_new_tab_status(
+    paths: &maestro_shell::AppPaths,
+    start: maestro_shell::PreparedNewSessionStart,
+    now_ms: u64,
+) -> NewTabPreparedCompensationStatus {
+    match maestro_shell::WindowLayoutService::new(paths).cancel_prepared_new_session(start, now_ms)
+    {
+        Ok(maestro_shell::ConditionalPreparedNewSessionCompensation::ExistingWindow(
+            maestro_shell::ConditionalCreatedTabSessionRollback::RolledBack(_),
+        )) => NewTabPreparedCompensationStatus::RolledBack,
+        Ok(maestro_shell::ConditionalPreparedNewSessionCompensation::ExistingWindow(
+            maestro_shell::ConditionalCreatedTabSessionRollback::Missing,
+        )) => NewTabPreparedCompensationStatus::Missing,
+        Ok(maestro_shell::ConditionalPreparedNewSessionCompensation::ExistingWindow(
+            maestro_shell::ConditionalCreatedTabSessionRollback::Changed,
+        )) => NewTabPreparedCompensationStatus::Changed,
+        Ok(maestro_shell::ConditionalPreparedNewSessionCompensation::ExistingWindow(
+            maestro_shell::ConditionalCreatedTabSessionRollback::Referenced,
+        )) => NewTabPreparedCompensationStatus::Referenced,
+        Ok(maestro_shell::ConditionalPreparedNewSessionCompensation::FreshWindowGraph(_)) => {
+            NewTabPreparedCompensationStatus::Failed {
+                detail: "existing-window new-tab cancellation returned a fresh-graph receipt"
+                    .into(),
+            }
+        }
+        Ok(maestro_shell::ConditionalPreparedNewSessionCompensation::Unplaced(_)) => {
+            NewTabPreparedCompensationStatus::Failed {
+                detail: "existing-window new-tab cancellation returned an unplaced receipt".into(),
+            }
+        }
+        Err(error) => NewTabPreparedCompensationStatus::Failed {
+            detail: error.to_string(),
+        },
+    }
+}
+
+fn drain_committed_new_tab_release(
+    paths: &maestro_shell::AppPaths,
+    socket_path: &Path,
+    release_receipt: maestro_shell::PendingReleaseReceipt,
+    renderer_ready: bool,
+) -> ResolvedNewTabRecoveryActionStatus {
+    let service = maestro_shell::SessionReleaseService::new(paths);
+    let attempt = if renderer_ready {
+        match maestro_shell::DaemonClient::connect(socket_path) {
+            Ok(mut client) => service.attempt_owned_with_daemon(release_receipt, &mut client),
+            Err(error) => service.attempt_owned_with_daemon_unavailable(release_receipt, error),
+        }
+    } else {
+        service.attempt_owned_with_daemon_unavailable(
+            release_receipt,
+            maestro_shell::DaemonClientError::Protocol {
+                detail: "renderer recovery was not confirmed before new-tab release".into(),
+            },
+        )
+    };
+    let (outcome, _confirmed_lifetimes) = attempt.into_parts();
+    match outcome {
+        maestro_shell::ReleaseOperationOutcome::Complete {
+            confirmed,
+            retained: _,
+        } if confirmed > 0 => ResolvedNewTabRecoveryActionStatus::Succeeded,
+        maestro_shell::ReleaseOperationOutcome::Complete { retained, .. } => {
+            ResolvedNewTabRecoveryActionStatus::Skipped {
+                reason: format!("durable ownership retained {retained} release target(s)"),
+            }
+        }
+        maestro_shell::ReleaseOperationOutcome::UnpublishedFailure { compensation, .. } => {
+            // This does not restore the deleted graph or compensate an unpublished renderer Claim.
+            // It surrenders only the zero-publication lease so the durable RowMustBeAbsent forward
+            // journal is immediately claimable by the next release worker.
+            match service.release_unpublished_for_retry(compensation) {
+                Ok(()) => ResolvedNewTabRecoveryActionStatus::Skipped {
+                    reason: "release queued for forward retry before any daemon publication".into(),
+                },
+                Err(_) => ResolvedNewTabRecoveryActionStatus::Failed {
+                    error: "release retry scheduling failed; durable lease will expire safely"
+                        .into(),
+                },
+            }
+        }
+        maestro_shell::ReleaseOperationOutcome::ForwardOnly {
+            confirmed,
+            possibly_published,
+            pending,
+            ..
+        } => ResolvedNewTabRecoveryActionStatus::Skipped {
+            reason: format!(
+                "release remains forward-only (confirmed={confirmed}, possibly_published={possibly_published}, pending={pending})"
+            ),
+        },
+    }
+}
+
+/// Execute the generation-bound production recovery state machine.
+///
+/// Durable rollback/journaling always runs before renderer repair. Daemon connection/CAS is lazy
+/// and occurs only after renderer state is known neutralized; a renderer or connection failure
+/// surrenders zero-publication authority for durable forward retry. Refused/changed rollback
+/// authority suppresses renderer, daemon, and scratch effects entirely.
+pub fn execute_production_new_tab_recovery(
+    paths: &maestro_shell::AppPaths,
+    socket_path: &Path,
+    now_ms: u64,
+    error: &mut NewTabForegroundError,
+    previous_strip_tabs: &[WindowTabJson],
+    previous_selection: &[TabSelection],
+    runtime: &mut RendererTabRuntime,
+) -> ResolvedNewTabRecoveryExecutionReport {
+    let disposition_handoff = match error {
+        NewTabForegroundError::GenerationBoundAttachSession {
+            session_id,
+            error: NewTabAttachSessionError::HandoffNotClaimed { request_id, .. },
+            ..
+        }
+        | NewTabForegroundError::PreparedGenerationBoundAttachSession {
+            session_id,
+            error: NewTabAttachSessionError::HandoffNotClaimed { request_id, .. },
+            ..
+        } => Some((*request_id, session_id.clone())),
+        _ => None,
+    };
+    let diagnostic = classify_new_tab_foreground_failure(error);
+    if let NewTabForegroundError::SessionStart { error, .. } = error {
+        if let Some(shell_error) = error.take_shell_error() {
+            settle_new_tab_shell_runtime_error(shell_error);
+        }
+    }
+    let Some(authority) = error.take_rollback_authority() else {
+        let mut outcomes = Vec::new();
+        // The opaque capability already encodes both ScratchCwd provenance and mutation
+        // certainty. Prepared GraphAuthority and D.U.+RolledBack failures may therefore clean up
+        // even though their diagnostic stage is SessionStart; Refused never does.
+        let scratch_cwd = new_tab_failure_scratch_to_remove(error).map(Path::to_path_buf);
+        if let Some(authority) = take_new_tab_failure_scratch_authority(error) {
+            let cwd = scratch_cwd.unwrap_or_else(|| paths.scratch_base().join("redacted"));
+            let action = ResolvedNewTabRecoveryAction::RemoveScratch(cwd.clone());
+            outcomes.push(resolved_recovery_effect_outcome(
+                &action,
+                cleanup_new_tab_scratch(paths, authority),
+            ));
+        }
+        return ResolvedNewTabRecoveryExecutionReport {
+            diagnostic,
+            outcomes,
+        };
+    };
+
+    let service = maestro_shell::WindowLayoutService::new(paths);
+    let mut outcomes = Vec::new();
+    let mut committed = match authority {
+        NewTabRollbackAuthority::StartedSession(mut authority) => {
+            let session_id = authority.expected_session.session_id.clone();
+            let expected_generation = authority.expected_generation.clone();
+            let handoff_cancel = NewTabHandoffCancelGuard::new(authority.attachment_handoff.take());
+            let release_action = new_tab_release_action(&session_id, &expected_generation);
+            match service.delete_created_session_if_unreferenced(
+                &authority.expected_layout_without_tab,
+                &authority.created_tab_id,
+                &authority.expected_session,
+                now_ms,
+            ) {
+                Ok(maestro_shell::ConditionalCreatedSessionDelete::Deleted {
+                    release_receipt,
+                    unresolved_release_session_ids,
+                }) => CommittedNewTabRollback {
+                    release_receipt,
+                    unresolved_release_session_ids,
+                    session_id,
+                    expected_generation,
+                    scratch_cwd: authority.scratch_cwd,
+                    window_id: authority.expected_layout_without_tab.layout.window_id,
+                    renderer: NewTabRendererRecoveryKind::None,
+                    handoff_cancel,
+                },
+                Ok(maestro_shell::ConditionalCreatedSessionDelete::Missing) => {
+                    outcomes.push(ResolvedNewTabRecoveryActionOutcome::skipped(
+                        release_action,
+                        "exact created Session is already missing; recovery authority consumed",
+                    ));
+                    return ResolvedNewTabRecoveryExecutionReport {
+                        diagnostic,
+                        outcomes,
+                    };
+                }
+                Ok(maestro_shell::ConditionalCreatedSessionDelete::Changed) => {
+                    outcomes.push(ResolvedNewTabRecoveryActionOutcome::skipped(
+                        release_action,
+                        "created Session/layout authority changed; no recovery effects published",
+                    ));
+                    return ResolvedNewTabRecoveryExecutionReport {
+                        diagnostic,
+                        outcomes,
+                    };
+                }
+                Ok(maestro_shell::ConditionalCreatedSessionDelete::Referenced) => {
+                    outcomes.push(ResolvedNewTabRecoveryActionOutcome::skipped(
+                        release_action,
+                        "created Session acquired a durable owner; no recovery effects published",
+                    ));
+                    return ResolvedNewTabRecoveryExecutionReport {
+                        diagnostic,
+                        outcomes,
+                    };
+                }
+                Err(_) => {
+                    outcomes.push(ResolvedNewTabRecoveryActionOutcome::failed(
+                        release_action,
+                        "atomic created-Session rollback failed",
+                    ));
+                    return ResolvedNewTabRecoveryExecutionReport {
+                        diagnostic,
+                        outcomes,
+                    };
+                }
+            }
+        }
+        NewTabRollbackAuthority::CreatedTab {
+            mut authority,
+            renderer,
+        } => {
+            let session_id = authority.expected_session.session_id.clone();
+            let expected_generation = authority.expected_generation.clone();
+            let handoff_cancel = NewTabHandoffCancelGuard::new(authority.attachment_handoff.take());
+            let rollback_action = ResolvedNewTabRecoveryAction::RollbackTabRecord {
+                window_id: authority.expected_post_layout.layout.window_id.clone(),
+                tab_id: authority.created_tab_id.clone(),
+            };
+            match service.rollback_created_tab_and_session_if_unchanged(
+                &authority.expected_post_layout,
+                &authority.created_tab_id,
+                &authority.expected_session,
+                now_ms,
+            ) {
+                Ok(maestro_shell::ConditionalCreatedTabSessionRollback::RolledBack(rollback)) => {
+                    outcomes.push(ResolvedNewTabRecoveryActionOutcome::succeeded(
+                        rollback_action,
+                    ));
+                    CommittedNewTabRollback {
+                        release_receipt: rollback.release_receipt,
+                        unresolved_release_session_ids: rollback.unresolved_release_session_ids,
+                        session_id,
+                        expected_generation,
+                        scratch_cwd: authority.scratch_cwd,
+                        window_id: authority.expected_post_layout.layout.window_id,
+                        renderer,
+                        handoff_cancel,
+                    }
+                }
+                Ok(maestro_shell::ConditionalCreatedTabSessionRollback::Missing) => {
+                    outcomes.push(ResolvedNewTabRecoveryActionOutcome::skipped(
+                        rollback_action,
+                        "created tab or Session is already missing; no recovery effects published",
+                    ));
+                    return ResolvedNewTabRecoveryExecutionReport {
+                        diagnostic,
+                        outcomes,
+                    };
+                }
+                Ok(maestro_shell::ConditionalCreatedTabSessionRollback::Changed) => {
+                    outcomes.push(ResolvedNewTabRecoveryActionOutcome::skipped(
+                        rollback_action,
+                        "created tab/Session authority changed; no recovery effects published",
+                    ));
+                    return ResolvedNewTabRecoveryExecutionReport {
+                        diagnostic,
+                        outcomes,
+                    };
+                }
+                Ok(maestro_shell::ConditionalCreatedTabSessionRollback::Referenced) => {
+                    outcomes.push(ResolvedNewTabRecoveryActionOutcome::skipped(
+                        rollback_action,
+                        "created Session acquired another durable owner; no recovery effects published",
+                    ));
+                    return ResolvedNewTabRecoveryExecutionReport {
+                        diagnostic,
+                        outcomes,
+                    };
+                }
+                Err(_) => {
+                    outcomes.push(ResolvedNewTabRecoveryActionOutcome::failed(
+                        rollback_action,
+                        "atomic created-tab rollback failed",
+                    ));
+                    return ResolvedNewTabRecoveryExecutionReport {
+                        diagnostic,
+                        outcomes,
+                    };
+                }
+            }
+        }
+        NewTabRollbackAuthority::Prepared {
+            mut authority,
+            renderer,
+        } => {
+            let handoff_cancel = NewTabHandoffCancelGuard::new(authority.attachment_handoff.take());
+            let rollback_action = ResolvedNewTabRecoveryAction::RollbackTabRecord {
+                window_id: authority.window_id.clone(),
+                tab_id: authority.tab_id.clone(),
+            };
+            match service.compensate_prepared_new_session(authority.compensation, now_ms) {
+                Ok(maestro_shell::ConditionalPreparedNewSessionCompensation::ExistingWindow(
+                    maestro_shell::ConditionalCreatedTabSessionRollback::RolledBack(rollback),
+                )) => {
+                    outcomes.push(ResolvedNewTabRecoveryActionOutcome::succeeded(
+                        rollback_action,
+                    ));
+                    CommittedNewTabRollback {
+                        release_receipt: rollback.release_receipt,
+                        unresolved_release_session_ids: rollback.unresolved_release_session_ids,
+                        session_id: authority.session_id,
+                        expected_generation: authority.expected_generation,
+                        scratch_cwd: None,
+                        window_id: authority.window_id,
+                        renderer,
+                        handoff_cancel,
+                    }
+                }
+                Ok(maestro_shell::ConditionalPreparedNewSessionCompensation::ExistingWindow(
+                    maestro_shell::ConditionalCreatedTabSessionRollback::Missing,
+                )) => {
+                    outcomes.push(ResolvedNewTabRecoveryActionOutcome::skipped(
+                        rollback_action,
+                        "prepared tab or Session is already missing; compensation consumed",
+                    ));
+                    return ResolvedNewTabRecoveryExecutionReport {
+                        diagnostic,
+                        outcomes,
+                    };
+                }
+                Ok(maestro_shell::ConditionalPreparedNewSessionCompensation::ExistingWindow(
+                    maestro_shell::ConditionalCreatedTabSessionRollback::Changed,
+                )) => {
+                    outcomes.push(ResolvedNewTabRecoveryActionOutcome::skipped(
+                        rollback_action,
+                        "prepared graph authority changed; no recovery effects published",
+                    ));
+                    return ResolvedNewTabRecoveryExecutionReport {
+                        diagnostic,
+                        outcomes,
+                    };
+                }
+                Ok(maestro_shell::ConditionalPreparedNewSessionCompensation::ExistingWindow(
+                    maestro_shell::ConditionalCreatedTabSessionRollback::Referenced,
+                )) => {
+                    outcomes.push(ResolvedNewTabRecoveryActionOutcome::skipped(
+                        rollback_action,
+                        "prepared Session acquired a durable owner; no recovery effects published",
+                    ));
+                    return ResolvedNewTabRecoveryExecutionReport {
+                        diagnostic,
+                        outcomes,
+                    };
+                }
+                Ok(maestro_shell::ConditionalPreparedNewSessionCompensation::FreshWindowGraph(
+                    _,
+                )) => {
+                    outcomes.push(ResolvedNewTabRecoveryActionOutcome::failed(
+                        rollback_action,
+                        "existing-window recovery received a fresh-graph compensation outcome",
+                    ));
+                    return ResolvedNewTabRecoveryExecutionReport {
+                        diagnostic,
+                        outcomes,
+                    };
+                }
+                Ok(maestro_shell::ConditionalPreparedNewSessionCompensation::Unplaced(_)) => {
+                    outcomes.push(ResolvedNewTabRecoveryActionOutcome::failed(
+                        rollback_action,
+                        "existing-window recovery received an unplaced compensation outcome",
+                    ));
+                    return ResolvedNewTabRecoveryExecutionReport {
+                        diagnostic,
+                        outcomes,
+                    };
+                }
+                Err(_) => {
+                    outcomes.push(ResolvedNewTabRecoveryActionOutcome::failed(
+                        rollback_action,
+                        "atomic prepared-session compensation failed",
+                    ));
+                    return ResolvedNewTabRecoveryExecutionReport {
+                        diagnostic,
+                        outcomes,
+                    };
+                }
+            }
+        }
+    };
+
+    let renderer_ready = match committed.renderer {
+        NewTabRendererRecoveryKind::None => true,
+        NewTabRendererRecoveryKind::RevertStrip => {
+            let action = ResolvedNewTabRecoveryAction::RevertRendererStrip {
+                strip_tabs: previous_strip_tabs.to_vec(),
+                selection: previous_selection.to_vec(),
+            };
+            let mut controller = match &disposition_handoff {
+                Some((request_id, session_id)) => ForegroundRendererStateController::for_handoff(
+                    runtime,
+                    committed.window_id.clone(),
+                    *request_id,
+                    session_id.clone(),
+                ),
+                None => {
+                    ForegroundRendererStateController::new(runtime, committed.window_id.clone())
+                }
+            };
+            let outcome = resolved_recovery_effect_outcome(
+                &action,
+                revert_renderer_strip_recovery_effect(
+                    previous_strip_tabs,
+                    previous_selection,
+                    &mut controller,
+                ),
+            );
+            let ready = !outcome.status.is_failed();
+            outcomes.push(outcome);
+            ready
+        }
+        NewTabRendererRecoveryKind::ReconcileState => {
+            let action = ResolvedNewTabRecoveryAction::ReconcileRendererState {
+                strip_tabs: previous_strip_tabs.to_vec(),
+                selection: previous_selection.to_vec(),
+            };
+            let mut controller = match &disposition_handoff {
+                Some((request_id, session_id)) => ForegroundRendererStateController::for_handoff(
+                    runtime,
+                    committed.window_id.clone(),
+                    *request_id,
+                    session_id.clone(),
+                ),
+                None => {
+                    ForegroundRendererStateController::new(runtime, committed.window_id.clone())
+                }
+            };
+            let outcome = resolved_recovery_effect_outcome(
+                &action,
+                reconcile_renderer_state_recovery_effect(
+                    previous_strip_tabs,
+                    previous_selection,
+                    &mut controller,
+                ),
+            );
+            let ready = !outcome.status.is_failed();
+            outcomes.push(outcome);
+            ready
+        }
+    };
+
+    // Retire any still-owned pre-command handoff before the forward-only release attempt. A
+    // post-disposition failure has already transferred that authority out of the rollback guard,
+    // so this remains a no-op for a possibly-applied Claim.
+    committed.handoff_cancel.cancel_now();
+
+    let release_action =
+        new_tab_release_action(&committed.session_id, &committed.expected_generation);
+    let release_status = match committed.release_receipt {
+        Some(receipt) => {
+            drain_committed_new_tab_release(paths, socket_path, receipt, renderer_ready)
+        }
+        None if committed.unresolved_release_session_ids.is_empty() => {
+            ResolvedNewTabRecoveryActionStatus::Skipped {
+                reason: "no daemon lifetime remained after exact durable rollback".into(),
+            }
+        }
+        None => ResolvedNewTabRecoveryActionStatus::Skipped {
+            reason:
+                "exact daemon generation was unavailable; durable cleanup committed as a safe leak"
+                    .into(),
+        },
+    };
+    outcomes.push(ResolvedNewTabRecoveryActionOutcome {
+        action: release_action,
+        status: release_status,
+    });
+
+    if let Some(cwd) = committed.scratch_cwd {
+        outcomes.push(ResolvedNewTabRecoveryActionOutcome::skipped(
+            ResolvedNewTabRecoveryAction::RemoveScratch(cwd),
+            "scratch is retained after Session start because a replacement lifetime may share it",
+        ));
+    }
+
+    ResolvedNewTabRecoveryExecutionReport {
+        diagnostic,
+        outcomes,
+    }
+}
+
 /// Concrete filesystem-backed resolved recovery effects.
 ///
 /// This first implementation only supports `RemoveScratch`. The remaining effects are explicit
 /// skipped no-ops so wiring this into the resolved executor cannot accidentally kill sessions,
 /// mutate records, or send renderer commands.
+#[cfg(test)]
 #[derive(Clone, Debug, Default)]
 pub struct ResolvedNewTabRecoveryFilesystemEffects;
 
+#[cfg(test)]
 impl ResolvedNewTabRecoveryEffects for ResolvedNewTabRecoveryFilesystemEffects {
     type Error = std::io::Error;
 
@@ -1849,6 +3568,7 @@ impl ResolvedNewTabRecoveryEffects for ResolvedNewTabRecoveryFilesystemEffects {
     fn kill_session(
         &mut self,
         _session_id: &str,
+        _expected_generation: &str,
     ) -> Result<ResolvedNewTabRecoveryEffectResult, Self::Error> {
         Ok(ResolvedNewTabRecoveryEffectResult::skipped(
             "kill_session unsupported by filesystem effects",
@@ -1887,6 +3607,7 @@ impl ResolvedNewTabRecoveryEffects for ResolvedNewTabRecoveryFilesystemEffects {
 }
 
 /// Error vocabulary for concrete local resolved new-tab recovery effects.
+#[cfg(test)]
 #[derive(Debug)]
 pub enum ResolvedNewTabRecoveryLocalEffectError<KillError> {
     Io(std::io::Error),
@@ -1894,6 +3615,7 @@ pub enum ResolvedNewTabRecoveryLocalEffectError<KillError> {
     WindowLayout(maestro_shell::window_layout::WindowLayoutError),
 }
 
+#[cfg(test)]
 impl<KillError: std::fmt::Display> std::fmt::Display
     for ResolvedNewTabRecoveryLocalEffectError<KillError>
 {
@@ -1906,6 +3628,7 @@ impl<KillError: std::fmt::Display> std::fmt::Display
     }
 }
 
+#[cfg(test)]
 impl<KillError> std::error::Error for ResolvedNewTabRecoveryLocalEffectError<KillError>
 where
     KillError: std::error::Error + 'static,
@@ -1924,11 +3647,13 @@ where
 /// This adapter can remove orphan scratch directories and kill a resolved session through an
 /// injected capability. Post-record rollback and renderer reconciliation are explicit skipped
 /// no-ops here; the complete live adapter below implements all five actions.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct ResolvedNewTabRecoveryLocalEffects<K> {
     session_killer: K,
 }
 
+#[cfg(test)]
 impl<K> ResolvedNewTabRecoveryLocalEffects<K> {
     pub fn new(session_killer: K) -> Self {
         Self { session_killer }
@@ -1937,12 +3662,9 @@ impl<K> ResolvedNewTabRecoveryLocalEffects<K> {
     pub fn session_killer(&self) -> &K {
         &self.session_killer
     }
-
-    pub fn session_killer_mut(&mut self) -> &mut K {
-        &mut self.session_killer
-    }
 }
 
+#[cfg(test)]
 impl<K> ResolvedNewTabRecoveryEffects for ResolvedNewTabRecoveryLocalEffects<K>
 where
     K: NewTabRecoverySessionKiller,
@@ -1959,8 +3681,9 @@ where
     fn kill_session(
         &mut self,
         session_id: &str,
+        expected_generation: &str,
     ) -> Result<ResolvedNewTabRecoveryEffectResult, Self::Error> {
-        kill_session_recovery_effect(session_id, &mut self.session_killer)
+        kill_session_recovery_effect(session_id, expected_generation, &mut self.session_killer)
             .map_err(ResolvedNewTabRecoveryLocalEffectError::Kill)
     }
 
@@ -2000,6 +3723,7 @@ where
 /// This extends the local scratch/session effects with an app-support-backed `RollbackTabRecord`
 /// implementation. Renderer actions remain explicit skipped no-ops here; the complete live adapter
 /// below supplies them.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct ResolvedNewTabRecoveryRecordLocalEffects<K> {
     paths: maestro_shell::AppPaths,
@@ -2007,6 +3731,7 @@ pub struct ResolvedNewTabRecoveryRecordLocalEffects<K> {
     session_killer: K,
 }
 
+#[cfg(test)]
 impl<K> ResolvedNewTabRecoveryRecordLocalEffects<K> {
     pub fn new(paths: maestro_shell::AppPaths, now_ms: u64, session_killer: K) -> Self {
         Self {
@@ -2016,23 +3741,12 @@ impl<K> ResolvedNewTabRecoveryRecordLocalEffects<K> {
         }
     }
 
-    pub fn paths(&self) -> &maestro_shell::AppPaths {
-        &self.paths
-    }
-
-    pub fn now_ms(&self) -> u64 {
-        self.now_ms
-    }
-
     pub fn session_killer(&self) -> &K {
         &self.session_killer
     }
-
-    pub fn session_killer_mut(&mut self) -> &mut K {
-        &mut self.session_killer
-    }
 }
 
+#[cfg(test)]
 impl<K> ResolvedNewTabRecoveryEffects for ResolvedNewTabRecoveryRecordLocalEffects<K>
 where
     K: NewTabRecoverySessionKiller,
@@ -2049,8 +3763,9 @@ where
     fn kill_session(
         &mut self,
         session_id: &str,
+        expected_generation: &str,
     ) -> Result<ResolvedNewTabRecoveryEffectResult, Self::Error> {
-        kill_session_recovery_effect(session_id, &mut self.session_killer)
+        kill_session_recovery_effect(session_id, expected_generation, &mut self.session_killer)
             .map_err(ResolvedNewTabRecoveryLocalEffectError::Kill)
     }
 
@@ -2085,6 +3800,7 @@ where
 }
 
 /// Error vocabulary for the complete headless resolved new-tab recovery effects object.
+#[cfg(test)]
 #[derive(Debug)]
 pub enum ResolvedNewTabRecoveryCompleteEffectError<KillError, RendererError> {
     Io(std::io::Error),
@@ -2093,6 +3809,7 @@ pub enum ResolvedNewTabRecoveryCompleteEffectError<KillError, RendererError> {
     Renderer(RendererError),
 }
 
+#[cfg(test)]
 impl<KillError: std::fmt::Display, RendererError: std::fmt::Display> std::fmt::Display
     for ResolvedNewTabRecoveryCompleteEffectError<KillError, RendererError>
 {
@@ -2106,6 +3823,7 @@ impl<KillError: std::fmt::Display, RendererError: std::fmt::Display> std::fmt::D
     }
 }
 
+#[cfg(test)]
 impl<KillError, RendererError> std::error::Error
     for ResolvedNewTabRecoveryCompleteEffectError<KillError, RendererError>
 where
@@ -2127,6 +3845,7 @@ where
 /// This composes the record-local filesystem/session/layout effects with an injected renderer-state
 /// controller. Foreground failure branches construct it as the complete live recovery adapter;
 /// renderer restore/reconcile details remain owned by the injected controller.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct ResolvedNewTabRecoveryCompleteEffects<K, C> {
     paths: maestro_shell::AppPaths,
@@ -2135,6 +3854,7 @@ pub struct ResolvedNewTabRecoveryCompleteEffects<K, C> {
     renderer_controller: C,
 }
 
+#[cfg(test)]
 impl<K, C> ResolvedNewTabRecoveryCompleteEffects<K, C> {
     pub fn new(
         paths: maestro_shell::AppPaths,
@@ -2150,31 +3870,16 @@ impl<K, C> ResolvedNewTabRecoveryCompleteEffects<K, C> {
         }
     }
 
-    pub fn paths(&self) -> &maestro_shell::AppPaths {
-        &self.paths
-    }
-
-    pub fn now_ms(&self) -> u64 {
-        self.now_ms
-    }
-
     pub fn session_killer(&self) -> &K {
         &self.session_killer
-    }
-
-    pub fn session_killer_mut(&mut self) -> &mut K {
-        &mut self.session_killer
     }
 
     pub fn renderer_controller(&self) -> &C {
         &self.renderer_controller
     }
-
-    pub fn renderer_controller_mut(&mut self) -> &mut C {
-        &mut self.renderer_controller
-    }
 }
 
+#[cfg(test)]
 impl<K, C> ResolvedNewTabRecoveryEffects for ResolvedNewTabRecoveryCompleteEffects<K, C>
 where
     K: NewTabRecoverySessionKiller,
@@ -2192,8 +3897,9 @@ where
     fn kill_session(
         &mut self,
         session_id: &str,
+        expected_generation: &str,
     ) -> Result<ResolvedNewTabRecoveryEffectResult, Self::Error> {
-        kill_session_recovery_effect(session_id, &mut self.session_killer)
+        kill_session_recovery_effect(session_id, expected_generation, &mut self.session_killer)
             .map_err(ResolvedNewTabRecoveryCompleteEffectError::Kill)
     }
 
@@ -2235,7 +3941,9 @@ pub struct NewTabForegroundRequest<'a> {
     pub socket_path: std::path::PathBuf,
     pub window_id: &'a str,
     pub plan: &'a NewTabPlan,
-    pub argv: &'a [String],
+    /// Consume-once launch description. It is converted into a Shell-owned opaque prepared spec
+    /// only after this attempt's exact workspace/cwd has been prepared.
+    pub launch: NewTabForegroundLaunch,
     pub cols: u16,
     pub rows: u16,
     pub now_ms: u64,
@@ -2245,6 +3953,14 @@ pub struct NewTabForegroundRequest<'a> {
     /// the layout-record step differs — so a GUI split reuses the whole new-tab launch path. `None`
     /// is the existing plain new-tab behavior, byte-identical.
     pub split_from: Option<NewTabSplitFrom>,
+    /// Exact source lifetime when a split inherits its Workspace from that pane. The shell core
+    /// revalidates this row and the source tab edge in the same transaction that prepares the
+    /// child; ordinary new tabs and splits with independently selected Workspaces leave it empty.
+    pub split_source_session: Option<&'a maestro_shell::SessionRecord>,
+    /// Optional caller-reviewed Project owner (used by React intents carrying an explicit
+    /// project id). A later window reassignment is a refusal, never authority to adopt the new
+    /// owner by window id alone.
+    pub expected_project_id: Option<&'a str>,
 }
 
 /// Names the source tab and axis for a split-tab record on [`NewTabForegroundRequest`]. The new tab
@@ -2267,26 +3983,47 @@ pub struct NewTabSplitFrom {
 /// Side effects occur in this exact order:
 ///
 /// ```text
-/// prepare_new_tab_scratch_workspace
+/// prepare_fresh_scratch_cwd (exclusive leaf + opaque cleanup receipt)
 ///   -> new_tab_prepared_start_params
-///   -> start_new_tab_prepared_session
-///   -> record_new_tab_in_window_layout
-///   -> new_tab_strip_projection
-///   -> send_new_tab_set_tab_strip
-///   -> send_new_tab_attach_session
+///   -> prepare_new_{tab|split}_session (one IMMEDIATE Unknown + placement transaction)
+///   -> start_prepared_new_session_for_renderer (one conditional Absent(None))
+///   -> same-IMMEDIATE Live(G) finalization + rebased compensation receipt
+///   -> load_viewport_snapshot
+///   -> send_new_tab_attach_session_with_handoff (atomic exact viewport + strip + Claim)
 /// ```
 ///
-/// The returned [`NewTabForegroundSuccess`] contains the post-record projections that the caller may
-/// adopt only on `Ok`. On error, this function does not roll back records, remove scratch dirs, or
-/// kill sessions; the foreground listener logs and continues.
+/// The returned [`NewTabForegroundSuccess`] remains pending until the correlated renderer
+/// disposition claims the exact viewport. Typed error paths either consume their exact prepared
+/// compensation/cleanup authority or retain ambiguous state for forward recovery; no id-based
+/// rollback or unconditional scratch deletion is permitted.
 pub fn run_new_tab_foreground_pipeline(
     request: NewTabForegroundRequest<'_>,
     env: &impl maestro_shell::EnvLookup,
     runtime: &mut RendererTabRuntime,
 ) -> Result<NewTabForegroundSuccess, NewTabForegroundError> {
-    let prepared = prepare_new_tab_scratch_workspace(request.paths, request.plan, "")
-        .map_err(NewTabForegroundError::WorkspacePrepare)?;
-    run_new_tab_foreground_pipeline_from_prepared(request, prepared, env, runtime)
+    if runtime.handoff_is_pending() {
+        return Err(NewTabForegroundError::WorkspacePrepare(
+            NewTabWorkspacePrepareError::RendererHandoffPending,
+        ));
+    }
+    validate_new_tab_launch_source(request.plan, &request.launch).map_err(|error| {
+        NewTabForegroundError::StartParams {
+            cwd: PathBuf::new(),
+            scratch: None,
+            error,
+        }
+    })?;
+    let (prepared, scratch) =
+        prepare_fresh_new_tab_scratch_workspace(request.paths, request.plan, "")
+            .map_err(NewTabForegroundError::WorkspacePrepare)?;
+    run_new_tab_foreground_pipeline_from_prepared(
+        request,
+        prepared,
+        Some(scratch),
+        None,
+        env,
+        runtime,
+    )
 }
 
 /// The already-consented consent-gated foreground new-tab entry point for `Worktree` AND `RepoWrite`
@@ -2300,97 +4037,496 @@ pub fn run_new_tab_foreground_pipeline(
 /// picker resolvers (which read consent from the fresh record and never grant it); `fresh_workspace` is
 /// that same fresh authoritative record.
 ///
-/// The post-preparation side-effect order is shared with the scratch path
-/// (see [`run_new_tab_foreground_pipeline`]). On any error this function does not roll back records,
-/// remove any prepared worktree, or kill sessions — prepared worktrees are left for idempotent reuse;
-/// the foreground listener logs and continues.
+/// The post-preparation transaction/start/disposition order is shared with the scratch path (see
+/// [`run_new_tab_foreground_pipeline`]). Worktree/RepoWrite paths never mint scratch-removal
+/// authority; typed PreparedNew compensation owns any safe durable rollback.
 pub fn run_new_tab_foreground_pipeline_with_consent(
     request: NewTabForegroundRequest<'_>,
     fresh_workspace: &maestro_shell::Workspace,
     env: &impl maestro_shell::EnvLookup,
     runtime: &mut RendererTabRuntime,
 ) -> Result<NewTabForegroundSuccess, NewTabForegroundError> {
+    if runtime.handoff_is_pending() {
+        return Err(NewTabForegroundError::WorkspacePrepare(
+            NewTabWorkspacePrepareError::RendererHandoffPending,
+        ));
+    }
+    validate_new_tab_launch_source(request.plan, &request.launch).map_err(|error| {
+        NewTabForegroundError::StartParams {
+            cwd: PathBuf::new(),
+            scratch: None,
+            error,
+        }
+    })?;
     let session_id = new_tab_plan_session_id(request.plan).ok_or(
         NewTabForegroundError::WorkspacePrepare(NewTabWorkspacePrepareError::NotCreate),
     )?;
-    let prepared = maestro_shell::prepare_workspace_with_consent(
-        request.paths,
-        fresh_workspace.policy,
-        fresh_workspace,
-        session_id,
+    let (prepared, scratch) = if fresh_workspace.policy
+        == maestro_shell::WorkspacePolicy::ScratchCwd
+    {
+        maestro_shell::check_policy_consent(fresh_workspace, fresh_workspace.policy).map_err(
+            |error| {
+                NewTabForegroundError::WorkspacePrepare(NewTabWorkspacePrepareError::WorkspaceExec(
+                    maestro_shell::WorkspaceExecError::Consent(error),
+                ))
+            },
+        )?;
+        let (prepared, receipt) = maestro_shell::prepare_fresh_scratch_cwd(
+            request.paths,
+            &fresh_workspace.workspace_id,
+            session_id,
+            &fresh_workspace.root,
+        )
+        .map_err(|error| {
+            NewTabForegroundError::WorkspacePrepare(NewTabWorkspacePrepareError::WorkspaceExec(
+                error,
+            ))
+        })?
+        .into_parts();
+        (
+            prepared,
+            Some(NewTabScratchRemovalAuthority::from_fresh_receipt(receipt)),
+        )
+    } else {
+        (
+            maestro_shell::prepare_workspace_with_consent(
+                request.paths,
+                fresh_workspace.policy,
+                fresh_workspace,
+                session_id,
+            )
+            .map_err(|error| {
+                NewTabForegroundError::WorkspacePrepare(NewTabWorkspacePrepareError::WorkspaceExec(
+                    error,
+                ))
+            })?,
+            None,
+        )
+    };
+    run_new_tab_foreground_pipeline_from_prepared(
+        request,
+        prepared,
+        scratch,
+        Some(fresh_workspace.clone()),
+        env,
+        runtime,
     )
-    .map_err(|e| {
-        NewTabForegroundError::WorkspacePrepare(NewTabWorkspacePrepareError::WorkspaceExec(e))
-    })?;
-    run_new_tab_foreground_pipeline_from_prepared(request, prepared, env, runtime)
 }
 
-/// Shared post-preparation foreground new-tab flow. Both the scratch and already-consented worktree
-/// entry points converge here once a [`maestro_shell::PreparedWorkspace`] exists, so the
-/// session-start / layout-record / renderer-projection side effects (and their exact order) are
-/// identical regardless of how the workspace was prepared:
+/// Shared post-preparation foreground new-tab flow. Scratch, Worktree, and RepoWrite entry points
+/// converge here once a [`maestro_shell::PreparedWorkspace`] exists. The exact graph is prepared
+/// before the single daemon request, then finalized Live before renderer projection:
 ///
 /// ```text
 /// new_tab_prepared_start_params
-///   -> start_new_tab_prepared_session
-///   -> record_new_tab_in_window_layout
-///   -> new_tab_strip_projection
-///   -> send_new_tab_set_tab_strip
-///   -> send_new_tab_attach_session
+///   -> exact Window/Project/Workspace/source proof
+///   -> prepare_new_{tab|split}_session (Unknown + placement, atomic)
+///   -> start_prepared_new_session_for_renderer
+///   -> Live(G) + release-journal finalization (atomic)
+///   -> exact viewport snapshot/projection
+///   -> send_new_tab_attach_session_with_handoff
 /// ```
+fn prepared_new_tab_failure(
+    prepared: &maestro_shell::PreparedWorkspace,
+    scratch: &mut Option<NewTabScratchRemovalAuthority>,
+    error: NewTabPreparedSessionError,
+) -> NewTabForegroundError {
+    NewTabForegroundError::PreparedSessionStart {
+        cwd: prepared.cwd.clone(),
+        scratch: scratch.take(),
+        error,
+    }
+}
+
 fn run_new_tab_foreground_pipeline_from_prepared(
     request: NewTabForegroundRequest<'_>,
     prepared: maestro_shell::PreparedWorkspace,
+    scratch: Option<NewTabScratchRemovalAuthority>,
+    reviewed_workspace: Option<maestro_shell::Workspace>,
     env: &impl maestro_shell::EnvLookup,
     runtime: &mut RendererTabRuntime,
 ) -> Result<NewTabForegroundSuccess, NewTabForegroundError> {
-    let prepared_start = new_tab_prepared_start_params(
-        request.plan,
-        &prepared,
-        request.argv,
-        request.cols,
-        request.rows,
-        request.now_ms,
-    )
-    .map_err(|error| NewTabForegroundError::StartParams {
-        cwd: prepared.cwd.clone(),
-        error,
-    })?;
-    let started = start_new_tab_prepared_session(
-        request.paths,
-        Some(request.socket_path),
+    run_new_tab_foreground_pipeline_from_prepared_with_reprobe(
+        request,
+        prepared,
+        scratch,
+        reviewed_workspace,
         env,
-        &prepared_start,
+        runtime,
+        |source_argv, selected_agent, cwd| {
+            crate::launch_preflight::reprobe_prepared_argv(source_argv, selected_agent, cwd)
+                .map_err(|_| NewTabStartParamsError::PreparedLaunch)
+        },
     )
-    .map_err(|error| NewTabForegroundError::SessionStart {
-        cwd: prepared.cwd.clone(),
-        error,
-    })?;
-    let recorded = record_new_tab_in_window_layout(
-        request.paths,
-        request.window_id,
-        &started,
-        request.split_from.as_ref(),
-        request.now_ms,
-    )
-    .map_err(|error| NewTabForegroundError::LayoutRecord {
-        cwd: prepared.cwd.clone(),
-        error,
-    })?;
-    let projection = new_tab_strip_projection(request.window_id, &recorded)
-        .map_err(NewTabForegroundError::Projection)?;
+}
 
-    send_new_tab_set_tab_strip(runtime, &projection).map_err(NewTabForegroundError::SetTabStrip)?;
-    send_new_tab_attach_session(runtime, &projection)
-        .map_err(NewTabForegroundError::AttachSession)?;
+fn run_new_tab_foreground_pipeline_from_prepared_with_reprobe<R>(
+    request: NewTabForegroundRequest<'_>,
+    prepared: maestro_shell::PreparedWorkspace,
+    mut scratch: Option<NewTabScratchRemovalAuthority>,
+    reviewed_workspace: Option<maestro_shell::Workspace>,
+    env: &impl maestro_shell::EnvLookup,
+    runtime: &mut RendererTabRuntime,
+    mut reprobe: R,
+) -> Result<NewTabForegroundSuccess, NewTabForegroundError>
+where
+    R: FnMut(&[String], Option<&str>, &Path) -> Result<(), NewTabStartParamsError>,
+{
+    let (tab_id, title) =
+        validate_new_tab_prepared_identity(request.plan, &prepared, Some(&request.launch))
+            .map_err(|error| NewTabForegroundError::StartParams {
+                cwd: prepared.cwd.clone(),
+                scratch: scratch.take(),
+                error,
+            })?;
+    let session_spec = request
+        .launch
+        .into_session_spec_with_reprobe(
+            &prepared,
+            request.cols,
+            request.rows,
+            request.now_ms,
+            &mut reprobe,
+        )
+        .map_err(|error| NewTabForegroundError::StartParams {
+            cwd: prepared.cwd.clone(),
+            scratch: scratch.take(),
+            error,
+        })?;
+    let windows = maestro_shell::WindowLayoutService::new(request.paths);
+    let expected_window = windows
+        .load_snapshot(request.window_id)
+        .map_err(|error| {
+            prepared_new_tab_failure(
+                &prepared,
+                &mut scratch,
+                NewTabPreparedSessionError::GraphAuthority {
+                    detail: error.to_string(),
+                },
+            )
+        })?
+        .ok_or_else(|| {
+            prepared_new_tab_failure(
+                &prepared,
+                &mut scratch,
+                NewTabPreparedSessionError::GraphAuthority {
+                    detail: format!("new-tab target window {:?} is missing", request.window_id),
+                },
+            )
+        })?;
+    let project_id = expected_window.project_id.clone().ok_or_else(|| {
+        prepared_new_tab_failure(
+            &prepared,
+            &mut scratch,
+            NewTabPreparedSessionError::GraphAuthority {
+                detail: format!(
+                    "new-tab target window {:?} has no exact Project owner",
+                    request.window_id
+                ),
+            },
+        )
+    })?;
+    let proof = match windows
+        .prove_project_assignment(request.window_id, &project_id)
+        .map_err(|error| {
+            prepared_new_tab_failure(
+                &prepared,
+                &mut scratch,
+                NewTabPreparedSessionError::GraphAuthority {
+                    detail: error.to_string(),
+                },
+            )
+        })? {
+        maestro_shell::WindowProjectAssignmentProofOutcome::Proven(proof) => proof,
+        outcome => {
+            return Err(prepared_new_tab_failure(
+                &prepared,
+                &mut scratch,
+                NewTabPreparedSessionError::GraphAuthority {
+                    detail: format!(
+                        "new-tab target window/project authority is unavailable: {outcome:?}"
+                    ),
+                },
+            ))
+        }
+    };
+    if request
+        .expected_project_id
+        .is_some_and(|expected| expected != proof.project.project_id)
+    {
+        return Err(prepared_new_tab_failure(
+            &prepared,
+            &mut scratch,
+            NewTabPreparedSessionError::GraphAuthority {
+                detail: format!(
+                    "new-tab target Project changed (expected {:?}, got {:?})",
+                    request.expected_project_id, proof.project.project_id
+                ),
+            },
+        ));
+    }
+    let workspace = match reviewed_workspace {
+        Some(workspace) => workspace,
+        None => match maestro_shell::load_one::<maestro_shell::Workspace>(
+            request.paths,
+            maestro_shell::RecordKind::Workspace,
+            &prepared.workspace_id,
+        )
+        .map_err(|error| {
+            prepared_new_tab_failure(
+                &prepared,
+                &mut scratch,
+                NewTabPreparedSessionError::GraphAuthority {
+                    detail: error.to_string(),
+                },
+            )
+        })? {
+            Some(maestro_shell::LoadOutcome::Loaded(workspace)) => workspace,
+            Some(outcome) => {
+                return Err(prepared_new_tab_failure(
+                    &prepared,
+                    &mut scratch,
+                    NewTabPreparedSessionError::GraphAuthority {
+                        detail: format!(
+                            "new-tab Workspace {:?} is not current/loadable: {outcome:?}",
+                            prepared.workspace_id
+                        ),
+                    },
+                ))
+            }
+            None => {
+                return Err(prepared_new_tab_failure(
+                    &prepared,
+                    &mut scratch,
+                    NewTabPreparedSessionError::GraphAuthority {
+                        detail: format!(
+                        "new-tab Workspace {:?} is missing; implicit workspace creation is refused",
+                        prepared.workspace_id
+                    ),
+                    },
+                ))
+            }
+        },
+    };
+    if workspace.workspace_id != prepared.workspace_id || workspace.policy != prepared.policy {
+        return Err(prepared_new_tab_failure(
+            &prepared,
+            &mut scratch,
+            NewTabPreparedSessionError::GraphAuthority {
+                detail: "prepared cwd and exact Workspace authority disagree".into(),
+            },
+        ));
+    }
+    let sealed_start = match request.split_from.as_ref() {
+        Some(split) => match request.split_source_session {
+            Some(source) => windows.prepare_new_split_session_from_source_with_spec(
+                &proof.window,
+                &proof.project,
+                &workspace,
+                source,
+                session_spec,
+                &split.from_tab_id,
+                &tab_id,
+                &title,
+                split.axis,
+            ),
+            None => windows.prepare_new_split_session_with_spec(
+                &proof.window,
+                &proof.project,
+                &workspace,
+                session_spec,
+                &split.from_tab_id,
+                &tab_id,
+                &title,
+                split.axis,
+            ),
+        },
+        None => windows.prepare_new_tab_session_with_spec(
+            &proof.window,
+            &proof.project,
+            &workspace,
+            session_spec,
+            &tab_id,
+            &title,
+            false,
+            maestro_shell::AttentionState::default(),
+        ),
+    }
+    .map_err(|error| {
+        prepared_new_tab_failure(
+            &prepared,
+            &mut scratch,
+            NewTabPreparedSessionError::GraphAuthority {
+                detail: error.to_string(),
+            },
+        )
+    })?;
 
-    let strip_tabs: Vec<WindowTabJson> = recorded.layout.tabs.iter().map(tab_record_json).collect();
-    let selection = selection_from_strip_tabs(&strip_tabs);
+    let runtime_start = maestro_shell::ShellRuntime::new(request.paths)
+        .start_prepared_new_session_for_renderer(Some(request.socket_path), env, sealed_start);
+    let started = match runtime_start {
+        Ok(started) => started,
+        Err(maestro_shell::PreparedNewSessionRuntimeError::DefinitelyUnpublished {
+            error,
+            start,
+        }) => {
+            let compensation = cancel_prepared_new_tab_status(request.paths, start, request.now_ms);
+            return Err(prepared_new_tab_failure(
+                &prepared,
+                &mut scratch,
+                NewTabPreparedSessionError::DefinitelyUnpublished {
+                    error,
+                    compensation,
+                },
+            ));
+        }
+        Err(maestro_shell::PreparedNewSessionRuntimeError::Refused {
+            error,
+            compensation,
+        }) => {
+            let compensation =
+                compensate_prepared_new_tab_status(request.paths, compensation, request.now_ms);
+            return Err(NewTabForegroundError::PreparedSessionStart {
+                cwd: prepared.cwd.clone(),
+                scratch: None,
+                error: NewTabPreparedSessionError::Refused {
+                    error,
+                    compensation,
+                },
+            });
+        }
+        Err(maestro_shell::PreparedNewSessionRuntimeError::PossiblyApplied { error }) => {
+            let detail = error.to_string();
+            settle_new_tab_shell_runtime_error(error);
+            return Err(NewTabForegroundError::PreparedSessionStart {
+                cwd: prepared.cwd.clone(),
+                scratch: None,
+                error: NewTabPreparedSessionError::PossiblyApplied { detail },
+            });
+        }
+    };
+    // A daemon request succeeded. Fresh-directory cleanup authority is now permanently burned;
+    // all later recovery is durable/generation-bound and never removes the cwd.
+    drop(scratch.take());
+    let (_socket_path, expected_session, compensation, attachment_handoff) = started.into_parts();
+    let started_session_id = expected_session.session_id.clone();
+    let started_session_generation = match expected_session.last_known_generation.clone() {
+        Some(generation) => generation,
+        None => {
+            if let Some(authority) = attachment_handoff {
+                cancel_new_tab_attachment_handoff(authority);
+            }
+            let compensation =
+                compensate_prepared_new_tab_status(request.paths, compensation, request.now_ms);
+            return Err(NewTabForegroundError::PreparedSessionStart {
+                cwd: prepared.cwd.clone(),
+                scratch: None,
+                error: NewTabPreparedSessionError::FinalizedInvariant {
+                    detail: "finalized prepared Session supplied no PTY generation".into(),
+                    compensation,
+                },
+            });
+        }
+    };
+    let Some(attachment_handoff) = attachment_handoff else {
+        return Err(NewTabForegroundError::PreparedStartedHandoffMissing {
+            session_id: started_session_id.clone(),
+            session_generation: started_session_generation.clone(),
+            rollback_authority: Some(NewTabPreparedRollbackAuthority {
+                compensation,
+                session_id: started_session_id,
+                expected_generation: started_session_generation,
+                tab_id,
+                window_id: request.window_id.to_string(),
+                attachment_handoff: None,
+            }),
+        });
+    };
+    let renderer_handoff =
+        maestro_renderer::RendererAttachmentHandoff::new(attachment_handoff.clone());
+    let exact_snapshot = match maestro_shell::WindowLayoutService::new(request.paths)
+        .load_viewport_snapshot(request.window_id)
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return Err(NewTabForegroundError::PreparedGenerationBoundProjection {
+                session_id: started_session_id.clone(),
+                session_generation: started_session_generation.clone(),
+                rollback_authority: Some(NewTabPreparedRollbackAuthority {
+                    compensation,
+                    session_id: started_session_id,
+                    expected_generation: started_session_generation,
+                    tab_id,
+                    window_id: request.window_id.to_string(),
+                    attachment_handoff: Some(attachment_handoff),
+                }),
+                error: NewTabStripProjectionError::ExactViewportSnapshot(error.to_string()),
+            });
+        }
+    };
+    let exact_projection =
+        match crate::renderer_viewport_projection_from_snapshot(&exact_snapshot, &tab_id) {
+            Ok(projection) => projection,
+            Err(error) => {
+                return Err(NewTabForegroundError::PreparedGenerationBoundProjection {
+                    session_id: started_session_id.clone(),
+                    session_generation: started_session_generation.clone(),
+                    rollback_authority: Some(NewTabPreparedRollbackAuthority {
+                        compensation,
+                        session_id: started_session_id,
+                        expected_generation: started_session_generation,
+                        tab_id,
+                        window_id: request.window_id.to_string(),
+                        attachment_handoff: Some(attachment_handoff),
+                    }),
+                    error: NewTabStripProjectionError::ExactViewport(error),
+                });
+            }
+        };
+
+    if let Err(error) = send_new_tab_attach_session_with_handoff(
+        runtime,
+        &exact_projection,
+        renderer_handoff.clone(),
+    ) {
+        return Err(
+            NewTabForegroundError::PreparedGenerationBoundAttachSession {
+                session_id: started_session_id.clone(),
+                session_generation: started_session_generation.clone(),
+                rollback_authority: Some(NewTabPreparedRollbackAuthority {
+                    compensation,
+                    session_id: started_session_id,
+                    expected_generation: started_session_generation,
+                    tab_id,
+                    window_id: request.window_id.to_string(),
+                    attachment_handoff: Some(attachment_handoff),
+                }),
+                error,
+            },
+        );
+    }
+
+    let strip_tabs = exact_projection.strip_tabs().to_vec();
+    let selection = exact_projection.selection().to_vec();
     Ok(NewTabForegroundSuccess {
-        tab_id: projection.tab_id,
-        session_id: projection.session_id,
+        tab_id: exact_projection.target().tab_id.clone(),
+        session_id: exact_projection.target().session_id.clone(),
         strip_tabs,
         selection,
+        pending_handoff: NewTabForegroundPendingHandoff {
+            handoff: renderer_handoff,
+            expected_generation: started_session_generation.clone(),
+            rollback_authority: Some(NewTabPreparedRollbackAuthority {
+                compensation,
+                session_id: started_session_id,
+                expected_generation: started_session_generation,
+                tab_id,
+                window_id: request.window_id.to_string(),
+                // Renderer owns cancellation after command delivery; a non-Claimed disposition
+                // has already settled it and returns any retry authority explicitly.
+                attachment_handoff: None,
+            }),
+        },
     })
 }
 
@@ -2403,7 +4539,7 @@ fn new_tab_plan_session_id(plan: &NewTabPlan) -> Option<&str> {
     }
 }
 
-/// How one preset slot was brought back to life by [`execute_preset_restore`].
+/// How one preset slot will be reported once exact asynchronous preset restore is implemented.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PresetRestoreSlotKind {
     /// A fresh session was launched through the ordinary new-tab foreground pipeline.
@@ -2430,12 +4566,19 @@ pub struct PresetRestoreSlotOutcome {
     pub split_parent_tab_id: Option<String>,
 }
 
-/// Why [`execute_preset_restore`] could not finish a slot. The executor is fail-fast: the first slot
-/// error stops the walk (later slots are not attempted) so a partially-built layout never silently
-/// drops the tail. Slots already recorded before the failure stay on disk (no rollback) — exactly
-/// like the foreground pipeline, which also never rolls back records on a later-step failure.
+/// Why preset restore cannot begin. The current availability gate refuses every non-empty plan
+/// before id minting, layout creation, renderer publication, or daemon work.
 #[derive(Debug)]
 pub enum PresetRestoreError {
+    /// Another renderer handoff is unresolved. Refuse the whole preset before any id mint,
+    /// session start, or layout mutation.
+    RendererHandoffPending,
+    /// Multi-slot restore has no asynchronous per-slot disposition state machine yet. Refuse every
+    /// LaunchFresh plan before id minting, daemon startup, or durable layout mutation.
+    LaunchFreshRequiresAsyncHandoff { index: u32 },
+    /// Reattach currently carries only a textual session id. Refuse before id mint/layout mutation
+    /// until an exact generation + renderer publication receipt can join the topology transaction.
+    ReattachRequiresExactViewport { index: u32 },
     /// A LaunchFresh slot's new-tab foreground pipeline failed (carrying the slot index).
     Launch {
         index: u32,
@@ -2454,6 +4597,20 @@ pub enum PresetRestoreError {
 impl std::fmt::Display for PresetRestoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            PresetRestoreError::RendererHandoffPending => {
+                write!(
+                    f,
+                    "renderer handoff is still pending; preset restore refused"
+                )
+            }
+            PresetRestoreError::LaunchFreshRequiresAsyncHandoff { index } => write!(
+                f,
+                "restore slot {index} requires asynchronous renderer handoff settlement"
+            ),
+            PresetRestoreError::ReattachRequiresExactViewport { index } => write!(
+                f,
+                "restore slot {index} requires exact Session/renderer viewport authority"
+            ),
             PresetRestoreError::Launch { index, error } => {
                 write!(f, "restore slot {index} launch failed: {error}")
             }
@@ -2470,6 +4627,9 @@ impl std::fmt::Display for PresetRestoreError {
 impl std::error::Error for PresetRestoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            PresetRestoreError::RendererHandoffPending => None,
+            PresetRestoreError::LaunchFreshRequiresAsyncHandoff { .. } => None,
+            PresetRestoreError::ReattachRequiresExactViewport { .. } => None,
             PresetRestoreError::Launch { error, .. } => Some(error),
             PresetRestoreError::Reattach { error, .. } => Some(error),
             PresetRestoreError::TabIdMintExhausted { .. } => None,
@@ -2497,233 +4657,44 @@ pub struct PresetRestoreRequest<'a> {
     pub now_ms: u64,
 }
 
-/// Drive a preset restore: walk the ordered restore plan and, per slot, either LAUNCH a fresh
-/// session through the ordinary new-tab foreground pipeline ([`run_new_tab_foreground_pipeline`]) or
-/// REATTACH the slot's still-live hinted session by recording a tab against it (no relaunch). This is
-/// the execution path for layout-preset restore; it reuses existing launch plumbing rather than inventing
-/// a second launch path.
+/// Pure, effect-free availability preflight shared by every preset-restore entry point.
 ///
-/// Invariants:
-/// - Slots are processed strictly in plan order, so a split child is always recorded AFTER its
-///   parent (capture renumbers slots so a parent precedes its children).
-/// - Each slot gets a FRESHLY-MINTED tab id (unique against the window's existing tabs and ids minted
-///   earlier in this walk); the capture-time tab id is never reused as a live id.
-/// - A slot's `split_from` is resolved by matching its capture-time `split_from.tab_id` against the
-///   `source_tab_id` of an EARLIER slot in this same restore, then substituting that slot's minted
-///   tab id. An unresolved source (parent not in this restore, empty `source_tab_id`, or a forward
-///   reference) records the slot UNSPLIT — a top-level tab — as the safe fallback. A resolved split
-///   is recorded via [`maestro_shell::WindowLayoutService::split_tab`] so the split child stays
-///   INSIDE the same top-level window layout, never as a new top-level tab header.
-/// - Pin state and a split's `ratio_per_mille` are applied after the tab is recorded, so the rebuilt
-///   arrangement matches the captured one.
-///
-/// Fail-fast: the first slot error stops the walk (returning the slots completed so far is not done;
-/// the error is returned). Records written before the failure are left in place (no rollback), like
-/// the foreground pipeline.
-pub fn execute_preset_restore(
-    request: PresetRestoreRequest<'_>,
-    env: &impl maestro_shell::EnvLookup,
-    id_gen: &mut dyn IdGen,
-    runtime: &mut RendererTabRuntime,
-) -> Result<Vec<PresetRestoreSlotOutcome>, PresetRestoreError> {
-    let layout_service = maestro_shell::WindowLayoutService::new(request.paths);
-    let mut outcomes: Vec<PresetRestoreSlotOutcome> = Vec::with_capacity(request.plan.len());
-    // Capture-time source tab id -> freshly minted tab id, for resolving later slots' `split_from`.
-    let mut source_to_minted: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-
-    for (slot_pos, slot) in request.plan.iter().enumerate() {
-        // Mint a tab id unique against the window's CURRENT tabs plus everything minted in this walk.
-        let existing_tab_ids = window_existing_tab_ids(&layout_service, request.window_id);
-        let reserved: Vec<&str> = outcomes.iter().map(|o| o.tab_id.as_str()).collect();
-        let Some(tab_id) = mint_unique_id(&existing_tab_ids, &reserved, || id_gen.next_tab_id())
-        else {
-            return Err(PresetRestoreError::TabIdMintExhausted { index: slot.index });
-        };
-
-        // Resolve `split_from` (if any) to a parent that was ALREADY restored in this walk.
-        let resolved_split = slot.split_from.as_ref().and_then(|sf| {
-            source_to_minted
-                .get(&sf.tab_id)
-                .map(|parent| (parent.clone(), sf.axis, sf.ratio_per_mille))
-        });
-        let split_from_for_launch =
-            resolved_split
-                .as_ref()
-                .map(|(parent, axis, _)| NewTabSplitFrom {
-                    from_tab_id: parent.clone(),
-                    axis: *axis,
-                });
-
-        match &slot.action {
-            maestro_shell::PresetRestoreAction::LaunchFresh => {
-                // Build a Create plan carrying the minted ids + the policy's presentation fields, then
-                // run the ordinary foreground pipeline (workspace prep -> session start -> layout
-                // record -> renderer projection/attach). The renderer sends land on the app-owned
-                // `runtime` whose receiver the caller keeps alive, so they succeed headlessly.
-                let session_id = mint_session_id_for_restore(id_gen, &tab_id, &outcomes);
-                let plan = NewTabPlan::Create {
-                    tab_id: tab_id.clone(),
-                    session_id,
-                    source: request.policy.source.clone(),
-                    workspace: request.policy.workspace,
-                    workspace_id: request.policy.workspace_id.clone(),
-                    cwd_basis: request.policy.cwd_basis.clone(),
-                    title: slot.title.clone(),
-                };
-                let success = run_new_tab_foreground_pipeline(
-                    NewTabForegroundRequest {
-                        paths: request.paths,
-                        socket_path: request.socket_path.clone(),
-                        window_id: request.window_id,
-                        plan: &plan,
-                        argv: request.argv,
-                        cols: request.cols,
-                        rows: request.rows,
-                        now_ms: request.now_ms,
-                        split_from: split_from_for_launch,
-                    },
-                    env,
-                    runtime,
-                )
-                .map_err(|error| PresetRestoreError::Launch {
-                    index: slot.index,
-                    error,
-                })?;
-                apply_slot_fidelity(
-                    &layout_service,
-                    request.window_id,
-                    &tab_id,
-                    slot.pinned,
-                    resolved_split.as_ref().and_then(|(_, _, ratio)| *ratio),
-                    request.now_ms,
-                )
-                .map_err(|error| PresetRestoreError::Reattach {
-                    index: slot.index,
-                    error,
-                })?;
-                source_to_minted.insert(
-                    source_tab_id_at(request.source_tabs, slot_pos),
-                    tab_id.clone(),
-                );
-                outcomes.push(PresetRestoreSlotOutcome {
-                    index: slot.index,
-                    tab_id,
-                    session_id: success.session_id,
-                    kind: PresetRestoreSlotKind::Launched,
-                    split_parent_tab_id: resolved_split.map(|(parent, _, _)| parent),
-                });
-            }
-            maestro_shell::PresetRestoreAction::Reattach { session_id } => {
-                // The hinted session is live: record a tab against it WITHOUT relaunching. This is the
-                // no-launch record path (not a second launch path): identical layout recording to the
-                // foreground pipeline's record step, only the session start is skipped.
-                let record_result = match &split_from_for_launch {
-                    Some(split) => layout_service.split_tab(
-                        request.window_id,
-                        &split.from_tab_id,
-                        &tab_id,
-                        session_id,
-                        &slot.title,
-                        split.axis,
-                        request.now_ms,
-                    ),
-                    None => layout_service.open_tab(
-                        request.window_id,
-                        &tab_id,
-                        session_id,
-                        &slot.title,
-                        false,
-                        maestro_shell::AttentionState::default(),
-                        request.now_ms,
-                    ),
-                };
-                record_result.map_err(|error| PresetRestoreError::Reattach {
-                    index: slot.index,
-                    error,
-                })?;
-                apply_slot_fidelity(
-                    &layout_service,
-                    request.window_id,
-                    &tab_id,
-                    slot.pinned,
-                    resolved_split.as_ref().and_then(|(_, _, ratio)| *ratio),
-                    request.now_ms,
-                )
-                .map_err(|error| PresetRestoreError::Reattach {
-                    index: slot.index,
-                    error,
-                })?;
-                source_to_minted.insert(
-                    source_tab_id_at(request.source_tabs, slot_pos),
-                    tab_id.clone(),
-                );
-                outcomes.push(PresetRestoreSlotOutcome {
-                    index: slot.index,
-                    tab_id,
-                    session_id: session_id.clone(),
-                    kind: PresetRestoreSlotKind::Reattached,
-                    split_parent_tab_id: resolved_split.map(|(parent, _, _)| parent),
-                });
-            }
+/// Empty plans are legal no-ops. Every non-empty plan is refused at its first slot until the exact
+/// topology coordinator can atomically combine layout placement with a correlated renderer proof.
+/// Keeping the renderer-pending bit explicit lets callers run this check before creating a target
+/// window, preparing logs, resolving/spawning a daemon, or minting an id.
+pub fn preflight_preset_restore(
+    plan: &[maestro_shell::PresetRestoreSlot],
+    renderer_handoff_pending: bool,
+) -> Result<(), PresetRestoreError> {
+    let Some(slot) = plan.first() else {
+        return Ok(());
+    };
+    if renderer_handoff_pending {
+        return Err(PresetRestoreError::RendererHandoffPending);
+    }
+    match &slot.action {
+        maestro_shell::PresetRestoreAction::LaunchFresh => {
+            Err(PresetRestoreError::LaunchFreshRequiresAsyncHandoff { index: slot.index })
+        }
+        maestro_shell::PresetRestoreAction::Reattach { .. } => {
+            Err(PresetRestoreError::ReattachRequiresExactViewport { index: slot.index })
         }
     }
-
-    Ok(outcomes)
 }
 
-/// The current tab ids of `window_id`'s layout, or an empty list if the layout is missing/unreadable
-/// (a fresh window). Used only to keep minted tab ids unique; an unreadable layout just means no
-/// collisions to avoid yet.
-fn window_existing_tab_ids(
-    service: &maestro_shell::WindowLayoutService<'_>,
-    window_id: &str,
-) -> Vec<String> {
-    match service.load(window_id) {
-        Ok(Some(layout)) => layout.tabs.into_iter().map(|t| t.tab_id).collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// The capture-time `source_tab_id` for the slot at `pos` in the parallel `source_tabs`, or an empty
-/// string if out of range (which can never match a real `split_from.tab_id`, the safe fallback).
-fn source_tab_id_at(source_tabs: &[maestro_shell::records::LayoutPresetTab], pos: usize) -> String {
-    source_tabs
-        .get(pos)
-        .map(|t| t.source_tab_id.clone())
-        .unwrap_or_default()
-}
-
-/// Mint a session id for a restored LaunchFresh slot, unique against the tab id and the sessions
-/// already produced in this walk. Mirrors the planner's tab/session independence invariant.
-fn mint_session_id_for_restore(
-    id_gen: &mut dyn IdGen,
-    tab_id: &str,
-    outcomes: &[PresetRestoreSlotOutcome],
-) -> String {
-    let existing: Vec<String> = outcomes.iter().map(|o| o.session_id.clone()).collect();
-    mint_unique_id(&existing, &[tab_id], || id_gen.next_session_id())
-        .unwrap_or_else(|| id_gen.next_session_id())
-}
-
-/// Apply post-record fidelity for a restored slot: pin state always, and a split child's divider
-/// ratio when one was captured. `set_split_ratio` is a no-op on a non-split tab, so an unconditional
-/// call is safe; we only call it when a ratio was captured to avoid a needless rewrite.
-fn apply_slot_fidelity(
-    service: &maestro_shell::WindowLayoutService<'_>,
-    window_id: &str,
-    tab_id: &str,
-    pinned: bool,
-    ratio_per_mille: Option<u16>,
-    now_ms: u64,
-) -> Result<(), maestro_shell::WindowLayoutError> {
-    if pinned {
-        service.set_pinned(window_id, tab_id, true, now_ms)?;
-    }
-    if let Some(ratio) = ratio_per_mille {
-        service.set_split_ratio(window_id, tab_id, ratio, now_ms)?;
-    }
-    Ok(())
+/// Recheck the pure availability gate at the executor boundary. Callers must invoke
+/// [`preflight_preset_restore`] immediately after deriving the plan and before any side effect; this
+/// second check prevents a direct caller from bypassing the invariant.
+pub fn execute_preset_restore(
+    request: PresetRestoreRequest<'_>,
+    _env: &impl maestro_shell::EnvLookup,
+    _id_gen: &mut dyn IdGen,
+    runtime: &mut RendererTabRuntime,
+) -> Result<Vec<PresetRestoreSlotOutcome>, PresetRestoreError> {
+    preflight_preset_restore(request.plan, runtime.handoff_is_pending())?;
+    debug_assert!(request.plan.is_empty());
+    Ok(Vec::new())
 }
 
 #[cfg(test)]
@@ -2820,6 +4791,33 @@ mod tests {
     /// `create_plan*` / `prepared_start_for` / `started_session_for` helper) uses.
     fn seed_default_scratch_workspace_parents(paths: &maestro_shell::AppPaths) {
         seed_scratch_workspace_parents(paths, "maestro-app-dev");
+    }
+
+    fn seed_exact_test_session(
+        paths: &maestro_shell::AppPaths,
+        session_id: &str,
+        generation: &str,
+    ) {
+        seed_default_scratch_workspace_parents(paths);
+        maestro_shell::store::write_record(
+            paths,
+            maestro_shell::RecordKind::Session,
+            session_id,
+            1,
+            &maestro_shell::SessionRecord {
+                session_id: session_id.into(),
+                workspace_id: "maestro-app-dev".into(),
+                kind: maestro_shell::SessionKind::Shell,
+                launch: maestro_shell::LaunchSpec::OptOut,
+                cwd_resolved: "/tmp".into(),
+                agent_task_id: None,
+                created_at_ms: 1,
+                last_attached_at_ms: 1,
+                last_known_generation: Some(generation.into()),
+                status: maestro_shell::SessionStatus::Live,
+            },
+        )
+        .expect("seed exact test Session");
     }
 
     fn snapshot_with(tab_ids: &[&str], session_ids: &[&str]) -> NewTabSnapshot {
@@ -2943,12 +4941,12 @@ mod tests {
 
     /// A prepared workspace matching the `scratch_policy` defaults for the given ids.
     fn prepared_for(session_id: &str) -> maestro_shell::PreparedWorkspace {
-        maestro_shell::PreparedWorkspace {
-            policy: maestro_shell::WorkspacePolicy::ScratchCwd,
-            workspace_id: s("maestro-app-dev"),
-            session_id: s(session_id),
-            cwd: std::path::PathBuf::from("/tmp/maestro-scratch/sess"),
-        }
+        maestro_shell::PreparedWorkspace::unsealed(
+            maestro_shell::WorkspacePolicy::ScratchCwd,
+            "maestro-app-dev",
+            session_id,
+            "/tmp/maestro-scratch/sess",
+        )
     }
 
     #[test]
@@ -3110,6 +5108,7 @@ mod tests {
     /// `WorkspaceExecError` does not implement it).
     fn prepare_err_tag(err: &NewTabWorkspacePrepareError) -> &'static str {
         match err {
+            NewTabWorkspacePrepareError::RendererHandoffPending => "renderer_handoff_pending",
             NewTabWorkspacePrepareError::NotCreate => "not_create",
             NewTabWorkspacePrepareError::UnsupportedWorkspacePolicy { .. } => "unsupported_policy",
             NewTabWorkspacePrepareError::WorkspaceExec(_) => "workspace_exec",
@@ -3276,6 +5275,8 @@ mod tests {
     /// socket path and its temp dir.
     struct StubDaemon {
         handle: Option<std::thread::JoinHandle<()>>,
+        socket_path: std::path::PathBuf,
+        stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl StubDaemon {
@@ -3284,14 +5285,21 @@ mod tests {
             F: FnOnce(&mut std::os::unix::net::UnixStream) + Send + 'static,
         {
             let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind stub socket");
+            let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let worker_stopping = std::sync::Arc::clone(&stopping);
             let handle = std::thread::spawn(move || {
                 if let Ok((mut stream, _)) = listener.accept() {
+                    if worker_stopping.load(std::sync::atomic::Ordering::Acquire) {
+                        return;
+                    }
                     serve(&mut stream);
                     drop(stream);
                 }
             });
             StubDaemon {
                 handle: Some(handle),
+                socket_path: path,
+                stopping,
             }
         }
     }
@@ -3299,6 +5307,9 @@ mod tests {
     impl Drop for StubDaemon {
         fn drop(&mut self) {
             if let Some(h) = self.handle.take() {
+                self.stopping
+                    .store(true, std::sync::atomic::Ordering::Release);
+                let _ = std::os::unix::net::UnixStream::connect(&self.socket_path);
                 let _ = h.join();
             }
         }
@@ -3314,13 +5325,24 @@ mod tests {
         Some(line.trim().to_string())
     }
 
-    /// A serve script that accepts the protocol-v2 mutation probe, then answers the StartSession +
+    /// A serve script that accepts the protocol-v3/capability mutation probe, then answers the StartSession +
     /// Attach handshake with a grid for `id` at `generation` (a successful start) — mirrors the
     /// shell-runtime test stub.
     fn serve_grid(
         id: String,
         generation: String,
     ) -> impl FnOnce(&mut std::os::unix::net::UnixStream) + Send + 'static {
+        serve_grid_with_start_observer(id, generation, |_| {})
+    }
+
+    fn serve_grid_with_start_observer<F>(
+        id: String,
+        generation: String,
+        observe_start: F,
+    ) -> impl FnOnce(&mut std::os::unix::net::UnixStream) + Send + 'static
+    where
+        F: FnOnce(&maestro_protocol::ClientRequest) + Send + 'static,
+    {
         move |stream| {
             use std::io::Write;
             let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone stream"));
@@ -3330,21 +5352,110 @@ mod tests {
             );
             writeln!(
                 stream,
-                "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\"}}",
+                "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"daemon_instance_id\":\"22222222222242228222222222222222\",\"output_generation_echo\":true,\"child_environment\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"generation_conditional_attach\":true}}",
                 maestro_protocol::DAEMON_PROTOCOL_VERSION
             )
             .expect("write daemon_info");
             stream.flush().expect("flush daemon_info");
-            stub_read_line(&mut reader); // StartSession
-            stub_read_line(&mut reader); // Attach
+
+            let reserve = stub_read_line(&mut reader).expect("ReserveStartOperation");
+            let (reserved_id, reserved_token) =
+                match serde_json::from_str::<maestro_protocol::ClientRequest>(&reserve)
+                    .expect("decode ReserveStartOperation")
+                {
+                    maestro_protocol::ClientRequest::ReserveStartOperation {
+                        id,
+                        operation_token,
+                    } => (id, operation_token),
+                    other => panic!("expected ReserveStartOperation, got {other:?}"),
+                };
+            assert_eq!(reserved_id.0, id);
+            writeln!(
+                stream,
+                "{{\"ev\":\"start_operation_reserved\",\"id\":\"{id}\",\"operation_token\":\"{}\",\"daemon_instance_id\":\"22222222222242228222222222222222\",\"outcome\":{{\"status\":\"reserved\"}}}}",
+                reserved_token.as_str()
+            )
+            .expect("write start operation reservation acknowledgement");
+            stream
+                .flush()
+                .expect("flush start operation reservation acknowledgement");
+
+            let start = stub_read_line(&mut reader).expect("StartSession");
+            let request = serde_json::from_str::<maestro_protocol::ClientRequest>(&start)
+                .expect("decode StartSession");
+            observe_start(&request);
+            let operation_token = match request {
+                maestro_protocol::ClientRequest::StartSession {
+                    ref id,
+                    conditional_start: Some(conditional),
+                    ..
+                } if id == &reserved_id && conditional.operation_token == reserved_token => {
+                    conditional.operation_token
+                }
+                other => panic!("expected conditional StartSession, got {other:?}"),
+            };
+            writeln!(
+                stream,
+                "{{\"ev\":\"conditional_session_start\",\"id\":\"{id}\",\"operation_token\":\"{}\",\"daemon_instance_id\":\"22222222222242228222222222222222\",\"outcome\":{{\"status\":\"applied\",\"generation\":\"{generation}\"}}}}",
+                operation_token.as_str()
+            )
+            .expect("write conditional start acknowledgement");
+            stream
+                .flush()
+                .expect("flush conditional start acknowledgement");
+            let attach = stub_read_line(&mut reader).expect("Attach offer");
+            let output_generation =
+                match serde_json::from_str::<maestro_protocol::ClientRequest>(&attach)
+                    .expect("decode Attach")
+                {
+                    maestro_protocol::ClientRequest::Attach {
+                        handoff: Some(maestro_protocol::AttachmentHandoff::Offer { .. }),
+                        output_generation,
+                        ..
+                    } => output_generation,
+                    other => panic!("expected Attach offer, got {other:?}"),
+                };
             let grid = format!(
-                r#"{{"ev":"grid","id":"{id}","grid":{{"generation":"{generation}","revision":1}}}}"#
+                r#"{{"ev":"grid","id":"{id}","output_generation":{},"grid":{{"generation":"{generation}","revision":1}}}}"#,
+                output_generation
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "null".to_string())
             );
             stream
                 .write_all(format!("{grid}\n").as_bytes())
                 .expect("write grid");
             stream.flush().expect("flush grid");
+            // The production daemon keeps the Offer connection alive. Give the client time to
+            // restore its bounded socket options before this minimal one-shot stub closes; closing
+            // immediately can make that required post-Offer check observe EINVAL on macOS.
+            std::thread::sleep(std::time::Duration::from_millis(25));
         }
+    }
+
+    fn expect_single_handoff_command(
+        rx: &std::sync::mpsc::Receiver<maestro_renderer::RendererCommand>,
+        expected_session_id: &str,
+        expected_tab_count: usize,
+    ) -> maestro_renderer::RendererTabStrip {
+        let strip = match rx.try_recv().expect("one atomic renderer handoff") {
+            maestro_renderer::RendererCommand::AttachSessionWithHandoff {
+                session_id,
+                handoff,
+                tab_strip,
+                ..
+            } => {
+                assert_eq!(session_id, expected_session_id);
+                assert!(
+                    format!("{handoff:?}").contains("redacted"),
+                    "handoff Debug must remain opaque"
+                );
+                tab_strip
+            }
+            other => panic!("expected atomic AttachSessionWithHandoff, got {other:?}"),
+        };
+        assert_eq!(strip.tabs.len(), expected_tab_count);
+        assert!(rx.try_recv().is_err(), "exactly one renderer command");
+        strip
     }
 
     /// Build the `NewTabPreparedStart` for `session_id` by running the real planner -> preparer ->
@@ -3660,6 +5771,8 @@ mod tests {
         // leaf's record and leave the root tab/header in place.
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = maestro_shell::AppPaths::with_base(tmp.path());
+        seed_exact_test_session(&paths, "sess-root", "gen-root");
+        seed_exact_test_session(&paths, "sess-leaf", "gen-leaf");
 
         let service = maestro_shell::WindowLayoutService::new(&paths);
         service.create_empty("w1", 0).expect("create window");
@@ -3776,9 +5889,7 @@ mod tests {
 
     // ---- new-tab strip projection + renderer send/attach -------------------------------
     // `ActiveTab` is re-exported at the crate root from `window`; `new_tab.rs`'s module imports do
-    // not bring it in, so these tests reach it by its crate path.
-    use crate::ActiveTab;
-
+    // not bring it in, so the moved cohort reaches it by its crate path.
     #[test]
     fn new_tab_strip_projection_marks_recorded_tab_active_in_both_strips() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -3850,26 +5961,26 @@ mod tests {
 
     #[test]
     fn new_tab_strip_projection_missing_recorded_tab_is_typed_error() {
-        // A hand-built record whose layout does NOT contain the claimed active tab_id.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = maestro_shell::AppPaths::with_base(tmp.path());
+        let windows = maestro_shell::WindowLayoutService::new(&paths);
+        windows.create_empty("w1", 0).expect("create window");
+        let rollback_snapshot = windows
+            .open_tab_snapshot(
+                "w1",
+                "real",
+                "sess-real",
+                "Real",
+                false,
+                maestro_shell::AttentionState::default(),
+                1,
+            )
+            .expect("record exact layout incarnation");
+        // The exact recorded layout does NOT contain the claimed active tab_id.
         let record = NewTabLayoutRecord {
             tab_id: s("ghost"),
             session_id: s("sess-ghost"),
-            layout: maestro_shell::WindowLayout {
-                window_id: s("w1"),
-                name: None,
-                tabs: vec![maestro_shell::TabRecord {
-                    tab_id: s("real"),
-                    session_id: s("sess-real"),
-                    index: 0,
-                    title: s("Real"),
-                    pinned: false,
-                    attention: maestro_shell::AttentionState::default(),
-                    split_from: None,
-                    pane_rect: None,
-                    stashed_from: None,
-                    stashed: false,
-                }],
-            },
+            layout: rollback_snapshot.layout.clone(),
         };
         let err = new_tab_strip_projection("w1", &record)
             .expect_err("a recorded tab id missing from the layout must be a typed error");
@@ -3879,6 +5990,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn new_tab_strip_projection_never_resurrects_existing_stashed_rows() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = maestro_shell::AppPaths::with_base(tmp.path());
+        let windows = maestro_shell::WindowLayoutService::new(&paths);
+        windows.create_empty("w1", 0).expect("create window");
+        windows
+            .open_stashed_tab(
+                "w1",
+                "parked",
+                "sess-parked",
+                "Parked",
+                false,
+                maestro_shell::AttentionState::default(),
+                1,
+            )
+            .expect("record stashed tab");
+        let rollback_snapshot = windows
+            .open_tab_snapshot(
+                "w1",
+                "new-live",
+                "sess-new",
+                "New live",
+                false,
+                maestro_shell::AttentionState::default(),
+                2,
+            )
+            .expect("record live tab");
+        let record = NewTabLayoutRecord {
+            tab_id: s("new-live"),
+            session_id: s("sess-new"),
+            layout: rollback_snapshot.layout.clone(),
+        };
+
+        let projection =
+            new_tab_strip_projection("w1", &record).expect("the new live tab projects");
+        assert_eq!(
+            projection
+                .model
+                .tabs
+                .iter()
+                .map(|tab| tab.tab_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["new-live"],
+            "durable stashed rows stay inspectable but never enter RendererTabRuntime"
+        );
+        assert_eq!(projection.renderer_strip.tabs.len(), 1);
+    }
+
     /// Build a `NewTabStripProjection` for `tab_id`/`session_id` without any daemon/filesystem: a
     /// single-tab in-memory `NewTabLayoutRecord` run through the real `new_tab_strip_projection`.
     fn strip_projection_fixture(
@@ -3886,178 +6046,107 @@ mod tests {
         tab_id: &str,
         session_id: &str,
     ) -> NewTabStripProjection {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = maestro_shell::AppPaths::with_base(tmp.path());
+        let windows = maestro_shell::WindowLayoutService::new(&paths);
+        windows
+            .create_empty(window_id, 0)
+            .expect("create projection window");
+        let rollback_snapshot = windows
+            .open_tab_snapshot(
+                window_id,
+                tab_id,
+                session_id,
+                &format!("Title {tab_id}"),
+                false,
+                maestro_shell::AttentionState::default(),
+                1,
+            )
+            .expect("record projection tab");
         let record = NewTabLayoutRecord {
             tab_id: s(tab_id),
             session_id: s(session_id),
-            layout: maestro_shell::WindowLayout {
-                window_id: s(window_id),
-                name: None,
-                tabs: vec![maestro_shell::TabRecord {
-                    tab_id: s(tab_id),
-                    session_id: s(session_id),
-                    index: 0,
-                    title: format!("Title {tab_id}"),
-                    pinned: false,
-                    attention: maestro_shell::AttentionState::default(),
-                    split_from: None,
-                    pane_rect: None,
-                    stashed_from: None,
-                    stashed: false,
-                }],
-            },
+            layout: rollback_snapshot.layout.clone(),
         };
         new_tab_strip_projection(window_id, &record).expect("projection must succeed")
     }
 
     #[test]
-    fn send_new_tab_set_tab_strip_sends_one_command_matching_projection() {
+    fn legacy_new_tab_strip_without_exact_active_is_refused_and_sends_nothing() {
         let projection = strip_projection_fixture("w1", "tab-1", "sess-1");
         let (mut rt, rx) = RendererTabRuntime::new();
 
-        let out = send_new_tab_set_tab_strip(&mut rt, &projection)
-            .expect("an open receiver must accept the strip update");
         assert_eq!(
-            out,
-            NewTabSetTabStrip {
-                tab_id: s("tab-1"),
-                session_id: s("sess-1"),
-            }
+            send_new_tab_set_tab_strip(&mut rt, &projection),
+            Err(NewTabSetTabStripError::HandoffPending)
         );
-
-        // Exactly one command, and it is a SetTabStrip whose payload equals projection.renderer_strip.
-        match rx.try_recv() {
-            Ok(maestro_renderer::RendererCommand::SetTabStrip { tab_strip }) => {
-                assert_eq!(tab_strip, Some(projection.renderer_strip.clone()));
-            }
-            other => panic!("expected one SetTabStrip, got {other:?}"),
-        }
-        assert!(
-            rx.try_recv().is_err(),
-            "exactly one command is sent (no AttachSession)"
-        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
-    fn send_new_tab_set_tab_strip_does_not_alter_active_tab() {
+    fn textual_seed_cannot_authorize_new_tab_strip() {
         let projection = strip_projection_fixture("w1", "tab-1", "sess-1");
         let (mut rt, rx) = RendererTabRuntime::new();
-        // Seed an active tab WITHOUT sending a command; the helper must leave it untouched.
-        rt.seed_active_tab("w0", "t0");
+        rt.seed_active_tab("w0", "t0", "sess-t0");
 
-        send_new_tab_set_tab_strip(&mut rt, &projection).expect("strip update");
         assert_eq!(
-            rt.active_tab_key(),
-            Some(&ActiveTab {
-                window_id: s("w0"),
-                tab_id: s("t0"),
-            }),
-            "set-tab-strip is display chrome only; active tab is unchanged"
+            send_new_tab_set_tab_strip(&mut rt, &projection),
+            Err(NewTabSetTabStripError::HandoffPending)
         );
-        // Drain the single strip command so the receiver is not flagged unused.
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(maestro_renderer::RendererCommand::SetTabStrip { .. })
-        ));
+        assert!(rt.active_tab_key().is_none());
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
-    fn send_new_tab_set_tab_strip_dropped_receiver_is_control_closed() {
+    fn legacy_new_tab_strip_refuses_before_observing_a_closed_receiver() {
         let projection = strip_projection_fixture("w1", "tab-1", "sess-1");
         let (mut rt, rx) = RendererTabRuntime::new();
         drop(rx);
         assert_eq!(
             send_new_tab_set_tab_strip(&mut rt, &projection),
-            Err(NewTabSetTabStripError::RendererControlClosed)
+            Err(NewTabSetTabStripError::HandoffPending)
         );
     }
 
     #[test]
-    fn send_new_tab_attach_session_sends_one_attach_and_advances_active_tab() {
+    fn legacy_new_tab_attach_requires_exact_viewport_and_sends_nothing() {
         let projection = strip_projection_fixture("w1", "tab-1", "sess-1");
         let (mut rt, rx) = RendererTabRuntime::new();
 
-        let out = send_new_tab_attach_session(&mut rt, &projection)
-            .expect("an open receiver must accept the attach");
         assert_eq!(
-            out,
-            NewTabAttachSession {
-                tab_id: s("tab-1"),
-                session_id: s("sess-1"),
-                attached: true,
-            }
+            send_new_tab_attach_session(&mut rt, &projection),
+            Err(NewTabAttachSessionError::ViewportAuthorityRequired)
         );
-
-        // Exactly one command, and it is AttachSession for the projected session (not SetTabStrip).
-        match rx.try_recv() {
-            Ok(maestro_renderer::RendererCommand::AttachSession { session_id }) => {
-                assert_eq!(session_id, s("sess-1"));
-            }
-            other => panic!("expected one AttachSession, got {other:?}"),
-        }
-        assert!(
-            rx.try_recv().is_err(),
-            "exactly one command is sent (no SetTabStrip)"
-        );
-
-        // Success advances active-tab state to (model.window_id, tab_id).
-        assert_eq!(
-            rt.active_tab_key(),
-            Some(&ActiveTab {
-                window_id: s("w1"),
-                tab_id: s("tab-1"),
-            })
-        );
+        assert!(rt.active_tab_key().is_none());
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
-    fn send_new_tab_attach_session_already_active_tab_is_noop() {
+    fn textual_seed_does_not_make_legacy_new_tab_attach_a_noop() {
         let projection = strip_projection_fixture("w1", "tab-1", "sess-1");
         let (mut rt, rx) = RendererTabRuntime::new();
-        // Seed the SAME (window_id, tab_id) as active without sending; the attach is then a no-op.
-        rt.seed_active_tab("w1", "tab-1");
+        rt.seed_active_tab("w1", "tab-1", "sess-1");
 
-        let out = send_new_tab_attach_session(&mut rt, &projection).expect("noop is Ok");
         assert_eq!(
-            out,
-            NewTabAttachSession {
-                tab_id: s("tab-1"),
-                session_id: s("sess-1"),
-                attached: false,
-            }
+            send_new_tab_attach_session(&mut rt, &projection),
+            Err(NewTabAttachSessionError::ViewportAuthorityRequired)
         );
-        assert!(
-            rx.try_recv().is_err(),
-            "already-active attach sends nothing"
-        );
-        assert_eq!(
-            rt.active_tab_key(),
-            Some(&ActiveTab {
-                window_id: s("w1"),
-                tab_id: s("tab-1"),
-            })
-        );
+        assert!(rt.active_tab_key().is_none());
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
-    fn send_new_tab_attach_session_dropped_receiver_is_control_closed_and_active_unchanged() {
+    fn legacy_new_tab_attach_refuses_before_observing_a_closed_receiver() {
         let projection = strip_projection_fixture("w1", "tab-1", "sess-1");
         let (mut rt, rx) = RendererTabRuntime::new();
-        // A pre-existing active tab must survive a failed (closed-channel) attach.
-        rt.seed_active_tab("w0", "t0");
+        rt.seed_active_tab("w0", "t0", "sess-t0");
         drop(rx);
 
         assert_eq!(
             send_new_tab_attach_session(&mut rt, &projection),
-            Err(NewTabAttachSessionError::RendererControlClosed)
+            Err(NewTabAttachSessionError::ViewportAuthorityRequired)
         );
-        assert_eq!(
-            rt.active_tab_key(),
-            Some(&ActiveTab {
-                window_id: s("w0"),
-                tab_id: s("t0"),
-            }),
-            "a closed channel leaves active-tab state unchanged"
-        );
+        assert!(rt.active_tab_key().is_none());
     }
 
     // ---- new-tab foreground scratch/worktree pipeline ----
@@ -4066,7 +6155,36 @@ mod tests {
     // private test helpers for this module.
     use crate::new_tab_snapshot_from_strip_tabs;
 
-    fn one_existing_tab_window(paths: &maestro_shell::AppPaths) {
+    fn one_existing_tab_window(paths: &maestro_shell::AppPaths, project_id: &str) {
+        if maestro_shell::store::load_one::<maestro_shell::Workspace>(
+            paths,
+            maestro_shell::RecordKind::Workspace,
+            "maestro-app-dev",
+        )
+        .expect("load fixture Workspace")
+        .is_none()
+        {
+            seed_default_scratch_workspace_parents(paths);
+        }
+        maestro_shell::store::write_record(
+            paths,
+            maestro_shell::RecordKind::Session,
+            "sess-t0",
+            1,
+            &maestro_shell::SessionRecord {
+                session_id: "sess-t0".into(),
+                workspace_id: "maestro-app-dev".into(),
+                kind: maestro_shell::SessionKind::Shell,
+                launch: maestro_shell::LaunchSpec::OptOut,
+                cwd_resolved: "/tmp".into(),
+                agent_task_id: None,
+                created_at_ms: 1,
+                last_attached_at_ms: 1,
+                last_known_generation: Some("existing-generation".into()),
+                status: maestro_shell::SessionStatus::Live,
+            },
+        )
+        .expect("seed exact existing Session");
         let service = maestro_shell::WindowLayoutService::new(paths);
         service.create_empty("w1", 0).expect("create window");
         service
@@ -4080,6 +6198,9 @@ mod tests {
                 0,
             )
             .expect("seed prior tab");
+        service
+            .ensure_project_assignment("w1", project_id, 2)
+            .expect("assign exact Project/order owner to fixture window");
     }
 
     fn snapshot_tab(tab_id: &str, session_id: &str, index: u32) -> WindowTabJson {
@@ -4284,8 +6405,8 @@ mod tests {
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = maestro_shell::AppPaths::with_base(tmp.path());
-        one_existing_tab_window(&paths);
         seed_missing_consent_worktree_project(&paths, "proj-wt", "ws-wt", repo.path());
+        one_existing_tab_window(&paths, "proj-wt");
 
         // --- Request phase: fresh snapshot -> ShowConfirm, no consent write. ---
         let snapshot = maestro_shell::DashboardSnapshotService::new(&paths)
@@ -4355,7 +6476,7 @@ mod tests {
         );
         let argv = vec![s("/bin/zsh"), s("-l")];
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        rt.seed_active_tab("w1", "t0", "sess-t0");
 
         let out = run_new_tab_foreground_pipeline_with_consent(
             NewTabForegroundRequest {
@@ -4363,37 +6484,30 @@ mod tests {
                 socket_path: sock_path,
                 window_id: "w1",
                 plan: &plan,
-                argv: &argv,
+                launch: NewTabForegroundLaunch::shell_adhoc(&argv),
                 cols: 80,
                 rows: 24,
                 now_ms: 1_700_000_000,
                 split_from: None,
+                split_source_session: None,
+                expected_project_id: None,
             },
             &granted,
             &env,
             &mut rt,
         )
-        .expect("granted worktree launch succeeds");
+        .unwrap_or_else(|error| panic!("granted worktree launch succeeds: {error}"));
 
         assert_eq!(out.tab_id, "tab-1");
         assert_eq!(out.session_id, "sess-1");
-        assert_eq!(rt.active_tab_id(), Some("tab-1"));
-        // Strip then attach, then nothing — the shared post-preparation order.
-        match rx.try_recv().expect("first command is strip") {
-            maestro_renderer::RendererCommand::SetTabStrip { tab_strip } => {
-                let strip = tab_strip.expect("Some strip");
-                assert_eq!(strip.tabs.len(), 2);
-                assert!(strip.tabs[1].active);
-            }
-            other => panic!("expected SetTabStrip first, got {other:?}"),
-        }
-        match rx.try_recv().expect("second command is attach") {
-            maestro_renderer::RendererCommand::AttachSession { session_id } => {
-                assert_eq!(session_id, "sess-1");
-            }
-            other => panic!("expected AttachSession second, got {other:?}"),
-        }
-        assert!(rx.try_recv().is_err(), "exactly two renderer commands");
+        assert_eq!(rt.active_tab_id(), None, "send is not renderer adoption");
+        assert_eq!(
+            rt.pending_handoff()
+                .map(|pending| pending.target().target().tab_id.as_str()),
+            Some("tab-1")
+        );
+        let strip = expect_single_handoff_command(&rx, "sess-1", 2);
+        assert!(strip.tabs[1].active);
 
         let persisted = maestro_shell::WindowLayoutService::new(&paths)
             .load("w1")
@@ -4426,8 +6540,8 @@ mod tests {
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = maestro_shell::AppPaths::with_base(tmp.path());
-        one_existing_tab_window(&paths);
         seed_missing_consent_repo_write_project(&paths, "proj-rw", "ws-rw", checkout.path());
+        one_existing_tab_window(&paths, "proj-rw");
 
         // --- Request phase: fresh snapshot -> ShowConfirm, no consent write. ---
         let snapshot = maestro_shell::DashboardSnapshotService::new(&paths)
@@ -4502,7 +6616,7 @@ mod tests {
         );
         let argv = vec![s("/bin/zsh"), s("-l")];
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        rt.seed_active_tab("w1", "t0", "sess-t0");
 
         let out = run_new_tab_foreground_pipeline_with_consent(
             NewTabForegroundRequest {
@@ -4510,11 +6624,13 @@ mod tests {
                 socket_path: sock_path,
                 window_id: "w1",
                 plan: &plan,
-                argv: &argv,
+                launch: NewTabForegroundLaunch::shell_adhoc(&argv),
                 cols: 80,
                 rows: 24,
                 now_ms: 1_700_000_000,
                 split_from: None,
+                split_source_session: None,
+                expected_project_id: None,
             },
             &granted,
             &env,
@@ -4524,22 +6640,14 @@ mod tests {
 
         assert_eq!(out.tab_id, "tab-1");
         assert_eq!(out.session_id, "sess-1");
-        assert_eq!(rt.active_tab_id(), Some("tab-1"));
-        match rx.try_recv().expect("first command is strip") {
-            maestro_renderer::RendererCommand::SetTabStrip { tab_strip } => {
-                let strip = tab_strip.expect("Some strip");
-                assert_eq!(strip.tabs.len(), 2);
-                assert!(strip.tabs[1].active);
-            }
-            other => panic!("expected SetTabStrip first, got {other:?}"),
-        }
-        match rx.try_recv().expect("second command is attach") {
-            maestro_renderer::RendererCommand::AttachSession { session_id } => {
-                assert_eq!(session_id, "sess-1");
-            }
-            other => panic!("expected AttachSession second, got {other:?}"),
-        }
-        assert!(rx.try_recv().is_err(), "exactly two renderer commands");
+        assert_eq!(rt.active_tab_id(), None, "send is not renderer adoption");
+        assert_eq!(
+            rt.pending_handoff()
+                .map(|pending| pending.target().target().tab_id.as_str()),
+            Some("tab-1")
+        );
+        let strip = expect_single_handoff_command(&rx, "sess-1", 2);
+        assert!(strip.tabs[1].active);
 
         let persisted = maestro_shell::WindowLayoutService::new(&paths)
             .load("w1")
@@ -4696,7 +6804,7 @@ mod tests {
         let tabs = vec![snapshot_tab("t0", "sess-t0", 0)];
         let snapshot = new_tab_snapshot_from_strip_tabs(&tabs, Some("t0"));
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        rt.seed_active_tab("w1", "t0", "sess-t0");
         let mut id_gen = ScriptedIdGen::new(&["unused-tab"], &["unused-sess"]);
 
         assert_eq!(
@@ -4709,7 +6817,11 @@ mod tests {
             rx.try_recv().is_err(),
             "decline path must not send SetTabStrip or AttachSession"
         );
-        assert_eq!(rt.active_tab_id(), Some("t0"));
+        assert_eq!(
+            rt.active_tab_id(),
+            None,
+            "textual seed facts cannot invent a proven renderer lifetime"
+        );
     }
 
     #[test]
@@ -4719,7 +6831,7 @@ mod tests {
         // The pipeline starts a session whose SessionRecord references the scratch workspace; seed
         // its FK parents so the SQLite session INSERT does not fail the foreign-key constraint.
         seed_default_scratch_workspace_parents(&paths);
-        one_existing_tab_window(&paths);
+        one_existing_tab_window(&paths, "maestro-app-dev-project");
 
         let sock_dir = tempfile::tempdir().expect("sock dir");
         let sock_path = sock_dir.path().join("stub.sock");
@@ -4728,7 +6840,7 @@ mod tests {
         let plan = create_plan("tab-1", "sess-1", NewTabLaunchSource::DefaultShellDev);
         let argv = vec![s("/bin/zsh"), s("-l")];
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        rt.seed_active_tab("w1", "t0", "sess-t0");
 
         let out = run_new_tab_foreground_pipeline(
             NewTabForegroundRequest {
@@ -4736,11 +6848,13 @@ mod tests {
                 socket_path: sock_path,
                 window_id: "w1",
                 plan: &plan,
-                argv: &argv,
+                launch: NewTabForegroundLaunch::shell_adhoc(&argv),
                 cols: 80,
                 rows: 24,
                 now_ms: 1_700_000_000,
                 split_from: None,
+                split_source_session: None,
+                expected_project_id: None,
             },
             &env,
             &mut rt,
@@ -4763,26 +6877,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("t0", "sess-t0"), ("tab-1", "sess-1")]
         );
-        assert_eq!(rt.active_tab_id(), Some("tab-1"));
+        assert_eq!(rt.active_tab_id(), None, "send is not renderer adoption");
+        assert_eq!(
+            rt.pending_handoff()
+                .map(|pending| pending.target().target().tab_id.as_str()),
+            Some("tab-1")
+        );
 
-        match rx.try_recv().expect("first command is strip") {
-            maestro_renderer::RendererCommand::SetTabStrip { tab_strip } => {
-                let strip = tab_strip.expect("new-tab success sends Some strip");
-                assert_eq!(strip.window_id, "w1");
-                assert_eq!(strip.tabs.len(), 2);
-                assert!(!strip.tabs[0].active);
-                assert!(strip.tabs[1].active);
-                assert_eq!(strip.tabs[1].tab_id, "tab-1");
-            }
-            other => panic!("expected SetTabStrip first, got {other:?}"),
-        }
-        match rx.try_recv().expect("second command is attach") {
-            maestro_renderer::RendererCommand::AttachSession { session_id } => {
-                assert_eq!(session_id, "sess-1");
-            }
-            other => panic!("expected AttachSession second, got {other:?}"),
-        }
-        assert!(rx.try_recv().is_err(), "exactly two renderer commands");
+        let strip = expect_single_handoff_command(&rx, "sess-1", 2);
+        assert_eq!(strip.window_id, "w1");
+        assert!(!strip.tabs[0].active);
+        assert!(strip.tabs[1].active);
+        assert_eq!(strip.tabs[1].tab_id, "tab-1");
 
         let persisted = maestro_shell::WindowLayoutService::new(&paths)
             .load("w1")
@@ -4800,13 +6906,423 @@ mod tests {
     }
 
     #[test]
+    fn custom_agent_split_seals_after_scratch_and_keeps_exact_source_fence() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = maestro_shell::AppPaths::with_base(tmp.path());
+        seed_default_scratch_workspace_parents(&paths);
+        one_existing_tab_window(&paths, "maestro-app-dev-project");
+        let source_session = match maestro_shell::load_one::<maestro_shell::SessionRecord>(
+            &paths,
+            maestro_shell::RecordKind::Session,
+            "sess-t0",
+        )
+        .unwrap()
+        .unwrap()
+        {
+            maestro_shell::LoadOutcome::Loaded(session) => session,
+            other => panic!("source Session must be current: {other:?}"),
+        };
+
+        let sock_dir = tempfile::tempdir().expect("sock dir");
+        let sock_path = sock_dir.path().join("stub.sock");
+        let stub = StubDaemon::spawn_at(sock_path.clone(), serve_grid(s("sess-agent"), s("gen-1")));
+        let env = MapEnv::new(&[]);
+        let plan = create_plan(
+            "tab-agent",
+            "sess-agent",
+            NewTabLaunchSource::PreparedAgentAdHoc,
+        );
+        let launch = NewTabForegroundLaunch::agent_adhoc(vec![s("/bin/sh"), s("-l")], None)
+            .expect("absolute custom Agent source is valid");
+        let (mut rt, rx) = RendererTabRuntime::new();
+        rt.seed_active_tab("w1", "t0", "sess-t0");
+
+        let out = run_new_tab_foreground_pipeline(
+            NewTabForegroundRequest {
+                paths: &paths,
+                socket_path: sock_path,
+                window_id: "w1",
+                plan: &plan,
+                launch,
+                cols: 80,
+                rows: 24,
+                now_ms: 1_700_000_000,
+                split_from: Some(NewTabSplitFrom {
+                    from_tab_id: s("t0"),
+                    axis: maestro_shell::SplitAxis::Right,
+                }),
+                split_source_session: Some(&source_session),
+                expected_project_id: Some("maestro-app-dev-project"),
+            },
+            &env,
+            &mut rt,
+        )
+        .expect("custom Agent split succeeds through PreparedNew");
+
+        assert_eq!(out.session_id, "sess-agent");
+        let strip = expect_single_handoff_command(&rx, "sess-agent", 2);
+        assert_eq!(strip.tabs[1].tab_id, "tab-agent");
+        let stored = match maestro_shell::load_one::<maestro_shell::SessionRecord>(
+            &paths,
+            maestro_shell::RecordKind::Session,
+            "sess-agent",
+        )
+        .unwrap()
+        .unwrap()
+        {
+            maestro_shell::LoadOutcome::Loaded(session) => session,
+            other => panic!("new Session must be current: {other:?}"),
+        };
+        assert_eq!(stored.kind, maestro_shell::SessionKind::Agent);
+        assert_eq!(stored.status, maestro_shell::SessionStatus::Live);
+        assert_eq!(stored.last_known_generation.as_deref(), Some("gen-1"));
+        assert!(matches!(
+            stored.launch,
+            maestro_shell::LaunchSpec::AdHocRedacted {
+                redacted: true,
+                restart_requires_user: true,
+                ..
+            }
+        ));
+        let layout = maestro_shell::WindowLayoutService::new(&paths)
+            .load("w1")
+            .unwrap()
+            .unwrap();
+        let child = layout
+            .tabs
+            .iter()
+            .find(|tab| tab.tab_id == "tab-agent")
+            .expect("split child is durable");
+        assert_eq!(
+            child.split_from.as_ref().map(|split| split.tab_id.as_str()),
+            Some("t0")
+        );
+        drop(stub);
+        drop(sock_dir);
+    }
+
+    #[test]
+    fn assigned_provider_split_uses_redacted_unknown_a_then_publishes_exact_b() {
+        const PROVIDER_ID: &str = "70000000-0000-4000-8000-000000000001";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = maestro_shell::AppPaths::with_base(tmp.path());
+        seed_default_scratch_workspace_parents(&paths);
+        one_existing_tab_window(&paths, "maestro-app-dev-project");
+        let source_session = match maestro_shell::load_one::<maestro_shell::SessionRecord>(
+            &paths,
+            maestro_shell::RecordKind::Session,
+            "sess-t0",
+        )
+        .unwrap()
+        .unwrap()
+        {
+            maestro_shell::LoadOutcome::Loaded(session) => session,
+            other => panic!("source Session must be current: {other:?}"),
+        };
+        let plan = create_plan(
+            "tab-provider",
+            "sess-provider",
+            NewTabLaunchSource::KnownSafeSpec {
+                launch_spec_id: s("claude"),
+            },
+        );
+        let launch = NewTabForegroundLaunch::provider(
+            s("claude"),
+            vec![s("claude"), s("--session-id"), s(PROVIDER_ID)],
+            s("claude"),
+        )
+        .expect("assigned Claude identity is a strict fresh provider source");
+        let (prepared, scratch) =
+            prepare_fresh_new_tab_scratch_workspace(&paths, &plan, "").unwrap();
+
+        let sock_dir = tempfile::tempdir().expect("sock dir");
+        let sock_path = sock_dir.path().join("stub.sock");
+        let paths_at_wire = paths.clone();
+        let serve =
+            serve_grid_with_start_observer(s("sess-provider"), s("gen-provider"), |request| {
+                match request {
+                    maestro_protocol::ClientRequest::StartSession { args, .. } => {
+                        let packed = args.last().expect("login-shell provider command");
+                        assert!(packed.contains("--session-id") && packed.contains(PROVIDER_ID));
+                        assert!(!packed.contains("--resume"));
+                    }
+                    other => panic!("expected StartSession, got {other:?}"),
+                }
+            });
+        let stub = StubDaemon::spawn_at(sock_path.clone(), move |stream| {
+            let unknown = match maestro_shell::load_one::<maestro_shell::SessionRecord>(
+                &paths_at_wire,
+                maestro_shell::RecordKind::Session,
+                "sess-provider",
+            )
+            .unwrap()
+            .unwrap()
+            {
+                maestro_shell::LoadOutcome::Loaded(session) => session,
+                other => panic!("provider A must be durable before daemon wire: {other:?}"),
+            };
+            assert_eq!(unknown.status, maestro_shell::SessionStatus::Unknown);
+            assert_eq!(unknown.last_known_generation, None);
+            assert!(matches!(
+                unknown.launch,
+                maestro_shell::LaunchSpec::AdHocRedacted {
+                    ref argv,
+                    redacted: true,
+                    restart_requires_user: true,
+                } if argv == &[s("claude"), s("--session-id"), s("<redacted>")]
+            ));
+            serve(stream);
+        });
+        let env = MapEnv::new(&[]);
+        let (mut runtime, rx) = RendererTabRuntime::new();
+        runtime.seed_active_tab("w1", "t0", "sess-t0");
+        let request = NewTabForegroundRequest {
+            paths: &paths,
+            socket_path: sock_path,
+            window_id: "w1",
+            plan: &plan,
+            launch,
+            cols: 80,
+            rows: 24,
+            now_ms: 1_700_000_000,
+            split_from: Some(NewTabSplitFrom {
+                from_tab_id: s("t0"),
+                axis: maestro_shell::SplitAxis::Right,
+            }),
+            split_source_session: Some(&source_session),
+            expected_project_id: Some("maestro-app-dev-project"),
+        };
+        let out = run_new_tab_foreground_pipeline_from_prepared_with_reprobe(
+            request,
+            prepared,
+            Some(scratch),
+            None,
+            &env,
+            &mut runtime,
+            |_source_argv, _selected_agent, _cwd| Ok(()),
+        )
+        .expect("strict provider split succeeds through the shared production pipeline");
+
+        assert_eq!(out.session_id, "sess-provider");
+        let strip = expect_single_handoff_command(&rx, "sess-provider", 2);
+        assert_eq!(strip.tabs[1].tab_id, "tab-provider");
+        let live = match maestro_shell::load_one::<maestro_shell::SessionRecord>(
+            &paths,
+            maestro_shell::RecordKind::Session,
+            "sess-provider",
+        )
+        .unwrap()
+        .unwrap()
+        {
+            maestro_shell::LoadOutcome::Loaded(session) => session,
+            other => panic!("provider B must be current after Grid: {other:?}"),
+        };
+        assert_eq!(live.status, maestro_shell::SessionStatus::Live);
+        assert_eq!(live.last_known_generation.as_deref(), Some("gen-provider"));
+        assert_eq!(
+            live.launch,
+            maestro_shell::LaunchSpec::KnownSafe {
+                launch_spec_id: s("claude"),
+                params: vec![s("--resume"), s(PROVIDER_ID)],
+            }
+        );
+        let layout = maestro_shell::WindowLayoutService::new(&paths)
+            .load("w1")
+            .unwrap()
+            .unwrap();
+        let child = layout
+            .tabs
+            .iter()
+            .find(|tab| tab.tab_id == "tab-provider")
+            .expect("provider split child is durable");
+        assert_eq!(
+            child.split_from.as_ref().map(|split| split.tab_id.as_str()),
+            Some("t0")
+        );
+        drop(stub);
+        drop(sock_dir);
+    }
+
+    #[test]
+    fn provider_word_custom_split_keeps_redacted_adhoc_a_and_b() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = maestro_shell::AppPaths::with_base(tmp.path());
+        seed_default_scratch_workspace_parents(&paths);
+        one_existing_tab_window(&paths, "maestro-app-dev-project");
+        let source_session = match maestro_shell::load_one::<maestro_shell::SessionRecord>(
+            &paths,
+            maestro_shell::RecordKind::Session,
+            "sess-t0",
+        )
+        .unwrap()
+        .unwrap()
+        {
+            maestro_shell::LoadOutcome::Loaded(session) => session,
+            other => panic!("source Session must be current: {other:?}"),
+        };
+        let plan = create_plan(
+            "tab-provider-custom",
+            "sess-provider-custom",
+            NewTabLaunchSource::PreparedAgentAdHoc,
+        );
+        let source_argv = vec![s("claude"), s("mcp"), s("--serve")];
+        let launch = NewTabForegroundLaunch::provider_custom_adhoc(
+            s("claude"),
+            source_argv.clone(),
+            s("claude"),
+        )
+        .expect("non-selector provider-word command is valid opaque custom Agent input");
+        let (prepared, scratch) =
+            prepare_fresh_new_tab_scratch_workspace(&paths, &plan, "").unwrap();
+
+        let sock_dir = tempfile::tempdir().expect("sock dir");
+        let sock_path = sock_dir.path().join("stub.sock");
+        let paths_at_wire = paths.clone();
+        let serve = serve_grid_with_start_observer(
+            s("sess-provider-custom"),
+            s("gen-provider-custom"),
+            |request| match request {
+                maestro_protocol::ClientRequest::StartSession { command, args, .. } => {
+                    assert_ne!(
+                        command, "claude",
+                        "provider-word source uses private shell wire"
+                    );
+                    assert_eq!(args.first().map(String::as_str), Some("-lic"));
+                    assert!(
+                        args.iter().any(|arg| arg.contains("claude")),
+                        "private login-shell wire retains the reviewed source command"
+                    );
+                }
+                other => panic!("expected StartSession, got {other:?}"),
+            },
+        );
+        let source_for_wire = source_argv.clone();
+        let stub = StubDaemon::spawn_at(sock_path.clone(), move |stream| {
+            let unknown = match maestro_shell::load_one::<maestro_shell::SessionRecord>(
+                &paths_at_wire,
+                maestro_shell::RecordKind::Session,
+                "sess-provider-custom",
+            )
+            .unwrap()
+            .unwrap()
+            {
+                maestro_shell::LoadOutcome::Loaded(session) => session,
+                other => panic!("custom provider A must precede daemon wire: {other:?}"),
+            };
+            assert_eq!(unknown.status, maestro_shell::SessionStatus::Unknown);
+            assert!(matches!(
+                unknown.launch,
+                maestro_shell::LaunchSpec::AdHocRedacted {
+                    ref argv,
+                    redacted: true,
+                    restart_requires_user: true,
+                } if argv == &source_for_wire
+            ));
+            serve(stream);
+        });
+        let env = MapEnv::new(&[]);
+        let (mut runtime, rx) = RendererTabRuntime::new();
+        runtime.seed_active_tab("w1", "t0", "sess-t0");
+        let request = NewTabForegroundRequest {
+            paths: &paths,
+            socket_path: sock_path,
+            window_id: "w1",
+            plan: &plan,
+            launch,
+            cols: 80,
+            rows: 24,
+            now_ms: 1_700_000_000,
+            split_from: Some(NewTabSplitFrom {
+                from_tab_id: s("t0"),
+                axis: maestro_shell::SplitAxis::Right,
+            }),
+            split_source_session: Some(&source_session),
+            expected_project_id: Some("maestro-app-dev-project"),
+        };
+        let out = run_new_tab_foreground_pipeline_from_prepared_with_reprobe(
+            request,
+            prepared,
+            Some(scratch),
+            None,
+            &env,
+            &mut runtime,
+            |_source_argv, _selected_agent, _cwd| Ok(()),
+        )
+        .expect("provider-word custom split succeeds through the shared production pipeline");
+
+        assert_eq!(out.session_id, "sess-provider-custom");
+        let strip = expect_single_handoff_command(&rx, "sess-provider-custom", 2);
+        assert_eq!(strip.tabs[1].tab_id, "tab-provider-custom");
+        let live = match maestro_shell::load_one::<maestro_shell::SessionRecord>(
+            &paths,
+            maestro_shell::RecordKind::Session,
+            "sess-provider-custom",
+        )
+        .unwrap()
+        .unwrap()
+        {
+            maestro_shell::LoadOutcome::Loaded(session) => session,
+            other => panic!("custom provider B must be current after Grid: {other:?}"),
+        };
+        assert_eq!(live.status, maestro_shell::SessionStatus::Live);
+        assert_eq!(
+            live.launch,
+            maestro_shell::LaunchSpec::AdHocRedacted {
+                argv: source_argv,
+                redacted: true,
+                restart_requires_user: true,
+            }
+        );
+        let layout = maestro_shell::WindowLayoutService::new(&paths)
+            .load("w1")
+            .unwrap()
+            .unwrap();
+        let child = layout
+            .tabs
+            .iter()
+            .find(|tab| tab.tab_id == "tab-provider-custom")
+            .expect("custom provider split child is durable");
+        assert_eq!(
+            child.split_from.as_ref().map(|split| split.tab_id.as_str()),
+            Some("t0")
+        );
+        drop(stub);
+        drop(sock_dir);
+    }
+
+    #[test]
+    fn custom_agent_carrier_preserves_opaque_cross_provider_commands() {
+        assert!(NewTabForegroundLaunch::agent_adhoc(
+            vec![s("claude"), s("mcp"), s("--serve")],
+            Some(s("claude")),
+        )
+        .is_some());
+        assert!(NewTabForegroundLaunch::agent_adhoc(
+            vec![s("claude"), s("--continue=foreign")],
+            Some(s("codex")),
+        )
+        .is_some());
+        assert!(NewTabForegroundLaunch::agent_adhoc(
+            vec![s("/opt/custom/claude"), s("--continue=foreign")],
+            Some(s("claude")),
+        )
+        .is_some());
+        assert!(NewTabForegroundLaunch::provider_custom_adhoc(
+            s("copilot"),
+            vec![s("copilot"), s("-r=foreign")],
+            s("copilot"),
+        )
+        .is_none());
+    }
+
+    #[test]
     fn worktree_foreground_pipeline_missing_consent_fails_at_gate_before_any_side_effect() {
         // Defense-in-depth: even if the caller routed a worktree here, a record WITHOUT
         // `worktree_create` consent must fail at `prepare_workspace_with_consent`'s consent gate
         // BEFORE any git runs, any daemon connect, or any renderer command is sent.
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = maestro_shell::AppPaths::with_base(tmp.path());
-        one_existing_tab_window(&paths);
+        one_existing_tab_window(&paths, "maestro-app-dev-project");
 
         let env = MapEnv::new(&[]);
         let plan =
@@ -4818,7 +7334,7 @@ mod tests {
         let fresh = fresh_worktree_workspace(workspace_id, tmp.path(), false);
         let argv = vec![s("/bin/zsh"), s("-l")];
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        rt.seed_active_tab("w1", "t0", "sess-t0");
 
         let err = run_new_tab_foreground_pipeline_with_consent(
             NewTabForegroundRequest {
@@ -4826,11 +7342,13 @@ mod tests {
                 socket_path: tmp.path().join("unused.sock"),
                 window_id: "w1",
                 plan: &plan,
-                argv: &argv,
+                launch: NewTabForegroundLaunch::shell_adhoc(&argv),
                 cols: 80,
                 rows: 24,
                 now_ms: 1_700_000_000,
                 split_from: None,
+                split_source_session: None,
+                expected_project_id: None,
             },
             &fresh,
             &env,
@@ -4855,8 +7373,8 @@ mod tests {
         );
         assert_eq!(
             rt.active_tab_id(),
-            Some("t0"),
-            "consent-gate failure leaves active tab unchanged"
+            None,
+            "consent-gate failure cannot upgrade the textual seed into authority"
         );
         let persisted = maestro_shell::WindowLayoutService::new(&paths)
             .load("w1")
@@ -4894,10 +7412,15 @@ mod tests {
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = maestro_shell::AppPaths::with_base(tmp.path());
-        // The pipeline starts a session whose SessionRecord references the workspace id; seed its FK
-        // parents so the SQLite session INSERT does not fail the foreign-key constraint.
-        seed_default_scratch_workspace_parents(&paths);
-        one_existing_tab_window(&paths);
+        seed_missing_consent_worktree_project(&paths, "proj-wt", "maestro-app-dev", repo.path());
+        let fresh = maestro_shell::grant_consent(
+            &paths,
+            "maestro-app-dev",
+            maestro_shell::WorkspaceConsentKind::WorktreeCreate,
+            2,
+        )
+        .expect("grant fixture worktree consent");
+        one_existing_tab_window(&paths, "proj-wt");
 
         let sock_dir = tempfile::tempdir().expect("sock dir");
         let sock_path = sock_dir.path().join("stub.sock");
@@ -4908,10 +7431,10 @@ mod tests {
         let NewTabPlan::Create { workspace_id, .. } = &plan else {
             panic!("expected Create");
         };
-        let fresh = fresh_worktree_workspace(workspace_id, repo.path(), true);
+        assert_eq!(workspace_id, &fresh.workspace_id);
         let argv = vec![s("/bin/zsh"), s("-l")];
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        rt.seed_active_tab("w1", "t0", "sess-t0");
 
         let out = run_new_tab_foreground_pipeline_with_consent(
             NewTabForegroundRequest {
@@ -4919,37 +7442,30 @@ mod tests {
                 socket_path: sock_path,
                 window_id: "w1",
                 plan: &plan,
-                argv: &argv,
+                launch: NewTabForegroundLaunch::shell_adhoc(&argv),
                 cols: 80,
                 rows: 24,
                 now_ms: 1_700_000_000,
                 split_from: None,
+                split_source_session: None,
+                expected_project_id: None,
             },
             &fresh,
             &env,
             &mut rt,
         )
-        .expect("consented worktree foreground pipeline succeeds");
+        .unwrap_or_else(|error| panic!("consented worktree foreground pipeline succeeds: {error}"));
 
         assert_eq!(out.tab_id, "tab-1");
         assert_eq!(out.session_id, "sess-1");
-        assert_eq!(rt.active_tab_id(), Some("tab-1"));
-        // Shared post-preparation order: strip first, then attach, then nothing.
-        match rx.try_recv().expect("first command is strip") {
-            maestro_renderer::RendererCommand::SetTabStrip { tab_strip } => {
-                let strip = tab_strip.expect("Some strip");
-                assert_eq!(strip.tabs.len(), 2);
-                assert!(strip.tabs[1].active);
-            }
-            other => panic!("expected SetTabStrip first, got {other:?}"),
-        }
-        match rx.try_recv().expect("second command is attach") {
-            maestro_renderer::RendererCommand::AttachSession { session_id } => {
-                assert_eq!(session_id, "sess-1");
-            }
-            other => panic!("expected AttachSession second, got {other:?}"),
-        }
-        assert!(rx.try_recv().is_err(), "exactly two renderer commands");
+        assert_eq!(rt.active_tab_id(), None, "send is not renderer adoption");
+        assert_eq!(
+            rt.pending_handoff()
+                .map(|pending| pending.target().target().tab_id.as_str()),
+            Some("tab-1")
+        );
+        let strip = expect_single_handoff_command(&rx, "sess-1", 2);
+        assert!(strip.tabs[1].active);
 
         let persisted = maestro_shell::WindowLayoutService::new(&paths)
             .load("w1")
@@ -5012,28 +7528,21 @@ mod tests {
             (
                 NewTabForegroundError::StartParams {
                     cwd: cwd.join("start-params"),
+                    scratch: None,
                     error: NewTabStartParamsError::NotCreate,
                 },
                 NewTabFailureStage::StartParams,
-                vec![NewTabRecoveryAction::RemoveScratch(
-                    cwd.join("start-params"),
-                )],
+                vec![],
             ),
             (
                 session_start_foreground_error(cwd.join("session-start")),
                 NewTabFailureStage::SessionStart,
-                vec![
-                    NewTabRecoveryAction::KillStartedSession,
-                    NewTabRecoveryAction::RemoveScratch(cwd.join("session-start")),
-                ],
+                vec![],
             ),
             (
                 layout_record_foreground_error(cwd.join("layout-record")),
                 NewTabFailureStage::LayoutRecord,
-                vec![
-                    NewTabRecoveryAction::KillStartedSession,
-                    NewTabRecoveryAction::RemoveScratch(cwd.join("layout-record")),
-                ],
+                vec![NewTabRecoveryAction::KillStartedSession],
             ),
             (
                 NewTabForegroundError::Projection(NewTabStripProjectionError::ActiveTabNotFound {
@@ -5081,6 +7590,7 @@ mod tests {
             NewTabForegroundError::WorkspacePrepare(NewTabWorkspacePrepareError::NotCreate),
             NewTabForegroundError::StartParams {
                 cwd: cwd.join("start-params"),
+                scratch: None,
                 error: NewTabStartParamsError::NotCreate,
             },
             session_start_foreground_error(cwd.join("session-start")),
@@ -5137,6 +7647,7 @@ mod tests {
             window_id: Some(s("w1")),
             tab_id: Some(s("tab-new")),
             session_id: Some(s("sess-new")),
+            session_generation: Some(s("gen-new")),
             previous_strip_tabs: Some(vec![snapshot_tab("tab-old", "sess-old", 0)]),
             previous_selection: Some(vec![TabSelection {
                 tab_id: s("tab-old"),
@@ -5168,8 +7679,9 @@ mod tests {
                     strip_tabs,
                     selection,
                 },
-                ResolvedNewTabRecoveryAction::KillSession {
+                ResolvedNewTabRecoveryAction::KillSessionIfGeneration {
                     session_id: s("sess-new"),
+                    expected_generation: s("gen-new"),
                 },
             ],
             "resolved actions preserve planner order while attaching concrete state"
@@ -5189,13 +7701,8 @@ mod tests {
 
         assert_eq!(
             resolved.actions,
-            vec![
-                ResolvedNewTabRecoveryAction::MissingSessionForKill,
-                ResolvedNewTabRecoveryAction::RemoveScratch(PathBuf::from(
-                    "/tmp/maestro-no-session"
-                )),
-            ],
-            "missing session context is explicit and does not block the planned scratch action"
+            vec![ResolvedNewTabRecoveryAction::MissingSessionForKill],
+            "missing session context is explicit, while a path-only cwd grants no scratch cleanup authority"
         );
     }
 
@@ -5208,6 +7715,7 @@ mod tests {
         let plan = plan_new_tab_failure_recovery(&err);
         let context = NewTabRecoveryContext {
             session_id: Some(s("sess-new")),
+            session_generation: Some(s("gen-new")),
             ..Default::default()
         };
 
@@ -5217,8 +7725,9 @@ mod tests {
             resolved.actions,
             vec![
                 ResolvedNewTabRecoveryAction::MissingTabRecordTarget,
-                ResolvedNewTabRecoveryAction::KillSession {
+                ResolvedNewTabRecoveryAction::KillSessionIfGeneration {
                     session_id: s("sess-new"),
+                    expected_generation: s("gen-new"),
                 },
             ]
         );
@@ -5246,8 +7755,9 @@ mod tests {
                     strip_tabs,
                     selection,
                 },
-                ResolvedNewTabRecoveryAction::KillSession {
+                ResolvedNewTabRecoveryAction::KillSessionIfGeneration {
                     session_id: s("sess-new"),
+                    expected_generation: s("gen-new"),
                 },
             ]
         );
@@ -5264,6 +7774,7 @@ mod tests {
             window_id: Some(s("w1")),
             tab_id: Some(s("tab-new")),
             session_id: Some(s("sess-new")),
+            session_generation: Some(s("gen-new")),
             scratch_cwd: Some(PathBuf::from("/tmp/must-not-remove")),
             ..Default::default()
         };
@@ -5386,10 +7897,10 @@ mod tests {
 
     #[test]
     fn execute_new_tab_recovery_plan_reports_failure_and_continues() {
-        let err = layout_record_foreground_error(PathBuf::from("/tmp/maestro-exec-failure"));
+        let err = NewTabForegroundError::SetTabStrip(NewTabSetTabStripError::RendererControlClosed);
         let plan = plan_new_tab_failure_recovery(&err);
         let mut effects = FakeNewTabRecoveryEffects {
-            fail_on: Some("kill_started_session"),
+            fail_on: Some("rollback_tab_record"),
             ..Default::default()
         };
 
@@ -5398,24 +7909,27 @@ mod tests {
         assert_eq!(
             effects.calls,
             vec![
+                "rollback_tab_record",
+                "revert_renderer_strip",
                 "kill_started_session",
-                "remove_scratch:/tmp/maestro-exec-failure"
             ],
-            "scratch cleanup still runs after kill failure"
+            "renderer recovery and generation-bound cleanup still run after rollback failure"
         );
-        assert_eq!(report.outcomes.len(), 2);
+        assert_eq!(report.outcomes.len(), 3);
         assert_eq!(
             report.outcomes[0],
             NewTabRecoveryActionOutcome::failed(
-                NewTabRecoveryAction::KillStartedSession,
-                "kill_started_session failed"
+                NewTabRecoveryAction::RollbackTabRecord,
+                "rollback_tab_record failed"
             )
         );
         assert_eq!(
             report.outcomes[1],
-            NewTabRecoveryActionOutcome::ok(NewTabRecoveryAction::RemoveScratch(PathBuf::from(
-                "/tmp/maestro-exec-failure"
-            )))
+            NewTabRecoveryActionOutcome::ok(NewTabRecoveryAction::RevertRendererStrip)
+        );
+        assert_eq!(
+            report.outcomes[2],
+            NewTabRecoveryActionOutcome::ok(NewTabRecoveryAction::KillStartedSession)
         );
         assert_eq!(report.failed_count(), 1);
     }
@@ -5478,6 +7992,7 @@ mod tests {
         fn kill_session(
             &mut self,
             session_id: &str,
+            _expected_generation: &str,
         ) -> Result<ResolvedNewTabRecoveryEffectResult, Self::Error> {
             self.calls.push(format!("kill_session:{session_id}"));
             self.finish("kill_session")
@@ -5546,8 +8061,9 @@ mod tests {
                 strip_tabs: saved_tabs,
                 selection: saved_selection,
             },
-            ResolvedNewTabRecoveryAction::KillSession {
+            ResolvedNewTabRecoveryAction::KillSessionIfGeneration {
                 session_id: s("sess-new"),
+                expected_generation: s("gen-new"),
             },
         ]);
         let mut effects = FakeResolvedNewTabRecoveryEffects::default();
@@ -5581,8 +8097,9 @@ mod tests {
             ResolvedNewTabRecoveryAction::MissingSessionForKill,
             ResolvedNewTabRecoveryAction::MissingTabRecordTarget,
             ResolvedNewTabRecoveryAction::RemoveScratch(PathBuf::from("/tmp/missing-scratch")),
-            ResolvedNewTabRecoveryAction::KillSession {
+            ResolvedNewTabRecoveryAction::KillSessionIfGeneration {
                 session_id: s("sess-already-gone"),
+                expected_generation: s("gen-already-gone"),
             },
         ]);
         let mut effects = FakeResolvedNewTabRecoveryEffects {
@@ -5650,8 +8167,9 @@ mod tests {
                 strip_tabs: saved_tabs,
                 selection: saved_selection,
             },
-            ResolvedNewTabRecoveryAction::KillSession {
+            ResolvedNewTabRecoveryAction::KillSessionIfGeneration {
                 session_id: s("sess-new"),
+                expected_generation: s("gen-new"),
             },
         ]);
         let mut effects = FakeResolvedNewTabRecoveryEffects {
@@ -5735,7 +8253,7 @@ mod tests {
 
     #[test]
     fn foreground_new_tab_recovery_context_reports_concrete_post_record_targets() {
-        let err = NewTabForegroundError::SetTabStrip(NewTabSetTabStripError::RendererControlClosed);
+        let err = generation_bound_set_tab_strip_failure();
         let previous_strip_tabs = vec![snapshot_tab("tab-old", "sess-old", 0)];
         let previous_selection = vec![TabSelection {
             tab_id: s("tab-old"),
@@ -5777,8 +8295,18 @@ mod tests {
 
     #[test]
     fn foreground_new_tab_recovery_context_carries_pre_record_scratch_cleanup() {
-        let cwd = PathBuf::from("/tmp/maestro-foreground-reporting");
-        let err = layout_record_foreground_error(cwd.clone());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = maestro_shell::AppPaths::with_base(tmp.path());
+        let (prepared, receipt) =
+            maestro_shell::prepare_fresh_scratch_cwd(&paths, "ws-report", "sess-new", "")
+                .expect("prepare fresh scratch")
+                .into_parts();
+        let cwd = prepared.cwd;
+        let err = NewTabForegroundError::StartParams {
+            cwd: cwd.clone(),
+            scratch: Some(NewTabScratchRemovalAuthority::from_fresh_receipt(receipt)),
+            error: NewTabStartParamsError::NotCreate,
+        };
 
         let context =
             foreground_new_tab_recovery_context("w-live", "tab-new", "sess-new", &[], &[], &err);
@@ -5786,10 +8314,13 @@ mod tests {
         assert_eq!(context.scratch_cwd.as_deref(), Some(cwd.as_path()));
 
         let line = render_resolved_recovery_log_line(&resolve_new_tab_recovery(&err, &context));
-        assert!(line.contains("stage=LayoutRecord"), "{line}");
-        assert!(line.contains("kill_session(sess-new)"), "{line}");
+        assert!(line.contains("stage=StartParams"), "{line}");
         assert!(
-            line.contains("remove_scratch(/tmp/maestro-foreground-reporting)"),
+            !line.contains("kill_session(") && !line.contains("missing_session_for_kill"),
+            "pre-start failure has no session cleanup action: {line}"
+        );
+        assert!(
+            line.contains(&format!("remove_scratch({})", cwd.display())),
             "{line}"
         );
     }
@@ -5852,8 +8383,9 @@ mod tests {
                     ResolvedNewTabRecoveryAction::RemoveScratch(PathBuf::from("/tmp/scratch-x")),
                 ),
                 ResolvedNewTabRecoveryActionOutcome::skipped(
-                    ResolvedNewTabRecoveryAction::KillSession {
+                    ResolvedNewTabRecoveryAction::KillSessionIfGeneration {
                         session_id: s("sess-gone"),
+                        expected_generation: s("gen-gone"),
                     },
                     "session already gone",
                 ),
@@ -5882,12 +8414,13 @@ mod tests {
 
     #[test]
     fn render_resolved_recovery_execution_log_line_renders_failed_outcome_with_error() {
-        let err = NewTabForegroundError::SetTabStrip(NewTabSetTabStripError::RendererControlClosed);
+        let err = generation_bound_set_tab_strip_failure();
         let report = ResolvedNewTabRecoveryExecutionReport {
             diagnostic: classify_new_tab_foreground_failure(&err),
             outcomes: vec![ResolvedNewTabRecoveryActionOutcome::failed(
-                ResolvedNewTabRecoveryAction::KillSession {
+                ResolvedNewTabRecoveryAction::KillSessionIfGeneration {
                     session_id: s("sess-new"),
+                    expected_generation: s("gen-new"),
                 },
                 "daemon unavailable",
             )],
@@ -5909,7 +8442,7 @@ mod tests {
         // executor never ran and no per-action outcome exists. The live path must still emit ONE
         // deterministic diagnostic carrying the failure stage, never an ad-hoc fallback. A synthetic
         // zero-outcome report built straight from the resolved plan's diagnostic renders exactly that.
-        let err = NewTabForegroundError::SetTabStrip(NewTabSetTabStripError::RendererControlClosed);
+        let err = generation_bound_set_tab_strip_failure();
         let report = ResolvedNewTabRecoveryExecutionReport {
             diagnostic: classify_new_tab_foreground_failure(&err),
             outcomes: Vec::new(),
@@ -5937,8 +8470,9 @@ mod tests {
         std::fs::create_dir_all(&scratch).expect("create scratch");
         let plan = resolved_recovery_plan(vec![
             ResolvedNewTabRecoveryAction::RemoveScratch(scratch.clone()),
-            ResolvedNewTabRecoveryAction::KillSession {
+            ResolvedNewTabRecoveryAction::KillSessionIfGeneration {
                 session_id: s("sess-new"),
+                expected_generation: s("gen-new"),
             },
         ]);
         let killer = FakeRecoverySessionKiller {
@@ -5969,8 +8503,10 @@ mod tests {
         fn kill_session(
             &mut self,
             session_id: &str,
+            expected_generation: &str,
         ) -> Result<KillSessionRecoveryEffectResult, Self::Error> {
-            self.calls.push(session_id.to_string());
+            self.calls
+                .push(format!("{session_id}@{expected_generation}"));
             self.result.clone()
         }
     }
@@ -5982,9 +8518,10 @@ mod tests {
             calls: Vec::new(),
         };
 
-        let result = kill_session_recovery_effect("sess-new", &mut killer).expect("kill succeeds");
+        let result = kill_session_recovery_effect("sess-new", "gen-new", &mut killer)
+            .expect("kill succeeds");
 
-        assert_eq!(killer.calls, vec![s("sess-new")]);
+        assert_eq!(killer.calls, vec![s("sess-new@gen-new")]);
         assert_eq!(result, ResolvedNewTabRecoveryEffectResult::Succeeded);
     }
 
@@ -5995,10 +8532,10 @@ mod tests {
             calls: Vec::new(),
         };
 
-        let result = kill_session_recovery_effect("sess-gone", &mut killer)
+        let result = kill_session_recovery_effect("sess-gone", "gen-gone", &mut killer)
             .expect("already-gone session is idempotent");
 
-        assert_eq!(killer.calls, vec![s("sess-gone")]);
+        assert_eq!(killer.calls, vec![s("sess-gone@gen-gone")]);
         assert_eq!(
             result,
             ResolvedNewTabRecoveryEffectResult::Skipped {
@@ -6014,10 +8551,10 @@ mod tests {
             calls: Vec::new(),
         };
 
-        let err = kill_session_recovery_effect("sess-new", &mut killer)
+        let err = kill_session_recovery_effect("sess-new", "gen-new", &mut killer)
             .expect_err("genuine kill failure is propagated");
 
-        assert_eq!(killer.calls, vec![s("sess-new")]);
+        assert_eq!(killer.calls, vec![s("sess-new@gen-new")]);
         assert_eq!(err, "daemon unavailable");
     }
 
@@ -6025,6 +8562,8 @@ mod tests {
     fn new_tab_rollback_tab_record_recovery_effect_removes_existing_tab_record() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = maestro_shell::AppPaths::with_base(tmp.path());
+        seed_exact_test_session(&paths, "sess-t0", "gen-t0");
+        seed_exact_test_session(&paths, "sess-new", "gen-new");
         let service = maestro_shell::WindowLayoutService::new(&paths);
         service.create_empty("w1", 0).expect("create layout");
         service
@@ -6327,11 +8866,8 @@ mod tests {
                     self.restore_renderer_projection(strip_tabs, selection)
                 }
                 ContractRendererStateMode::AlreadyCorrect => {
-                    assert_eq!(
-                        self.runtime.active_window_id(),
-                        Some(self.window_id.as_str())
-                    );
-                    assert_eq!(self.runtime.active_tab_id(), self.active_tab_id.as_deref());
+                    // This mode represents an independently reviewed exact-current signal. It is
+                    // deliberately not derived from the runtime's textual compatibility getters.
                     Ok(RendererStateRecoveryEffectResult::AlreadyCurrent)
                 }
                 ContractRendererStateMode::AmbiguousActiveState => {
@@ -6364,11 +8900,7 @@ mod tests {
                     self.restore_renderer_projection(strip_tabs, selection)
                 }
                 ContractRendererStateMode::AlreadyCorrect => {
-                    assert_eq!(
-                        self.runtime.active_window_id(),
-                        Some(self.window_id.as_str())
-                    );
-                    assert_eq!(self.runtime.active_tab_id(), self.active_tab_id.as_deref());
+                    // See the matching `revert` arm: the test injects the proof classification.
                     Ok(RendererStateRecoveryEffectResult::AlreadyCurrent)
                 }
                 ContractRendererStateMode::AmbiguousActiveState => {
@@ -6406,33 +8938,15 @@ mod tests {
             adopted_selection: None,
         };
 
-        let restored =
+        let refused =
             revert_renderer_strip_recovery_effect(&strip_tabs, &selection, &mut controller)
-                .expect("open renderer command channel restores strip");
-
-        assert_eq!(restored, ResolvedNewTabRecoveryEffectResult::Succeeded);
-        assert_eq!(
-            controller.adopted_strip_tabs.as_deref(),
-            Some(strip_tabs.as_slice())
-        );
-        assert_eq!(
-            controller.adopted_selection.as_deref(),
-            Some(selection.as_slice())
-        );
-        match rx.try_recv().expect("one strip command is delivered") {
-            maestro_renderer::RendererCommand::SetTabStrip {
-                tab_strip: Some(strip),
-            } => {
-                assert_eq!(strip.window_id, "w-live");
-                assert_eq!(strip.tabs.len(), 2);
-                assert_eq!(strip.tabs[0].tab_id, "tab-old");
-                assert!(strip.tabs[0].active);
-            }
-            other => panic!("expected SetTabStrip(Some(..)), got {other:?}"),
-        }
+                .expect_err("presentation-only restore has no exact viewport authority");
+        assert_eq!(refused, TabSwitchError::ViewportAuthorityRequired);
+        assert!(controller.adopted_strip_tabs.is_none());
+        assert!(controller.adopted_selection.is_none());
         assert!(
             matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
-            "successful restore sends exactly one renderer command"
+            "authority refusal sends no renderer command"
         );
 
         let (runtime, closed_rx) = RendererTabRuntime::new();
@@ -6467,7 +8981,7 @@ mod tests {
         let failed_line = render_resolved_recovery_execution_log_line(&failed_report);
         assert!(
             failed_line.contains(
-                "revert_renderer_strip(tabs=2,selection=2)=fail(renderer control channel is closed)"
+                "revert_renderer_strip(tabs=2,selection=2)=fail(renderer switch requires an exact viewport authority)"
             ),
             "{failed_line}"
         );
@@ -6480,8 +8994,7 @@ mod tests {
             "listener selection must not be adopted when renderer command delivery fails"
         );
 
-        let (mut runtime, _rx) = RendererTabRuntime::new();
-        runtime.seed_active_tab("w-live", "tab-old");
+        let (runtime, _rx) = RendererTabRuntime::new();
         let mut already_correct = ContractRendererStateController {
             runtime,
             window_id: s("w-live"),
@@ -6605,8 +9118,9 @@ mod tests {
     #[test]
     fn new_tab_filesystem_recovery_effects_report_unsupported_effects_as_skipped() {
         let plan = resolved_recovery_plan(vec![
-            ResolvedNewTabRecoveryAction::KillSession {
+            ResolvedNewTabRecoveryAction::KillSessionIfGeneration {
                 session_id: s("sess-new"),
+                expected_generation: s("gen-new"),
             },
             ResolvedNewTabRecoveryAction::RollbackTabRecord {
                 window_id: s("w1"),
@@ -6661,8 +9175,9 @@ mod tests {
         std::fs::write(scratch.join("nested").join("marker"), b"orphan").expect("write marker");
         let plan = resolved_recovery_plan(vec![
             ResolvedNewTabRecoveryAction::RemoveScratch(scratch.clone()),
-            ResolvedNewTabRecoveryAction::KillSession {
+            ResolvedNewTabRecoveryAction::KillSessionIfGeneration {
                 session_id: s("sess-new"),
+                expected_generation: s("gen-new"),
             },
         ]);
         let killer = FakeRecoverySessionKiller {
@@ -6674,7 +9189,7 @@ mod tests {
         let report = execute_resolved_new_tab_recovery_plan(&plan, &mut effects);
 
         assert!(!scratch.exists(), "scratch dir must be removed");
-        assert_eq!(effects.session_killer().calls, vec![s("sess-new")]);
+        assert_eq!(effects.session_killer().calls, vec![s("sess-new@gen-new")]);
         assert_eq!(
             report
                 .outcomes
@@ -6695,8 +9210,9 @@ mod tests {
         let scratch = tmp.path().join("never-created");
         let plan = resolved_recovery_plan(vec![
             ResolvedNewTabRecoveryAction::RemoveScratch(scratch.clone()),
-            ResolvedNewTabRecoveryAction::KillSession {
+            ResolvedNewTabRecoveryAction::KillSessionIfGeneration {
                 session_id: s("sess-gone"),
+                expected_generation: s("gen-gone"),
             },
         ]);
         let killer = FakeRecoverySessionKiller {
@@ -6707,7 +9223,10 @@ mod tests {
 
         let report = execute_resolved_new_tab_recovery_plan(&plan, &mut effects);
 
-        assert_eq!(effects.session_killer().calls, vec![s("sess-gone")]);
+        assert_eq!(
+            effects.session_killer().calls,
+            vec![s("sess-gone@gen-gone")]
+        );
         assert_eq!(report.succeeded_count(), 0);
         assert_eq!(report.skipped_count(), 2);
         assert_eq!(report.failed_count(), 0);
@@ -6719,8 +9238,9 @@ mod tests {
                     "missing scratch dir (already gone)",
                 ),
                 ResolvedNewTabRecoveryActionOutcome::skipped(
-                    ResolvedNewTabRecoveryAction::KillSession {
-                        session_id: s("sess-gone")
+                    ResolvedNewTabRecoveryAction::KillSessionIfGeneration {
+                        session_id: s("sess-gone"),
+                        expected_generation: s("gen-gone"),
                     },
                     "session already gone",
                 ),
@@ -6793,6 +9313,8 @@ mod tests {
     fn new_tab_record_local_recovery_effects_remove_rollback_and_kill_in_plan_order() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = maestro_shell::AppPaths::with_base(tmp.path());
+        seed_exact_test_session(&paths, "sess-t0", "gen-t0");
+        seed_exact_test_session(&paths, "sess-new", "gen-new");
         let scratch = tmp.path().join("scratch-cwd");
         std::fs::create_dir_all(scratch.join("nested")).expect("create scratch");
         std::fs::write(scratch.join("nested").join("marker"), b"orphan").expect("write marker");
@@ -6826,8 +9348,9 @@ mod tests {
                 window_id: s("w1"),
                 tab_id: s("tab-new"),
             },
-            ResolvedNewTabRecoveryAction::KillSession {
+            ResolvedNewTabRecoveryAction::KillSessionIfGeneration {
                 session_id: s("sess-new"),
+                expected_generation: s("gen-new"),
             },
         ]);
         let killer = FakeRecoverySessionKiller {
@@ -6839,7 +9362,7 @@ mod tests {
         let report = execute_resolved_new_tab_recovery_plan(&plan, &mut effects);
 
         assert!(!scratch.exists(), "scratch dir must be removed");
-        assert_eq!(effects.session_killer().calls, vec![s("sess-new")]);
+        assert_eq!(effects.session_killer().calls, vec![s("sess-new@gen-new")]);
         let reloaded = maestro_shell::WindowLayoutService::new(&paths)
             .load("w1")
             .expect("load layout")
@@ -6970,6 +9493,8 @@ mod tests {
     fn new_tab_complete_recovery_effects_execute_all_five_actions_in_plan_order() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = maestro_shell::AppPaths::with_base(tmp.path());
+        seed_exact_test_session(&paths, "sess-t0", "gen-t0");
+        seed_exact_test_session(&paths, "sess-new", "gen-new");
         let scratch = tmp.path().join("scratch-cwd");
         std::fs::create_dir_all(scratch.join("nested")).expect("create scratch");
         std::fs::write(scratch.join("nested").join("marker"), b"orphan").expect("write marker");
@@ -7012,8 +9537,9 @@ mod tests {
                 strip_tabs: strip_tabs.clone(),
                 selection: selection.clone(),
             },
-            ResolvedNewTabRecoveryAction::KillSession {
+            ResolvedNewTabRecoveryAction::KillSessionIfGeneration {
                 session_id: s("sess-new"),
+                expected_generation: s("gen-new"),
             },
         ]);
         let killer = FakeRecoverySessionKiller {
@@ -7031,7 +9557,7 @@ mod tests {
         let report = execute_resolved_new_tab_recovery_plan(&plan, &mut effects);
 
         assert!(!scratch.exists(), "scratch dir must be removed");
-        assert_eq!(effects.session_killer().calls, vec![s("sess-new")]);
+        assert_eq!(effects.session_killer().calls, vec![s("sess-new@gen-new")]);
         assert_eq!(
             effects.renderer_controller().calls,
             vec![
@@ -7092,8 +9618,9 @@ mod tests {
                 strip_tabs,
                 selection,
             },
-            ResolvedNewTabRecoveryAction::KillSession {
+            ResolvedNewTabRecoveryAction::KillSessionIfGeneration {
                 session_id: s("sess-gone"),
+                expected_generation: s("gen-gone"),
             },
         ]);
         let killer = FakeRecoverySessionKiller {
@@ -7110,7 +9637,10 @@ mod tests {
 
         let report = execute_resolved_new_tab_recovery_plan(&plan, &mut effects);
 
-        assert_eq!(effects.session_killer().calls, vec![s("sess-gone")]);
+        assert_eq!(
+            effects.session_killer().calls,
+            vec![s("sess-gone@gen-gone")]
+        );
         let reloaded = maestro_shell::WindowLayoutService::new(&paths)
             .load("w1")
             .expect("load layout")
@@ -7154,8 +9684,9 @@ mod tests {
                 strip_tabs: strip_tabs.clone(),
                 selection: selection.clone(),
             },
-            ResolvedNewTabRecoveryAction::KillSession {
+            ResolvedNewTabRecoveryAction::KillSessionIfGeneration {
                 session_id: s("sess-new"),
+                expected_generation: s("gen-new"),
             },
             ResolvedNewTabRecoveryAction::ReconcileRendererState {
                 strip_tabs,
@@ -7175,7 +9706,7 @@ mod tests {
 
         let report = execute_resolved_new_tab_recovery_plan(&plan, &mut effects);
 
-        assert_eq!(effects.session_killer().calls, vec![s("sess-new")]);
+        assert_eq!(effects.session_killer().calls, vec![s("sess-new@gen-new")]);
         assert_eq!(
             effects.renderer_controller().calls,
             vec![
@@ -7219,7 +9750,7 @@ mod tests {
         // The pipeline starts a session whose SessionRecord references the scratch workspace; seed
         // its FK parents so the SQLite session INSERT does not fail the foreign-key constraint.
         seed_default_scratch_workspace_parents(&paths);
-        one_existing_tab_window(&paths);
+        one_existing_tab_window(&paths, "maestro-app-dev-project");
 
         let sock_dir = tempfile::tempdir().expect("sock dir");
         let sock_path = sock_dir.path().join("stub.sock");
@@ -7228,7 +9759,7 @@ mod tests {
         let plan = create_plan("tab-1", "sess-1", NewTabLaunchSource::DefaultShellDev);
         let argv = vec![s("/bin/zsh"), s("-l")];
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        rt.seed_active_tab("w1", "t0", "sess-t0");
         drop(rx);
 
         let err = run_new_tab_foreground_pipeline(
@@ -7237,11 +9768,13 @@ mod tests {
                 socket_path: sock_path,
                 window_id: "w1",
                 plan: &plan,
-                argv: &argv,
+                launch: NewTabForegroundLaunch::shell_adhoc(&argv),
                 cols: 80,
                 rows: 24,
                 now_ms: 1_700_000_000,
                 split_from: None,
+                split_source_session: None,
+                expected_project_id: None,
             },
             &env,
             &mut rt,
@@ -7250,12 +9783,17 @@ mod tests {
 
         assert!(matches!(
             err,
-            NewTabForegroundError::SetTabStrip(NewTabSetTabStripError::RendererControlClosed)
+            NewTabForegroundError::PreparedGenerationBoundAttachSession {
+                ref session_id,
+                ref session_generation,
+                error: NewTabAttachSessionError::RendererControlClosed,
+                ..
+            } if session_id == "sess-1" && session_generation == "gen-1"
         ));
         assert_eq!(
             rt.active_tab_id(),
-            Some("t0"),
-            "failed strip send leaves active-tab state unchanged"
+            None,
+            "a textual seed never authorizes an active renderer lifetime"
         );
         let persisted = maestro_shell::WindowLayoutService::new(&paths)
             .load("w1")
@@ -7279,26 +9817,28 @@ mod tests {
     fn new_tab_smoke_pre_record_failure_removes_orphan_scratch_and_leaves_layout_unchanged() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = maestro_shell::AppPaths::with_base(tmp.path());
-        one_existing_tab_window(&paths);
+        one_existing_tab_window(&paths, "maestro-app-dev-project");
 
         let env = MapEnv::new(&[]);
         let plan = create_plan("tab-1", "sess-1", NewTabLaunchSource::DefaultShellDev);
         let argv = vec![s("/bin/zsh"), s("-l")];
         let (mut rt, rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        rt.seed_active_tab("w1", "t0", "sess-t0");
         let missing_socket = tmp.path().join("missing.sock");
 
-        let err = run_new_tab_foreground_pipeline(
+        let mut err = run_new_tab_foreground_pipeline(
             NewTabForegroundRequest {
                 paths: &paths,
                 socket_path: missing_socket,
                 window_id: "w1",
                 plan: &plan,
-                argv: &argv,
+                launch: NewTabForegroundLaunch::shell_adhoc(&argv),
                 cols: 80,
                 rows: 24,
                 now_ms: 1_700_000_000,
                 split_from: None,
+                split_source_session: None,
+                expected_project_id: None,
             },
             &env,
             &mut rt,
@@ -7311,7 +9851,16 @@ mod tests {
         assert_eq!(cleanup, paths.scratch_base().join("sess-1"));
         assert!(cleanup.is_dir(), "scratch exists before cleanup");
 
-        remove_new_tab_scratch(&cleanup).expect("eligible orphan scratch is removable");
+        let report = execute_production_new_tab_recovery(
+            &paths,
+            &tmp.path().join("missing-again.sock"),
+            1_700_000_001,
+            &mut err,
+            &[],
+            &[],
+            &mut rt,
+        );
+        assert_eq!(report.succeeded_count(), 1);
         assert!(
             !cleanup.exists(),
             "orphan scratch cwd is gone after cleanup"
@@ -7322,8 +9871,8 @@ mod tests {
         );
         assert_eq!(
             rt.active_tab_id(),
-            Some("t0"),
-            "pre-record failure leaves active tab unchanged"
+            None,
+            "pre-record failure cannot upgrade the textual seed into authority"
         );
 
         let persisted = maestro_shell::WindowLayoutService::new(&paths)
@@ -7354,6 +9903,7 @@ mod tests {
             (
                 NewTabForegroundError::StartParams {
                     cwd: cwd.join("start-params"),
+                    scratch: None,
                     error: NewTabStartParamsError::NotCreate,
                 },
                 NewTabFailureStage::StartParams,
@@ -7436,7 +9986,7 @@ mod tests {
     #[test]
     fn new_tab_failure_scratch_to_remove_matches_pre_record_residue_contract() {
         let cwd = PathBuf::from("/tmp/maestro-pre-record-scratch");
-        let cases = vec![
+        let cases: Vec<(NewTabForegroundError, Option<PathBuf>)> = vec![
             (
                 NewTabForegroundError::WorkspacePrepare(NewTabWorkspacePrepareError::NotCreate),
                 None,
@@ -7444,13 +9994,14 @@ mod tests {
             (
                 NewTabForegroundError::StartParams {
                     cwd: cwd.join("start-params"),
+                    scratch: None,
                     error: NewTabStartParamsError::NotCreate,
                 },
-                Some(cwd.join("start-params")),
+                None,
             ),
             (
                 session_start_foreground_error(cwd.join("session-start")),
-                Some(cwd.join("session-start")),
+                None,
             ),
             (
                 NewTabForegroundError::LayoutRecord {
@@ -7461,7 +10012,7 @@ mod tests {
                         },
                     ),
                 },
-                Some(cwd.join("layout-record")),
+                None,
             ),
             (
                 NewTabForegroundError::Projection(NewTabStripProjectionError::ActiveTabNotFound {
@@ -7486,13 +10037,14 @@ mod tests {
         }
     }
 
-    // ---- NewTab live-recovery + end-to-end recovery-log tests ----------------------------
-    // Kept beside the owning recovery resolver/executor/effects items.
+    // ---- NewTab live-recovery + end-to-end recovery-log tests (localized 2026-06-13) ----
+    // Moved from `lib.rs` beside the owning recovery resolver/executor/effects items.
     // Reached via `use super::*;`; they reuse the existing private `new_tab::tests` copies of
     // `resolved_recovery_plan`, `snapshot_tab`, `FakeRecoverySessionKiller`,
     // `FakeRendererStateController`, `renderer_state_payload`, and `session_start_foreground_error`.
-    // The live-test helper `post_record_set_tab_strip_failure` has no callers outside this module.
-    // ---- Live `attach-tab` recovery wiring ----------------------------------------------
+    // The live-test helper `post_record_set_tab_strip_failure` moved with this cohort (it had no
+    // retained `lib.rs` callers).
+    // ---- Live `attach-tab` recovery wiring (instruction 2026-06-11) ----
     //
     // The foreground `attach-tab` `NewTabRequested` listener only constructs a
     // `ResolvedNewTabRecoveryPlan` and runs the executor on the `Err(e)` arm of
@@ -7503,6 +10055,618 @@ mod tests {
 
     fn post_record_set_tab_strip_failure() -> NewTabForegroundError {
         NewTabForegroundError::SetTabStrip(NewTabSetTabStripError::RendererControlClosed)
+    }
+
+    fn generation_bound_set_tab_strip_failure() -> NewTabForegroundError {
+        NewTabForegroundError::GenerationBoundSetTabStrip {
+            session_id: s("sess-new"),
+            session_generation: s("gen-new"),
+            rollback_authority: None,
+            error: NewTabSetTabStripError::RendererControlClosed,
+        }
+    }
+
+    fn seed_production_new_tab_recovery_graph(
+        paths: &maestro_shell::AppPaths,
+        cwd: &Path,
+        generation: Option<&str>,
+        include_created_tab: bool,
+    ) -> (
+        maestro_shell::SessionRecord,
+        maestro_shell::WindowLayoutSnapshot,
+    ) {
+        let project = maestro_shell::Project {
+            project_id: s("project-recovery"),
+            name: s("Recovery project"),
+            root: cwd.to_string_lossy().into_owned(),
+            default_workspace_policy: maestro_shell::WorkspacePolicy::ScratchCwd,
+            created_at_ms: 1,
+            last_active_at_ms: 1,
+            icon: None,
+            accent_color: None,
+            launch_defaults: None,
+            directories: Vec::new(),
+            window_order: Vec::new(),
+            system: false,
+            hidden: false,
+        };
+        maestro_shell::write_record(
+            paths,
+            maestro_shell::RecordKind::Project,
+            &project.project_id,
+            1,
+            &project,
+        )
+        .expect("seed project");
+        let workspace = maestro_shell::Workspace {
+            workspace_id: s("workspace-recovery"),
+            project_id: project.project_id,
+            root: cwd.to_string_lossy().into_owned(),
+            policy: maestro_shell::WorkspacePolicy::ScratchCwd,
+            consent: maestro_shell::WorkspaceConsent::default(),
+        };
+        maestro_shell::write_record(
+            paths,
+            maestro_shell::RecordKind::Workspace,
+            &workspace.workspace_id,
+            1,
+            &workspace,
+        )
+        .expect("seed workspace");
+        let session = maestro_shell::SessionRecord {
+            session_id: s("session-recovery"),
+            workspace_id: workspace.workspace_id,
+            kind: maestro_shell::SessionKind::Shell,
+            launch: maestro_shell::LaunchSpec::KnownSafe {
+                launch_spec_id: s("secret-launch-spec"),
+                params: vec![s("secret-argv")],
+            },
+            cwd_resolved: cwd.to_string_lossy().into_owned(),
+            agent_task_id: None,
+            created_at_ms: 1,
+            last_attached_at_ms: 1,
+            last_known_generation: generation.map(str::to_string),
+            status: maestro_shell::SessionStatus::Live,
+        };
+        maestro_shell::write_record(
+            paths,
+            maestro_shell::RecordKind::Session,
+            &session.session_id,
+            1,
+            &session,
+        )
+        .expect("seed session");
+        let windows = maestro_shell::WindowLayoutService::new(paths);
+        let empty = windows
+            .create_empty_snapshot("window-recovery", 1)
+            .expect("seed recovery window");
+        let snapshot = if include_created_tab {
+            windows
+                .open_tab_snapshot(
+                    "window-recovery",
+                    "tab-recovery",
+                    &session.session_id,
+                    "secret-tab-title",
+                    false,
+                    maestro_shell::AttentionState::default(),
+                    2,
+                )
+                .expect("seed created tab")
+        } else {
+            empty
+        };
+        (session, snapshot)
+    }
+
+    fn created_tab_recovery_error(
+        snapshot: maestro_shell::WindowLayoutSnapshot,
+        session: maestro_shell::SessionRecord,
+        generation: &str,
+        scratch_cwd: Option<PathBuf>,
+    ) -> NewTabForegroundError {
+        NewTabForegroundError::GenerationBoundSetTabStrip {
+            session_id: session.session_id.clone(),
+            session_generation: generation.to_string(),
+            rollback_authority: Some(NewTabCreatedTabRollbackAuthority {
+                expected_post_layout: snapshot,
+                expected_session: session,
+                expected_generation: generation.to_string(),
+                created_tab_id: s("tab-recovery"),
+                scratch_cwd,
+                attachment_handoff: None,
+            }),
+            error: NewTabSetTabStripError::RendererControlClosed,
+        }
+    }
+
+    fn assert_no_socket_connection(listener: &std::os::unix::net::UnixListener) {
+        match listener.accept() {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(_) => panic!("recovery unexpectedly connected to the daemon socket"),
+            Err(error) => panic!("checking daemon socket: {error}"),
+        }
+    }
+
+    #[test]
+    fn production_new_tab_recovery_rolls_back_offline_repairs_renderer_and_parks_release() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = maestro_shell::AppPaths::with_base(tmp.path().join("Maestro"));
+        let scratch = tmp.path().join("secret-scratch");
+        std::fs::create_dir_all(&scratch).expect("create scratch");
+        let (session, snapshot) =
+            seed_production_new_tab_recovery_graph(&paths, &scratch, Some("generation-a"), true);
+        let mut error = created_tab_recovery_error(
+            snapshot,
+            session.clone(),
+            "generation-a",
+            Some(scratch.clone()),
+        );
+        if let NewTabForegroundError::GenerationBoundSetTabStrip {
+            session_generation, ..
+        } = &mut error
+        {
+            *session_generation = s("tampered-diagnostic-generation");
+        }
+        let socket = tmp.path().join("offline.sock");
+        let (mut runtime, commands) = RendererTabRuntime::new();
+        runtime.seed_active_tab("window-recovery", "tab-old", "session-old");
+        let previous_strip_tabs = vec![snapshot_tab("tab-old", "session-old", 0)];
+        let previous_selection = vec![TabSelection {
+            tab_id: s("tab-old"),
+            session_id: s("session-old"),
+        }];
+
+        let report = execute_production_new_tab_recovery(
+            &paths,
+            &socket,
+            3,
+            &mut error,
+            &previous_strip_tabs,
+            &previous_selection,
+            &mut runtime,
+        );
+
+        assert!(
+            maestro_shell::load_one::<maestro_shell::SessionRecord>(
+                &paths,
+                maestro_shell::RecordKind::Session,
+                &session.session_id,
+            )
+            .unwrap()
+            .is_none(),
+            "the exact Session row is removed before daemon connection"
+        );
+        assert!(
+            maestro_shell::WindowLayoutService::new(&paths)
+                .load("window-recovery")
+                .unwrap()
+                .unwrap()
+                .tabs
+                .is_empty(),
+            "the created tab is removed in the same commit"
+        );
+        assert!(
+            matches!(
+                commands.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "recovery has no fresh exact prior-lifetime authority, so it stays renderer-neutral"
+        );
+        assert!(
+            maestro_shell::SessionReleaseService::new(&paths)
+                .claim_next()
+                .expect("claim parked release")
+                .is_some(),
+            "offline Unpublished authority is surrendered for forward retry"
+        );
+        assert!(scratch.exists(), "post-start scratch is always retained");
+        assert_eq!(report.failed_count(), 0);
+        assert!(
+            report.outcomes.iter().any(|outcome| matches!(
+                &outcome.action,
+                ResolvedNewTabRecoveryAction::KillSessionIfGeneration {
+                    expected_generation,
+                    ..
+                } if expected_generation == "generation-a"
+            )),
+            "private authority, not mutable diagnostic fields, binds the release generation"
+        );
+
+        let second = execute_production_new_tab_recovery(
+            &paths,
+            &socket,
+            4,
+            &mut error,
+            &previous_strip_tabs,
+            &previous_selection,
+            &mut runtime,
+        );
+        assert!(
+            second.outcomes.is_empty(),
+            "opaque rollback authority is consumed by the first execution"
+        );
+        assert!(
+            commands.try_recv().is_err(),
+            "second execution sends nothing"
+        );
+    }
+
+    #[test]
+    fn production_new_tab_recovery_neutral_renderer_parks_release_without_raw_restore() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = maestro_shell::AppPaths::with_base(tmp.path().join("Maestro"));
+        let scratch = tmp.path().join("scratch-renderer-failure");
+        std::fs::create_dir_all(&scratch).expect("create scratch");
+        let (session, snapshot) =
+            seed_production_new_tab_recovery_graph(&paths, &scratch, Some("generation-a"), true);
+        let mut error =
+            created_tab_recovery_error(snapshot, session, "generation-a", Some(scratch.clone()));
+        let socket = tmp.path().join("offline.sock");
+        let (mut runtime, commands) = RendererTabRuntime::new();
+
+        let report = execute_production_new_tab_recovery(
+            &paths,
+            &socket,
+            3,
+            &mut error,
+            &[],
+            &[],
+            &mut runtime,
+        );
+
+        assert!(report.outcomes.iter().any(|outcome| {
+            matches!(
+                outcome.action,
+                ResolvedNewTabRecoveryAction::RevertRendererStrip { .. }
+            ) && matches!(
+                &outcome.status,
+                ResolvedNewTabRecoveryActionStatus::Skipped { reason }
+                    if reason == "renderer remained neutral; exact prior lifetime was not reacquired"
+            )
+        }));
+        assert!(matches!(
+            commands.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(maestro_shell::SessionReleaseService::new(&paths)
+            .claim_next()
+            .expect("claim parked release")
+            .is_some());
+        assert!(
+            scratch.exists(),
+            "renderer failure cannot authorize scratch deletion"
+        );
+    }
+
+    #[test]
+    fn production_new_tab_recovery_replacement_session_refuses_every_followup_effect() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = maestro_shell::AppPaths::with_base(tmp.path().join("Maestro"));
+        let scratch = tmp.path().join("scratch-replacement");
+        std::fs::create_dir_all(&scratch).expect("create scratch");
+        let (session_a, snapshot_a) =
+            seed_production_new_tab_recovery_graph(&paths, &scratch, Some("generation-a"), true);
+        let mut error = created_tab_recovery_error(
+            snapshot_a,
+            session_a.clone(),
+            "generation-a",
+            Some(scratch.clone()),
+        );
+        let mut session_b = session_a;
+        session_b.last_known_generation = Some(s("generation-b"));
+        session_b.last_attached_at_ms = 9;
+        maestro_shell::write_record(
+            &paths,
+            maestro_shell::RecordKind::Session,
+            &session_b.session_id,
+            9,
+            &session_b,
+        )
+        .expect("replace Session A with B");
+        let socket = tmp.path().join("must-not-connect.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind probe socket");
+        listener
+            .set_nonblocking(true)
+            .expect("set probe nonblocking");
+        let (mut runtime, commands) = RendererTabRuntime::new();
+
+        let report = execute_production_new_tab_recovery(
+            &paths,
+            &socket,
+            10,
+            &mut error,
+            &[],
+            &[],
+            &mut runtime,
+        );
+
+        assert_eq!(report.outcomes.len(), 1);
+        assert!(report.outcomes[0].status.is_skipped());
+        assert!(commands.try_recv().is_err(), "renderer remains untouched");
+        assert_no_socket_connection(&listener);
+        assert!(
+            maestro_shell::SessionReleaseService::new(&paths)
+                .claim_next()
+                .unwrap()
+                .is_none(),
+            "a replacement lifetime never enters the journal"
+        );
+        let loaded = maestro_shell::load_one::<maestro_shell::SessionRecord>(
+            &paths,
+            maestro_shell::RecordKind::Session,
+            &session_b.session_id,
+        )
+        .unwrap()
+        .expect("Session B remains");
+        assert!(matches!(loaded, maestro_shell::LoadOutcome::Loaded(value) if value == session_b));
+        assert!(scratch.exists());
+
+        let second = execute_production_new_tab_recovery(
+            &paths,
+            &socket,
+            11,
+            &mut error,
+            &[],
+            &[],
+            &mut runtime,
+        );
+        assert!(second.outcomes.is_empty());
+        assert_no_socket_connection(&listener);
+    }
+
+    #[test]
+    fn production_new_tab_layout_record_failure_deletes_only_exact_session_and_journals() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = maestro_shell::AppPaths::with_base(tmp.path().join("Maestro"));
+        let scratch = tmp.path().join("scratch-layout-record");
+        std::fs::create_dir_all(&scratch).expect("create scratch");
+        let (session, empty_snapshot) =
+            seed_production_new_tab_recovery_graph(&paths, &scratch, Some("generation-a"), false);
+        let mut error = NewTabForegroundError::GenerationBoundLayoutRecord {
+            cwd: scratch.clone(),
+            session_id: session.session_id.clone(),
+            session_generation: s("generation-a"),
+            rollback_authority: Some(NewTabSessionRollbackAuthority {
+                expected_layout_without_tab: empty_snapshot,
+                expected_session: session.clone(),
+                expected_generation: s("generation-a"),
+                created_tab_id: s("tab-recovery"),
+                scratch_cwd: Some(scratch.clone()),
+                attachment_handoff: None,
+            }),
+            error: NewTabLayoutRecordError::WindowLayout(
+                maestro_shell::WindowLayoutError::WindowLayoutNotFound {
+                    window_id: s("window-recovery"),
+                },
+            ),
+        };
+        let (mut runtime, commands) = RendererTabRuntime::new();
+
+        let report = execute_production_new_tab_recovery(
+            &paths,
+            &tmp.path().join("offline.sock"),
+            3,
+            &mut error,
+            &[],
+            &[],
+            &mut runtime,
+        );
+
+        assert_eq!(report.failed_count(), 0);
+        assert!(
+            commands.try_recv().is_err(),
+            "no renderer state was published"
+        );
+        assert!(maestro_shell::load_one::<maestro_shell::SessionRecord>(
+            &paths,
+            maestro_shell::RecordKind::Session,
+            &session.session_id,
+        )
+        .unwrap()
+        .is_none());
+        assert!(maestro_shell::SessionReleaseService::new(&paths)
+            .claim_next()
+            .unwrap()
+            .is_some());
+        assert!(scratch.exists());
+    }
+
+    #[test]
+    fn production_new_tab_recovery_missing_grid_generation_safe_leaks_without_effects() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = maestro_shell::AppPaths::with_base(tmp.path().join("Maestro"));
+        let scratch = tmp.path().join("scratch-unresolved");
+        std::fs::create_dir_all(&scratch).expect("create scratch");
+        let (session, _snapshot) =
+            seed_production_new_tab_recovery_graph(&paths, &scratch, None, true);
+        let mut error = NewTabForegroundError::StartedSessionGenerationMissing {
+            session_id: session.session_id.clone(),
+        };
+        let socket = tmp.path().join("must-not-connect.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind probe socket");
+        listener
+            .set_nonblocking(true)
+            .expect("set probe nonblocking");
+        let (mut runtime, commands) = RendererTabRuntime::new();
+
+        let report = execute_production_new_tab_recovery(
+            &paths,
+            &socket,
+            3,
+            &mut error,
+            &[],
+            &[],
+            &mut runtime,
+        );
+
+        assert!(commands.try_recv().is_err());
+        assert_no_socket_connection(&listener);
+        assert!(
+            maestro_shell::SessionReleaseService::new(&paths)
+                .claim_next()
+                .unwrap()
+                .is_none(),
+            "unproven generation is a safe leak, never an ID fallback"
+        );
+        assert!(report.outcomes.is_empty());
+        assert!(
+            maestro_shell::load_one::<maestro_shell::SessionRecord>(
+                &paths,
+                maestro_shell::RecordKind::Session,
+                &session.session_id,
+            )
+            .unwrap()
+            .is_some(),
+            "missing Grid generation retains the entire durable graph"
+        );
+        assert_eq!(
+            maestro_shell::WindowLayoutService::new(&paths)
+                .load("window-recovery")
+                .unwrap()
+                .unwrap()
+                .tabs
+                .len(),
+            1
+        );
+        assert!(scratch.exists());
+    }
+
+    #[test]
+    fn production_new_tab_rollback_debug_is_payload_redacted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = maestro_shell::AppPaths::with_base(tmp.path().join("Maestro"));
+        let secret_cwd = tmp.path().join("secret-cwd-marker");
+        std::fs::create_dir_all(&secret_cwd).expect("create cwd");
+        let (session, snapshot) = seed_production_new_tab_recovery_graph(
+            &paths,
+            &secret_cwd,
+            Some("secret-generation-marker"),
+            true,
+        );
+        let authority = NewTabCreatedTabRollbackAuthority {
+            expected_post_layout: snapshot,
+            expected_session: session,
+            expected_generation: s("secret-generation-marker"),
+            created_tab_id: s("tab-recovery"),
+            scratch_cwd: Some(secret_cwd.clone()),
+            attachment_handoff: None,
+        };
+        let authority_debug = format!("{authority:?}");
+        let error = NewTabForegroundError::GenerationBoundSetTabStrip {
+            session_id: s("secret-session-marker"),
+            session_generation: s("secret-generation-marker"),
+            rollback_authority: Some(authority),
+            error: NewTabSetTabStripError::RendererControlClosed,
+        };
+        let error_debug = format!("{error:?}");
+
+        for rendered in [&authority_debug, &error_debug] {
+            assert!(!rendered.contains("secret-cwd-marker"), "{rendered}");
+            assert!(!rendered.contains("secret-argv"), "{rendered}");
+            assert!(!rendered.contains("secret-tab-title"), "{rendered}");
+            assert!(!rendered.contains("secret-generation-marker"), "{rendered}");
+            assert!(!rendered.contains("secret-launch-spec"), "{rendered}");
+        }
+    }
+
+    struct RepresentSessionDuringRendererRecovery {
+        paths: maestro_shell::AppPaths,
+        session_id: String,
+    }
+
+    impl NewTabRecoveryRendererStateController for RepresentSessionDuringRendererRecovery {
+        type Error = String;
+
+        fn revert_renderer_strip(
+            &mut self,
+            _strip_tabs: &[WindowTabJson],
+            _selection: &[TabSelection],
+        ) -> Result<RendererStateRecoveryEffectResult, Self::Error> {
+            maestro_shell::WindowLayoutService::new(&self.paths)
+                .open_tab(
+                    "w-race",
+                    "tab-race-owner",
+                    &self.session_id,
+                    "Concurrent owner",
+                    false,
+                    maestro_shell::AttentionState::default(),
+                    2,
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(RendererStateRecoveryEffectResult::Restored)
+        }
+
+        fn reconcile_renderer_state(
+            &mut self,
+            strip_tabs: &[WindowTabJson],
+            selection: &[TabSelection],
+        ) -> Result<RendererStateRecoveryEffectResult, Self::Error> {
+            self.revert_renderer_strip(strip_tabs, selection)
+        }
+    }
+
+    #[test]
+    fn legacy_recovery_diagnostic_preserves_concurrent_owner_when_killer_refuses() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = maestro_shell::AppPaths::with_base(tmp.path().join("Maestro"));
+        let windows = maestro_shell::WindowLayoutService::new(&paths);
+        windows.create_empty("w-live", 1).unwrap();
+        windows.create_empty("w-race", 1).unwrap();
+        windows
+            .open_tab(
+                "w-live",
+                "tab-new",
+                "sess-new",
+                "New",
+                false,
+                maestro_shell::AttentionState::default(),
+                1,
+            )
+            .unwrap();
+
+        let err = post_record_set_tab_strip_failure();
+        let plan = resolve_new_tab_recovery(
+            &err,
+            &NewTabRecoveryContext {
+                window_id: Some("w-live".into()),
+                tab_id: Some("tab-new".into()),
+                session_id: Some("sess-new".into()),
+                session_generation: Some("gen-new".into()),
+                previous_strip_tabs: Some(vec![]),
+                previous_selection: Some(vec![]),
+                scratch_cwd: None,
+            },
+        );
+
+        let killer = FakeRecoverySessionKiller {
+            result: Ok(KillSessionRecoveryEffectResult::Represented),
+            calls: Vec::new(),
+        };
+        let controller = RepresentSessionDuringRendererRecovery {
+            paths: paths.clone(),
+            session_id: "sess-new".into(),
+        };
+        let mut effects =
+            ResolvedNewTabRecoveryCompleteEffects::new(paths.clone(), 2, killer, controller);
+
+        let report = execute_resolved_new_tab_recovery_plan(&plan, &mut effects);
+        assert!(matches!(
+            report.outcomes.last().map(|outcome| &outcome.status),
+            Some(ResolvedNewTabRecoveryActionStatus::Skipped { reason })
+                if reason == "session is represented by a durable pane"
+        ));
+        assert!(
+            windows
+                .load("w-race")
+                .unwrap()
+                .unwrap()
+                .tabs
+                .iter()
+                .any(|tab| tab.session_id == "sess-new"),
+            "the owner inserted between rollback and release remains durable"
+        );
+
+        assert_eq!(effects.session_killer().calls, vec![s("sess-new@gen-new")]);
     }
 
     #[test]
@@ -7519,6 +10683,7 @@ mod tests {
                 window_id: Some(s("w-live")),
                 tab_id: Some(s("tab-new")),
                 session_id: Some(s("sess-new")),
+                session_generation: Some(s("gen-new")),
                 previous_strip_tabs: Some(vec![snapshot_tab("tab-old", "sess-old", 0)]),
                 previous_selection: Some(vec![TabSelection {
                     tab_id: s("tab-old"),
@@ -7542,6 +10707,7 @@ mod tests {
             window_id: Some(s("w-live")),
             tab_id: Some(s("tab-new")),
             session_id: Some(s("sess-new")),
+            session_generation: Some(s("gen-new")),
             previous_strip_tabs: Some(vec![snapshot_tab("tab-old", "sess-old", 0)]),
             previous_selection: Some(vec![TabSelection {
                 tab_id: s("tab-old"),
@@ -7557,8 +10723,8 @@ mod tests {
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = maestro_shell::AppPaths::with_base(tmp.path());
-        // The runtime is NOT already attached to w-live, so revert performs a genuine restore (not
-        // an idempotent skip) and sends exactly one renderer command.
+        // No exact prior viewport authority is available in this legacy recovery payload. The
+        // production controller must stay neutral and still allow the later generation-bound kill.
         let (mut runtime, rx) = RendererTabRuntime::new();
         let killer = FakeRecoverySessionKiller {
             result: Ok(KillSessionRecoveryEffectResult::Killed),
@@ -7575,72 +10741,205 @@ mod tests {
         assert!(!plan_log.contains('\n'));
         assert!(!execution_log.contains('\n'));
         assert!(execution_log.contains("new-tab recovery executed"));
-        // SetTabStrip stage plan = rollback (skip: no record), revert strip (ok: open channel),
-        // kill session (ok: fake killer). One renderer command was sent.
+        // SetTabStrip stage plan = rollback (skip: no record), prior projection (skip: neutral),
+        // kill session (ok: fake killer). No raw renderer command is authorized.
         assert_eq!(report.outcomes.len(), 3);
         assert_eq!(report.failed_count(), 0);
-        assert!(report.succeeded_count() >= 1);
-        match rx.try_recv().expect("revert sent one strip command") {
-            maestro_renderer::RendererCommand::SetTabStrip {
-                tab_strip: Some(strip),
-            } => {
-                assert_eq!(strip.window_id, "w-live");
-                assert_eq!(strip.tabs.len(), 1);
-                assert_eq!(strip.tabs[0].tab_id, "tab-old");
-            }
-            other => panic!("expected SetTabStrip(Some(..)), got {other:?}"),
-        }
+        assert_eq!(report.succeeded_count(), 1);
+        assert_eq!(report.skipped_count(), 2);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
     }
 
     #[test]
     fn live_recovery_scratch_cleanup_has_exactly_one_owner() {
-        // A pre-record StartParams failure resolves to a single RemoveScratch action; the executor
-        // owns it. The legacy `new_tab_failure_scratch_to_remove`/`remove_new_tab_scratch` direct
-        // block is gone from the listener, so cleanup happens exactly once through the executor.
+        // Production takes the opaque capability out of the error. A second pass cannot replay
+        // even an idempotent delete, so ownership does not depend on filesystem state.
         let tmp = tempfile::tempdir().expect("tempdir");
-        let scratch = tmp.path().join("orphan-scratch");
-        std::fs::create_dir_all(&scratch).expect("create scratch dir");
-        let err = NewTabForegroundError::StartParams {
+        let paths = maestro_shell::AppPaths::with_base(tmp.path());
+        let (prepared, receipt) =
+            maestro_shell::prepare_fresh_scratch_cwd(&paths, "ws-new", "sess-new", "")
+                .unwrap()
+                .into_parts();
+        let scratch = prepared.cwd;
+        let mut err = NewTabForegroundError::StartParams {
             cwd: scratch.clone(),
+            scratch: Some(NewTabScratchRemovalAuthority::from_fresh_receipt(receipt)),
             error: NewTabStartParamsError::NotCreate,
         };
-        let context =
-            foreground_new_tab_recovery_context("w-live", "tab-new", "sess-new", &[], &[], &err);
-        let plan = resolve_new_tab_recovery(&err, &context);
-        let remove_scratch_actions = plan
-            .actions
-            .iter()
-            .filter(|a| matches!(a, ResolvedNewTabRecoveryAction::RemoveScratch(_)))
-            .count();
-        assert_eq!(
-            remove_scratch_actions, 1,
-            "exactly one RemoveScratch owner in the resolved plan"
-        );
-
-        let paths = maestro_shell::AppPaths::with_base(tmp.path());
         let (mut runtime, _rx) = RendererTabRuntime::new();
-        let killer = FakeRecoverySessionKiller {
-            result: Ok(KillSessionRecoveryEffectResult::Killed),
-            calls: Vec::new(),
-        };
-        let controller = ForegroundRendererStateController::new(&mut runtime, s("w-live"));
-        let mut effects = ResolvedNewTabRecoveryCompleteEffects::new(paths, 1, killer, controller);
-        let report = execute_resolved_new_tab_recovery_plan(&plan, &mut effects);
+        let missing_socket = tmp.path().join("missing.sock");
+        let report = execute_production_new_tab_recovery(
+            &paths,
+            &missing_socket,
+            1,
+            &mut err,
+            &[],
+            &[],
+            &mut runtime,
+        );
 
         assert_eq!(report.failed_count(), 0);
         assert!(
             !scratch.exists(),
             "executor-owned RemoveScratch removed the orphan scratch dir exactly once"
         );
+        let replay = execute_production_new_tab_recovery(
+            &paths,
+            &missing_socket,
+            2,
+            &mut err,
+            &[],
+            &[],
+            &mut runtime,
+        );
+        assert!(
+            replay.outcomes.is_empty(),
+            "consumed authority is not replayed"
+        );
     }
 
     #[test]
-    fn live_recovery_closed_renderer_channel_is_failed_with_no_adoption() {
+    fn production_recovery_never_deletes_worktree_or_repo_write_cwd() {
+        for (_policy, suffix) in [
+            (maestro_shell::WorkspacePolicy::Worktree, "worktree"),
+            (maestro_shell::WorkspacePolicy::RepoWrite, "repo-write"),
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let paths = maestro_shell::AppPaths::with_base(tmp.path());
+            let checkout = tmp.path().join(suffix);
+            let nested = checkout.join("nested");
+            std::fs::create_dir_all(&nested).expect("create checkout");
+            let sentinel = nested.join("KEEP");
+            std::fs::write(&sentinel, b"user data").expect("write sentinel");
+            let mut error = NewTabForegroundError::StartParams {
+                cwd: checkout,
+                scratch: None,
+                error: NewTabStartParamsError::NotCreate,
+            };
+            let (mut runtime, _rx) = RendererTabRuntime::new();
+            let report = execute_production_new_tab_recovery(
+                &paths,
+                &tmp.path().join("missing.sock"),
+                1,
+                &mut error,
+                &[],
+                &[],
+                &mut runtime,
+            );
+            assert!(report.outcomes.is_empty());
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"user data");
+        }
+    }
+
+    #[test]
+    fn prepared_scratch_cleanup_requires_proven_unpublication_and_exact_app_paths() {
+        let shell_error = || {
+            maestro_shell::ShellRuntimeError::Daemon(maestro_shell::DaemonClientError::Timeout {
+                during: "test",
+            })
+        };
+        assert!(NewTabPreparedSessionError::GraphAuthority {
+            detail: "pre-wire".into()
+        }
+        .permits_scratch_removal());
+        assert!(NewTabPreparedSessionError::DefinitelyUnpublished {
+            error: shell_error(),
+            compensation: NewTabPreparedCompensationStatus::RolledBack,
+        }
+        .permits_scratch_removal());
+        assert!(!NewTabPreparedSessionError::Refused {
+            error: shell_error(),
+            compensation: NewTabPreparedCompensationStatus::RolledBack,
+        }
+        .permits_scratch_removal());
+        for status in [
+            NewTabPreparedCompensationStatus::Missing,
+            NewTabPreparedCompensationStatus::Changed,
+            NewTabPreparedCompensationStatus::Referenced,
+            NewTabPreparedCompensationStatus::Failed {
+                detail: "failed".into(),
+            },
+        ] {
+            assert!(!NewTabPreparedSessionError::DefinitelyUnpublished {
+                error: shell_error(),
+                compensation: status,
+            }
+            .permits_scratch_removal());
+        }
+        assert!(!NewTabPreparedSessionError::PossiblyApplied {
+            detail: "ambiguous".into()
+        }
+        .permits_scratch_removal());
+        assert!(!NewTabPreparedSessionError::FinalizedInvariant {
+            detail: "post-grid".into(),
+            compensation: NewTabPreparedCompensationStatus::RolledBack,
+        }
+        .permits_scratch_removal());
+
+        let tmp_a = tempfile::tempdir().unwrap();
+        let tmp_b = tempfile::tempdir().unwrap();
+        let paths_a = maestro_shell::AppPaths::with_base(tmp_a.path());
+        let paths_b = maestro_shell::AppPaths::with_base(tmp_b.path());
+        let (prepared, receipt) = maestro_shell::prepare_fresh_scratch_cwd(
+            &paths_a,
+            "wrong-base-workspace",
+            "wrong-base-session",
+            "",
+        )
+        .unwrap()
+        .into_parts();
+        let scratch = prepared.cwd;
+        let sentinel = scratch.join("KEEP");
+        std::fs::write(&sentinel, b"keep").unwrap();
+        let mut error = NewTabForegroundError::StartParams {
+            cwd: scratch.clone(),
+            scratch: Some(NewTabScratchRemovalAuthority::from_fresh_receipt(receipt)),
+            error: NewTabStartParamsError::NotCreate,
+        };
+        let (mut runtime, _rx) = RendererTabRuntime::new();
+        let report = execute_production_new_tab_recovery(
+            &paths_b,
+            &tmp_b.path().join("missing.sock"),
+            1,
+            &mut error,
+            &[],
+            &[],
+            &mut runtime,
+        );
+        assert_eq!(report.outcomes.len(), 1);
+        assert_eq!(report.failed_count(), 1);
+        assert!(matches!(
+            &report.outcomes[0].action,
+            ResolvedNewTabRecoveryAction::RemoveScratch(path) if path == &scratch
+        ));
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
+        let replay = execute_production_new_tab_recovery(
+            &paths_a,
+            &tmp_a.path().join("missing.sock"),
+            2,
+            &mut error,
+            &[],
+            &[],
+            &mut runtime,
+        );
+        assert!(
+            replay.outcomes.is_empty(),
+            "wrong-base use still consumed authority"
+        );
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn live_recovery_without_exact_prior_authority_stays_neutral_with_closed_channel() {
         let err = post_record_set_tab_strip_failure();
         let context = NewTabRecoveryContext {
             window_id: Some(s("w-live")),
             tab_id: Some(s("tab-new")),
             session_id: Some(s("sess-new")),
+            session_generation: Some(s("gen-new")),
             previous_strip_tabs: Some(vec![snapshot_tab("tab-old", "sess-old", 0)]),
             previous_selection: Some(vec![TabSelection {
                 tab_id: s("tab-old"),
@@ -7653,9 +10952,9 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = maestro_shell::AppPaths::with_base(tmp.path());
         let (mut runtime, closed_rx) = RendererTabRuntime::new();
-        // Seed a DIFFERENT window so the controller is not already-current for w-live: revert
-        // attempts a genuine restore and hits the closed channel (rather than skipping).
-        runtime.seed_active_tab("w-other", "tab-old");
+        // A textual seed is deliberately not a lifetime proof. The exact-authority gate is reached
+        // before transport, so even a closed channel cannot turn this into a raw restore attempt.
+        runtime.seed_active_tab("w-other", "tab-old", "sess-old");
         let active_before = runtime.active_tab_id().map(str::to_string);
         drop(closed_rx); // closed renderer command channel
         let killer = FakeRecoverySessionKiller {
@@ -7666,23 +10965,22 @@ mod tests {
         let mut effects = ResolvedNewTabRecoveryCompleteEffects::new(paths, 1, killer, controller);
         let report = execute_resolved_new_tab_recovery_plan(&plan, &mut effects);
 
-        // The revert-renderer-strip action failed because the channel was closed; later actions
-        // (kill session) still ran (ordered, non-fatal).
-        assert!(
-            report.failed_count() >= 1,
-            "closed renderer channel produces at least one failed outcome"
-        );
-        let revert_failed = report.outcomes.iter().any(|o| {
+        assert_eq!(report.failed_count(), 0);
+        let revert_neutral = report.outcomes.iter().any(|outcome| {
             matches!(
-                o.action,
+                outcome.action,
                 ResolvedNewTabRecoveryAction::RevertRendererStrip { .. }
-            ) && o.status.is_failed()
+            ) && matches!(
+                &outcome.status,
+                ResolvedNewTabRecoveryActionStatus::Skipped { reason }
+                    if reason == "renderer remained neutral; exact prior lifetime was not reacquired"
+            )
         });
         assert!(
-            revert_failed,
-            "the renderer revert action is the failed one"
+            revert_neutral,
+            "the prior projection is explicitly classified neutral"
         );
-        // The controller never advanced the live active tab on a failed renderer command.
+        // The controller never advanced the live active tab or emitted a command.
         assert_eq!(runtime.active_tab_id().map(str::to_string), active_before);
     }
 
@@ -7708,72 +11006,39 @@ mod tests {
     }
 
     #[test]
-    fn live_recovery_production_controller_restores_strip_even_when_active_tab_unchanged() {
+    fn live_recovery_production_controller_requires_exact_prior_authority_or_stays_neutral() {
         let (strip_tabs, selection) = renderer_state_payload();
 
-        // 1. Non-current state: the runtime is not yet attached to this window, so revert restores
-        //    the strip — sending exactly one SetTabStrip command — and reports Restored.
+        // A presentation-only recovery payload cannot reacquire a prior PTY lifetime.
         let (mut runtime, rx) = RendererTabRuntime::new();
         let mut controller = ForegroundRendererStateController::new(&mut runtime, "w-live");
         let restored = controller
             .revert_renderer_strip(&strip_tabs, &selection)
-            .expect("non-current revert restores");
-        assert_eq!(restored, RendererStateRecoveryEffectResult::Restored);
-        match rx.try_recv().expect("restore sends one strip command") {
-            maestro_renderer::RendererCommand::SetTabStrip {
-                tab_strip: Some(strip),
-            } => {
-                assert_eq!(strip.window_id, "w-live");
-                assert_eq!(strip.tabs.len(), 2);
-            }
-            other => panic!("expected SetTabStrip(Some(..)), got {other:?}"),
-        }
+            .expect("neutral recovery is non-fatal");
+        assert_eq!(restored, RendererStateRecoveryEffectResult::Neutralized);
         assert!(
             matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
-            "successful restore sends exactly one renderer command"
+            "neutral recovery sends no generation-free renderer command"
         );
 
-        // 2. Partial `AttachSession` failure: the foreground pipeline sends
-        //    `SetTabStrip` (which may already show the failed new tab) BEFORE `AttachSession`, and
-        //    that send does not advance active-tab state. So the runtime can be attached to
-        //    w-live/tab-old AND tab-old is present in the pre-attempt strip, yet the VISIBLE strip is
-        //    stale. `RendererTabRuntime` tracks active session/window ownership, not the last strip
-        //    payload, so this is NOT proof the strip is current. The production controller MUST still
-        //    restore the previous strip (one SetTabStrip), not return AlreadyCurrent — otherwise the
-        //    failed new tab stays visible.
+        // A textual seed remains non-authoritative and cannot change that classification.
         let (mut runtime, rx) = RendererTabRuntime::new();
-        runtime.seed_active_tab("w-live", "tab-old");
+        runtime.seed_active_tab("w-live", "tab-old", "sess-old");
         let mut controller = ForegroundRendererStateController::new(&mut runtime, "w-live");
         let reconciled = controller
             .reconcile_renderer_state(&strip_tabs, &selection)
-            .expect("partial-failure reconcile restores the previous strip");
-        assert_eq!(reconciled, RendererStateRecoveryEffectResult::Restored);
-        match rx.try_recv().expect("reconcile sends one strip command") {
-            maestro_renderer::RendererCommand::SetTabStrip {
-                tab_strip: Some(strip),
-            } => {
-                assert_eq!(strip.window_id, "w-live");
-                assert_eq!(strip.tabs.len(), 2);
-                // The live active tab id (tab-old) still exists in the strip, so it is marked active
-                // rather than dropped.
-                assert!(strip.tabs.iter().any(|t| t.tab_id == "tab-old" && t.active));
-            }
-            other => panic!("expected SetTabStrip(Some(..)), got {other:?}"),
-        }
+            .expect("textual prior state stays neutral");
+        assert_eq!(reconciled, RendererStateRecoveryEffectResult::Neutralized);
         let revert = controller
             .revert_renderer_strip(&strip_tabs, &selection)
-            .expect("partial-failure revert restores the previous strip");
-        assert_eq!(revert, RendererStateRecoveryEffectResult::Restored);
+            .expect("repeated neutral recovery is stable");
+        assert_eq!(revert, RendererStateRecoveryEffectResult::Neutralized);
         assert!(
-            matches!(
-                rx.try_recv(),
-                Ok(maestro_renderer::RendererCommand::SetTabStrip { tab_strip: Some(_) })
-            ),
-            "revert also restores the strip on the partial-failure path"
+            matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+            "neither attempt emits a raw strip/Attach command"
         );
 
-        // 3. Closed channel on a restore: the executor records a failed outcome and the listener must
-        //    not adopt projections.
+        // Proof refusal precedes transport, so a closed channel still produces a neutral skip.
         let (mut runtime, closed_rx) = RendererTabRuntime::new();
         drop(closed_rx);
         let renderer_controller = ForegroundRendererStateController::new(&mut runtime, "w-live");
@@ -7792,12 +11057,12 @@ mod tests {
             }]);
         let report = execute_resolved_new_tab_recovery_plan(&plan, &mut effects);
         assert_eq!(report.succeeded_count(), 0);
-        assert_eq!(report.skipped_count(), 0);
-        assert_eq!(report.failed_count(), 1);
+        assert_eq!(report.skipped_count(), 1);
+        assert_eq!(report.failed_count(), 0);
         let line = render_resolved_recovery_execution_log_line(&report);
         assert!(
             line.contains(
-                "revert_renderer_strip(tabs=2,selection=2)=fail(renderer control channel is closed)"
+                "revert_renderer_strip(tabs=2,selection=2)=skip(renderer remained neutral; exact prior lifetime was not reacquired)"
             ),
             "{line}"
         );
@@ -7811,6 +11076,8 @@ mod tests {
         // by `WindowLayoutService`, so the rollback action exercises the durable store.
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = maestro_shell::AppPaths::with_base(tmp.path());
+        seed_exact_test_session(&paths, "sess-old", "gen-old");
+        seed_exact_test_session(&paths, "sess-new", "gen-new");
         let service = maestro_shell::WindowLayoutService::new(&paths);
         service.create_empty("w-live", 0).expect("create layout");
         service
@@ -7843,7 +11110,7 @@ mod tests {
             session_id: s("sess-old"),
         }];
 
-        let err = NewTabForegroundError::SetTabStrip(NewTabSetTabStripError::RendererControlClosed);
+        let err = generation_bound_set_tab_strip_failure();
         let context = foreground_new_tab_recovery_context(
             "w-live",
             "tab-new",
@@ -7866,8 +11133,9 @@ mod tests {
                     strip_tabs: previous_strip_tabs.clone(),
                     selection: previous_selection.clone(),
                 },
-                ResolvedNewTabRecoveryAction::KillSession {
+                ResolvedNewTabRecoveryAction::KillSessionIfGeneration {
                     session_id: s("sess-new"),
+                    expected_generation: s("gen-new"),
                 },
             ],
             "resolver emits the post-record SetTabStrip recovery order"
@@ -7896,7 +11164,7 @@ mod tests {
         assert_eq!(reloaded.tabs[0].tab_id, "tab-old");
 
         // Fakes saw exactly the resolved calls.
-        assert_eq!(effects.session_killer().calls, vec![s("sess-new")]);
+        assert_eq!(effects.session_killer().calls, vec![s("sess-new@gen-new")]);
         assert_eq!(
             effects.renderer_controller().calls,
             vec![s("revert:1:1:tab-old")]
@@ -7948,18 +11216,14 @@ mod tests {
         let context =
             foreground_new_tab_recovery_context("w-live", "tab-new", "sess-new", &[], &[], &err);
 
-        // Resolver produces the pre-record plan: kill the possible started session, then remove
-        // the prepared scratch cwd. No tab record or renderer state is touched at this stage.
+        // This legacy path-only SessionStart error has neither accepted Grid/generation proof nor
+        // an owned fresh-scratch receipt. Recovery must synthesize neither an id-only Kill nor
+        // recursive-delete authority from the diagnostic cwd string.
         let plan = resolve_new_tab_recovery(&err, &context);
         assert_eq!(
             plan.actions,
-            vec![
-                ResolvedNewTabRecoveryAction::KillSession {
-                    session_id: s("sess-new"),
-                },
-                ResolvedNewTabRecoveryAction::RemoveScratch(scratch.clone()),
-            ],
-            "resolver emits the pre-record SessionStart recovery order"
+            vec![],
+            "path-only SessionStart diagnostics grant no destructive recovery authority"
         );
 
         let killer = FakeRecoverySessionKiller {
@@ -7975,13 +11239,19 @@ mod tests {
 
         let report = execute_resolved_new_tab_recovery_plan(&plan, &mut effects);
 
-        assert!(!scratch.exists(), "scratch dir must be removed");
-        assert_eq!(effects.session_killer().calls, vec![s("sess-new")]);
+        assert!(
+            scratch.exists(),
+            "path-only diagnostic cwd must remain untouched without an owned receipt"
+        );
+        assert!(
+            effects.session_killer().calls.is_empty(),
+            "no generation proof means no daemon kill call"
+        );
         assert!(
             effects.renderer_controller().calls.is_empty(),
             "pre-record recovery must not call renderer-state effects"
         );
-        assert_eq!(report.succeeded_count(), 2);
+        assert_eq!(report.succeeded_count(), 0);
         assert_eq!(report.skipped_count(), 0);
         assert_eq!(report.failed_count(), 0);
 
@@ -7991,20 +11261,14 @@ mod tests {
             "execution line is single-line: {line}"
         );
         assert!(line.contains("stage=SessionStart"), "{line}");
-        assert!(line.contains("succeeded=2 skipped=0 failed=0"), "{line}");
-        let kill = line
-            .find("kill_session(sess-new)=ok")
-            .expect("kill outcome");
-        let remove = line
-            .find(&format!("remove_scratch({})=ok", scratch.display()))
-            .expect("scratch outcome");
+        assert!(line.contains("succeeded=0 skipped=0 failed=0"), "{line}");
         assert!(
-            kill < remove,
-            "execution outcomes preserve resolved plan order: {line}"
+            !line.contains("remove_scratch("),
+            "path-only cwd must not render scratch cleanup authority: {line}"
         );
         assert!(
-            !line.contains("missing"),
-            "a fully-populated context renders no missing marker: {line}"
+            !line.contains("kill_session("),
+            "pre-Grid failure must not render a kill authority: {line}"
         );
     }
 
@@ -8016,6 +11280,8 @@ mod tests {
         // action fails non-fatally and later actions still run.
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = maestro_shell::AppPaths::with_base(tmp.path());
+        seed_exact_test_session(&paths, "sess-old", "gen-old");
+        seed_exact_test_session(&paths, "sess-new", "gen-new");
         let service = maestro_shell::WindowLayoutService::new(&paths);
         service.create_empty("w-live", 0).expect("create layout");
         service
@@ -8045,7 +11311,7 @@ mod tests {
             tab_id: s("tab-old"),
             session_id: s("sess-old"),
         }];
-        let err = NewTabForegroundError::SetTabStrip(NewTabSetTabStripError::RendererControlClosed);
+        let err = generation_bound_set_tab_strip_failure();
         let context = foreground_new_tab_recovery_context(
             "w-live",
             "tab-new",
@@ -8066,8 +11332,9 @@ mod tests {
                     strip_tabs: previous_strip_tabs,
                     selection: previous_selection,
                 },
-                ResolvedNewTabRecoveryAction::KillSession {
+                ResolvedNewTabRecoveryAction::KillSessionIfGeneration {
                     session_id: s("sess-new"),
+                    expected_generation: s("gen-new"),
                 },
             ],
             "resolver emits rollback -> revert -> kill before mixed execution"
@@ -8106,7 +11373,7 @@ mod tests {
         );
         assert_eq!(
             effects.session_killer().calls,
-            vec![s("sess-new")],
+            vec![s("sess-new@gen-new")],
             "kill still runs after the non-fatal revert failure"
         );
         assert_eq!(report.succeeded_count(), 2);
@@ -8151,6 +11418,7 @@ mod tests {
             NewTabForegroundError::AttachSession(NewTabAttachSessionError::RendererControlClosed);
         let context = NewTabRecoveryContext {
             session_id: Some(s("sess-gone")),
+            session_generation: Some(s("gen-gone")),
             previous_strip_tabs: Some(previous_strip_tabs.clone()),
             previous_selection: Some(previous_selection.clone()),
             ..Default::default()
@@ -8165,8 +11433,9 @@ mod tests {
                     strip_tabs: previous_strip_tabs,
                     selection: previous_selection,
                 },
-                ResolvedNewTabRecoveryAction::KillSession {
+                ResolvedNewTabRecoveryAction::KillSessionIfGeneration {
                     session_id: s("sess-gone"),
+                    expected_generation: s("gen-gone"),
                 },
             ],
             "resolver preserves AttachSession recovery order with partial context"
@@ -8189,7 +11458,10 @@ mod tests {
             effects.renderer_controller().calls,
             vec![s("reconcile:1:1:sess-old")]
         );
-        assert_eq!(effects.session_killer().calls, vec![s("sess-gone")]);
+        assert_eq!(
+            effects.session_killer().calls,
+            vec![s("sess-gone@gen-gone")]
+        );
         assert_eq!(report.succeeded_count(), 0);
         assert_eq!(report.skipped_count(), 3);
         assert_eq!(report.failed_count(), 0);
@@ -8231,26 +11503,28 @@ mod tests {
     fn new_tab_foreground_session_start_failure_carries_actual_prepared_scratch_cwd() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = maestro_shell::AppPaths::with_base(tmp.path());
-        one_existing_tab_window(&paths);
+        one_existing_tab_window(&paths, "maestro-app-dev-project");
 
         let env = MapEnv::new(&[]);
         let plan = create_plan("tab-1", "sess-1", NewTabLaunchSource::DefaultShellDev);
         let argv = vec![s("/bin/zsh"), s("-l")];
         let (mut rt, _rx) = RendererTabRuntime::new();
-        rt.seed_active_tab("w1", "t0");
+        rt.seed_active_tab("w1", "t0", "sess-t0");
         let missing_socket = tmp.path().join("missing.sock");
 
-        let err = run_new_tab_foreground_pipeline(
+        let mut err = run_new_tab_foreground_pipeline(
             NewTabForegroundRequest {
                 paths: &paths,
-                socket_path: missing_socket,
+                socket_path: missing_socket.clone(),
                 window_id: "w1",
                 plan: &plan,
-                argv: &argv,
+                launch: NewTabForegroundLaunch::shell_adhoc(&argv),
                 cols: 80,
                 rows: 24,
                 now_ms: 1_700_000_000,
                 split_from: None,
+                split_source_session: None,
+                expected_project_id: None,
             },
             &env,
             &mut rt,
@@ -8259,16 +11533,289 @@ mod tests {
 
         let expected = paths.scratch_base().join("sess-1");
         match &err {
-            NewTabForegroundError::SessionStart { cwd, .. } => {
+            NewTabForegroundError::PreparedSessionStart {
+                cwd,
+                scratch: Some(_),
+                error:
+                    NewTabPreparedSessionError::DefinitelyUnpublished {
+                        compensation: NewTabPreparedCompensationStatus::RolledBack,
+                        ..
+                    },
+            } => {
                 assert_eq!(cwd, &expected);
                 assert!(cwd.is_dir(), "prepared scratch cwd exists before cleanup");
             }
-            other => panic!("expected session-start failure, got {other:?}"),
+            other => panic!("expected compensated prepared-start failure, got {other:?}"),
         }
         assert_eq!(
             new_tab_failure_scratch_to_remove(&err),
             Some(expected.as_path())
         );
+        let report = execute_production_new_tab_recovery(
+            &paths,
+            &missing_socket,
+            1_700_000_001,
+            &mut err,
+            &[],
+            &[],
+            &mut rt,
+        );
+        assert_eq!(report.succeeded_count(), 1);
+        assert!(!expected.exists(), "D.U.+RolledBack consumes fresh receipt");
+    }
+
+    #[test]
+    fn prepared_agent_reprobe_failure_cleans_owned_scratch_without_graph_or_path_log() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = maestro_shell::AppPaths::with_base(tmp.path());
+        one_existing_tab_window(&paths, "maestro-app-dev-project");
+        let env = MapEnv::new(&[]);
+        let plan = create_plan(
+            "tab-agent",
+            "sess-agent",
+            NewTabLaunchSource::PreparedAgentAdHoc,
+        );
+        let expected = paths.scratch_base().join("sess-agent");
+        let (mut runtime, rx) = RendererTabRuntime::new();
+        runtime.seed_active_tab("w1", "t0", "sess-t0");
+        let missing_socket = tmp.path().join("must-not-connect.sock");
+
+        let mut error = run_new_tab_foreground_pipeline(
+            NewTabForegroundRequest {
+                paths: &paths,
+                socket_path: missing_socket.clone(),
+                window_id: "w1",
+                plan: &plan,
+                launch: NewTabForegroundLaunch::agent_adhoc(
+                    vec!["/definitely/missing/hydra-agent".into()],
+                    None,
+                )
+                .expect("absolute custom Agent source is valid"),
+                cols: 80,
+                rows: 24,
+                now_ms: 1_700_000_000,
+                split_from: None,
+                split_source_session: None,
+                expected_project_id: None,
+            },
+            &env,
+            &mut runtime,
+        )
+        .expect_err("actual prepared-cwd reprobe refuses missing executable");
+        assert!(matches!(
+            &error,
+            NewTabForegroundError::StartParams {
+                scratch: Some(_),
+                error: NewTabStartParamsError::PreparedLaunch,
+                ..
+            }
+        ));
+        assert!(
+            expected.is_dir(),
+            "exclusive scratch exists until recovery consumes it"
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains(&expected.to_string_lossy().to_string()),
+            "user/log diagnostics must not expose prepared cwd bytes"
+        );
+        let report = execute_production_new_tab_recovery(
+            &paths,
+            &missing_socket,
+            1_700_000_001,
+            &mut error,
+            &[],
+            &[],
+            &mut runtime,
+        );
+        assert_eq!(report.succeeded_count(), 1);
+        assert!(!expected.exists());
+        assert!(
+            rx.try_recv().is_err(),
+            "reprobe failure emits no renderer command"
+        );
+        assert!(maestro_shell::load_one::<maestro_shell::SessionRecord>(
+            &paths,
+            maestro_shell::RecordKind::Session,
+            "sess-agent",
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            maestro_shell::WindowLayoutService::new(&paths)
+                .load("w1")
+                .unwrap()
+                .unwrap()
+                .tabs
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn new_tab_foreground_plain_and_consented_scratch_refuse_preexisting_same_id_cwd() {
+        for consent_route in [false, true] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let paths = maestro_shell::AppPaths::with_base(tmp.path());
+            one_existing_tab_window(&paths, "maestro-app-dev-project");
+            let plan = create_plan("tab-1", "sess-1", NewTabLaunchSource::DefaultShellDev);
+            let cwd = paths.scratch_base().join("sess-1");
+            std::fs::create_dir_all(&cwd).unwrap();
+            let sentinel = cwd.join("KEEP");
+            std::fs::write(&sentinel, b"earlier lifetime").unwrap();
+            let argv = vec![s("/bin/zsh"), s("-l")];
+            let env = MapEnv::new(&[]);
+            let (mut runtime, rx) = RendererTabRuntime::new();
+            runtime.seed_active_tab("w1", "t0", "sess-t0");
+            let request = NewTabForegroundRequest {
+                paths: &paths,
+                socket_path: tmp.path().join("must-not-connect.sock"),
+                window_id: "w1",
+                plan: &plan,
+                launch: NewTabForegroundLaunch::shell_adhoc(&argv),
+                cols: 80,
+                rows: 24,
+                now_ms: 1_700_000_000,
+                split_from: None,
+                split_source_session: None,
+                expected_project_id: None,
+            };
+            let result = if consent_route {
+                let workspace = match maestro_shell::load_one::<maestro_shell::Workspace>(
+                    &paths,
+                    maestro_shell::RecordKind::Workspace,
+                    "maestro-app-dev",
+                )
+                .unwrap()
+                {
+                    Some(maestro_shell::LoadOutcome::Loaded(workspace)) => workspace,
+                    other => panic!("expected exact Scratch workspace, got {other:?}"),
+                };
+                run_new_tab_foreground_pipeline_with_consent(
+                    request,
+                    &workspace,
+                    &env,
+                    &mut runtime,
+                )
+            } else {
+                run_new_tab_foreground_pipeline(request, &env, &mut runtime)
+            };
+            assert!(matches!(
+                result,
+                Err(NewTabForegroundError::WorkspacePrepare(
+                    NewTabWorkspacePrepareError::WorkspaceExec(
+                        maestro_shell::WorkspaceExecError::FreshScratchCwdAlreadyExists { .. }
+                    )
+                ))
+            ));
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"earlier lifetime");
+            assert!(rx.try_recv().is_err(), "refusal sends zero renderer bytes");
+            let layout = maestro_shell::WindowLayoutService::new(&paths)
+                .load("w1")
+                .unwrap()
+                .unwrap();
+            assert_eq!(layout.tabs.len(), 1, "refusal writes no prepared tab");
+        }
+    }
+
+    #[test]
+    fn new_tab_foreground_graph_refusal_consumes_only_its_fresh_scratch_receipt() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = maestro_shell::AppPaths::with_base(tmp.path());
+        let plan = create_plan("tab-1", "sess-1", NewTabLaunchSource::DefaultShellDev);
+        let argv = vec![s("/bin/zsh"), s("-l")];
+        let env = MapEnv::new(&[]);
+        let (mut runtime, rx) = RendererTabRuntime::new();
+        let mut error = run_new_tab_foreground_pipeline(
+            NewTabForegroundRequest {
+                paths: &paths,
+                socket_path: tmp.path().join("must-not-connect.sock"),
+                window_id: "missing-window",
+                plan: &plan,
+                launch: NewTabForegroundLaunch::shell_adhoc(&argv),
+                cols: 80,
+                rows: 24,
+                now_ms: 1,
+                split_from: None,
+                split_source_session: None,
+                expected_project_id: None,
+            },
+            &env,
+            &mut runtime,
+        )
+        .expect_err("missing exact window graph must fail before daemon wire");
+        assert!(matches!(
+            &error,
+            NewTabForegroundError::PreparedSessionStart {
+                scratch: Some(_),
+                error: NewTabPreparedSessionError::GraphAuthority { .. },
+                ..
+            }
+        ));
+        assert!(rx.try_recv().is_err());
+        let cwd = paths.scratch_base().join("sess-1");
+        assert!(cwd.is_dir());
+        let report = execute_production_new_tab_recovery(
+            &paths,
+            &tmp.path().join("unused.sock"),
+            2,
+            &mut error,
+            &[],
+            &[],
+            &mut runtime,
+        );
+        assert_eq!(report.succeeded_count(), 1);
+        assert!(!cwd.exists());
+    }
+
+    #[test]
+    fn refused_and_possibly_applied_never_consume_fresh_scratch_cleanup() {
+        for possibly_applied in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let paths = maestro_shell::AppPaths::with_base(tmp.path());
+            let session_id = if possibly_applied {
+                "possibly-session"
+            } else {
+                "refused-session"
+            };
+            let (prepared, receipt) =
+                maestro_shell::prepare_fresh_scratch_cwd(&paths, "workspace", session_id, "")
+                    .unwrap()
+                    .into_parts();
+            let sentinel = prepared.cwd.join("KEEP");
+            std::fs::write(&sentinel, b"may be daemon-owned").unwrap();
+            let prepared_error = if possibly_applied {
+                NewTabPreparedSessionError::PossiblyApplied {
+                    detail: "request admission ambiguous".into(),
+                }
+            } else {
+                NewTabPreparedSessionError::Refused {
+                    error: maestro_shell::ShellRuntimeError::Daemon(
+                        maestro_shell::DaemonClientError::Timeout { during: "test" },
+                    ),
+                    compensation: NewTabPreparedCompensationStatus::RolledBack,
+                }
+            };
+            let mut error = NewTabForegroundError::PreparedSessionStart {
+                cwd: prepared.cwd.clone(),
+                scratch: Some(NewTabScratchRemovalAuthority::from_fresh_receipt(receipt)),
+                error: prepared_error,
+            };
+            let (mut runtime, _rx) = RendererTabRuntime::new();
+            let report = execute_production_new_tab_recovery(
+                &paths,
+                &tmp.path().join("unused.sock"),
+                1,
+                &mut error,
+                &[],
+                &[],
+                &mut runtime,
+            );
+            assert!(report.outcomes.is_empty());
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"may be daemon-owned");
+            assert!(new_tab_failure_scratch_to_remove(&error).is_none());
+        }
     }
 
     #[test]
@@ -8297,7 +11844,8 @@ mod tests {
     fn new_tab_event_wiring_no_policy_declines_without_id_gen() {
         // Mirrors the foreground `NewTabRequested` arm: a `None` policy (no
         // `--new-tab-default-shell`) must decline WITHOUT minting any id, even when a scripted
-        // generator is supplied. Proves the listener can match-and-plan a payload-free event safely.
+        // generator is supplied. Proves the listener can match and plan a window-bound event with no
+        // tab/session identity safely.
         let tabs = vec![snapshot_tab("tab-0", "sess-0", 0)];
         let snapshot = new_tab_snapshot_from_strip_tabs(&tabs, Some("tab-0"));
         let mut id_gen = ScriptedIdGen::new(&["unused"], &["unused"]);
@@ -8513,11 +12061,11 @@ mod tests {
         }
     }
 
-    // ---- preset restore executor ----------------------------------------------------------------
+    // ---- preset restore availability gate -------------------------------------------------------
     //
-    // These exercise the executor's distinctive decisions WITHOUT a live daemon by driving the
-    // REATTACH path (record-only: no session start). The LaunchFresh end-to-end smoke (which needs a
-    // daemon socket) lives in the binary_smoke integration test.
+    // Non-empty restore remains fail-closed until exact topology + renderer coordination exists.
+    // These tests pin ordered refusal and zero mutation; the binary smoke pins the callsite before
+    // target/log/daemon effects.
 
     fn restore_slot(
         index: u32,
@@ -8554,7 +12102,48 @@ mod tests {
     }
 
     #[test]
-    fn execute_preset_restore_reattaches_in_order_minting_fresh_tab_ids() {
+    fn preset_restore_preflight_is_ordered_empty_safe_and_pending_aware() {
+        assert!(preflight_preset_restore(&[], false).is_ok());
+        assert!(
+            preflight_preset_restore(&[], true).is_ok(),
+            "an empty preset is a no-op even while another viewport request is pending"
+        );
+
+        let launch = vec![restore_slot(
+            4,
+            "fresh",
+            maestro_shell::PresetRestoreAction::LaunchFresh,
+        )];
+        assert!(matches!(
+            preflight_preset_restore(&launch, false),
+            Err(PresetRestoreError::LaunchFreshRequiresAsyncHandoff { index: 4 })
+        ));
+        assert!(matches!(
+            preflight_preset_restore(&launch, true),
+            Err(PresetRestoreError::RendererHandoffPending)
+        ));
+
+        let reattach_then_launch = vec![
+            restore_slot(7, "retained", reattach("sess-live")),
+            restore_slot(8, "fresh", maestro_shell::PresetRestoreAction::LaunchFresh),
+        ];
+        assert!(matches!(
+            preflight_preset_restore(&reattach_then_launch, false),
+            Err(PresetRestoreError::ReattachRequiresExactViewport { index: 7 })
+        ));
+
+        let launch_then_reattach = vec![
+            restore_slot(9, "fresh", maestro_shell::PresetRestoreAction::LaunchFresh),
+            restore_slot(10, "retained", reattach("sess-live")),
+        ];
+        assert!(matches!(
+            preflight_preset_restore(&launch_then_reattach, false),
+            Err(PresetRestoreError::LaunchFreshRequiresAsyncHandoff { index: 9 })
+        ));
+    }
+
+    #[test]
+    fn execute_preset_restore_reattach_fails_closed_before_id_or_layout_mutation() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = maestro_shell::AppPaths::with_base(tmp.path());
         // The restore target window must already have a layout record (the caller load_or_creates it).
@@ -8575,7 +12164,7 @@ mod tests {
         let (mut runtime, _commands) = RendererTabRuntime::new();
         let env = MapEnv::new(&[]);
 
-        let outcomes = execute_preset_restore(
+        let error = execute_preset_restore(
             PresetRestoreRequest {
                 paths: &paths,
                 socket_path: tmp.path().join("does-not-open.sock"),
@@ -8592,35 +12181,22 @@ mod tests {
             &mut id_gen,
             &mut runtime,
         )
-        .expect("reattach restore must succeed");
-
-        assert_eq!(outcomes.len(), 2);
-        assert_eq!(outcomes[0].tab_id, "new-0");
-        assert_eq!(outcomes[0].session_id, "sess-live-0");
-        assert_eq!(outcomes[0].kind, PresetRestoreSlotKind::Reattached);
-        assert_eq!(outcomes[1].tab_id, "new-1");
-        assert_eq!(outcomes[1].session_id, "sess-live-1");
-
-        // The durable layout has both tabs in slot order, each pointing at its reattached session.
+        .expect_err("id-only reattach must fail closed");
+        assert!(matches!(
+            error,
+            PresetRestoreError::ReattachRequiresExactViewport { index: 0 }
+        ));
+        assert_eq!(id_gen.tab_calls, 0);
+        assert_eq!(id_gen.session_calls, 0);
         let layout = maestro_shell::WindowLayoutService::new(&paths)
             .load("win-restore")
             .unwrap()
             .unwrap();
-        assert_eq!(
-            layout
-                .tabs
-                .iter()
-                .map(|t| t.tab_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["new-0", "new-1"]
-        );
-        assert_eq!(layout.tabs[0].session_id, "sess-live-0");
-        assert_eq!(layout.tabs[1].session_id, "sess-live-1");
-        assert!(layout.tabs.iter().all(|t| t.split_from.is_none()));
+        assert!(layout.tabs.is_empty());
     }
 
     #[test]
-    fn execute_preset_restore_resolves_split_from_to_minted_parent_inside_one_tab_list() {
+    fn execute_preset_restore_split_reattach_fails_before_parent_or_child_mutation() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = maestro_shell::AppPaths::with_base(tmp.path());
         maestro_shell::WindowLayoutService::new(&paths)
@@ -8644,7 +12220,7 @@ mod tests {
         let (mut runtime, _commands) = RendererTabRuntime::new();
         let env = MapEnv::new(&[]);
 
-        let outcomes = execute_preset_restore(
+        let error = execute_preset_restore(
             PresetRestoreRequest {
                 paths: &paths,
                 socket_path: tmp.path().join("does-not-open.sock"),
@@ -8661,38 +12237,21 @@ mod tests {
             &mut id_gen,
             &mut runtime,
         )
-        .expect("split restore must succeed");
-
-        // The child's split parent resolved to the PARENT slot's freshly-minted tab id, not the
-        // capture-time "orig-0".
-        assert_eq!(outcomes[1].split_parent_tab_id.as_deref(), Some("new-0"));
-
+        .expect_err("split reattach requires exact viewport authority");
+        assert!(matches!(
+            error,
+            PresetRestoreError::ReattachRequiresExactViewport { index: 0 }
+        ));
+        assert_eq!(id_gen.tab_calls, 0);
         let layout = maestro_shell::WindowLayoutService::new(&paths)
             .load("win-restore")
             .unwrap()
             .unwrap();
-        // Both panes live in ONE top-level tab list (split child is NOT a new top-level header).
-        assert_eq!(layout.tabs.len(), 2);
-        let child_rec = layout
-            .tabs
-            .iter()
-            .find(|t| t.tab_id == "new-1")
-            .expect("child recorded");
-        let split = child_rec.split_from.as_ref().expect("child is a split");
-        assert_eq!(
-            split.tab_id, "new-0",
-            "split points at the minted parent id"
-        );
-        assert_eq!(split.axis, maestro_shell::SplitAxis::Right);
-        assert_eq!(split.ratio_per_mille, Some(700), "captured ratio applied");
-        assert!(child_rec.pinned, "captured pin state applied");
-        // The parent slot is a plain top-level tab.
-        let parent_rec = layout.tabs.iter().find(|t| t.tab_id == "new-0").unwrap();
-        assert!(parent_rec.split_from.is_none());
+        assert!(layout.tabs.is_empty());
     }
 
     #[test]
-    fn execute_preset_restore_unresolved_split_source_falls_back_to_top_level_tab() {
+    fn execute_preset_restore_orphan_reattach_fails_before_fallback_mutation() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = maestro_shell::AppPaths::with_base(tmp.path());
         maestro_shell::WindowLayoutService::new(&paths)
@@ -8712,7 +12271,7 @@ mod tests {
         let (mut runtime, _commands) = RendererTabRuntime::new();
         let env = MapEnv::new(&[]);
 
-        let outcomes = execute_preset_restore(
+        let error = execute_preset_restore(
             PresetRestoreRequest {
                 paths: &paths,
                 socket_path: tmp.path().join("does-not-open.sock"),
@@ -8729,17 +12288,16 @@ mod tests {
             &mut id_gen,
             &mut runtime,
         )
-        .expect("orphan-split restore must still succeed");
-
-        assert_eq!(outcomes[0].split_parent_tab_id, None);
+        .expect_err("orphan reattach requires exact viewport authority");
+        assert!(matches!(
+            error,
+            PresetRestoreError::ReattachRequiresExactViewport { index: 0 }
+        ));
+        assert_eq!(id_gen.tab_calls, 0);
         let layout = maestro_shell::WindowLayoutService::new(&paths)
             .load("win-restore")
             .unwrap()
             .unwrap();
-        assert_eq!(layout.tabs.len(), 1);
-        assert!(
-            layout.tabs[0].split_from.is_none(),
-            "an unresolved split source records a plain top-level tab"
-        );
+        assert!(layout.tabs.is_empty());
     }
 }

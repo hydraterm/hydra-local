@@ -1,12 +1,9 @@
 //! Two-writer integrity repair: re-derive and stamp missing window→project ownership (invariant I5).
 //!
-//! `windows.project_id` is the cascade/ownership FK, but it is stamped SEPARATELY from the window row
-//! itself: `WindowLayoutService::create_empty` writes the row, and only a later
-//! `ensure_window_in_project_order` / `set_window_project` stamps the owner. A crash or error between
-//! the two — in any local writer process — leaves a window with a NULL owner and
-//! possibly missing from `project.window_order`: it renders under the wrong place (or as unassigned),
-//! and a project delete no longer cascades to it. This is the corruption class behind the
-//! "window row lost / main window NULL project_id" incident.
+//! `windows.project_id` is the cascade/ownership FK. Legacy create flows stamped it separately from
+//! `project.window_order`, so a crash or error could leave a NULL owner or a missing order entry. New
+//! app/agent flows update both signals through one conditional writer transaction, while this repair
+//! remains the startup bridge for already persisted partial assignments.
 //!
 //! [`repair_window_ownership`] fixes what is PROVABLE and touches nothing else:
 //! - The owner is re-derived by the dashboard snapshot itself (tab sessions → owning task's project,
@@ -17,15 +14,16 @@
 //! - A window with NO derivable owner is LEFT ALONE — it stays visible in `unassigned_windows`.
 //!   Repair never deletes, never guesses.
 //!
-//! Both mutations ride the normal traced paths (`set_window_project` → "WindowOwner" trace,
-//! `reorder_windows` → write_record), so a repair is itself attributable in db-write.jsonl. Callers
-//! should wrap the call in a mutation context (e.g. "local:startupOwnershipRepair").
+//! Both signals ride `WindowLayoutService::ensure_project_assignment`: a fresh `BEGIN IMMEDIATE`
+//! accepts only NULL-or-same FK authority, validates every strictly parsed project order, updates the
+//! FK and order atomically, and emits post-commit traces. A concurrent foreign owner is surfaced as
+//! unassigned and never overwritten. Callers should wrap the call in a mutation context (e.g.
+//! "local:startupOwnershipRepair").
 
 use std::collections::{HashMap, HashSet};
 
 use crate::dashboard_snapshot::DashboardSnapshotService;
 use crate::paths::AppPaths;
-use crate::project::ProjectService;
 use crate::store;
 
 /// What a repair pass did — empty vecs = healthy store, nothing written.
@@ -66,78 +64,69 @@ pub fn repair_window_ownership(
         .collect();
 
     let mut report = OwnershipRepairReport::default();
-    let projects = ProjectService::new(paths);
+    let windows = crate::WindowLayoutService::new(paths);
 
     for project in &snapshot.projects {
-        if project.windows.is_empty() {
-            continue;
-        }
-        // The snapshot's ProjectSnapshot carries derived windows but not the record's window_order —
-        // load the record once per project that actually has windows to check/repair the order.
-        let mut order: Vec<String> = projects
-            .load(&project.project_id)
-            .map_err(|e| format!("load {} failed: {e:?}", project.project_id))?
-            .map(|p| p.window_order)
-            .unwrap_or_default();
-        let mut order_changed = false;
         for window in &project.windows {
-            // 1) FK stamp: missing, or dangling (points at a project the snapshot no longer knows).
-            let stored = owners.get(&window.window_id).cloned().flatten();
-            let fk_ok = stored
-                .as_deref()
-                .is_some_and(|pid| pid == project.project_id && known_projects.contains(pid));
-            if !fk_ok {
-                store::set_window_project(paths, &window.window_id, &project.project_id)
-                    .map_err(|e| format!("stamp {} failed: {e:?}", window.window_id))?;
-                report
-                    .stamped
-                    .push((window.window_id.clone(), project.project_id.clone()));
+            match windows
+                .ensure_project_assignment(&window.window_id, &project.project_id, now_ms)
+                .map_err(|error| format!("repair {} failed: {error:?}", window.window_id))?
+            {
+                crate::ConditionalWindowProjectAssignment::Applied(assignment) => {
+                    if assignment.owner_changed {
+                        report
+                            .stamped
+                            .push((window.window_id.clone(), project.project_id.clone()));
+                    }
+                    if assignment.order_changed {
+                        report
+                            .ordered
+                            .push((window.window_id.clone(), project.project_id.clone()));
+                    }
+                }
+                // A foreign FK/order is durable authority. Repair is intentionally NULL-or-same,
+                // so it surfaces the conflict instead of retargeting another writer's window.
+                crate::ConditionalWindowProjectAssignment::Conflict { .. }
+                | crate::ConditionalWindowProjectAssignment::Changed
+                | crate::ConditionalWindowProjectAssignment::WindowMissing
+                | crate::ConditionalWindowProjectAssignment::ProjectMissing => {
+                    report.unassigned.push(window.window_id.clone());
+                }
             }
-            // 2) window_order: the sidebar's ordering signal — append when missing.
-            if !order.contains(&window.window_id) {
-                order.push(window.window_id.clone());
-                order_changed = true;
-                report
-                    .ordered
-                    .push((window.window_id.clone(), project.project_id.clone()));
-            }
-        }
-        if order_changed {
-            projects
-                .reorder_windows(&project.project_id, &order, now_ms)
-                .map_err(|e| format!("order {} failed: {e:?}", project.project_id))?;
         }
     }
     // Adopt FK-owned strays: a window whose FK names a LIVE project but which the snapshot left
     // unassigned (no deriving tabs, missing from window_order). The FK is authoritative ownership
     // intent — one of the writers stamped it — so appending it to the owner's window_order makes it
     // visible under its project again instead of floating (invariant "owned-but-unassigned").
-    let mut adopt_by_project: HashMap<String, Vec<String>> = HashMap::new();
     for window in &snapshot.unassigned_windows {
         match owners.get(&window.window_id).cloned().flatten() {
-            Some(pid) if known_projects.contains(pid.as_str()) => adopt_by_project
-                .entry(pid)
-                .or_default()
-                .push(window.window_id.clone()),
+            Some(pid) if known_projects.contains(pid.as_str()) => {
+                match windows
+                    .ensure_project_assignment(&window.window_id, &pid, now_ms)
+                    .map_err(|error| format!("adopt {} failed: {error:?}", window.window_id))?
+                {
+                    crate::ConditionalWindowProjectAssignment::Applied(assignment) => {
+                        if assignment.owner_changed {
+                            report.stamped.push((window.window_id.clone(), pid.clone()));
+                        }
+                        if assignment.order_changed {
+                            report.ordered.push((window.window_id.clone(), pid.clone()));
+                        }
+                    }
+                    crate::ConditionalWindowProjectAssignment::Conflict { .. }
+                    | crate::ConditionalWindowProjectAssignment::Changed
+                    | crate::ConditionalWindowProjectAssignment::WindowMissing
+                    | crate::ConditionalWindowProjectAssignment::ProjectMissing => {
+                        report.unassigned.push(window.window_id.clone());
+                    }
+                }
+            }
             _ => report.unassigned.push(window.window_id.clone()),
         }
     }
-    for (pid, window_ids) in adopt_by_project {
-        let mut order = projects
-            .load(&pid)
-            .map_err(|e| format!("load {pid} failed: {e:?}"))?
-            .map(|p| p.window_order)
-            .unwrap_or_default();
-        for wid in &window_ids {
-            if !order.contains(wid) {
-                order.push(wid.clone());
-            }
-            report.ordered.push((wid.clone(), pid.clone()));
-        }
-        projects
-            .reorder_windows(&pid, &order, now_ms)
-            .map_err(|e| format!("adopt into {pid} failed: {e:?}"))?;
-    }
+    report.unassigned.sort();
+    report.unassigned.dedup();
     Ok(report)
 }
 
@@ -150,6 +139,7 @@ mod tests {
         Attention, AttentionSource, AttentionState, LaunchSpec, Project, SessionKind,
         SessionRecord, SessionStatus, TabRecord, WindowLayout, Workspace, WorkspaceConsent,
     };
+    use crate::ProjectService;
     use tempfile::TempDir;
 
     fn temp_paths() -> (TempDir, AppPaths) {
@@ -301,6 +291,53 @@ mod tests {
         assert_eq!(report.stamped, vec![("w1".to_string(), "p1".to_string())]);
         assert!(report.ordered.is_empty(), "already in window_order");
         assert_eq!(owner_of(&paths, "w1"), Some("p1".to_string()));
+    }
+
+    #[test]
+    fn foreign_project_order_conflict_is_left_unassigned_and_unchanged() {
+        let (_tmp, paths) = temp_paths();
+        seed_project(&paths, "derived-owner", vec![]);
+        seed_project(
+            &paths,
+            "foreign-order-owner",
+            vec!["conflicted-window".into()],
+        );
+        seed_workspace_session(
+            &paths,
+            "conflicted-workspace",
+            "derived-owner",
+            "conflicted-session",
+        );
+        seed_window(&paths, "conflicted-window", "conflicted-session");
+        let epoch_before = {
+            let connection = crate::db::conn_for(paths.base()).unwrap();
+            let guard = connection.lock().unwrap();
+            crate::db::window_mutation_epoch(&guard).unwrap()
+        };
+        let foreign_before = ProjectService::new(&paths)
+            .load("foreign-order-owner")
+            .unwrap()
+            .unwrap();
+
+        // Session ownership derives `derived-owner`, but the foreign order is durable competing
+        // authority. Startup repair must surface the row rather than retargeting either signal.
+        let report = repair_window_ownership(&paths, 100).unwrap();
+        assert!(report.stamped.is_empty() && report.ordered.is_empty());
+        assert_eq!(report.unassigned, vec!["conflicted-window"]);
+        assert_eq!(owner_of(&paths, "conflicted-window"), None);
+        assert_eq!(
+            ProjectService::new(&paths)
+                .load("foreign-order-owner")
+                .unwrap()
+                .unwrap(),
+            foreign_before
+        );
+        let epoch_after = {
+            let connection = crate::db::conn_for(paths.base()).unwrap();
+            let guard = connection.lock().unwrap();
+            crate::db::window_mutation_epoch(&guard).unwrap()
+        };
+        assert_eq!(epoch_after, epoch_before);
     }
 
     #[test]

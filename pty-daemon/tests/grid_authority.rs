@@ -146,11 +146,23 @@ fn grid_is_authoritative_and_reflows() {
     );
     assert_eq!(parse_usize_field(&snap1, "cols"), 80, "initial cols");
     assert_eq!(parse_usize_field(&snap1, "rows"), 24, "initial rows");
+    let generation = serde_json::from_str::<serde_json::Value>(snap1.trim())
+        .expect("initial Grid JSON")["grid"]["generation"]
+        .as_str()
+        .expect("initial Grid generation")
+        .to_string();
 
     // Resize, then take a second snapshot: geometry must reflow to the new size.
     send(
         &mut stream,
-        &format!(r#"{{"op":"resize","id":"{id}","cols":100,"rows":30}}"#),
+        &serde_json::json!({
+            "op": "resize",
+            "id": id,
+            "cols": 100,
+            "rows": 30,
+            "expected_generation": generation
+        })
+        .to_string(),
     );
     std::thread::sleep(Duration::from_millis(200));
     send(&mut stream, &format!(r#"{{"op":"snapshot","id":"{id}"}}"#));

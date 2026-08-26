@@ -102,6 +102,68 @@ pub struct DropHighlight {
     pub dock: bool,
 }
 
+/// One hovered terminal-link span in absolute window-grid coordinates.  The App
+/// derives this from the same cell hit test used for selection/mouse input; the
+/// renderer converts it with the same `cw`/`ch`/grid origins used for glyphs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalLinkHighlight {
+    pub row: usize,
+    pub start_col: usize,
+    pub end_col: usize,
+}
+
+/// The externally meaningful result of one attempted terminal frame. The App owns
+/// recovery scheduling; the renderer only reports whether it presented the normal
+/// frame, presented a privacy-safe frame without glyphs, or could not acquire a
+/// surface at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrameOutcome {
+    Presented,
+    PresentedWithoutText,
+    SurfaceUnavailable,
+    FatalSurface,
+}
+
+/// GPU work selected after glyphon preparation. Both variants still encode the
+/// background clear and safe quad pass and submit/present the acquired frame. The
+/// failure variant deliberately omits glyphon's render call: a failed prepare does
+/// not authorize reusing whatever vertex bytes glyphon left from an older frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreparedFramePlan {
+    ClearQuadsAndText,
+    ClearQuadsWithoutText,
+}
+
+impl PreparedFramePlan {
+    fn after_text_prepare(succeeded: bool) -> Self {
+        if succeeded {
+            Self::ClearQuadsAndText
+        } else {
+            Self::ClearQuadsWithoutText
+        }
+    }
+
+    fn draws_text(self) -> bool {
+        matches!(self, Self::ClearQuadsAndText)
+    }
+
+    fn presented_outcome(self) -> FrameOutcome {
+        match self {
+            Self::ClearQuadsAndText => FrameOutcome::Presented,
+            Self::ClearQuadsWithoutText => FrameOutcome::PresentedWithoutText,
+        }
+    }
+}
+
+fn surface_failure_outcome(error: &wgpu::SurfaceError) -> FrameOutcome {
+    match error {
+        wgpu::SurfaceError::OutOfMemory => FrameOutcome::FatalSurface,
+        wgpu::SurfaceError::Timeout | wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost => {
+            FrameOutcome::SurfaceUnavailable
+        }
+    }
+}
+
 /// Cache key for a shaped per-cell glyph buffer. The dominant per-frame cost is
 /// `Buffer::new` + `shape_until_scroll` once PER non-blank cell (measured ~99% of
 /// frame time on dense grids). The shaped result depends ONLY on what determines
@@ -394,6 +456,9 @@ pub struct Renderer {
     // frame from the live drag state + cursor; `None` clears it so the highlight never outlives the
     // gesture. Display-only chrome — it never changes pane geometry, clipping, or input routing.
     drop_highlight: Option<DropHighlight>,
+    // Hover underline for one proven HTTP(S) terminal span.  Absolute window-grid
+    // cells keep split panes and the single-pane path on one geometry authority.
+    terminal_link_highlight: Option<TerminalLinkHighlight>,
 
     // Instrumentation: when true (MAESTRO_RENDER_STATS=1), `render` measures
     // per-frame cost and prints a one-line stats summary. Off by default and on the
@@ -754,6 +819,7 @@ impl Renderer {
             focus_indicator: None,
             inactive_dims: Vec::new(),
             drop_highlight: None,
+            terminal_link_highlight: None,
             stats_enabled: std::env::var_os("MAESTRO_RENDER_STATS").is_some_and(|v| v == "1"),
             frame_index: 0,
         }
@@ -1013,6 +1079,10 @@ impl Renderer {
         self.drop_highlight = region;
     }
 
+    pub fn set_terminal_link_highlight(&mut self, highlight: Option<TerminalLinkHighlight>) {
+        self.terminal_link_highlight = highlight;
+    }
+
     /// Swap the live color `theme` in place: re-resolve the palette so subsequent frames paint with the
     /// new colors. Color-only — cell metrics, grid geometry, scrollback, selection, and all chrome are
     /// untouched. Idempotent: re-applying the active theme is a no-op (the stored `theme` short-circuits).
@@ -1082,7 +1152,7 @@ impl Renderer {
         grid: Option<&GridSnapshot>,
         overlay: Option<&str>,
         selection: Option<(CellPos, CellPos)>,
-    ) {
+    ) -> FrameOutcome {
         let frame_start = self.stats_enabled.then(Instant::now);
         let mut stats = FrameStats::default();
 
@@ -1522,6 +1592,28 @@ impl Renderer {
                     rect,
                     color: rgba([rgb.0, rgb.1, rgb.2], alpha),
                 });
+            }
+        }
+
+        // --- terminal-link hover underline (opt-in) ---
+        // The target is already an absolute window-grid span from App's authoritative
+        // hit test.  Reusing this frame's exact cell metrics/origins keeps the visible
+        // underline and clickable rectangle locked together on every host.
+        if let Some(link) = self.terminal_link_highlight {
+            if let Some(rect) = terminal_link_underline_rect(link, cw, ch, ox, oy, scale) {
+                let terminal_bounds = [
+                    ox,
+                    oy,
+                    (self.config.width as f32 - ox).max(0.0),
+                    (self.config.height as f32 - oy).max(0.0),
+                ];
+                if let Some(rect) = clip_rect_to_pixel_bounds(rect, Some(terminal_bounds)) {
+                    quads.push(QuadInstance {
+                        rect,
+                        color: rgba(self.palette.foreground, 1.0),
+                    });
+                    stats.decoration_quads += 1;
+                }
             }
         }
 
@@ -3147,7 +3239,7 @@ impl Renderer {
 
         stats.text_areas = text_areas.len() as u32;
         let prepare_start = self.stats_enabled.then(Instant::now);
-        if let Err(e) = self.text_renderer.prepare(
+        let text_prepare = self.text_renderer.prepare(
             &self.device,
             &self.queue,
             &mut self.font_system,
@@ -3155,7 +3247,9 @@ impl Renderer {
             &self.viewport,
             text_areas,
             &mut self.swash_cache,
-        ) {
+        );
+        let frame_plan = PreparedFramePlan::after_text_prepare(text_prepare.is_ok());
+        if let Err(e) = text_prepare {
             eprintln!("maestro-renderer: text prepare failed: {e}");
         }
         if let Some(t) = prepare_start {
@@ -3165,13 +3259,17 @@ impl Renderer {
         // --- encode + submit ---
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
-            Err(_) => {
+            Err(first_error) => {
+                if surface_failure_outcome(&first_error) == FrameOutcome::FatalSurface {
+                    eprintln!("maestro-renderer: fatal surface error: {first_error}");
+                    return FrameOutcome::FatalSurface;
+                }
                 self.surface.configure(&self.device, &self.config);
                 match self.surface.get_current_texture() {
                     Ok(f) => f,
                     Err(e) => {
                         eprintln!("maestro-renderer: surface error: {e}");
-                        return;
+                        return surface_failure_outcome(&e);
                     }
                 }
             }
@@ -3209,11 +3307,13 @@ impl Renderer {
             pass.set_vertex_buffer(0, self.instance_buf.slice(..));
             pass.draw(0..6, 0..self.instance_count);
 
-            if let Err(e) = self
-                .text_renderer
-                .render(&self.atlas, &self.viewport, &mut pass)
-            {
-                eprintln!("maestro-renderer: text render failed: {e}");
+            if frame_plan.draws_text() {
+                if let Err(e) = self
+                    .text_renderer
+                    .render(&self.atlas, &self.viewport, &mut pass)
+                {
+                    eprintln!("maestro-renderer: text render failed: {e}");
+                }
             }
         }
         let submit_start = self.stats_enabled.then(Instant::now);
@@ -3229,6 +3329,7 @@ impl Renderer {
             self.print_stats(&stats);
         }
         self.frame_index = self.frame_index.wrapping_add(1);
+        frame_plan.presented_outcome()
     }
 
     /// Emit a one-line stats summary for this frame (only when stats are enabled).
@@ -3250,6 +3351,69 @@ impl Renderer {
             s.text_prepare_us,
             s.submit_present_cpu_us,
         );
+    }
+}
+
+/// Convert the exact absolute cell span used for hit testing into its hover
+/// underline.  Pure so geometry parity is checked without a GPU/window.
+fn terminal_link_underline_rect(
+    link: TerminalLinkHighlight,
+    cw: f32,
+    ch: f32,
+    ox: f32,
+    oy: f32,
+    scale: f32,
+) -> Option<[f32; 4]> {
+    if link.end_col <= link.start_col
+        || !cw.is_finite()
+        || !ch.is_finite()
+        || cw <= 0.0
+        || ch <= 0.0
+    {
+        return None;
+    }
+    let thickness = scale.max(1.0).min(ch);
+    Some([
+        ox + link.start_col as f32 * cw,
+        oy + (link.row + 1) as f32 * ch - thickness,
+        (link.end_col - link.start_col) as f32 * cw,
+        thickness,
+    ])
+}
+
+#[cfg(test)]
+mod terminal_link_highlight_tests {
+    use super::{terminal_link_underline_rect, TerminalLinkHighlight};
+
+    #[test]
+    fn underline_uses_exact_hit_span_and_cell_origins() {
+        let rect = terminal_link_underline_rect(
+            TerminalLinkHighlight {
+                row: 3,
+                start_col: 4,
+                end_col: 9,
+            },
+            8.0,
+            16.0,
+            20.0,
+            32.0,
+            2.0,
+        )
+        .unwrap();
+        assert_eq!(rect, [52.0, 94.0, 40.0, 2.0]);
+        assert!(terminal_link_underline_rect(
+            TerminalLinkHighlight {
+                row: 0,
+                start_col: 2,
+                end_col: 2,
+            },
+            8.0,
+            16.0,
+            0.0,
+            0.0,
+            1.0,
+        )
+        .is_none());
     }
 }
 
@@ -5996,6 +6160,7 @@ mod glyph_cache_tests {
             strikeout: false,
             dim: false,
             hidden: false,
+            hyperlink: None,
             width: 1,
         }
     }
@@ -6317,6 +6482,58 @@ mod device_limits_tests {
                 &[wgpu::PresentMode::Fifo],
             ),
             wgpu::PresentMode::Fifo
+        );
+    }
+}
+
+#[cfg(test)]
+mod frame_failure_policy_tests {
+    use super::{surface_failure_outcome, FrameOutcome, PreparedFramePlan};
+
+    #[test]
+    fn failed_text_prepare_selects_clear_quad_present_without_text() {
+        let plan = PreparedFramePlan::after_text_prepare(false);
+
+        assert_eq!(plan, PreparedFramePlan::ClearQuadsWithoutText);
+        assert!(
+            !plan.draws_text(),
+            "stale glyph vertex bytes must not be drawn"
+        );
+        assert_eq!(
+            plan.presented_outcome(),
+            FrameOutcome::PresentedWithoutText,
+            "the acquired frame still follows the clear + safe-quads + present path"
+        );
+    }
+
+    #[test]
+    fn successful_text_prepare_preserves_the_normal_text_path() {
+        let plan = PreparedFramePlan::after_text_prepare(true);
+
+        assert_eq!(plan, PreparedFramePlan::ClearQuadsAndText);
+        assert!(plan.draws_text());
+        assert_eq!(plan.presented_outcome(), FrameOutcome::Presented);
+    }
+
+    #[test]
+    fn recoverable_surface_errors_are_typed_unavailable() {
+        for error in [
+            wgpu::SurfaceError::Timeout,
+            wgpu::SurfaceError::Outdated,
+            wgpu::SurfaceError::Lost,
+        ] {
+            assert_eq!(
+                surface_failure_outcome(&error),
+                FrameOutcome::SurfaceUnavailable
+            );
+        }
+    }
+
+    #[test]
+    fn surface_out_of_memory_is_fatal() {
+        assert_eq!(
+            surface_failure_outcome(&wgpu::SurfaceError::OutOfMemory),
+            FrameOutcome::FatalSurface
         );
     }
 }

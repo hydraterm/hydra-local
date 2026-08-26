@@ -101,6 +101,15 @@ pub struct Cell {
     pub dim: bool,
     #[serde(default)]
     pub hidden: bool,
+    /// Bounded OSC 8 target supplied by the daemon.  Missing stays `None` for
+    /// compatibility with older retained daemons; opening still re-validates the
+    /// scheme/content at the renderer boundary.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_cell_hyperlink"
+    )]
+    pub hyperlink: Option<String>,
     pub width: u8,
 }
 
@@ -140,6 +149,70 @@ where
         }
     }
     de.deserialize_str(TextVisitor)
+}
+
+fn deserialize_cell_hyperlink<'de, D>(de: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{Error, Visitor};
+    use std::fmt;
+
+    struct OptionalHyperlinkVisitor;
+    impl<'de> Visitor<'de> for OptionalHyperlinkVisitor {
+        type Value = Option<String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(
+                f,
+                "null or a terminal hyperlink up to {} bytes",
+                maestro_protocol::MAX_TERMINAL_URL_BYTES
+            )
+        }
+
+        fn visit_none<E: Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2>(self, de: D2) -> Result<Self::Value, D2::Error>
+        where
+            D2: serde::Deserializer<'de>,
+        {
+            struct HyperlinkVisitor;
+            impl Visitor<'_> for HyperlinkVisitor {
+                type Value = String;
+
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    write!(
+                        f,
+                        "a terminal hyperlink up to {} bytes",
+                        maestro_protocol::MAX_TERMINAL_URL_BYTES
+                    )
+                }
+
+                fn visit_str<E: Error>(self, value: &str) -> Result<Self::Value, E> {
+                    if value.len() > maestro_protocol::MAX_TERMINAL_URL_BYTES {
+                        return Err(E::custom("terminal hyperlink exceeds byte cap"));
+                    }
+                    Ok(value.to_owned())
+                }
+
+                fn visit_string<E: Error>(self, value: String) -> Result<Self::Value, E> {
+                    if value.len() > maestro_protocol::MAX_TERMINAL_URL_BYTES {
+                        return Err(E::custom("terminal hyperlink exceeds byte cap"));
+                    }
+                    Ok(value)
+                }
+            }
+            de.deserialize_str(HyperlinkVisitor).map(Some)
+        }
+    }
+
+    de.deserialize_option(OptionalHyperlinkVisitor)
 }
 
 /// `SessionGeneration` serializes as a bare UUID string; we keep it as a String
@@ -196,16 +269,31 @@ pub struct GridSnapshot {
     pub mouse_sgr: bool,
 }
 
+/// Renderer-side enforcement of the shared OSC 8 cell budget. The daemon applies
+/// the same cap while producing snapshots, but every decoded or damage-mutated grid
+/// is rechecked because the local socket payload is still untrusted input.
+pub(crate) fn terminal_link_cells_within_cap(rows: &[Vec<Cell>]) -> bool {
+    rows.iter()
+        .flatten()
+        .filter(|cell| cell.hyperlink.is_some())
+        .take(maestro_protocol::MAX_TERMINAL_LINK_CELLS_PER_FRAME + 1)
+        .count()
+        <= maestro_protocol::MAX_TERMINAL_LINK_CELLS_PER_FRAME
+}
+
 /// `SessionId(pub String)` is a newtype tuple struct: serializes as a bare
 /// string. We send `{"op":"attach","id":"<session>"}` directly. The renderer
 /// attaches, pulls snapshots, writes input, and resizes the daemon.
 /// `Write.data` carries the LITERAL byte sequence to feed the PTY — the daemon
 /// forwards `data`'s raw UTF-8 bytes unchanged (see pty-daemon protocol.rs).
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ClientRequest {
-    /// `want_raw_output` opts the renderer out of raw `Output { data }`: with
-    /// `false` the daemon streams Grid/Damage/lifecycle/resync only. The
+    /// Read-only daemon protocol/capability probe. The renderer sends this on a candidate socket
+    /// before it admits any terminal mutation.
+    DaemonInfo,
+    /// `want_raw_output` (C3) opts the renderer OUT of raw `Output { data }`: with
+    /// `false` the daemon streams Grid/Damage/lifecycle/resync only. As of C3.6 the
     /// native renderer sends `false` — it is structured-only (live updates via Damage,
     /// no second VT parse) and the Output->Snapshot bridge is retired. Default mirrors
     /// the daemon: an absent field decodes to `true` for compatibility.
@@ -213,6 +301,24 @@ pub enum ClientRequest {
         id: String,
         #[serde(default = "default_true")]
         want_raw_output: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_session_generation: Option<String>,
+        /// Connection-local causal fence for this exact Attach incarnation. Canonical daemons
+        /// echo it on the Attach restore Grid and tag every event from that live forwarder. An
+        /// older daemon ignores the additive field; the client permits that only for the initial
+        /// connection incarnation and fails closed after any clear/rebind.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_generation: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handoff: Option<maestro_shell::AttachmentHandoff>,
+    },
+    /// Retire one exact pending startup-to-renderer ownership handoff. This is the renderer mirror
+    /// of `maestro_protocol::ClientRequest::CancelAttachmentHandoff`; the opaque token remains
+    /// redacted by its own Debug/Display implementations.
+    CancelAttachmentHandoff {
+        id: String,
+        token: maestro_shell::AttachmentHandoffToken,
+        expected_daemon_instance: maestro_shell::DaemonInstanceId,
     },
     /// Stop streaming a session to this client (the inverse of Attach). The session
     /// keeps running; only this client's forwarder ends. Mirror of the daemon's
@@ -227,10 +333,12 @@ pub enum ClientRequest {
     },
     Write {
         id: String,
+        expected_generation: SessionGeneration,
         data: String,
     },
     Resize {
         id: String,
+        expected_generation: SessionGeneration,
         cols: u16,
         rows: u16,
     },
@@ -270,23 +378,24 @@ pub const MAX_DAMAGE_CELLS: usize = 1_000_000;
 /// Practical per-frame serialized-byte cap (mirror of the daemon's `MAX_DAMAGE_BYTES`).
 /// Enforced at the framing layer BEFORE a full typed parse of a damage line: a damage
 /// event whose raw line exceeds this is rejected (drop to resync) without paying to
-/// deserialize an 8 MiB payload's nested cells.
-pub const MAX_DAMAGE_BYTES: usize = 8 * 1024 * 1024;
+/// deserialize a 9 MiB payload's nested cells.
+pub const MAX_DAMAGE_BYTES: usize = 9 * 1024 * 1024;
 
 /// Why decoding a raw event line failed at the framing layer (before a full typed
 /// parse). Distinct from `DamageInvalid` (post-decode structural validation).
 #[derive(Debug, PartialEq, Eq)]
 pub enum DecodeError {
     /// The raw line is not even a minimal `{"ev": "..."}` envelope (bad JSON / missing
-    /// tag). The caller logs and skips the line.
+    /// tag). With no trustworthy route this is a connection-terminal protocol failure.
     BadEnvelope,
     /// The event is a `damage` whose raw line exceeds `MAX_DAMAGE_BYTES`. Rejected at
-    /// the framing layer WITHOUT a full parse of its nested cells; the caller drops to
-    /// resync (requests one fresh snapshot) rather than trusting an oversized frame.
+    /// the framing layer WITHOUT a full parse of its nested cells. Route classification decides
+    /// whether an exact current Damage can recover or the connection must fail closed.
     DamageTooLarge { bytes: usize },
-    /// The line passed framing checks but full typed deserialization failed (malformed
-    /// fields, over-long cell text, etc.). The caller logs and skips.
-    BadPayload { message: String },
+    /// The line passed framing checks but full typed deserialization failed (malformed fields,
+    /// over-long cell text, etc.). Deliberately carries no serde text: those diagnostics may quote
+    /// terminal-controlled values and must never reach logs or a future derived `Debug` dump.
+    BadPayload,
 }
 
 /// Minimal borrowed envelope: reads ONLY the `ev` tag, ignoring every other field
@@ -299,6 +408,64 @@ pub enum DecodeError {
 struct EventEnvelope<'a> {
     #[serde(borrow)]
     ev: &'a str,
+    #[serde(default, borrow)]
+    id: Option<&'a str>,
+    #[serde(default, borrow)]
+    frame: Option<EventFrameEnvelope<'a>>,
+    /// Present only on the restore Grid produced by an Attach carrying the matching request
+    /// generation. Snapshot replies omit it.
+    #[serde(default)]
+    output_generation: Option<u64>,
+    /// Present on events emitted by one Attach's live forwarder (Damage, notifications, exit,
+    /// resync, and its follow-up Grid). It stays outside the typed event payload so old clients
+    /// continue to ignore it.
+    #[serde(default)]
+    live_output_generation: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct EventFrameEnvelope<'a> {
+    #[serde(borrow)]
+    id: &'a str,
+}
+
+/// Causal routing metadata extracted from the same bounded event line before its heavy payload is
+/// decoded. These fields are additive on the daemon wire and intentionally remain outside
+/// [`DaemonEvent`] so the existing event constructors and schema mirror stay compact.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EventRouteMetadata {
+    pub output_generation: Option<u64>,
+    pub live_output_generation: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventRouteKind {
+    Grid,
+    Damage,
+    ScrollbackRows,
+    Other,
+}
+
+impl EventRouteKind {
+    fn from_tag(tag: &str) -> Self {
+        match tag {
+            "grid" => Self::Grid,
+            "damage" => Self::Damage,
+            "scrollback_rows" => Self::ScrollbackRows,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// A payload/framing failure plus whatever bounded routing proof the lightweight envelope could
+/// establish. A malformed old-generation line must not be allowed to resync the current viewport,
+/// so callers inspect this metadata before mutating SyncState or admitting a Snapshot request.
+#[derive(Debug)]
+pub struct RoutedDecodeError {
+    pub error: DecodeError,
+    pub route: Option<EventRouteMetadata>,
+    pub kind: Option<EventRouteKind>,
+    pub session_id: Option<String>,
 }
 
 /// Decode one raw event line into a `DaemonEvent`, enforcing the damage byte cap
@@ -310,14 +477,53 @@ struct EventEnvelope<'a> {
 ///    ambiguous substring framing is not).
 ///
 /// `line` is the already-trimmed, already-`MAX_LINE_BYTES`-bounded UTF-8 line.
+#[cfg(test)]
 pub fn decode_event(line: &str) -> Result<DaemonEvent, DecodeError> {
-    let env: EventEnvelope = serde_json::from_str(line).map_err(|_| DecodeError::BadEnvelope)?;
-    if env.ev == "damage" && line.len() > MAX_DAMAGE_BYTES {
-        return Err(DecodeError::DamageTooLarge { bytes: line.len() });
+    decode_event_with_route(line)
+        .map(|(event, _)| event)
+        .map_err(|error| error.error)
+}
+
+/// Decode an event together with its connection-local Attach ownership proof. The discriminator
+/// pass remains lightweight: it reads only the event tag and two optional integers, then the same
+/// damage-size gate runs before full payload allocation.
+pub fn decode_event_with_route(
+    line: &str,
+) -> Result<(DaemonEvent, EventRouteMetadata), RoutedDecodeError> {
+    let env: EventEnvelope = serde_json::from_str(line).map_err(|_| RoutedDecodeError {
+        error: DecodeError::BadEnvelope,
+        route: None,
+        kind: None,
+        session_id: None,
+    })?;
+    let route = EventRouteMetadata {
+        output_generation: env.output_generation,
+        live_output_generation: env.live_output_generation,
+    };
+    let kind = EventRouteKind::from_tag(env.ev);
+    // Match the typed route exactly: Damage authority lives only at `frame.id`; every other modeled
+    // session event uses the top-level id. A conflicting attacker-supplied top-level Damage id must
+    // never redirect a malformed old payload into the current binding's recovery path.
+    let session_id = match kind {
+        EventRouteKind::Damage => env.frame.as_ref().map(|frame| frame.id),
+        _ => env.id,
     }
-    serde_json::from_str(line).map_err(|e| DecodeError::BadPayload {
-        message: e.to_string(),
-    })
+    .map(str::to_string);
+    if env.ev == "damage" && line.len() > MAX_DAMAGE_BYTES {
+        return Err(RoutedDecodeError {
+            error: DecodeError::DamageTooLarge { bytes: line.len() },
+            route: Some(route),
+            kind: Some(kind),
+            session_id,
+        });
+    }
+    let event = serde_json::from_str(line).map_err(|_| RoutedDecodeError {
+        error: DecodeError::BadPayload,
+        route: Some(route),
+        kind: Some(kind),
+        session_id,
+    })?;
+    Ok((event, route))
 }
 
 /// Per-line framing ceiling for the event read loop, mirror of the daemon's
@@ -335,6 +541,7 @@ pub enum DamageInvalid {
     BadDimensions { reason: &'static str },
     TooManyOps { got: usize },
     TooManyCells { got: usize },
+    TooManyHyperlinkCells { got: usize },
     RowSpanOutOfBounds { op: usize },
     EmptyRowSpan { op: usize },
     BadScrollRegion { op: usize },
@@ -448,6 +655,7 @@ impl DamageFrame {
             });
         }
         let mut total_cells = 0usize;
+        let mut hyperlink_cells = 0usize;
         for (i, op) in self.ops.iter().enumerate() {
             match op {
                 DamageOp::RowSpan { row, start, cells } => {
@@ -468,6 +676,14 @@ impl DamageFrame {
                             return Err(DamageInvalid::BadCell { op: i });
                         }
                     }
+                    hyperlink_cells = hyperlink_cells
+                        .checked_add(cells.iter().filter(|cell| cell.hyperlink.is_some()).count())
+                        .ok_or(DamageInvalid::TooManyHyperlinkCells { got: usize::MAX })?;
+                    if hyperlink_cells > maestro_protocol::MAX_TERMINAL_LINK_CELLS_PER_FRAME {
+                        return Err(DamageInvalid::TooManyHyperlinkCells {
+                            got: hyperlink_cells,
+                        });
+                    }
                     total_cells = total_cells
                         .checked_add(cells.len())
                         .ok_or(DamageInvalid::TooManyCells { got: usize::MAX })?;
@@ -481,6 +697,13 @@ impl DamageFrame {
                     // "blank" has exactly one representation.
                     if !cell_is_valid(cell) || cell.width != 1 || cell.text != " " {
                         return Err(DamageInvalid::BadCell { op: i });
+                    }
+                    if cell.hyperlink.is_some() {
+                        let projected =
+                            usize::from(self.cols).saturating_mul(usize::from(self.rows));
+                        if projected > maestro_protocol::MAX_TERMINAL_LINK_CELLS_PER_FRAME {
+                            return Err(DamageInvalid::TooManyHyperlinkCells { got: projected });
+                        }
                     }
                 }
                 DamageOp::ScrollUp {
@@ -523,12 +746,45 @@ fn default_true() -> bool {
     true
 }
 
+/// Renderer-local mirror of the protocol's typed generation-conditional Attach refusal. Keeping
+/// this leaf wire module independent of the full protocol crate preserves the existing renderer
+/// dependency boundary while decoding the exact same snake-case bytes.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionAttachRefusal {
+    Missing,
+    GenerationMismatch,
+}
+
 /// Events the daemon sends. We only model the variants this commit cares about;
 /// `#[serde(other)]` swallows the rest (channel, sessions, output's siblings)
 /// so an unknown `ev` never aborts the reader.
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(tag = "ev", rename_all = "snake_case")]
 pub enum DaemonEvent {
+    DaemonInfo {
+        protocol_version: u32,
+        build_version: String,
+        /// Opaque per-process identity required before a handoff Claim may cross this connection.
+        #[serde(default)]
+        daemon_instance_id: Option<maestro_shell::DaemonInstanceId>,
+        #[serde(default)]
+        output_generation_echo: bool,
+        #[serde(default)]
+        child_environment: bool,
+        #[serde(default)]
+        generation_conditional_mutations: bool,
+        #[serde(default)]
+        attachment_aware_conditional_kill: bool,
+        #[serde(default)]
+        generation_conditional_attach: bool,
+    },
+    SessionAttachRefused {
+        id: String,
+        expected_generation: String,
+        daemon_instance_id: maestro_shell::DaemonInstanceId,
+        reason: SessionAttachRefusal,
+    },
     TerminalBell {
         id: String,
     },
@@ -681,6 +937,7 @@ mod tests {
             strikeout: false,
             dim: false,
             hidden: false,
+            hyperlink: None,
             width: 1,
         }
     }
@@ -883,6 +1140,9 @@ mod tests {
         let req = ClientRequest::Attach {
             id: "s1".to_string(),
             want_raw_output: false,
+            expected_session_generation: None,
+            output_generation: Some(7),
+            handoff: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"op\":\"attach\""), "{json}");
@@ -891,6 +1151,50 @@ mod tests {
             !json.contains("\"want_raw_output\":true"),
             "structured-only renderer must NOT opt into raw output: {json}"
         );
+    }
+
+    #[test]
+    fn attachment_handoff_cancel_matches_canonical_request_shape() {
+        let token: maestro_shell::AttachmentHandoffToken = "0123456789abcdef0123456789abcdef"
+            .parse()
+            .expect("valid handoff token");
+        let expected_daemon_instance: maestro_shell::DaemonInstanceId =
+            "22222222222242228222222222222222"
+                .parse()
+                .expect("valid daemon instance");
+        let request = ClientRequest::CancelAttachmentHandoff {
+            id: "s1".to_string(),
+            token: token.clone(),
+            expected_daemon_instance,
+        };
+        let json = serde_json::to_string(&request).expect("cancel serializes");
+        assert_eq!(
+            json,
+            r#"{"op":"cancel_attachment_handoff","id":"s1","token":"0123456789abcdef0123456789abcdef","expected_daemon_instance":"22222222222242228222222222222222"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientRequest>(&json).expect("cancel round-trips"),
+            request
+        );
+    }
+
+    #[test]
+    fn conditional_attach_refusal_decodes_with_exact_correlation_facts() {
+        let event: DaemonEvent = serde_json::from_str(
+            r#"{"ev":"session_attach_refused","id":"s1","expected_generation":"generation-a","daemon_instance_id":"22222222222242228222222222222222","reason":"missing"}"#,
+        )
+        .expect("conditional Attach refusal decodes");
+        assert!(matches!(
+            event,
+            DaemonEvent::SessionAttachRefused {
+                ref id,
+                ref expected_generation,
+                ref daemon_instance_id,
+                reason: SessionAttachRefusal::Missing,
+            } if id == "s1"
+                && expected_generation == "generation-a"
+                && daemon_instance_id.as_str() == "22222222222242228222222222222222"
+        ));
     }
 
     /// The renderer mirrors the daemon's existing `Detach { id }` (NOT a new wire
@@ -1086,10 +1390,45 @@ mod tests {
         assert_eq!(f.validate(), Err(DamageInvalid::BadCell { op: 0 }));
     }
 
+    #[test]
+    fn hyperlink_field_round_trips_and_overlong_hostile_value_is_rejected() {
+        let mut linked = dmg_cell("x");
+        linked.hyperlink = Some("https://example.test/path".to_owned());
+        let json = serde_json::to_string(&linked).unwrap();
+        let decoded: Cell = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.hyperlink, linked.hyperlink);
+
+        linked.hyperlink = Some("x".repeat(maestro_protocol::MAX_TERMINAL_URL_BYTES + 1));
+        let json = serde_json::to_string(&linked).unwrap();
+        assert!(serde_json::from_str::<Cell>(&json).is_err());
+    }
+
+    #[test]
+    fn nested_grid_rejects_overlong_hyperlink_before_event_construction() {
+        let hostile = CROSS_WIRE_GRID_JSON.replace(
+            "https://grid.example.test/x",
+            &"x".repeat(maestro_protocol::MAX_TERMINAL_URL_BYTES + 1),
+        );
+        assert!(serde_json::from_str::<DaemonEvent>(&hostile).is_err());
+    }
+
+    #[test]
+    fn linked_clear_all_cannot_clone_beyond_the_frame_cell_budget() {
+        let mut linked_blank = dmg_cell(" ");
+        linked_blank.hyperlink = Some("https://clear.example.test".to_owned());
+        let mut frame = dmg_frame(vec![DamageOp::ClearAll { cell: linked_blank }]);
+        frame.cols = 17;
+        frame.rows = 16;
+        assert_eq!(
+            frame.validate(),
+            Err(DamageInvalid::TooManyHyperlinkCells { got: 272 })
+        );
+    }
+
     /// Byte-identical to the daemon's `CROSS_WIRE_DAMAGE_JSON` (protocol.rs). The
     /// daemon test proves it emits exactly these bytes; this test proves they decode
     /// in the renderer mirror and validate. Keep the two literals in lockstep.
-    const CROSS_WIRE_DAMAGE_JSON: &str = r#"{"ev":"damage","frame":{"schema":1,"id":"s1","generation":"11111111-1111-1111-1111-111111111111","base_revision":4,"revision":5,"cols":10,"rows":4,"cursor":{"line":1,"col":2,"visible":true,"shape":"block"},"modes":{"alt_screen":false,"app_cursor":true,"bracketed_paste":false,"focus_reporting":true,"mouse_report":false,"mouse_drag":false,"mouse_motion":false,"mouse_sgr":false},"ops":[{"op":"row_span","row":1,"start":2,"cells":[{"text":"a","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"width":1}]},{"op":"clear_all","cell":{"text":" ","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"width":1}}]}}"#;
+    const CROSS_WIRE_DAMAGE_JSON: &str = r#"{"ev":"damage","frame":{"schema":1,"id":"s1","generation":"11111111-1111-1111-1111-111111111111","base_revision":4,"revision":5,"cols":10,"rows":4,"cursor":{"line":1,"col":2,"visible":true,"shape":"block"},"modes":{"alt_screen":false,"app_cursor":true,"bracketed_paste":false,"focus_reporting":true,"mouse_report":false,"mouse_drag":false,"mouse_motion":false,"mouse_sgr":false},"ops":[{"op":"row_span","row":1,"start":2,"cells":[{"text":"a","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"hyperlink":"https://damage.example.test/a","width":1}]},{"op":"clear_all","cell":{"text":" ","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"width":1}}]}}"#;
 
     #[test]
     fn cross_wire_damage_decodes_in_renderer_mirror() {
@@ -1108,6 +1447,13 @@ mod tests {
                 assert!(frame.modes.app_cursor);
                 assert!(frame.modes.focus_reporting);
                 assert_eq!(frame.ops.len(), 2);
+                match &frame.ops[0] {
+                    DamageOp::RowSpan { cells, .. } => assert_eq!(
+                        cells[0].hyperlink.as_deref(),
+                        Some("https://damage.example.test/a")
+                    ),
+                    other => panic!("expected RowSpan, got {other:?}"),
+                }
                 // The decoded daemon frame is structurally valid under the mirror's
                 // identical validate().
                 assert_eq!(frame.validate(), Ok(()));
@@ -1338,7 +1684,7 @@ mod tests {
     /// Byte-identical to the daemon's `CROSS_WIRE_SCROLLBACK_JSON` (protocol.rs). The
     /// daemon test proves it emits exactly these bytes; this test proves they decode in
     /// the renderer mirror. Keep the two literals in lockstep.
-    const CROSS_WIRE_SCROLLBACK_JSON: &str = r#"{"ev":"scrollback_rows","id":"s1","generation":"11111111-1111-1111-1111-111111111111","revision":7,"history_len":5000,"offset_from_top":3,"rows":[[{"text":"a","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"width":1}]]}"#;
+    const CROSS_WIRE_SCROLLBACK_JSON: &str = r#"{"ev":"scrollback_rows","id":"s1","generation":"11111111-1111-1111-1111-111111111111","revision":7,"history_len":5000,"offset_from_top":3,"rows":[[{"text":"a","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"hyperlink":"https://scrollback.example.test/a","width":1}]]}"#;
 
     #[test]
     fn cross_wire_scrollback_decodes_in_renderer_mirror() {
@@ -1363,7 +1709,11 @@ mod tests {
                 assert_eq!(offset_from_top, 3);
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0].len(), 1);
-                assert_eq!(rows[0][0], dmg_cell("a"));
+                assert_eq!(rows[0][0].text, "a");
+                assert_eq!(
+                    rows[0][0].hyperlink.as_deref(),
+                    Some("https://scrollback.example.test/a")
+                );
             }
             other => panic!("expected ScrollbackRows, got {other:?}"),
         }
@@ -1383,7 +1733,7 @@ mod tests {
     /// mirror. `Grid` is the attach/resync baseline payload — if the mirror's `GridSnapshot`
     /// shape ever drifts from the daemon's (renamed/added/reordered field), decoding here
     /// fails and the product would be dead-on-attach. Keep the two literals in lockstep.
-    const CROSS_WIRE_GRID_JSON: &str = r#"{"ev":"grid","id":"s1","grid":{"version":2,"generation":"11111111-1111-1111-1111-111111111111","revision":5,"base_revision":4,"cols":3,"rows":1,"rows_cells":[[{"text":"界","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"width":2},{"text":"","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"width":0},{"text":"x","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"width":1}]],"cursor_line":0,"cursor_col":2,"cursor_visible":true,"cursor_shape":"beam","alt_screen":true,"app_cursor":true,"bracketed_paste":true,"focus_reporting":true,"mouse_report":true,"mouse_drag":true,"mouse_motion":true,"mouse_sgr":true}}"#;
+    const CROSS_WIRE_GRID_JSON: &str = r#"{"ev":"grid","id":"s1","grid":{"version":2,"generation":"11111111-1111-1111-1111-111111111111","revision":5,"base_revision":4,"cols":3,"rows":1,"rows_cells":[[{"text":"界","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"width":2},{"text":"","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"width":0},{"text":"x","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"hyperlink":"https://grid.example.test/x","width":1}]],"cursor_line":0,"cursor_col":2,"cursor_visible":true,"cursor_shape":"beam","alt_screen":true,"app_cursor":true,"bracketed_paste":true,"focus_reporting":true,"mouse_report":true,"mouse_drag":true,"mouse_motion":true,"mouse_sgr":true}}"#;
 
     #[test]
     fn cross_wire_grid_decodes_in_renderer_mirror() {
@@ -1407,6 +1757,10 @@ mod tests {
                 // Wide pair survives the wire: width-2 lead followed by width-0 spacer.
                 assert_eq!(grid.rows_cells[0][0].width, 2);
                 assert_eq!(grid.rows_cells[0][1].width, 0);
+                assert_eq!(
+                    grid.rows_cells[0][2].hyperlink.as_deref(),
+                    Some("https://grid.example.test/x")
+                );
                 assert_eq!(grid.cursor_line, 0);
                 assert_eq!(grid.cursor_col, 2);
                 assert!(grid.cursor_visible);

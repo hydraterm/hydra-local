@@ -36,6 +36,18 @@ impl SessionGeneration {
     pub fn new() -> Self {
         SessionGeneration(Uuid::new_v4())
     }
+
+    /// Mint a fresh generation that is provably different from one serialized predecessor. This
+    /// comparison happens before a replacement child is spawned, so even a UUID collision cannot
+    /// turn a typed conditional-start refusal into an already-executed command side effect.
+    pub fn new_excluding(excluded: &str) -> Self {
+        loop {
+            let candidate = Self::new();
+            if candidate.to_string() != excluded {
+                return candidate;
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for SessionGeneration {

@@ -9,6 +9,14 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use common::*;
 
+fn grid_generation(line: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(line.trim()).expect("grid event JSON")["grid"]
+        ["generation"]
+        .as_str()
+        .expect("grid generation")
+        .to_string()
+}
+
 fn decode_output(line: &str) -> Vec<u8> {
     let key = "\"data\":\"";
     let start = line.find(key).expect("data field") + key.len();
@@ -67,9 +75,16 @@ fn kill_terminates_child() {
     );
     send(&mut s, &format!(r#"{{"op":"attach","id":"{id}"}}"#));
     // Drain the grid restore so we're streaming.
-    let _ = read_until(&mut reader, "\"ev\":\"grid\"", Duration::from_secs(5));
+    let generation = grid_generation(&read_until(
+        &mut reader,
+        "\"ev\":\"grid\"",
+        Duration::from_secs(5),
+    ));
 
-    send(&mut s, &format!(r#"{{"op":"kill","id":"{id}"}}"#));
+    send(
+        &mut s,
+        &format!(r#"{{"op":"kill","id":"{id}","expected_generation":"{generation}"}}"#),
+    );
     let exited = read_until(
         &mut reader,
         "\"ev\":\"session_exited\"",
@@ -121,7 +136,11 @@ fn repeat_attach_does_not_duplicate() {
     send(&mut s, &format!(r#"{{"op":"attach","id":"{id}"}}"#));
     // Drain both grid restores (one per attach).
     let _ = read_until(&mut reader, "\"ev\":\"grid\"", Duration::from_secs(5));
-    let _ = read_until(&mut reader, "\"ev\":\"grid\"", Duration::from_secs(5));
+    let generation = grid_generation(&read_until(
+        &mut reader,
+        "\"ev\":\"grid\"",
+        Duration::from_secs(5),
+    ));
     // Let `stty -echo` take effect before we write the marker, else the line
     // discipline echoes it back and inflates the count independent of forwarders.
     std::thread::sleep(Duration::from_millis(300));
@@ -129,7 +148,9 @@ fn repeat_attach_does_not_duplicate() {
     // Echo the marker once.
     send(
         &mut s,
-        &format!(r#"{{"op":"write","id":"{id}","data":"{marker}\n"}}"#),
+        &format!(
+            r#"{{"op":"write","id":"{id}","data":"{marker}\n","expected_generation":"{generation}"}}"#
+        ),
     );
 
     // Collect output until reads quiesce (timeout) past a hard deadline, then

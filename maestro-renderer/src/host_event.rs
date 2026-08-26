@@ -18,6 +18,8 @@
 //! The keyboard model mirrors exactly the winit keyboard surface `App` reads today (logical key + text +
 //! location + state); `physical_key`/`KeyCode` are unused by `App`, so they are intentionally absent.
 
+use std::path::PathBuf;
+
 /// The neutral named (non-character) keys `App` acts on. Exactly the `winit::keyboard::NamedKey` variants the
 /// renderer reads today — extend only when `App` starts handling a new named key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +175,13 @@ pub enum HostEvent {
     /// An asynchronous native clipboard result or terminal context-menu action.
     #[cfg(target_os = "linux")]
     Clipboard(HostClipboardEvent),
+    /// One native file-drop delivery. Linux supplies the complete URI-list batch and exact terminal-slot
+    /// position; winit supplies one path per event and no drop position, so macOS samples the live global
+    /// pointer and coalesces consecutive deliveries before inserting anything.
+    DroppedFiles {
+        paths: Vec<PathBuf>,
+        position: Option<(f64, f64)>,
+    },
     /// Pointer moved to (x, y) physical pixels.
     CursorMoved { x: f64, y: f64 },
     /// Pointer left the window.

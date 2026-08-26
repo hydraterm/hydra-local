@@ -173,7 +173,8 @@ pub enum LaunchSpec {
         redacted: bool,
         restart_requires_user: bool,
     },
-    /// The launch was not retained at all. Restart requires the user to re-enter the command.
+    /// The launch was not retained at all, so its prior command is never replayed. An explicit
+    /// plain-terminal Reopen may start a separately reviewed default shell instead.
     OptOut,
 }
 
@@ -387,10 +388,10 @@ pub struct WindowLayout {
 
 /// One tab inside a saved [`LayoutPreset`]. Captures the LAYOUT POSITION of a tab — its order,
 /// title, pin state, and split provenance — deliberately WITHOUT binding to a live session. The
-/// safety model requires keeping running-session identity separate from layout position so restoring a
-/// preset never relabels or restarts the wrong pane; therefore a preset records only a best-effort
-/// `session_id` HINT (the session that occupied this slot at capture time), which revive treats as
-/// optional: if that session is gone, the slot is restored as a fresh launch in the same position.
+/// roadmap requires keeping running-session identity separate from layout position so a future
+/// restore never relabels or restarts the wrong pane; therefore a preset records only a best-effort
+/// `session_id` HINT (the session that occupied this slot at capture time). The hint can shape a
+/// candidate plan but grants no attach/start authority.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LayoutPresetTab {
     /// Order within the preset (mirrors `TabRecord.index`).
@@ -398,29 +399,28 @@ pub struct LayoutPresetTab {
     pub title: String,
     pub pinned: bool,
     /// Split provenance relative to another tab in THIS preset. `split_from.tab_id` holds the
-    /// CAPTURE-TIME tab id of the source slot (copied verbatim from the live layout); restore maps it
-    /// to a slot via that slot's `source_tab_id`, then to the freshly-minted tab id. Reuses the same
-    /// shape as the live model so capture is a 1:1 copy.
+    /// CAPTURE-TIME tab id of the source slot (copied verbatim from the live layout); a future exact
+    /// restore coordinator can map it back through `source_tab_id`. Reuses the live shape so capture
+    /// remains a 1:1 copy.
     #[serde(default)]
     pub split_from: Option<SplitFrom>,
     /// Best-effort pointer to the session that occupied this slot at capture time. `None` (or a
-    /// session that no longer exists at restore time) means "launch fresh here". Never used to
-    /// relabel a different running pane.
+    /// session that no longer exists at planning time) yields a LaunchFresh candidate. Never used as
+    /// authority to relabel, attach, or start a pane.
     #[serde(default)]
     pub session_id: Option<String>,
     /// The capture-time `tab_id` of the live tab this slot was copied from. Restore never reuses this
-    /// id (it mints fresh ones); it exists ONLY so a sibling slot's `split_from.tab_id` can be matched
-    /// back to its source slot, then resolved to that slot's newly-minted tab id. `#[serde(default)]`
-    /// (empty) for presets written before split-restore support; a slot with an empty `source_tab_id`
-    /// can never be a split source, which is the safe fallback (the dependent slot launches unsplit).
+    /// id; it exists ONLY so a future exact coordinator can match a sibling's `split_from.tab_id`
+    /// back to its source slot. `#[serde(default)]` (empty) for older presets.
     #[serde(default)]
     pub source_tab_id: String,
 }
 
 /// A named, reopenable window arrangement: the ordered tab/pane topology captured from a window so
 /// the user can rebuild a working layout without hand-placing tabs and splits. This is native Rust
-/// state (not tmux persistence): the preset DESCRIBES a dormant arrangement; revive starts or
-/// reattaches sessions through the app-owned daemon/session model in slot order.
+/// state (not tmux persistence): the preset DESCRIBES a dormant arrangement but grants no start,
+/// attach, or topology authority. The App currently exposes only a candidate restore plan and
+/// refuses non-empty execution until exact topology + renderer-publication coordination exists.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LayoutPreset {
     pub preset_id: String,

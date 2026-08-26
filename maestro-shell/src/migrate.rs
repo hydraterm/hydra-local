@@ -415,6 +415,15 @@ fn migrate_json_to_sqlite_inner(paths: &AppPaths) -> Result<MigrationReport, Str
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| format!("begin legacy import: {e}"))?;
+    let imports_window_namespace = records.iter().any(|record| {
+        record.kind == RecordKind::WindowLayout
+            || (record.kind == RecordKind::Project
+                && record
+                    .value
+                    .get("window_order")
+                    .and_then(Value::as_array)
+                    .is_some_and(|order| !order.is_empty()))
+    });
     for record in &mut records {
         if record.kind == RecordKind::WindowLayout {
             if let Some(project_id) = window_owner.get(record.id.as_str()) {
@@ -431,6 +440,13 @@ fn migrate_json_to_sqlite_inner(paths: &AppPaths) -> Result<MigrationReport, Str
                 record.path.display()
             )
         })?;
+    }
+    if imports_window_namespace {
+        // The complete legacy source set becomes authoritative at one commit. Treat that outer
+        // import as one ownership mutation even when it contains several layouts, and include a
+        // stale/order-only Project signal that has no matching WindowLayout row.
+        crate::db::bump_window_mutation_epoch(&tx)
+            .map_err(|error| format!("advance window mutation epoch for legacy import: {error}"))?;
     }
     // Catch mapping/readback and FK failures while rollback is still possible. Re-check the exact
     // source snapshot before commit as well, so a cooperating/ordinary concurrent writer cannot
@@ -2619,7 +2635,7 @@ fn unique_backup_dir(base: &Path) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::records::{Project, Workspace, WorkspaceConsent};
+    use crate::records::{Project, WindowLayout, Workspace, WorkspaceConsent};
     use tempfile::TempDir;
 
     struct MigrationFailpointGuard;
@@ -2813,6 +2829,53 @@ mod tests {
         let again = migrate_json_to_sqlite(&paths).unwrap();
         assert!(again.already_done);
         assert_eq!(again.migrated, 0);
+    }
+
+    #[test]
+    fn legacy_window_namespace_import_advances_the_outer_transaction_epoch_once() {
+        let tmp = TempDir::new().unwrap();
+        let paths = base_paths(&tmp);
+        write_legacy(
+            &paths,
+            RecordKind::Project,
+            "p1",
+            &project("p1", vec!["w1".into(), "w2".into()]),
+        );
+        for window_id in ["w1", "w2"] {
+            write_legacy(
+                &paths,
+                RecordKind::WindowLayout,
+                window_id,
+                &WindowLayout {
+                    window_id: window_id.into(),
+                    name: None,
+                    tabs: Vec::new(),
+                },
+            );
+        }
+
+        assert_eq!(migrate_json_to_sqlite(&paths).unwrap().migrated, 3);
+        let connection = crate::db::conn_for_migration(paths.base()).unwrap();
+        let guard = connection.lock().unwrap();
+        assert_eq!(crate::db::window_mutation_epoch(&guard).unwrap(), 1);
+        drop(guard);
+
+        let tmp = TempDir::new().unwrap();
+        let paths = base_paths(&tmp);
+        write_legacy(
+            &paths,
+            RecordKind::Project,
+            "order-only",
+            &project("order-only", vec!["stale-window".into()]),
+        );
+        assert_eq!(migrate_json_to_sqlite(&paths).unwrap().migrated, 1);
+        let connection = crate::db::conn_for_migration(paths.base()).unwrap();
+        let guard = connection.lock().unwrap();
+        assert_eq!(
+            crate::db::window_mutation_epoch(&guard).unwrap(),
+            1,
+            "a legacy order-only ownership signal must also enter the clock"
+        );
     }
 
     #[test]

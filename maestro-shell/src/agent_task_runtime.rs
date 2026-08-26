@@ -47,16 +47,28 @@
 //! original argv carried — and must not try. These methods are safe composition primitives,
 //! not silent command replay.
 
+// Recovery errors intentionally own consume-once receipts so callers cannot lose compensation
+// authority by construction; boxing their large variants would change that ownership API.
+#![allow(clippy::large_enum_variant, clippy::result_large_err)]
+
 use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::agent_tasks::{AgentTaskService, AgentTaskServiceError};
-use crate::daemon_client::DEFAULT_TIMEOUT;
+use crate::daemon_client::{ConditionalStartPeerIdentity, DEFAULT_TIMEOUT};
 use crate::daemon_endpoint::EnvLookup;
 use crate::paths::AppPaths;
-use crate::records::{AgentTask, SessionKind, SessionRecord};
+use crate::records::{AgentTask, AgentTaskState, Project, SessionKind, SessionRecord, Workspace};
 use crate::session_service::StartParams;
-use crate::shell_runtime::{ShellRuntime, ShellRuntimeError};
+use crate::shell_runtime::{
+    PreparedAgentTaskSessionRuntimeError, PreparedAgentTaskSessionRuntimeRecovery,
+    PreparedAgentTaskSessionRuntimeSettlement, ShellRuntime, ShellRuntimeError,
+};
+use crate::window_layout::{
+    PreparedAgentTaskSessionCompensation, PreparedAgentTaskSessionStart, WindowLayoutError,
+    WindowLayoutService,
+};
+use crate::PreparedSessionSpec;
 
 /// Why starting an agent-backed session failed, keeping each layer's typed error intact so a
 /// caller can tell validation, task-store, and shell/daemon failures apart.
@@ -74,6 +86,130 @@ pub enum AgentTaskRuntimeError {
     /// was already created, it remains `Draft`.
     Shell(ShellRuntimeError),
 }
+
+/// Ownership-preserving failure for the sealed task-aware start path. Unlike the legacy raw
+/// composition error, zero-wire and conditional-refusal variants return only task-aware opaque
+/// authority; no caller can peel out a generic Session start or task FK.
+pub enum PreparedAgentTaskRuntimeError {
+    Prepare(WindowLayoutError),
+    DefinitelyUnpublished {
+        error: ShellRuntimeError,
+        start: PreparedAgentTaskSessionStart,
+    },
+    Refused {
+        error: ShellRuntimeError,
+        compensation: PreparedAgentTaskSessionCompensation,
+    },
+    PossiblyApplied {
+        error: ShellRuntimeError,
+        recovery: PreparedAgentTaskRecoveryAuthority,
+    },
+}
+
+/// Opaque consume-once authority for exact task/session publication settlement. It exposes only
+/// safe durable ids; daemon tokens, peer identity, launch argv, cwd, and task transition bytes stay
+/// sealed inside the Shell runtime.
+pub struct PreparedAgentTaskRecoveryAuthority {
+    recovery: PreparedAgentTaskSessionRuntimeRecovery,
+}
+
+impl PreparedAgentTaskRecoveryAuthority {
+    pub fn session_id(&self) -> &str {
+        self.recovery.session_id()
+    }
+
+    pub fn agent_task_id(&self) -> &str {
+        self.recovery.agent_task_id()
+    }
+}
+
+impl std::fmt::Debug for PreparedAgentTaskRecoveryAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedAgentTaskRecoveryAuthority")
+            .field("session_id", &self.session_id())
+            .field("agent_task_id", &self.agent_task_id())
+            .finish_non_exhaustive()
+    }
+}
+
+pub enum PreparedAgentTaskSettlementError {
+    Pending {
+        recovery: PreparedAgentTaskRecoveryAuthority,
+        error: Option<ShellRuntimeError>,
+    },
+    Changed {
+        recovery: PreparedAgentTaskRecoveryAuthority,
+        error: ShellRuntimeError,
+    },
+}
+
+impl std::fmt::Debug for PreparedAgentTaskSettlementError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending { recovery, error } => formatter
+                .debug_struct("PreparedAgentTaskSettlementError::Pending")
+                .field("recovery", recovery)
+                .field("source_present", &error.is_some())
+                .finish(),
+            Self::Changed { recovery, .. } => formatter
+                .debug_struct("PreparedAgentTaskSettlementError::Changed")
+                .field("recovery", recovery)
+                .finish(),
+        }
+    }
+}
+
+impl std::fmt::Display for PreparedAgentTaskSettlementError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending { .. } => formatter.write_str(
+                "agent task publication remains pending exact conditional-start settlement",
+            ),
+            Self::Changed { .. } => {
+                formatter.write_str("agent task publication graph changed before exact settlement")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PreparedAgentTaskSettlementError {}
+
+impl std::fmt::Debug for PreparedAgentTaskRuntimeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Prepare(_) => formatter.write_str("PreparedAgentTaskRuntimeError::Prepare"),
+            Self::DefinitelyUnpublished { start, .. } => formatter
+                .debug_struct("DefinitelyUnpublished")
+                .field("start", start)
+                .finish(),
+            Self::Refused { compensation, .. } => formatter
+                .debug_struct("Refused")
+                .field("compensation", compensation)
+                .finish(),
+            Self::PossiblyApplied { recovery, .. } => formatter
+                .debug_struct("PossiblyApplied")
+                .field("recovery", recovery)
+                .finish(),
+        }
+    }
+}
+
+impl std::fmt::Display for PreparedAgentTaskRuntimeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Prepare(_) => formatter.write_str("agent task preparation failed"),
+            Self::DefinitelyUnpublished { .. } => {
+                formatter.write_str("agent task start was definitely unpublished")
+            }
+            Self::Refused { .. } => formatter.write_str("agent task start was refused"),
+            Self::PossiblyApplied { .. } => formatter
+                .write_str("agent task start requires exact conditional publication settlement"),
+        }
+    }
+}
+
+impl std::error::Error for PreparedAgentTaskRuntimeError {}
 
 impl std::fmt::Display for AgentTaskRuntimeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -155,6 +291,153 @@ impl<'a> AgentTaskRuntime<'a> {
     pub fn without_endpoint_persist(mut self) -> Self {
         self.persist_endpoint = false;
         self
+    }
+
+    pub fn prepare_new_agent_task_unplaced(
+        &self,
+        expected_project: &Project,
+        expected_workspace: &Workspace,
+        agent_task_id: impl Into<String>,
+        goal: impl Into<String>,
+        now_ms: u64,
+        session: PreparedSessionSpec,
+    ) -> Result<PreparedAgentTaskSessionStart, PreparedAgentTaskRuntimeError> {
+        let task = AgentTask {
+            agent_task_id: agent_task_id.into(),
+            project_id: expected_project.project_id.clone(),
+            goal: goal.into(),
+            state: AgentTaskState::Draft,
+            current_session_id: None,
+            session_history: Vec::new(),
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            result_summary: None,
+        };
+        WindowLayoutService::new(self.paths)
+            .prepare_new_agent_task_unplaced_session(
+                expected_project,
+                expected_workspace,
+                task,
+                session,
+            )
+            .map_err(PreparedAgentTaskRuntimeError::Prepare)
+    }
+
+    pub fn prepare_resumed_agent_task_unplaced(
+        &self,
+        expected_project: &Project,
+        expected_workspace: &Workspace,
+        agent_task_id: &str,
+        session: PreparedSessionSpec,
+    ) -> Result<PreparedAgentTaskSessionStart, PreparedAgentTaskRuntimeError> {
+        let task = AgentTaskService::new(self.paths)
+            .load(agent_task_id)
+            .map_err(|error| {
+                PreparedAgentTaskRuntimeError::Prepare(WindowLayoutError::Store(
+                    crate::StoreError::Map(error.to_string()),
+                ))
+            })?
+            .ok_or_else(|| {
+                PreparedAgentTaskRuntimeError::Prepare(WindowLayoutError::AgentTaskChanged {
+                    agent_task_id: agent_task_id.to_string(),
+                })
+            })?;
+        WindowLayoutService::new(self.paths)
+            .prepare_resumed_agent_task_unplaced_session(
+                expected_project,
+                expected_workspace,
+                task,
+                session,
+            )
+            .map_err(PreparedAgentTaskRuntimeError::Prepare)
+    }
+
+    pub fn start_prepared_agent_task(
+        &self,
+        explicit_socket: Option<PathBuf>,
+        env: &impl EnvLookup,
+        start: PreparedAgentTaskSessionStart,
+        expected_peer: Option<&ConditionalStartPeerIdentity>,
+    ) -> Result<StartAgentTaskOutcome, PreparedAgentTaskRuntimeError> {
+        let shell = {
+            let runtime = ShellRuntime::new(self.paths).with_connect_timeout(self.connect_timeout);
+            if self.persist_endpoint {
+                runtime
+            } else {
+                runtime.without_endpoint_persist()
+            }
+        };
+        match shell.start_prepared_agent_task_session(explicit_socket, env, start, expected_peer) {
+            Ok(outcome) => {
+                let task = outcome
+                    .agent_task()
+                    .expect("task-aware finalizer returns the exact committed Task B")
+                    .clone();
+                Ok(StartAgentTaskOutcome {
+                    socket_path: outcome.socket_path.clone(),
+                    task,
+                    session: outcome.record().clone(),
+                })
+            }
+            Err(PreparedAgentTaskSessionRuntimeError::DefinitelyUnpublished { error, start }) => {
+                Err(PreparedAgentTaskRuntimeError::DefinitelyUnpublished { error, start })
+            }
+            Err(PreparedAgentTaskSessionRuntimeError::Refused {
+                error,
+                compensation,
+            }) => Err(PreparedAgentTaskRuntimeError::Refused {
+                error,
+                compensation,
+            }),
+            Err(PreparedAgentTaskSessionRuntimeError::PossiblyApplied { error, recovery }) => {
+                Err(PreparedAgentTaskRuntimeError::PossiblyApplied {
+                    error,
+                    recovery: PreparedAgentTaskRecoveryAuthority { recovery },
+                })
+            }
+        }
+    }
+
+    /// Resolve one ambiguous task-aware Start using only its exact operation-token/same-daemon
+    /// authority. `Pending` and graph-change errors return that same consume-once authority; this
+    /// method never emits another Start or infers liveness from the daemon's ordinary id list.
+    pub fn settle_prepared_agent_task(
+        &self,
+        recovery: PreparedAgentTaskRecoveryAuthority,
+    ) -> Result<StartAgentTaskOutcome, PreparedAgentTaskSettlementError> {
+        let shell = {
+            let runtime = ShellRuntime::new(self.paths).with_connect_timeout(self.connect_timeout);
+            if self.persist_endpoint {
+                runtime
+            } else {
+                runtime.without_endpoint_persist()
+            }
+        };
+        match shell.settle_prepared_agent_task_session(recovery.recovery) {
+            PreparedAgentTaskSessionRuntimeSettlement::Published(outcome) => {
+                let task = outcome
+                    .agent_task()
+                    .expect("task-aware settlement returns the exact committed Task B")
+                    .clone();
+                Ok(StartAgentTaskOutcome {
+                    socket_path: outcome.socket_path.clone(),
+                    task,
+                    session: outcome.record().clone(),
+                })
+            }
+            PreparedAgentTaskSessionRuntimeSettlement::Pending { recovery, error } => {
+                Err(PreparedAgentTaskSettlementError::Pending {
+                    recovery: PreparedAgentTaskRecoveryAuthority { recovery },
+                    error,
+                })
+            }
+            PreparedAgentTaskSessionRuntimeSettlement::Changed { recovery, error } => {
+                Err(PreparedAgentTaskSettlementError::Changed {
+                    recovery: PreparedAgentTaskRecoveryAuthority { recovery },
+                    error,
+                })
+            }
+        }
     }
 
     /// Create a NEW agent task and start its first session. See the module docs for the exact
@@ -356,6 +639,8 @@ mod tests {
         Some(trimmed)
     }
 
+    const STUB_DAEMON_INSTANCE: &str = "22222222222242228222222222222222";
+
     fn accept_start_protocol(
         reader: &mut impl BufRead,
         stream: &mut StdUnixStream,
@@ -367,14 +652,165 @@ mod tests {
         );
         writeln!(
             stream,
-            "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\"}}",
-            maestro_protocol::DAEMON_PROTOCOL_VERSION
+            "{}",
+            serde_json::json!({
+                "ev": "daemon_info",
+                "protocol_version": maestro_protocol::DAEMON_PROTOCOL_VERSION,
+                "build_version": "agent-task-runtime-test",
+                "daemon_instance_id": STUB_DAEMON_INSTANCE,
+                "output_generation_echo": true,
+                "child_environment": true,
+                "generation_conditional_mutations": true,
+                "attachment_aware_conditional_kill": true,
+                "generation_conditional_start": true,
+                "start_operation_ledger": true,
+                "generation_conditional_attach": true,
+            })
         )
         .unwrap();
         stream.flush().unwrap();
     }
 
-    /// Answers StartSession+Attach with a grid (a successful start).
+    fn accept_start_operation(
+        reader: &mut impl BufRead,
+        stream: &mut StdUnixStream,
+        tx: &mpsc::Sender<String>,
+    ) -> (
+        maestro_protocol::SessionId,
+        maestro_protocol::SessionStartOperationToken,
+    ) {
+        let request: maestro_protocol::ClientRequest =
+            serde_json::from_str(&read_request(reader, tx).expect("ReserveStartOperation request"))
+                .unwrap();
+        let (id, operation_token) = match request {
+            maestro_protocol::ClientRequest::ReserveStartOperation {
+                id,
+                operation_token,
+            } => (id, operation_token),
+            other => panic!("expected ReserveStartOperation, got {other:?}"),
+        };
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({
+                "ev": "start_operation_reserved",
+                "id": id,
+                "operation_token": operation_token.as_str(),
+                "daemon_instance_id": STUB_DAEMON_INSTANCE,
+                "outcome": {"status": "reserved"},
+            })
+        )
+        .unwrap();
+        stream.flush().unwrap();
+        (id, operation_token)
+    }
+
+    fn accept_conditional_start_and_attach(
+        reader: &mut impl BufRead,
+        stream: &mut StdUnixStream,
+        tx: &mpsc::Sender<String>,
+        expected_id: &str,
+        generation: &str,
+    ) -> (
+        maestro_protocol::SessionId,
+        maestro_protocol::SessionStartOperationToken,
+        u64,
+    ) {
+        let (reserved_id, reserved_token) = accept_start_operation(reader, stream, tx);
+        let request: maestro_protocol::ClientRequest = serde_json::from_str(
+            &read_request(reader, tx).expect("conditional StartSession request"),
+        )
+        .unwrap();
+        let (id, operation_token) = match request {
+            maestro_protocol::ClientRequest::StartSession {
+                id,
+                restart_exited: false,
+                conditional_start:
+                    Some(maestro_protocol::ConditionalSessionStart {
+                        operation_token,
+                        precondition:
+                            maestro_protocol::SessionStartPrecondition::Absent {
+                                excluded_generation: None,
+                            },
+                    }),
+                ..
+            } => (id, operation_token),
+            other => panic!("expected conditional Absent StartSession, got {other:?}"),
+        };
+        assert_eq!(id, reserved_id);
+        assert_eq!(id.0, expected_id);
+        assert_eq!(operation_token, reserved_token);
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({
+                "ev": "conditional_session_start",
+                "id": id,
+                "operation_token": operation_token.as_str(),
+                "daemon_instance_id": STUB_DAEMON_INSTANCE,
+                "outcome": {"status": "applied", "generation": generation},
+            })
+        )
+        .unwrap();
+        stream.flush().unwrap();
+
+        let attach: maestro_protocol::ClientRequest = serde_json::from_str(
+            &read_request(reader, tx).expect("generation-conditional Attach request"),
+        )
+        .unwrap();
+        let output_generation = match attach {
+            maestro_protocol::ClientRequest::Attach {
+                id: attached_id,
+                want_raw_output: false,
+                expected_session_generation: Some(attached_generation),
+                output_generation: Some(output_generation),
+                handoff: None,
+            } if attached_id == id && attached_generation == generation => output_generation,
+            other => panic!("expected exact post-start Attach, got {other:?}"),
+        };
+        (id, operation_token, output_generation)
+    }
+
+    fn accept_applied_retirement(
+        reader: &mut impl BufRead,
+        stream: &mut StdUnixStream,
+        tx: &mpsc::Sender<String>,
+        expected_id: &maestro_protocol::SessionId,
+        expected_token: &maestro_protocol::SessionStartOperationToken,
+        expected_generation: &str,
+    ) {
+        let request: maestro_protocol::ClientRequest =
+            serde_json::from_str(&read_request(reader, tx).expect("RetireStartOperation request"))
+                .unwrap();
+        assert!(matches!(
+            request,
+            maestro_protocol::ClientRequest::RetireStartOperation {
+                ref id,
+                ref operation_token,
+                expected:
+                    maestro_protocol::SessionStartOperationRetireExpectation::Applied {
+                        ref generation,
+                    },
+            } if id == expected_id
+                && operation_token == expected_token
+                && generation == expected_generation
+        ));
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({
+                "ev": "start_operation_retired",
+                "id": expected_id,
+                "operation_token": expected_token.as_str(),
+                "daemon_instance_id": STUB_DAEMON_INSTANCE,
+                "outcome": {"status": "retired"},
+            })
+        )
+        .unwrap();
+        stream.flush().unwrap();
+    }
+
+    /// Answers ReserveStartOperation+conditional StartSession+Attach+Grid+retirement.
     fn serve_grid(
         id: &'static str,
         generation: &'static str,
@@ -382,18 +818,21 @@ mod tests {
         move |tx, stream| {
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             accept_start_protocol(&mut reader, stream, tx);
-            read_request(&mut reader, tx); // StartSession
-            read_request(&mut reader, tx); // Attach
-            stream
-                .write_all(
-                    format!(
-                        r#"{{"ev":"grid","id":"{id}","grid":{{"generation":"{generation}","revision":1}}}}"#
-                    )
-                    .as_bytes(),
-                )
-                .unwrap();
-            stream.write_all(b"\n").unwrap();
+            let (id, operation_token, output_generation) =
+                accept_conditional_start_and_attach(&mut reader, stream, tx, id, generation);
+            writeln!(
+                stream,
+                "{}",
+                serde_json::json!({
+                    "ev": "grid",
+                    "id": id,
+                    "output_generation": output_generation,
+                    "grid": {"generation": generation, "revision": 1},
+                })
+            )
+            .unwrap();
             stream.flush().unwrap();
+            accept_applied_retirement(&mut reader, stream, tx, &id, &operation_token, generation);
         }
     }
 
@@ -710,8 +1149,7 @@ mod tests {
         let stub = StubDaemon::spawn_at(sock_path.clone(), |tx, stream| {
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             accept_start_protocol(&mut reader, stream, tx);
-            read_request(&mut reader, tx); // StartSession
-            read_request(&mut reader, tx); // Attach
+            let _ = accept_conditional_start_and_attach(&mut reader, stream, tx, "s1", "gen-error");
             stream
                 .write_all(b"{\"ev\":\"error\",\"message\":\"nope\"}\n")
                 .unwrap();
@@ -731,12 +1169,16 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(
-                err,
+                &err,
                 AgentTaskRuntimeError::Shell(ShellRuntimeError::Session(
-                    SessionServiceError::Daemon(DaemonClientError::DaemonError { .. })
-                ))
+                    SessionServiceError::ConditionalStartPossiblyApplied { source, .. }
+                )) if matches!(
+                    source.as_ref(),
+                    SessionServiceError::Daemon(DaemonClientError::DaemonError { message })
+                        if message == "nope"
+                )
             ),
-            "expected Shell(Session(Daemon)), got {err:?}"
+            "expected exact applied-start recovery around DaemonError, got {err:?}"
         );
 
         // SessionService behavior preserved: record exists, still Unknown, carrying the FK the
@@ -1131,8 +1573,13 @@ mod tests {
         let stub = StubDaemon::spawn_at(sock_path.clone(), |tx, stream| {
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             accept_start_protocol(&mut reader, stream, tx);
-            read_request(&mut reader, tx); // StartSession
-            read_request(&mut reader, tx); // Attach
+            let _ = accept_conditional_start_and_attach(
+                &mut reader,
+                stream,
+                tx,
+                "s2",
+                "gen-resume-error",
+            );
             stream
                 .write_all(b"{\"ev\":\"error\",\"message\":\"nope\"}\n")
                 .unwrap();
@@ -1157,12 +1604,16 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(
-                err,
+                &err,
                 AgentTaskRuntimeError::Shell(ShellRuntimeError::Session(
-                    SessionServiceError::Daemon(DaemonClientError::DaemonError { .. })
-                ))
+                    SessionServiceError::ConditionalStartPossiblyApplied { source, .. }
+                )) if matches!(
+                    source.as_ref(),
+                    SessionServiceError::Daemon(DaemonClientError::DaemonError { message })
+                        if message == "nope"
+                )
             ),
-            "expected Shell(Session(Daemon)), got {err:?}"
+            "expected exact applied-start recovery around DaemonError, got {err:?}"
         );
 
         // Session semantics preserved verbatim: Unknown record with the forced FK.

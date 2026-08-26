@@ -70,12 +70,15 @@ fn live_output_emits_damage_with_correct_id_and_revisions() {
         .as_u64()
         .expect("restore snapshot revision");
     let gen = snap["grid"]["generation"].clone();
+    let generation = gen.as_str().expect("restore snapshot generation");
 
     // cat echoes the write; this advances the grid → one Output frame AND one Damage
     // frame. The Output bridge is preserved (we must see it), then the Damage frame.
     send(
         &mut stream,
-        &format!(r#"{{"op":"write","id":"{id}","data":"hello-damage\n"}}"#),
+        &format!(
+            r#"{{"op":"write","id":"{id}","data":"hello-damage\n","expected_generation":"{generation}"}}"#
+        ),
     );
 
     // (2) The raw Output bridge still emits for this write.
@@ -135,18 +138,25 @@ fn consecutive_damage_frames_chain_base_to_prev_revision() {
 
     start_cat(&mut stream, id);
     send(&mut stream, &format!(r#"{{"op":"attach","id":"{id}"}}"#));
-    read_until(&mut reader, "\"ev\":\"grid\"", WITHIN);
+    let baseline = ev(&read_until(&mut reader, "\"ev\":\"grid\"", WITHIN));
+    let generation = baseline["grid"]["generation"]
+        .as_str()
+        .expect("baseline generation");
 
     send(
         &mut stream,
-        &format!(r#"{{"op":"write","id":"{id}","data":"one\n"}}"#),
+        &format!(
+            r#"{{"op":"write","id":"{id}","data":"one\n","expected_generation":"{generation}"}}"#
+        ),
     );
     let d1 = ev(&read_until(&mut reader, "\"ev\":\"damage\"", WITHIN));
     let rev1 = d1["frame"]["revision"].as_u64().expect("frame1 revision");
 
     send(
         &mut stream,
-        &format!(r#"{{"op":"write","id":"{id}","data":"two\n"}}"#),
+        &format!(
+            r#"{{"op":"write","id":"{id}","data":"two\n","expected_generation":"{generation}"}}"#
+        ),
     );
     let d2 = ev(&read_until(&mut reader, "\"ev\":\"damage\"", WITHIN));
     let base2 = d2["frame"]["base_revision"]
@@ -180,18 +190,25 @@ fn resize_ships_full_grid_not_damage() {
     send(&mut stream, &format!(r#"{{"op":"attach","id":"{id}"}}"#));
     let snap = ev(&read_until(&mut reader, "\"ev\":\"grid\"", WITHIN));
     let cols0 = snap["grid"]["cols"].as_u64().expect("snapshot cols");
+    let generation = snap["grid"]["generation"]
+        .as_str()
+        .expect("snapshot generation");
     assert_eq!(cols0, 80, "started at 80 cols");
 
     // Resize the PTY+grid (different geometry), then drive output so the forwarder wakes
     // and diffs the new geometry against its 80-col baseline.
     send(
         &mut stream,
-        &format!(r#"{{"op":"resize","id":"{id}","cols":100,"rows":30}}"#),
+        &format!(
+            r#"{{"op":"resize","id":"{id}","cols":100,"rows":30,"expected_generation":"{generation}"}}"#
+        ),
     );
     std::thread::sleep(Duration::from_millis(150));
     send(
         &mut stream,
-        &format!(r#"{{"op":"write","id":"{id}","data":"after-resize\n"}}"#),
+        &format!(
+            r#"{{"op":"write","id":"{id}","data":"after-resize\n","expected_generation":"{generation}"}}"#
+        ),
     );
 
     // The geometry change must surface as ResyncRequired + a full Grid at the new size —
@@ -289,10 +306,15 @@ fn omitted_want_raw_output_still_receives_output() {
     start_cat(&mut stream, id);
     // No want_raw_output field → defaults to true.
     send(&mut stream, &format!(r#"{{"op":"attach","id":"{id}"}}"#));
-    read_until(&mut reader, "\"ev\":\"grid\"", WITHIN);
+    let baseline = ev(&read_until(&mut reader, "\"ev\":\"grid\"", WITHIN));
+    let generation = baseline["grid"]["generation"]
+        .as_str()
+        .expect("baseline generation");
     send(
         &mut stream,
-        &format!(r#"{{"op":"write","id":"{id}","data":"legacy\n"}}"#),
+        &format!(
+            r#"{{"op":"write","id":"{id}","data":"legacy\n","expected_generation":"{generation}"}}"#
+        ),
     );
     let out = ev(&read_until(&mut reader, "\"ev\":\"output\"", WITHIN));
     assert_eq!(out["id"].as_str(), Some(id));
@@ -313,10 +335,15 @@ fn want_raw_output_true_still_receives_output() {
         &mut stream,
         &format!(r#"{{"op":"attach","id":"{id}","want_raw_output":true}}"#),
     );
-    read_until(&mut reader, "\"ev\":\"grid\"", WITHIN);
+    let baseline = ev(&read_until(&mut reader, "\"ev\":\"grid\"", WITHIN));
+    let generation = baseline["grid"]["generation"]
+        .as_str()
+        .expect("baseline generation");
     send(
         &mut stream,
-        &format!(r#"{{"op":"write","id":"{id}","data":"raw-on\n"}}"#),
+        &format!(
+            r#"{{"op":"write","id":"{id}","data":"raw-on\n","expected_generation":"{generation}"}}"#
+        ),
     );
     let out = ev(&read_until(&mut reader, "\"ev\":\"output\"", WITHIN));
     assert_eq!(out["id"].as_str(), Some(id));
@@ -340,10 +367,15 @@ fn want_raw_output_false_gets_damage_not_output() {
         &mut stream,
         &format!(r#"{{"op":"attach","id":"{id}","want_raw_output":false}}"#),
     );
-    read_until(&mut reader, "\"ev\":\"grid\"", WITHIN);
+    let baseline = ev(&read_until(&mut reader, "\"ev\":\"grid\"", WITHIN));
+    let generation = baseline["grid"]["generation"]
+        .as_str()
+        .expect("baseline generation");
     send(
         &mut stream,
-        &format!(r#"{{"op":"write","id":"{id}","data":"structured-only\n"}}"#),
+        &format!(
+            r#"{{"op":"write","id":"{id}","data":"structured-only\n","expected_generation":"{generation}"}}"#
+        ),
     );
     // The Damage frame MUST arrive, and NO Output may precede it.
     let dmg = ev(&expect_before_forbidden(
@@ -361,7 +393,9 @@ fn want_raw_output_false_gets_damage_not_output() {
     // drain a short window asserting no `output` event ever crosses the socket.
     send(
         &mut stream,
-        &format!(r#"{{"op":"write","id":"{id}","data":"more-structured\n"}}"#),
+        &format!(
+            r#"{{"op":"write","id":"{id}","data":"more-structured\n","expected_generation":"{generation}"}}"#
+        ),
     );
     let seen = drain_assert_absent(&mut reader, "\"ev\":\"output\"", Duration::from_millis(600));
     assert!(
@@ -386,16 +420,23 @@ fn want_raw_output_false_resize_resyncs_without_output() {
         &mut stream,
         &format!(r#"{{"op":"attach","id":"{id}","want_raw_output":false}}"#),
     );
-    read_until(&mut reader, "\"ev\":\"grid\"", WITHIN);
+    let baseline = ev(&read_until(&mut reader, "\"ev\":\"grid\"", WITHIN));
+    let generation = baseline["grid"]["generation"]
+        .as_str()
+        .expect("baseline generation");
 
     send(
         &mut stream,
-        &format!(r#"{{"op":"resize","id":"{id}","cols":120,"rows":40}}"#),
+        &format!(
+            r#"{{"op":"resize","id":"{id}","cols":120,"rows":40,"expected_generation":"{generation}"}}"#
+        ),
     );
     std::thread::sleep(Duration::from_millis(150));
     send(
         &mut stream,
-        &format!(r#"{{"op":"write","id":"{id}","data":"post-resize\n"}}"#),
+        &format!(
+            r#"{{"op":"write","id":"{id}","data":"post-resize\n","expected_generation":"{generation}"}}"#
+        ),
     );
 
     // ResyncRequired must arrive with NO Output before it...
@@ -546,11 +587,12 @@ fn structured_only_damage_reconstructs_grid_without_snapshot() {
     // the wire form so the test needs no daemon-internal types.
     let mut held: Value = baseline_v["grid"].clone();
     let base_rev = held["revision"].as_u64().expect("baseline revision");
+    let generation = held["generation"].as_str().expect("baseline generation");
 
     // Drive a visible change.
     send(
         &mut stream,
-        &format!(r#"{{"op":"write","id":"{id}","data":"R"}}"#),
+        &format!(r#"{{"op":"write","id":"{id}","data":"R","expected_generation":"{generation}"}}"#),
     );
     // No Snapshot is requested by us; the daemon pushes Damage. Apply it to the held grid.
     let dmg_line = expect_before_forbidden(&mut reader, "\"ev\":\"damage\"", "\"ev\":\"output\"");
@@ -612,6 +654,10 @@ fn structured_scroll_damage_reconstructs_grid_without_snapshot() {
     let baseline_v: Value = serde_json::from_str(baseline_line.trim()).unwrap();
     let mut held: Value = baseline_v["grid"].clone();
     let mut held_rev = held["revision"].as_u64().expect("baseline revision");
+    let generation = held["generation"]
+        .as_str()
+        .expect("baseline generation")
+        .to_string();
     let mut saw_scroll = false;
 
     let drain_apply =
@@ -648,7 +694,9 @@ fn structured_scroll_damage_reconstructs_grid_without_snapshot() {
         .join("\\n");
     send(
         &mut stream,
-        &format!(r#"{{"op":"write","id":"{id}","data":"{fill}"}}"#),
+        &format!(
+            r#"{{"op":"write","id":"{id}","data":"{fill}","expected_generation":"{generation}"}}"#
+        ),
     );
     drain_apply(&mut reader, &mut held, &mut held_rev, &mut saw_scroll);
 
@@ -662,7 +710,9 @@ fn structured_scroll_damage_reconstructs_grid_without_snapshot() {
             .join("\\n");
         send(
             &mut stream,
-            &format!(r#"{{"op":"write","id":"{id}","data":"\n{more}"}}"#),
+            &format!(
+                r#"{{"op":"write","id":"{id}","data":"\n{more}","expected_generation":"{generation}"}}"#
+            ),
         );
         drain_apply(&mut reader, &mut held, &mut held_rev, &mut saw_scroll);
     }
@@ -703,17 +753,24 @@ fn structured_clear_screen_emits_clear_all_and_blanks_grid() {
         &mut stream,
         &format!(r#"{{"op":"attach","id":"{id}","want_raw_output":false}}"#),
     );
-    read_until(&mut reader, "\"ev\":\"grid\"", WITHIN);
+    let baseline = ev(&read_until(&mut reader, "\"ev\":\"grid\"", WITHIN));
+    let generation = baseline["grid"]["generation"]
+        .as_str()
+        .expect("baseline generation");
 
     send(
         &mut stream,
-        &format!(r#"{{"op":"write","id":"{id}","data":"hello\r\nworld"}}"#),
+        &format!(
+            r#"{{"op":"write","id":"{id}","data":"hello\r\nworld","expected_generation":"{generation}"}}"#
+        ),
     );
     read_until(&mut reader, "\"ev\":\"damage\"", WITHIN);
 
     send(
         &mut stream,
-        &format!(r#"{{"op":"write","id":"{id}","data":"\u001b[H\u001b[2J"}}"#),
+        &format!(
+            r#"{{"op":"write","id":"{id}","data":"\u001b[H\u001b[2J","expected_generation":"{generation}"}}"#
+        ),
     );
     let clear = ev(&read_until(&mut reader, "\"ev\":\"damage\"", WITHIN));
     assert!(
@@ -755,24 +812,33 @@ fn structured_alt_screen_round_trip_restores_primary_grid() {
         &mut stream,
         &format!(r#"{{"op":"attach","id":"{id}","want_raw_output":false}}"#),
     );
-    read_until(&mut reader, "\"ev\":\"grid\"", WITHIN);
+    let baseline = ev(&read_until(&mut reader, "\"ev\":\"grid\"", WITHIN));
+    let generation = baseline["grid"]["generation"]
+        .as_str()
+        .expect("baseline generation");
 
     send(
         &mut stream,
-        &format!(r#"{{"op":"write","id":"{id}","data":"primary"}}"#),
+        &format!(
+            r#"{{"op":"write","id":"{id}","data":"primary","expected_generation":"{generation}"}}"#
+        ),
     );
     read_until(&mut reader, "\"ev\":\"damage\"", WITHIN);
 
     send(
         &mut stream,
-        &format!(r#"{{"op":"write","id":"{id}","data":"\u001b[?1049h\u001b[Hdashboard"}}"#),
+        &format!(
+            r#"{{"op":"write","id":"{id}","data":"\u001b[?1049h\u001b[Hdashboard","expected_generation":"{generation}"}}"#
+        ),
     );
     let enter = ev(&read_until(&mut reader, "\"ev\":\"damage\"", WITHIN));
     assert_eq!(enter["frame"]["modes"]["alt_screen"], true);
 
     send(
         &mut stream,
-        &format!(r#"{{"op":"write","id":"{id}","data":"\u001b[?1049l"}}"#),
+        &format!(
+            r#"{{"op":"write","id":"{id}","data":"\u001b[?1049l","expected_generation":"{generation}"}}"#
+        ),
     );
     let leave = ev(&read_until(&mut reader, "\"ev\":\"damage\"", WITHIN));
     assert_eq!(leave["frame"]["modes"]["alt_screen"], false);
