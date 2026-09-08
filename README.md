@@ -125,3 +125,9 @@ Do not report vulnerabilities in a public issue. Follow [SECURITY.md](SECURITY.m
 Hydra's local desktop is licensed under the Apache License 2.0. That licence does not include the
 private Hydra Remote implementation or hosted service, and it grants no rights to HydraTerms names
 or logos. See [TRADEMARKS.md](TRADEMARKS.md).
+
+## Sponsor
+
+Hydra's development is funded by [Pairextr Teknoloji ve Yazılım A.Ş.](https://www.pairextr.com/)
+Hydra and HydraTerms remain marks of HydraTerms Limited; sponsorship grants no ownership of the
+project or its marks.
