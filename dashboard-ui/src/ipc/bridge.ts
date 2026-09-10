@@ -152,6 +152,7 @@ export type Intent =
   | { type: 'closeOverlay' }
   | {
       type: 'createWindow'
+      request_id?: string
       project_id: string
       name?: string
       root?: string
@@ -165,6 +166,7 @@ export type Intent =
     }
   | {
       type: 'splitPane'
+      request_id?: string
       project_id: string
       window_id: string
       tab_id: string
@@ -226,12 +228,16 @@ declare global {
       message: string | null,
       code?: unknown,
     ) => void
+    __HYDRA_DASHBOARD_RESOLVE_LAUNCH_MUTATION__?: (
+      requestId: string, ok: boolean, message: string | null,
+    ) => void
     __HYDRA_DASHBOARD_APPLY_SIDEBAR_STATE__?: (state: NativeSidebarState) => void
     __HYDRA_PENDING_SIDEBAR_STATE__?: NativeSidebarState
   }
 }
 
 export type LaunchPreflightResult = { ok: boolean; message: string | null; code: string | null }
+type LaunchMutationResult = { ok: boolean; message: string | null }
 export type NativeSidebarState = {
   width_logical_px: number
   last_expanded_width_logical_px: number
@@ -255,6 +261,8 @@ const sessionNameRequests = new Map<string, (result: { ok: boolean; sessions: Ag
 const hiddenSessionRequests = new Map<string, AbortableNativeRequest<AgentFolderSession[]>>()
 let nextHiddenSessionRequestId = 1
 let nextLaunchPreflightRequestId = 1
+let nextLaunchMutationRequestId = 1
+const launchMutationRequests = new Map<string, (result: LaunchMutationResult) => void>()
 // A WebView reload creates a fresh JS page while a delayed native callback from the old page may
 // still arrive. A page-unique epoch prevents its request id from colliding with the new page's
 // counters and resolving the wrong promise.
@@ -518,6 +526,39 @@ if (typeof window !== 'undefined') {
 }
 
 export const bridge = {
+  // A timeout is observation, not refusal: retain the exact pending request and never replay it.
+  awaitLaunchMutation(
+    mutate: (requestId: string) => void,
+    onWaiting: () => void,
+    signal: AbortSignal,
+  ): Promise<LaunchMutationResult> {
+    window.__HYDRA_DASHBOARD_RESOLVE_LAUNCH_MUTATION__ = (id, ok, message) => {
+      launchMutationRequests.get(id)?.({ ok: ok === true, message: boundedPreflightMessage(message) })
+    }
+    const requestId = nextNativeRequestId('launch-mutation', nextLaunchMutationRequestId++)
+    return new Promise((resolve) => {
+      const finish = (result: LaunchMutationResult): void => {
+        if (!launchMutationRequests.delete(requestId)) return
+        window.clearTimeout(timer)
+        signal.removeEventListener('abort', abort)
+        resolve(result)
+      }
+      const abort = (): void => finish({ ok: false, message: 'Dialog closed; native work was not retried.' })
+      const timer = window.setTimeout(() => {
+        if (launchMutationRequests.has(requestId)) onWaiting()
+      }, 10_000)
+      launchMutationRequests.set(requestId, finish)
+      signal.addEventListener('abort', abort, { once: true })
+      if (signal.aborted) abort()
+      else {
+        try { mutate(requestId) } catch {
+          // The host may have accepted before throwing. Do not invent refusal or enable replay.
+          onWaiting()
+        }
+      }
+    })
+  },
+
   // Read path. Native host should return the same DashboardModel shape as the
   // development mock. A production bundle without its native host must surface
   // an error instead of silently presenting development data.
@@ -984,6 +1025,7 @@ export const bridge = {
   createWindow(
     project_id: string,
     options?: {
+      request_id?: string
       name?: string
       root?: string
       agent?: string
@@ -1004,6 +1046,7 @@ export const bridge = {
     tab_id: string,
     dir: 'h' | 'v',
     options?: {
+      request_id?: string
       agent?: string
       resume_session_id?: string | null
       resume_session_title?: string | null

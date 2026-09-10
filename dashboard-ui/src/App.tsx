@@ -915,6 +915,7 @@ function OverlayChrome({
   const [launchPreflightPending, setLaunchPreflightPending] = useState(false)
   const [launchPreflightError, setLaunchPreflightError] = useState<string | null>(null)
   const launchPreflightPendingRef = useRef(false)
+  const launchMutationAbortRef = useRef<AbortController | null>(null)
   const launchPreflightAttemptRef = useRef(0)
   const launchPreflightDraftRef = useRef('')
   const autoPickerKey = useRef<string | null>(null)
@@ -934,6 +935,7 @@ function OverlayChrome({
   useEffect(() => {
     const hostWindow = window as OverlayHostWindow
     hostWindow.__HYDRA_SHOW_OVERLAY_MODAL__ = (next) => {
+      launchMutationAbortRef.current?.abort()
       cancelFolderSessionWork()
       const restoreParentFocus = deleteConfirmFocusOwnerRef.current && next !== null
       cancelDeleteConfirmFocusRestore()
@@ -995,6 +997,7 @@ function OverlayChrome({
       }
     }
     return () => {
+      launchMutationAbortRef.current?.abort()
       delete hostWindow.__HYDRA_SHOW_OVERLAY_MODAL__
     }
     // `latestModelRef` is App-owned and stable. Keeping this handler installed avoids a gap while
@@ -1226,6 +1229,7 @@ function OverlayChrome({
       : []
 
   const close = (): void => {
+    launchMutationAbortRef.current?.abort()
     cancelFolderSessionWork()
     cancelDeleteConfirmFocusRestore()
     deleteConfirmFocusOwnerRef.current = false
@@ -1243,13 +1247,14 @@ function OverlayChrome({
 
   const preflightThenMutate = async (
     input: { agent?: string; resolved_launch_command?: string; cwd?: string },
-    mutate: () => void,
+    mutate: (requestId?: string) => void,
+    awaitNativeAcceptance = false,
   ): Promise<void> => {
     const selectedAgent = input.agent?.trim().toLowerCase()
     // A project intentionally created without an initial session has nothing
     // to check. Terminal launches still reach native preflight so their cwd is
     // validated before durable topology is written.
-    if (!input.resolved_launch_command?.trim() && !selectedAgent) {
+    if (!input.resolved_launch_command?.trim() && !selectedAgent && !awaitNativeAcceptance) {
       mutate()
       close()
       return
@@ -1275,7 +1280,20 @@ function OverlayChrome({
         setLaunchPreflightError('The launch settings changed while Hydra was checking them. Review and try again.')
         return
       }
-      mutate()
+      if (awaitNativeAcceptance) {
+        const controller = new AbortController()
+        launchMutationAbortRef.current = controller
+        const outcome = await bridge.awaitLaunchMutation(mutate, () => {
+          if (launchPreflightAttemptRef.current === attempt) {
+            setLaunchPreflightError('Still waiting for native confirmation. Your draft and request are retained; nothing has been retried.')
+          }
+        }, controller.signal)
+        if (launchPreflightAttemptRef.current !== attempt || controller.signal.aborted) return
+        if (!outcome.ok) {
+          setLaunchPreflightError(launchPreflightFailureMessage({ ...outcome, code: null }, selectedAgent))
+          return
+        }
+      } else mutate()
       close()
     } catch {
       if (launchPreflightAttemptRef.current !== attempt) return
@@ -1343,8 +1361,9 @@ function OverlayChrome({
         resolved_launch_command: resolvedLaunchCommand,
         cwd: splitCwd?.trim() || splitWindowCwd?.trim() || folderSessionCwd.trim() || undefined,
       },
-      () =>
+      (requestId) =>
         bridge.splitPane(modal.project_id, modal.window_id, modal.tab_id, modal.dir, {
+          request_id: requestId,
           agent,
           resume_session_id: isTerminal ? null : selected?.id ?? null,
           resume_session_title: isTerminal ? null : selected ? selected.custom_name || selected.title : null,
@@ -1355,6 +1374,7 @@ function OverlayChrome({
           // Only an actual picker override is explicit; native remains authoritative over whether it is allowed.
           ...(splitCwd && splitCwd !== splitWindowCwd ? { cwd: splitCwd } : {}),
         }),
+      true,
     )
   }
 
@@ -1899,7 +1919,8 @@ function OverlayChrome({
         resolved_launch_command: options.resolved_launch_command,
         cwd: windowDraft.root.trim() || undefined,
       },
-      () => bridge.createWindow(modal.project_id, options),
+      (requestId) => bridge.createWindow(modal.project_id, { ...options, request_id: requestId }),
+      true,
     )
   }
 

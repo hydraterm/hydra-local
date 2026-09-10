@@ -84,6 +84,7 @@
 )]
 
 mod history_discovery;
+mod launch_mutation;
 mod launch_preflight;
 mod viewport_navigation;
 
@@ -574,6 +575,7 @@ fn react_chrome_allowed_fields(intent_type: &str) -> Option<&'static [&'static s
             "close_open_windows",
         ],
         "createWindow" => &[
+            "request_id",
             "project_id",
             "name",
             "root",
@@ -598,6 +600,7 @@ fn react_chrome_allowed_fields(intent_type: &str) -> Option<&'static [&'static s
         "reviveSession" => &["session_id", "window_id", "tab_id"],
         "reviveWindow" => &["window_id"],
         "splitPane" => &[
+            "request_id",
             "project_id",
             "window_id",
             "tab_id",
@@ -806,6 +809,7 @@ enum ReactChromeIntent {
     },
     #[serde(rename = "createWindow")]
     CreateWindow {
+        request_id: Option<String>,
         project_id: String,
         name: Option<String>,
         root: Option<String>,
@@ -904,6 +908,7 @@ enum ReactChromeIntent {
     ReviveWindow { window_id: String },
     #[serde(rename = "splitPane")]
     SplitPane {
+        request_id: Option<String>,
         project_id: String,
         window_id: String,
         tab_id: String,
@@ -14561,6 +14566,11 @@ fn spawn_window_event_listener(
                         disposition
                     }
                     maestro_renderer::RendererEvent::ReactChromeIntent { json } => {
+                        launch_mutation::reject_inactive_json(
+                            &mut tab_runtime,
+                            &json,
+                            "The viewport is still changing. No new window or pane was started.",
+                        );
                         pending_navigation.retain_pending_json(
                             &json,
                             listener_window_context.is_bound(),
@@ -15158,6 +15168,13 @@ fn spawn_window_event_listener(
                     }
                     Ok(maestro_renderer::RendererEvent::ExactViewportDisposition(disposition)) => {
                         let _ = tab_runtime.settle_exact_viewport_disposition(&disposition);
+                    }
+                    Ok(maestro_renderer::RendererEvent::ReactChromeIntent { json }) => {
+                        launch_mutation::reject_inactive_json(
+                            &mut tab_runtime,
+                            &json,
+                            "No active viewport is available. No new window or pane was started.",
+                        );
                     }
                     Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -16130,14 +16147,19 @@ fn spawn_window_event_listener(
                             .ok()
                             .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned))
                             .unwrap_or_else(|| "<unknown>".to_string());
-                        eprintln!(
-                            "hydra-dashboard intent {intent_name} unavailable: no window context in plain launch"
+                        launch_mutation::reject(
+                            &mut tab_runtime,
+                            launch_mutation::request_id(&intent),
+                            format!("hydra-dashboard intent {intent_name} unavailable: no window context in plain launch"),
                         );
                         continue;
                     }
                     if product_recovery_blocks_react_intent(&intent, &listener_window_id) {
-                        eprintln!(
+                        launch_mutation::reject(
+                            &mut tab_runtime,
+                            launch_mutation::request_id(&intent),
                             "product recovery: ignored React topology mutation for reserved ids"
+                                .into(),
                         );
                         continue;
                     }
@@ -16848,6 +16870,7 @@ fn spawn_window_event_listener(
                             }
                         }
                         ReactChromeIntent::CreateWindow {
+                            request_id,
                             project_id,
                             name,
                             root,
@@ -16878,15 +16901,15 @@ fn spawn_window_event_listener(
                             {
                                 Ok(Some(project)) => project,
                                 Ok(None) => {
-                                    eprintln!(
+                                    launch_mutation::reject(&mut tab_runtime, request_id.as_deref(), format!(
                                         "attach-tab: React createWindow declined missing project={project_id:?}"
-                                    );
+                                    ));
                                     continue;
                                 }
                                 Err(e) => {
-                                    eprintln!(
+                                    launch_mutation::reject(&mut tab_runtime, request_id.as_deref(), format!(
                                         "attach-tab: React createWindow could not load project={project_id:?}: {e}"
-                                    );
+                                    ));
                                     continue;
                                 }
                             };
@@ -16898,16 +16921,16 @@ fn spawn_window_event_listener(
                                 .map(std::path::PathBuf::from)
                                 .or_else(|| Some(std::path::PathBuf::from(&project_record.root)));
                             let Some(launch_root) = launch_root else {
-                                eprintln!(
+                                launch_mutation::reject(&mut tab_runtime, request_id.as_deref(), format!(
                                     "attach-tab: React createWindow declined project={project_id:?} name={name:?}; no root supplied and no project root available"
-                                );
+                                ));
                                 continue;
                             };
                             if !launch_root.is_dir() {
-                                eprintln!(
+                                launch_mutation::reject(&mut tab_runtime, request_id.as_deref(), format!(
                                     "attach-tab: React createWindow declined project={project_id:?} name={name:?}; root is not a directory: {}",
                                     launch_root.display()
-                                );
+                                ));
                                 continue;
                             }
 
@@ -16929,10 +16952,10 @@ fn spawn_window_event_listener(
                             ) {
                                 Ok(argv) => argv,
                                 Err(error) => {
-                                    eprintln!(
-                                        "attach-tab: React createWindow declined before mutation project={project_id:?} code={}",
-                                        error.code()
-                                    );
+                                    launch_mutation::reject(&mut tab_runtime, request_id.as_deref(), format!(
+                                        "attach-tab: React createWindow declined before mutation project={project_id:?} code={}: {}",
+                                        error.code(), error.user_message()
+                                    ));
                                     continue;
                                 }
                             };
@@ -16954,15 +16977,15 @@ fn spawn_window_event_listener(
                                     .as_deref()
                                     .is_some_and(|command| !command.trim().is_empty()),
                             ) else {
-                                eprintln!(
+                                launch_mutation::reject(&mut tab_runtime, request_id.as_deref(), format!(
                                     "attach-tab: React createWindow launch could not be sealed; no graph was written project={project_id:?}"
-                                );
+                                ));
                                 continue;
                             };
                             if !listener_window_context.is_bound() {
-                                eprintln!(
+                                launch_mutation::reject(&mut tab_runtime, request_id.as_deref(), format!(
                                     "hydra-dashboard intent createWindow unavailable without a bound renderer; no fresh graph was written project={project_id:?}"
-                                );
+                                ));
                                 continue;
                             }
 
@@ -17017,9 +17040,9 @@ fn spawn_window_event_listener(
                             let allocation = match allocation {
                                 Ok(allocation) => allocation,
                                 Err(error) => {
-                                    eprintln!(
+                                    launch_mutation::reject(&mut tab_runtime, request_id.as_deref(), format!(
                                         "attach-tab: React createWindow failed before publishing any graph project={project_id:?}: {error}"
-                                    );
+                                    ));
                                     continue;
                                 }
                             };
@@ -17039,12 +17062,13 @@ fn spawn_window_event_listener(
                                         model.is_some(),
                                         session_mode.is_some(),
                                     );
+                                    launch_mutation::respond(&mut tab_runtime, request_id.as_deref(), Ok(()));
                                     pending_fresh_graph_handoff = Some(pending);
                                     listener_activated = false;
                                 }
-                                Err(error) => eprintln!(
+                                Err(error) => launch_mutation::reject(&mut tab_runtime, request_id.as_deref(), format!(
                                     "attach-tab: React createWindow Prepared launch/focus failed project={project_id:?}: {error}"
-                                ),
+                                )),
                             }
                         }
                         intent @ (ReactChromeIntent::FocusWindow { .. }
@@ -18493,6 +18517,7 @@ fn spawn_window_event_listener(
                             }
                         }
                         ReactChromeIntent::SplitPane {
+                            request_id,
                             project_id,
                             window_id,
                             tab_id,
@@ -18510,18 +18535,18 @@ fn spawn_window_event_listener(
                             // sealed only after the child workspace's actual cwd is prepared.
                             {
                                 if window_id != listener_window_id {
-                                    eprintln!(
+                                    launch_mutation::reject(&mut tab_runtime, request_id.as_deref(), format!(
                                         "attach-tab: React splitPane for other window ignored project={project_id:?} window={window_id:?} tab={tab_id:?} dir={dir:?}"
-                                    );
+                                    ));
                                     continue;
                                 }
                                 let split_axis = match dir.as_str() {
                                     "h" | "right" | "horizontal" => maestro_shell::SplitAxis::Right,
                                     "v" | "down" | "vertical" => maestro_shell::SplitAxis::Down,
                                     other => {
-                                        eprintln!(
+                                        launch_mutation::reject(&mut tab_runtime, request_id.as_deref(), format!(
                                             "attach-tab: React splitPane ignored unknown dir={other:?} project={project_id:?} window={window_id:?} tab={tab_id:?}"
-                                        );
+                                        ));
                                         continue;
                                     }
                                 };
@@ -18530,15 +18555,15 @@ fn spawn_window_event_listener(
                                 {
                                     Ok(Some(layout)) => layout,
                                     Ok(None) => {
-                                        eprintln!(
+                                        launch_mutation::reject(&mut tab_runtime, request_id.as_deref(), format!(
                                             "attach-tab: React splitPane ignored missing window layout project={project_id:?} window={window_id:?} tab={tab_id:?}"
-                                        );
+                                        ));
                                         continue;
                                     }
                                     Err(error) => {
-                                        eprintln!(
+                                        launch_mutation::reject(&mut tab_runtime, request_id.as_deref(), format!(
                                             "attach-tab: React splitPane ignored unreadable window layout project={project_id:?} window={window_id:?} tab={tab_id:?}: {error}"
-                                        );
+                                        ));
                                         continue;
                                     }
                                 };
@@ -18562,9 +18587,9 @@ fn spawn_window_event_listener(
                                         })
                                     });
                                 let Some(split_source_tab_id) = split_source_tab_id else {
-                                    eprintln!(
+                                    launch_mutation::reject(&mut tab_runtime, request_id.as_deref(), format!(
                                         "attach-tab: React splitPane ignored missing live source tab project={project_id:?} window={window_id:?} requested_tab={tab_id:?}"
-                                    );
+                                    ));
                                     continue;
                                 };
                                 let source_session_id = layout
@@ -18580,9 +18605,9 @@ fn spawn_window_event_listener(
                                 ) {
                                     Ok(Some(LoadOutcome::Loaded(session))) => session,
                                     _ => {
-                                        eprintln!(
+                                        launch_mutation::reject(&mut tab_runtime, request_id.as_deref(), format!(
                                             "attach-tab: React splitPane ignored source without current Session authority project={project_id:?} window={window_id:?} source_tab={split_source_tab_id:?}"
-                                        );
+                                        ));
                                         continue;
                                     }
                                 };
@@ -18593,15 +18618,15 @@ fn spawn_window_event_listener(
                                 ) {
                                     Ok(Some(LoadOutcome::Loaded(workspace))) => workspace,
                                     _ => {
-                                        eprintln!(
+                                        launch_mutation::reject(&mut tab_runtime, request_id.as_deref(), format!(
                                             "attach-tab: React splitPane ignored source without current Workspace authority project={project_id:?} window={window_id:?} source_tab={split_source_tab_id:?}"
-                                        );
+                                        ));
                                         continue;
                                     }
                                 };
                                 if !react_split_cwd_matches_workspace(cwd.as_deref(), &workspace) {
-                                    eprintln!(
-                                        "attach-tab: React splitPane declined before mutation: requested cwd does not match the sealed source Workspace"
+                                    launch_mutation::reject(&mut tab_runtime, request_id.as_deref(),
+                                        "attach-tab: React splitPane declined before mutation: requested cwd does not match the sealed source Workspace".into()
                                     );
                                     continue;
                                 }
@@ -18618,10 +18643,10 @@ fn spawn_window_event_listener(
                                 ) {
                                     Ok(prepared) => prepared,
                                     Err(error) => {
-                                        eprintln!(
-                                            "attach-tab: React splitPane declined before mutation: launch preflight code={}",
-                                            error.code()
-                                        );
+                                        launch_mutation::reject(&mut tab_runtime, request_id.as_deref(), format!(
+                                            "attach-tab: React splitPane declined before mutation: launch preflight code={}: {}",
+                                            error.code(), error.user_message()
+                                        ));
                                         continue;
                                     }
                                 };
@@ -18643,16 +18668,16 @@ fn spawn_window_event_listener(
                                         .as_deref()
                                         .is_some_and(|command| !command.trim().is_empty()),
                                 ) else {
-                                    eprintln!(
-                                        "attach-tab: React splitPane declined before mutation: launch could not be sealed"
+                                    launch_mutation::reject(&mut tab_runtime, request_id.as_deref(),
+                                        "attach-tab: React splitPane declined before mutation: launch could not be sealed".into()
                                     );
                                     continue;
                                 };
                                 let Some((plan_source, foreground_launch)) =
                                     launch.into_new_tab_launch()
                                 else {
-                                    eprintln!(
-                                        "attach-tab: React splitPane declined before mutation: provider grammar was not exact"
+                                    launch_mutation::reject(&mut tab_runtime, request_id.as_deref(),
+                                        "attach-tab: React splitPane declined before mutation: provider grammar was not exact".into()
                                     );
                                     continue;
                                 };
@@ -18683,9 +18708,9 @@ fn spawn_window_event_listener(
                                         tab_id, session_id, ..
                                     } => (tab_id.clone(), session_id.clone()),
                                     other => {
-                                        eprintln!(
+                                        launch_mutation::reject(&mut tab_runtime, request_id.as_deref(), format!(
                                             "attach-tab: React splitPane planning declined before mutation: {other:?}"
-                                        );
+                                        ));
                                         continue;
                                     }
                                 };
@@ -18693,8 +18718,8 @@ fn spawn_window_event_listener(
                                     .known_daemon_session_ids
                                     .contains(&planned_session_id)
                                 {
-                                    eprintln!(
-                                        "attach-tab: React splitPane declined before mutation: planned session id is already daemon-owned"
+                                    launch_mutation::reject(&mut tab_runtime, request_id.as_deref(),
+                                        "attach-tab: React splitPane declined before mutation: planned session id is already daemon-owned".into()
                                     );
                                     continue;
                                 }
@@ -18726,6 +18751,11 @@ fn spawn_window_event_listener(
                                         eprintln!(
                                             "attach-tab: React splitPane PENDING exact renderer Claim tab_id={planned_tab_id:?} session_id={planned_session_id:?} from={split_source_tab_id:?} axis={split_axis:?}"
                                         );
+                                        launch_mutation::respond(
+                                            &mut tab_runtime,
+                                            request_id.as_deref(),
+                                            Ok(()),
+                                        );
                                         pending_new_tab_handoff =
                                             Some(PendingListenerNewTabHandoff {
                                                 success,
@@ -18737,9 +18767,9 @@ fn spawn_window_event_listener(
                                     Err(mut error) => {
                                         let diagnostic =
                                             classify_new_tab_foreground_failure(&error);
-                                        eprintln!(
+                                        launch_mutation::reject(&mut tab_runtime, request_id.as_deref(), format!(
                                             "attach-tab: React splitPane failed (non-fatal; {diagnostic}): {error}"
-                                        );
+                                        ));
                                         let report = execute_production_new_tab_recovery(
                                             &listener_paths,
                                             &listener_socket_path,
@@ -32800,6 +32830,7 @@ mod product_startup_target_tests {
         ));
         assert!(!product_recovery_blocks_react_intent(
             &ReactChromeIntent::CreateWindow {
+                request_id: None,
                 project_id: "real-project".to_string(),
                 name: None,
                 root: None,

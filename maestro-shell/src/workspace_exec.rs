@@ -32,10 +32,10 @@
 //! Path safety: workspace/session ids are validated (via `resolved_cwd` -> `ids::validate_id`)
 //! BEFORE any directory is created or any git command runs, so a traversing id fails with
 //! nothing on disk. Created cwds are under `scratch_base()` / `worktree_base()` by construction,
-//! and a supplied repo root is never written into: if the resolved scratch cwd would fall under
-//! the repo root (only possible when the repo root contains the app-support tree), preparation
-//! is REFUSED — unless the repo root itself lies inside the scratch base, the one unusual
-//! containment where "under the repo root" and "under scratch" coincide.
+//! and associated folders need not be repositories (for example a Terminal rooted at the user's
+//! home). App-owned scratch below such an ancestor is allowed. Existing repository/worktree
+//! metadata on the overlapping ancestry still refuses source contamination, resolving existing
+//! symlinks first. A root inside the scratch base retains its existing shell-owned exception.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -72,9 +72,8 @@ pub enum WorkspaceExecError {
     /// The workspace has not granted the consent the policy requires. Checked
     /// BEFORE the unsupported-policy rejection, so a consent failure is never masked.
     Consent(WorkspaceConsentError),
-    /// The resolved scratch cwd would sit under the supplied repo root (the repo root contains
-    /// the app-support tree) — refused so Maestro never creates state "inside" a repo, even
-    /// nominally. Nothing was created.
+    /// The scratch cwd overlaps an associated root with repository/worktree metadata on its
+    /// ancestry. An ordinary ancestor folder alone is not repository ownership. Nothing created.
     ScratchUnderRepoRoot { cwd: PathBuf, repo_root: PathBuf },
     /// The fresh-session-only scratch preparer found that its exact session directory already
     /// exists. It must not adopt that directory: another attempt or a live lifetime may own it.
@@ -743,10 +742,7 @@ pub fn prepare_fresh_scratch_cwd(
     debug_assert!(resolved.cwd.starts_with(&scratch_base));
 
     let repo_root_path = Path::new(repo_root);
-    if !repo_root.is_empty()
-        && resolved.cwd.starts_with(repo_root_path)
-        && !repo_root_path.starts_with(&scratch_base)
-    {
+    if scratch_overlaps_repository(repo_root_path, &scratch_base, &resolved.cwd)? {
         return Err(WorkspaceExecError::ScratchUnderRepoRoot {
             cwd: resolved.cwd,
             repo_root: repo_root_path.to_path_buf(),
@@ -786,6 +782,54 @@ pub fn prepare_fresh_scratch_cwd(
             session_id: session_id.to_string(),
         },
     })
+}
+
+/// Resolve existing aliases without creating the not-yet-owned scratch leaf or requiring Git.
+fn physical_scratch_path(path: &Path) -> io::Result<PathBuf> {
+    let mut resolved = PathBuf::new();
+    for component in std::path::absolute(path)?.components() {
+        if component == std::path::Component::ParentDir {
+            resolved.pop();
+            continue;
+        }
+        resolved.push(component);
+        match fs::canonicalize(&resolved) {
+            Ok(physical) => resolved = physical,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(resolved)
+}
+
+fn scratch_overlaps_repository(root: &Path, scratch: &Path, cwd: &Path) -> io::Result<bool> {
+    if root.as_os_str().is_empty() {
+        return Ok(false);
+    }
+    let root = physical_scratch_path(root)?;
+    let scratch = physical_scratch_path(scratch)?;
+    let cwd = physical_scratch_path(cwd)?;
+    if !cwd.starts_with(&root) || root.starts_with(&scratch) {
+        return Ok(false);
+    }
+    let present = |path: PathBuf| match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    };
+    for ancestor in cwd.ancestors().skip(1) {
+        if ancestor.starts_with(&scratch) {
+            continue;
+        }
+        // A .git directory, linked-worktree/submodule file, or alias all establish repository
+        // metadata. Bare repositories use HEAD + objects. Inspect names, never config or hooks.
+        if present(ancestor.join(".git"))?
+            || (present(ancestor.join("HEAD"))? && present(ancestor.join("objects"))?)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Consume a fresh-directory receipt and remove exactly the directory it created.
@@ -2000,9 +2044,9 @@ mod tests {
 
     #[test]
     fn repo_root_containing_app_support_is_refused_and_creates_nothing() {
-        // UNUSUAL: the supplied repo root is an ancestor of the app-support tree, so the
-        // scratch cwd would lexically sit "under the repo root". Refused, nothing created.
+        // An actual source repository containing app-support still cannot receive scratch data.
         let (tmp, paths) = temp_paths();
+        fs::create_dir(tmp.path().join(".git")).unwrap();
         let repo_root = tmp.path().to_str().expect("utf8 temp path");
         let r = prepare_scratch_cwd(&paths, "ws1", "sess1", repo_root);
         assert!(
@@ -2010,6 +2054,72 @@ mod tests {
             "ancestor repo root must be refused, got {r:?}"
         );
         assert!(!paths.base().exists(), "nothing may be created on refusal");
+    }
+
+    #[test]
+    fn ordinary_ancestor_folder_allows_only_fresh_app_owned_scratch() {
+        let home = TempDir::new().unwrap();
+        let source = home.path().join("unrelated-project");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("keep.txt"), b"unchanged source").unwrap();
+        let paths = AppPaths::with_base(home.path().join("qa-profile"));
+        let root = home.path().to_str().unwrap();
+        let first = prepare_fresh_scratch_cwd(&paths, "ws", "split-pane", root).unwrap();
+        let second = prepare_scratch_cwd(&paths, "ws", "new-window", root).unwrap();
+        assert_eq!(first.prepared.cwd, paths.scratch_base().join("split-pane"));
+        assert_eq!(second.cwd, paths.scratch_base().join("new-window"));
+        assert_eq!(
+            fs::read(source.join("keep.txt")).unwrap(),
+            b"unchanged source"
+        );
+        assert!(matches!(
+            prepare_fresh_scratch_cwd(&paths, "ws", "split-pane", root),
+            Err(WorkspaceExecError::FreshScratchCwdAlreadyExists { .. })
+        ));
+        assert!(prepare_scratch_cwd(&paths, "ws", "../escape", root).is_err());
+        assert!(!home.path().join("escape").exists());
+    }
+
+    #[test]
+    fn overlapping_linked_and_bare_repositories_remain_untouched() {
+        for linked in [true, false] {
+            let (tmp, paths) = temp_paths();
+            if linked {
+                fs::write(
+                    tmp.path().join(".git"),
+                    b"gitdir: elsewhere/worktrees/linked\n",
+                )
+                .unwrap();
+            } else {
+                fs::write(tmp.path().join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+                fs::create_dir(tmp.path().join("objects")).unwrap();
+            }
+            assert!(matches!(
+                prepare_fresh_scratch_cwd(&paths, "ws", "new", tmp.path().to_str().unwrap()),
+                Err(WorkspaceExecError::ScratchUnderRepoRoot { .. })
+            ));
+            assert!(!paths.base().exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn physical_alias_and_nested_repository_cannot_hide_source_overlap() {
+        use std::os::unix::fs::symlink;
+        let outer = TempDir::new().unwrap();
+        let root = outer.path().join("source");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join(".git")).unwrap();
+        let alias = outer.path().join("alias");
+        symlink(&root, &alias).unwrap();
+        let paths = AppPaths::with_base(alias.join("app"));
+        for supplied in [&root, &alias, &outer.path().to_path_buf()] {
+            assert!(matches!(
+                prepare_fresh_scratch_cwd(&paths, "ws", "new", supplied.to_str().unwrap()),
+                Err(WorkspaceExecError::ScratchUnderRepoRoot { .. })
+            ));
+            assert!(!paths.base().exists());
+        }
     }
 
     #[test]
