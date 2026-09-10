@@ -368,7 +368,16 @@ mod tests {
 
     use super::super::event_bridge::{ime_commit_event, ime_preedit_event};
     use super::*;
+    use crate::client::{ActiveBindingToken, ViewportBindingToken};
     use crate::host_event::{HostIme, HostKey, HostKeyEvent, HostKeyLocation};
+
+    fn terminal_binding() -> ViewportBindingToken {
+        ViewportBindingToken::Active(ActiveBindingToken {
+            session_id: "wake-test-session".to_string(),
+            epoch: 1,
+            output_generation: 1,
+        })
+    }
 
     /// A recording transport standing in for the Tao proxy: every accepted message is one
     /// owner-loop wake (tao pairs the channel push with `MainContext::wakeup`).
@@ -598,9 +607,15 @@ mod tests {
 
         record(UserEvent::Redraw, "redraw");
         record(UserEvent::Redraw, "coalesced-redraw");
-        record(UserEvent::TerminalBell, "bell");
+        record(
+            UserEvent::TerminalBell {
+                binding: terminal_binding(),
+            },
+            "bell",
+        );
         record(
             UserEvent::TerminalTitle {
+                binding: terminal_binding(),
                 title: Some("title".to_string()),
             },
             "title",
@@ -623,7 +638,9 @@ mod tests {
         };
 
         queue_redraw();
-        wake.acknowledge(&UserEvent::TerminalBell);
+        wake.acknowledge(&UserEvent::TerminalBell {
+            binding: terminal_binding(),
+        });
         queue_redraw();
 
         assert_eq!(sent.load(Ordering::Relaxed), 1);

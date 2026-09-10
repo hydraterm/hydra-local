@@ -23280,6 +23280,146 @@ mod split_frame_tests {
     }
 
     #[test]
+    fn ordinary_exact_viewport_drops_keyboard_and_ime_until_owner_publication() {
+        use crate::host_event::{HostEvent, HostIme, HostKey, HostKeyEvent, HostKeyLocation};
+
+        // Characterize today's input boundary, not a desired replay policy or a claim about
+        // physical screenshots. Deliver actual host events around the existing exact-bind fixture.
+        let send_input = |app: &mut App, key: &str, committed: &str| {
+            for event in [
+                HostEvent::Keyboard(HostKeyEvent {
+                    key: HostKey::Character(key.to_string()),
+                    text: Some(key.to_string()),
+                    base_text: Some(key.to_string()),
+                    location: HostKeyLocation::Standard,
+                    pressed: true,
+                    repeat: false,
+                }),
+                HostEvent::Ime(HostIme::Commit(committed.to_string())),
+            ] {
+                assert_eq!(app.handle_host_event(event), super::HostControl::Continue);
+            }
+        };
+        let expected_writes = |id: &str, generation: &str, key: &str, committed: &str| {
+            [key, committed]
+                .into_iter()
+                .map(|data| ClientRequest::Write {
+                    id: id.to_string(),
+                    expected_generation: SessionGeneration(generation.to_string()),
+                    data: data.to_string(),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let daemon_instance: maestro_shell::DaemonInstanceId =
+            "33333333333343338333333333333333".parse().unwrap();
+        let shared = Shared::with_test_handoff_peer_facts(Some(daemon_instance.clone()), None);
+        shared.set_active_session("sid-A").unwrap();
+        install_exact_test_grid(&shared, "sid-A", "gen-C");
+        let (mut app, _owner_events, app_events) =
+            role_transition_handoff_app(shared.clone(), "sid-A");
+        assert!(app.viewport_is_bound());
+        send_input(&mut app, "a", "old-owner-ime");
+        assert_eq!(
+            shared.drain_test_requests(),
+            expected_writes("sid-A", "gen-C", "a", "old-owner-ime")
+        );
+
+        // Select the second pane, not the first tab or the previous window's primary session.
+        let target_strip = strip(vec![
+            plain_tab("B", false),
+            split_child("C", "B", RendererTabSplitAxis::Down, true),
+        ]);
+        let received = request_exact_test_viewport(&mut app, target_strip, "gen-next");
+        let plan = shared.drain_test_requests();
+        let mut attachments = plan
+            .iter()
+            .filter_map(|request| match request {
+                ClientRequest::Attach {
+                    id,
+                    expected_session_generation,
+                    ..
+                } => Some((id.as_str(), expected_session_generation.as_deref())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        attachments.sort();
+        assert_eq!(
+            attachments,
+            vec![("sid-B", Some("gen-next")), ("sid-C", Some("gen-next"))]
+        );
+        assert!(!plan
+            .iter()
+            .any(|request| matches!(request, ClientRequest::Write { .. })));
+        assert!(!app.viewport_is_bound());
+        send_input(&mut app, "p", "pending-ime");
+        assert!(shared.drain_test_requests().is_empty());
+        assert!(
+            app.pending_owner_requests.is_empty(),
+            "unbound input is not retained"
+        );
+
+        assert!(shared.prove_test_exact_viewport_grid("sid-C", "gen-next"));
+        install_exact_test_grid(&shared, "sid-C", "gen-next");
+        app.handle_user_event(UserEvent::Redraw);
+        assert!(
+            !app.viewport_is_bound(),
+            "the other pane still needs its baseline"
+        );
+        send_input(&mut app, "q", "primary-only-ime");
+        assert!(shared.drain_test_requests().is_empty());
+        assert!(received.try_recv().is_err());
+
+        assert!(shared.prove_test_exact_viewport_grid("sid-B", "gen-next"));
+        install_exact_test_grid(&shared, "sid-B", "gen-next");
+        assert_eq!(
+            app.pending_viewport_binding.as_ref().unwrap().status(),
+            crate::client::ExactViewportAdmissionStatus::Complete
+        );
+        // Model a key already in the owner FIFO before the final baseline's Redraw wake.
+        // Shared proof is complete, but the owner has not published this exact projection yet.
+        assert!(!app.viewport_is_bound());
+        send_input(&mut app, "b", "before-redraw-ime");
+        assert!(shared.drain_test_requests().is_empty());
+        assert!(app.pending_owner_requests.is_empty());
+        assert!(
+            received.try_recv().is_err(),
+            "baseline completion is not publication"
+        );
+
+        app.handle_user_event(UserEvent::Redraw);
+        let disposition = receive_exact_viewport_disposition(&received);
+        assert_eq!(
+            disposition.outcome(),
+            RendererExactViewportOutcome::Published
+        );
+        assert_eq!(disposition.session_id(), "sid-C");
+        assert_eq!(disposition.generation(), "gen-next");
+        assert_eq!(disposition.daemon_instance_id(), Some(&daemon_instance));
+        assert!(app.viewport_is_bound());
+        assert_eq!(app.session_id, "sid-C");
+        assert_eq!(app.exact_viewport.as_ref().unwrap().primary_tab_id, "C");
+        send_input(&mut app, "k", "published-ime");
+        assert_eq!(
+            shared.drain_test_requests(),
+            expected_writes("sid-C", "gen-next", "k", "published-ime"),
+            "only post-publication bytes enter the exact second pane; no prefix is replayed"
+        );
+        app.handle_user_event(UserEvent::OutboundWritable);
+        app.handle_user_event(UserEvent::Redraw);
+        assert!(shared.drain_test_requests().is_empty());
+        assert!(app.pending_owner_requests.is_empty());
+        assert!(
+            received.try_recv().is_err(),
+            "publication remains exactly once"
+        );
+        assert!(
+            app_events.try_recv().is_err(),
+            "input emits no navigation intent"
+        );
+    }
+
+    #[test]
     fn ordinary_exact_viewport_clear_or_wrong_generation_is_unavailable_once_and_neutral() {
         for wrong_generation in [false, true] {
             let daemon_instance: maestro_shell::DaemonInstanceId =
@@ -37605,7 +37745,7 @@ mod terminal_selection_ownership_tests {
         }
     }
 
-    fn tab(
+    pub(super) fn tab(
         tab_id: &str,
         session_id: &str,
         active: bool,
@@ -37648,7 +37788,7 @@ mod terminal_selection_ownership_tests {
         )
     }
 
-    fn bind_exact_fixture_viewport(
+    pub(super) fn bind_exact_fixture_viewport(
         app: &mut App,
         shared: &Arc<Shared>,
         tab_strip: RendererTabStrip,
@@ -38602,6 +38742,7 @@ mod linux_clipboard_tests {
             strikeout: false,
             dim: false,
             hidden: false,
+            hyperlink: None,
             width: 1,
         }
     }
@@ -38637,7 +38778,20 @@ mod linux_clipboard_tests {
         bracketed_paste: bool,
         text: &str,
     ) -> (App, Arc<Shared>, Rc<FakeClipboardHost>) {
-        let shared = Shared::with_test_outbound();
+        clipboard_app_with_shared(
+            Shared::with_test_outbound(),
+            generation,
+            bracketed_paste,
+            text,
+        )
+    }
+
+    fn clipboard_app_with_shared(
+        shared: Arc<Shared>,
+        generation: &str,
+        bracketed_paste: bool,
+        text: &str,
+    ) -> (App, Arc<Shared>, Rc<FakeClipboardHost>) {
         shared
             .init_active_session("clipboard-session")
             .expect("fixture installs exact clipboard viewport authority");
@@ -38663,6 +38817,45 @@ mod linux_clipboard_tests {
         );
         app.clipboard_host = Some(fake.clone());
         (app, shared, fake)
+    }
+
+    fn published_app_with_grid(
+        generation: &str,
+        text: &str,
+    ) -> (App, Arc<Shared>, Rc<FakeClipboardHost>) {
+        use super::terminal_selection_ownership_tests::{bind_exact_fixture_viewport, tab};
+        let (mut app, shared, host) = clipboard_app_with_shared(
+            Shared::with_test_handoff_peer_facts(None, None),
+            generation,
+            false,
+            text,
+        );
+        assert!(
+            !app.viewport_is_bound(),
+            "a Shared grid alone is not viewport publication"
+        );
+        bind_exact_fixture_viewport(
+            &mut app,
+            &shared,
+            RendererTabStrip {
+                window_id: "clipboard-window".to_string(),
+                tabs: vec![tab("clipboard-tab", "clipboard-session", true, None, None)],
+            },
+            vec![("clipboard-session", grid(generation, false, text))],
+        );
+        let binding = shared
+            .binding_token_for_session("clipboard-session")
+            .unwrap();
+        assert!(shared.viewport_token_is_current(&binding));
+        assert_eq!(
+            app.exact_viewport.as_ref().unwrap().primary.generation,
+            generation
+        );
+        assert_eq!(
+            shared.grid.lock().unwrap().as_ref().unwrap().generation.0,
+            generation
+        );
+        (app, shared, host)
     }
 
     fn key(key: HostKey, repeat: bool) -> HostKeyEvent {
@@ -38796,7 +38989,7 @@ mod linux_clipboard_tests {
 
     #[test]
     fn linux_shortcuts_are_exact_and_ctrl_v_remains_terminal_input() {
-        let (mut app, shared, host) = app_with_grid("gen", false, "prompt");
+        let (mut app, shared, host) = published_app_with_grid("gen", "prompt");
         app.modifiers = HostModifiers {
             control: true,
             shift: true,
@@ -38840,7 +39033,7 @@ mod linux_clipboard_tests {
 
     #[test]
     fn selection_copy_and_osc_style_store_use_native_host() {
-        let (mut app, shared, host) = app_with_grid("gen", false, "copy");
+        let (mut app, shared, host) = published_app_with_grid("gen", "copy");
         app.sel_anchor = Some(super::CellPos { col: 0, row: 0 });
         app.sel_focus = Some(super::CellPos { col: 3, row: 0 });
         app.sel_session_id = Some("clipboard-session".to_string());
@@ -38887,7 +39080,7 @@ mod linux_clipboard_tests {
 
     #[test]
     fn menu_deactivation_keeps_guard_until_matching_right_release() {
-        let (mut app, shared, _host) = app_with_grid("gen", false, "prompt");
+        let (mut app, shared, _host) = published_app_with_grid("gen", "prompt");
         app.context_menu_click_in_progress = true;
         app.handle_host_event(HostEvent::Clipboard(HostClipboardEvent::ContextMenuClosed));
         assert!(
@@ -39209,8 +39402,8 @@ mod idle_wake_delivery_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn collapse_then_reexpand_trailing_resize_reaches_pty() {
-        let shared = Shared::with_test_outbound();
-        let mut app = headless_app_with_shared(shared.clone());
+        let mut app = bound_headless_app();
+        let shared = app.shared.clone();
         let now = Instant::now();
 
         // Fifty rapid allocation changes model repeated collapse/re-expand / drag geometry. The
@@ -39220,7 +39413,7 @@ mod idle_wake_delivery_tests {
         for index in 0..50 {
             let dims = if index % 2 == 0 { (156, 47) } else { (113, 47) };
             match app.resize.record(dims, now, RESIZE_MIN_INTERVAL) {
-                Some(dims) if index == 0 => app.send_resize(dims),
+                Some(dims) if index == 0 => assert!(app.send_resize(dims)),
                 Some(dims) => panic!("resize {index} bypassed throttle with {dims:?}"),
                 None => {}
             }
@@ -39305,7 +39498,10 @@ mod linux_chrome_state_tests {
     }
 
     fn headless_app(width: u32) -> App {
-        let shared = Arc::new(Shared::default());
+        headless_app_with_shared(width, Arc::new(Shared::default()))
+    }
+
+    fn headless_app_with_shared(width: u32, shared: Arc<Shared>) -> App {
         App::new(
             shared,
             "linux-chrome-state".to_string(),
@@ -39348,7 +39544,8 @@ mod linux_chrome_state_tests {
 
     #[test]
     fn viewport_clear_physically_hides_the_native_overlay_child() {
-        let mut app = headless_app(460);
+        let shared = Shared::with_test_outbound();
+        let mut app = headless_app_with_shared(460, shared.clone());
         let host = Rc::new(RecordingChromeHost::default());
         app.chrome_host = Some(host.clone());
         app.react_overlay_visible = true;
@@ -39357,6 +39554,16 @@ mod linux_chrome_state_tests {
 
         assert!(!app.react_overlay_visible);
         assert_eq!(host.overlay_visibility.borrow().as_slice(), &[false]);
+        assert_eq!(
+            shared.drain_test_requests(),
+            vec![super::ClientRequest::Detach {
+                id: "linux-chrome-state".to_string(),
+            }]
+        );
+        assert!(app.connection_alive);
+        assert!(!shared.connection_is_closed());
+        assert!(app.attached_sessions.is_empty());
+        assert!(app.pending_detach_sessions.is_empty());
     }
 
     #[test]
