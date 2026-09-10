@@ -65,6 +65,7 @@ type Props = {
   onReorder: (orderedIds: string[]) => void
   onWindowReorder: (projectId: string, orderedWindowIds: string[]) => void
   onFocusWindow: (projectId: string, windowId: string) => void
+  onFocusPane: (projectId: string, windowId: string, tabId: string, sessionId: string) => void
 }
 
 function statusDotClass(status: SessionStatus | null, stashed: boolean): string {
@@ -117,6 +118,7 @@ export function Sidebar({
   onReorder,
   onWindowReorder,
   onFocusWindow,
+  onFocusPane,
 }: Props): JSX.Element {
   // Independent expand state at each level. Projects default-expand when
   // selected; windows default-open inside the selected/focused project.
@@ -1212,8 +1214,7 @@ export function Sidebar({
                                     } else if (t.session_status === 'exited') {
                                       bridge.reviveSession(t.session_id, t.window_id, t.tab_id)
                                     } else {
-                                      onFocusWindow(p.project_id, t.window_id)
-                                      bridge.focusSessionOrPane(
+                                      onFocusPane(
                                         p.project_id,
                                         t.window_id,
                                         t.tab_id,

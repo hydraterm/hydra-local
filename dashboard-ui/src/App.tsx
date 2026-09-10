@@ -597,6 +597,15 @@ export function App(): JSX.Element {
     bridge.focusWindow(projectId, windowId)
   }
 
+  const focusPane = (projectId: string, windowId: string, tabId: string, sessionId: string): void => {
+    setSelectedId(projectId)
+    setFocusedWindowId(windowId)
+    focusedWindowByProjectRef.current.set(projectId, windowId)
+    // One exact destination, including project activation/recency on the native admission path.
+    // A preliminary window focus can start a transition before the requested pane is processed.
+    bridge.focusSessionOrPane(projectId, windowId, tabId, sessionId)
+  }
+
   const applySidebarWidth = (width: number): void => {
     const next = clampResizableSidebarWidth(width)
     setSidebarCollapsed(false)
@@ -696,6 +705,7 @@ export function App(): JSX.Element {
           onReorder={(ids) => bridge.updateProjectOrder(ids)}
           onWindowReorder={(projectId, ids) => bridge.updateWindowOrder(projectId, ids)}
           onFocusWindow={focusWindow}
+          onFocusPane={focusPane}
         />
         {!sidebarCollapsed && (
           <div
@@ -762,6 +772,7 @@ export function App(): JSX.Element {
         onReorder={(ids) => bridge.updateProjectOrder(ids)}
         onWindowReorder={(projectId, ids) => bridge.updateWindowOrder(projectId, ids)}
         onFocusWindow={focusWindow}
+        onFocusPane={focusPane}
       />
       {!sidebarCollapsed && (
         <div

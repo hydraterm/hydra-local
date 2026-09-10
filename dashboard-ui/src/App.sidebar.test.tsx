@@ -227,6 +227,56 @@ describe('native sidebar geometry and focus', () => {
     )).toBe(false)
   })
 
+  it('focuses a nonfirst pane with one exact intent and remembers its project window', async () => {
+    const intents: Array<Record<string, unknown>> = []
+    const initialModel = structuredClone(mockDashboardModel)
+    const targetWindow = initialModel.details.sample_workspace.windows.find(
+      (window) => window.window_id === 'w-main',
+    )!
+    targetWindow.tabs.forEach((tab) => {
+      tab.session_status = 'live'
+    })
+    initialModel.active_window_id = 'w-2'
+    initialModel.active_tab_id = 'tab-w2-claude'
+    installWindow('?chrome=sidebar', intents, initialModel)
+    await mount()
+
+    const projectRow = (name: string) =>
+      renderer!.root.find(
+        (node) =>
+          node.props.className === 'tree-project__name' && node.children.join('') === name,
+      ).parent!
+    // Leave this project's tree expanded, then select the other project.
+    act(() => projectRow('Sample Workspace').props.onClick())
+    const windowRow = renderer!.root.find(
+      (node) =>
+        node.props.className === 'tree-window__name' && node.children.join('') === 'Dashboard build',
+    ).parent!.parent!
+    act(() => windowRow.findByProps({ className: 'tree-chevron tree-chevron--nested' }).props.onClick())
+    act(() => projectRow('Sample Analytics').props.onClick())
+    intents.length = 0
+    const pane = renderer!.root.findByProps({ 'aria-label': 'Focus codex — renderer' })
+    act(() => pane.props.onClick({ detail: 1, stopPropagation: vi.fn() }))
+
+    expect(intents).toEqual([
+      {
+        type: 'focusSessionOrPane',
+        project_id: 'sample_workspace',
+        window_id: 'w-main',
+        tab_id: 'tab-codex',
+        session_id: 's-live-2',
+      },
+    ])
+    expect(projectRow('Sample Workspace').props['aria-current']).toBe('true')
+    act(() => projectRow('Sample Analytics').props.onClick())
+    act(() => projectRow('Sample Workspace').props.onClick())
+    expect(intents[intents.length - 1]).toEqual({
+      type: 'focusWindow',
+      project_id: 'sample_workspace',
+      window_id: 'w-main',
+    })
+  })
+
   it("enables a project's sole window Close and Remove while another project is visible", async () => {
     const intents: Array<Record<string, unknown>> = []
     const initialModel = structuredClone(mockDashboardModel)

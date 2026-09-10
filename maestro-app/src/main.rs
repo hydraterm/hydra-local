@@ -85,6 +85,7 @@
 
 mod history_discovery;
 mod launch_preflight;
+mod viewport_navigation;
 
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixStream;
@@ -5322,6 +5323,14 @@ fn request_preflighted_recorded_window_pane(
         now_ms,
     )?;
     let projection = load_renderer_viewport_projection(paths, &layout.window_id, tab_id)?;
+    request_prepared_renderer_viewport(tab_runtime, projection, attachment_handoff)
+}
+
+fn request_prepared_renderer_viewport(
+    tab_runtime: &mut RendererTabRuntime,
+    projection: maestro_app::RendererViewportProjection,
+    attachment_handoff: Option<maestro_shell::AttachmentHandoffAuthority>,
+) -> Result<Option<maestro_app::RendererViewportProjection>, String> {
     if let Some(authority) = attachment_handoff {
         let retry_authority = authority.clone();
         let handoff = maestro_renderer::RendererAttachmentHandoff::new(authority);
@@ -14332,7 +14341,55 @@ fn spawn_window_event_listener(
         }
         let mut history_results_due_after_event = false;
         let mut handoff_shutdown_deadline: Option<Instant> = None;
+        let mut pending_navigation = viewport_navigation::PendingNavigation::default();
         loop {
+            let preserved_navigation_event = match pending_navigation.drain_frontier(
+                &renderer_events_rx,
+                &listener_stop,
+                tab_runtime.handoff_is_pending(),
+                listener_activated,
+                listener_window_context.is_bound(),
+                &listener_window_id,
+            ) {
+                viewport_navigation::Frontier::Ready(destination) => {
+                    maestro_shell::write_trace::set_thread_mutation_context(Some(&format!(
+                        "local:{}",
+                        destination.intent_name()
+                    )));
+                    let result = destination.focus(
+                        &listener_paths,
+                        &listener_socket_path,
+                        listener_shell_default_argv.as_deref(),
+                        listener_open_policy,
+                        &mut tab_runtime,
+                    );
+                    maestro_shell::write_trace::set_thread_mutation_context(None);
+                    match result {
+                        Ok(projection) => {
+                            adopt_compatible_renderer_projection(
+                                &mut listener_window_id,
+                                &mut listener_selection,
+                                &mut listener_strip_tabs,
+                                &mut last_sent_strip,
+                                projection,
+                            );
+                            pending_dashboard_refresh = true;
+                        }
+                        Err(error) => eprintln!(
+                            "attach-tab: React {} declined: {error}",
+                            destination.intent_name()
+                        ),
+                    }
+                    continue;
+                }
+                viewport_navigation::Frontier::Event(event) => Some(event),
+                viewport_navigation::Frontier::Yield => {
+                    std::thread::yield_now();
+                    continue;
+                }
+                viewport_navigation::Frontier::Disconnected => break,
+                viewport_navigation::Frontier::NotReady => None,
+            };
             if tab_runtime.handoff_is_pending() {
                 let stopping = listener_stop.load(Ordering::Acquire);
                 if stopping && handoff_shutdown_deadline.is_none() {
@@ -14502,6 +14559,15 @@ fn spawn_window_event_listener(
                     }
                     maestro_renderer::RendererEvent::AttachmentHandoffDisposition(disposition) => {
                         disposition
+                    }
+                    maestro_renderer::RendererEvent::ReactChromeIntent { json } => {
+                        pending_navigation.retain_pending_json(
+                            &json,
+                            listener_window_context.is_bound(),
+                            &listener_window_id,
+                            stopping,
+                        );
+                        continue;
                     }
                     _ => {
                         // Until exact Claim/Grid proof, no React, topology, extension, focus, or
@@ -15129,11 +15195,15 @@ fn spawn_window_event_listener(
                 &mut tab_runtime,
                 &mut last_sent_react_model,
             );
-            let event = match receive_window_event(
-                &renderer_events_rx,
-                &listener_stop,
-                LISTENER_TICK_INTERVAL,
-            ) {
+            let received = match preserved_navigation_event {
+                Some(event) => classify_window_event_receive(Ok(event), &listener_stop),
+                None => receive_window_event(
+                    &renderer_events_rx,
+                    &listener_stop,
+                    LISTENER_TICK_INTERVAL,
+                ),
+            };
+            let event = match received {
                 WindowEventListenerReceive::Event(event) => {
                     history_results_due_after_event = true;
                     event
@@ -16977,39 +17047,9 @@ fn spawn_window_event_listener(
                                 ),
                             }
                         }
-                        ReactChromeIntent::FocusWindow {
-                            project_id,
-                            window_id,
-                        } => {
-                            match apply_focus_recorded_window_request(
-                                &listener_paths,
-                                &listener_socket_path,
-                                listener_shell_default_argv.as_deref(),
-                                listener_open_policy,
-                                &mut tab_runtime,
-                                &mut listener_window_id,
-                                &mut listener_selection,
-                                &mut listener_strip_tabs,
-                                &window_id,
-                                None,
-                                "focusWindow",
-                            ) {
-                                Ok(model) => {
-                                    adopt_compatible_renderer_projection(
-                                        &mut listener_window_id,
-                                        &mut listener_selection,
-                                        &mut listener_strip_tabs,
-                                        &mut last_sent_strip,
-                                        model,
-                                    );
-                                    eprintln!(
-                                        "attach-tab: React focusWindow focused project={project_id:?} window={window_id:?}"
-                                    );
-                                }
-                                Err(e) => eprintln!(
-                                    "attach-tab: React focusWindow failed project={project_id:?} window={window_id:?}: {e}"
-                                ),
-                            }
+                        intent @ (ReactChromeIntent::FocusWindow { .. }
+                        | ReactChromeIntent::FocusSessionOrPane { .. }) => {
+                            pending_navigation.retain(&intent);
                         }
                         ReactChromeIntent::SaveLayoutPreset {
                             project_id,
@@ -17973,77 +18013,6 @@ fn spawn_window_event_listener(
                                 eprintln!(
                                     "attach-tab: React completeStashedPaneDrop failed x={x} y={y} (non-fatal): {e}"
                                 );
-                            }
-                        }
-                        ReactChromeIntent::FocusSessionOrPane {
-                            project_id,
-                            window_id,
-                            tab_id,
-                            session_id,
-                        } => {
-                            if window_id != listener_window_id {
-                                let fallback_argv = effective_session_argv(
-                                    &[],
-                                    listener_shell_default_argv.as_deref(),
-                                    |k| std::env::var(k).ok(),
-                                );
-                                match focus_recorded_window_pane(
-                                    &listener_paths,
-                                    &listener_socket_path,
-                                    &fallback_argv,
-                                    listener_open_policy,
-                                    &mut tab_runtime,
-                                    &mut listener_window_id,
-                                    &mut listener_selection,
-                                    &mut listener_strip_tabs,
-                                    &window_id,
-                                    Some(&tab_id),
-                                ) {
-                                    Ok(model) => {
-                                        adopt_compatible_renderer_projection(
-                                            &mut listener_window_id,
-                                            &mut listener_selection,
-                                            &mut listener_strip_tabs,
-                                            &mut last_sent_strip,
-                                            model,
-                                        );
-                                        eprintln!(
-                                            "attach-tab: React focusSessionOrPane focused other window project={project_id:?} window={window_id:?} tab={tab_id:?} session={session_id:?}"
-                                        );
-                                    }
-                                    Err(e) => eprintln!(
-                                        "attach-tab: React focusSessionOrPane failed other window project={project_id:?} window={window_id:?} tab={tab_id:?} session={session_id:?}: {e}"
-                                    ),
-                                }
-                            } else {
-                                let fallback_argv = effective_session_argv(
-                                    &[],
-                                    listener_shell_default_argv.as_deref(),
-                                    |k| std::env::var(k).ok(),
-                                );
-                                match focus_recorded_window_pane(
-                                    &listener_paths,
-                                    &listener_socket_path,
-                                    &fallback_argv,
-                                    listener_open_policy,
-                                    &mut tab_runtime,
-                                    &mut listener_window_id,
-                                    &mut listener_selection,
-                                    &mut listener_strip_tabs,
-                                    &window_id,
-                                    Some(&tab_id),
-                                ) {
-                                    Ok(projection) => adopt_compatible_renderer_projection(
-                                        &mut listener_window_id,
-                                        &mut listener_selection,
-                                        &mut listener_strip_tabs,
-                                        &mut last_sent_strip,
-                                        projection,
-                                    ),
-                                    Err(e) => eprintln!(
-                                        "attach-tab: React focusSessionOrPane exact focus failed project={project_id:?} tab={tab_id:?} session={session_id:?}: {e}"
-                                    ),
-                                }
                             }
                         }
                         ReactChromeIntent::ReviveWindow { window_id } => {
