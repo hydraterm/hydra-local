@@ -10,6 +10,7 @@ import type {
 } from '../types/model'
 import { bridge } from '../ipc/bridge'
 import { AgentBadge } from './AgentBadge'
+import { useDeferredFocusLoss } from './useDeferredFocusLoss'
 
 const ENROLL_CONFIRMATION_TIMEOUT_MS = 70_000
 
@@ -456,6 +457,7 @@ export function Sidebar({
   }
 
   const startRenameProject = (project: ProjectCardView): void => {
+    projectRenameFocusLoss.cancel()
     setRenameDraft({ project_id: project.project_id, name: project.name })
     setOpenProjectMenuId(null)
   }
@@ -525,6 +527,7 @@ export function Sidebar({
   }
 
   const startRenameWindow = (projectId: string, windowId: string): void => {
+    windowRenameFocusLoss.cancel()
     const windowName =
       model.details[projectId]?.windows.find((window) => window.window_id === windowId)?.name ??
       windowId
@@ -539,6 +542,7 @@ export function Sidebar({
     name: string,
   ): void => {
     closeOpenMenus()
+    paneRenameFocusLoss.cancel()
     setPaneRenameDraft({ project_id: projectId, window_id: windowId, tab_id: tabId, name })
   }
 
@@ -555,6 +559,7 @@ export function Sidebar({
   }
 
   const commitPaneRename = (): void => {
+    paneRenameFocusLoss.cancel()
     if (!paneRenameDraft) return
     const name = paneRenameDraft.name.trim()
     if (!name) {
@@ -576,17 +581,39 @@ export function Sidebar({
 
   // Commit an in-place project rename (onBlur / Enter): persist a non-empty name, then close the editor.
   const commitProjectRename = (): void => {
+    projectRenameFocusLoss.cancel()
     if (!renameDraft) return
     const name = renameDraft.name.trim()
     if (name) bridge.updateProject({ project_id: renameDraft.project_id, name })
     setRenameDraft(null)
   }
   const commitWindowRename = (): void => {
+    windowRenameFocusLoss.cancel()
     if (!windowRenameDraft) return
     const name = windowRenameDraft.name.trim()
     if (name) bridge.updateWindow({ ...windowRenameDraft, name })
     setWindowRenameDraft(null)
   }
+
+  const projectRenameFocusLoss = useDeferredFocusLoss(
+    !collapsed && renameDraft ? JSON.stringify([renameDraft.project_id]) : null,
+    projectRenameInputRef,
+    commitProjectRename,
+  )
+  const windowRenameFocusLoss = useDeferredFocusLoss(
+    !collapsed && windowRenameDraft
+      ? JSON.stringify([windowRenameDraft.project_id, windowRenameDraft.window_id])
+      : null,
+    windowRenameInputRef,
+    commitWindowRename,
+  )
+  const paneRenameFocusLoss = useDeferredFocusLoss(
+    !collapsed && paneRenameDraft
+      ? JSON.stringify([paneRenameDraft.project_id, paneRenameDraft.window_id, paneRenameDraft.tab_id])
+      : null,
+    paneRenameInputRef,
+    commitPaneRename,
+  )
 
   const submitDeleteProject = (): void => {
     if (!deleteDraft) return
@@ -640,6 +667,8 @@ export function Sidebar({
           const isSel = p.project_id === selectedId
           const hasWindows = (detail?.windows.length ?? 0) > 0
           const isOpen = expandedProjects[p.project_id] ?? isSel
+          const isProjectRenaming = !collapsed && renameDraft?.project_id === p.project_id
+          const ProjectLabel = isProjectRenaming ? 'div' : 'button'
           const sum = projectSummary(detail)
           const projStatus: SessionStatus =
             sum.running > 0 ? 'live' : sum.total > 0 ? 'exited' : 'unknown'
@@ -711,13 +740,13 @@ export function Sidebar({
                 >
                   {!collapsed && hasWindows ? (isOpen ? '▾' : '▸') : ''}
                 </button>
-                <button
-                  type="button"
+                <ProjectLabel
+                  type={isProjectRenaming ? undefined : 'button'}
                   className="tree-label"
                   aria-current={isSel ? 'true' : undefined}
                   onClick={() => selectProjectAndExpand(p.project_id)}
                   onDoubleClick={(e) => {
-                    if (collapsed) return
+                    if (collapsed || isProjectRenaming) return
                     e.preventDefault()
                     e.stopPropagation()
                     startRenameProject(p)
@@ -742,12 +771,13 @@ export function Sidebar({
                       <input
                         ref={projectRenameInputRef}
                         className="tree-rename-input"
+                        aria-label={`Rename project ${p.name}`}
                         value={renameDraft.name}
                         onClick={(e) => e.stopPropagation()}
                         onChange={(e) =>
                           setRenameDraft((d) => d && { ...d, name: e.target.value })
                         }
-                        onBlur={commitProjectRename}
+                        onBlur={projectRenameFocusLoss.schedule}
                         onKeyDown={(e) => {
                           e.stopPropagation()
                           if (e.key === 'Enter') {
@@ -755,6 +785,7 @@ export function Sidebar({
                             commitProjectRename()
                           } else if (e.key === 'Escape') {
                             e.preventDefault()
+                            projectRenameFocusLoss.cancel()
                             setRenameDraft(null)
                           }
                         }}
@@ -777,7 +808,7 @@ export function Sidebar({
                       </span>
                     </span>
                   )}
-                </button>
+                </ProjectLabel>
                 {!collapsed && (
                   <button
                     type="button"
@@ -849,6 +880,9 @@ export function Sidebar({
                   const isFocused = w.window_id === focusedWindowId
                   const winOpen = expandedWindows[winKey] ?? (isFocused || isSel)
                   const menuKey = windowMenuKey(p.project_id, w.window_id)
+                  const isWindowRenaming = windowRenameDraft?.project_id === p.project_id
+                    && windowRenameDraft.window_id === w.window_id
+                  const WindowLabel = isWindowRenaming ? 'div' : 'button'
                   const paneMenuOpenInWindow = w.tabs.some(
                     (tab) =>
                       openPaneMenuKey === paneMenuKey(p.project_id, tab.window_id, tab.tab_id),
@@ -954,8 +988,8 @@ export function Sidebar({
                         >
                           {hasPanes ? (winOpen ? '▾' : '▸') : ''}
                         </button>
-                        <button
-                          type="button"
+                        <WindowLabel
+                          type={isWindowRenaming ? undefined : 'button'}
                           className="tree-label"
                           onClick={() => {
                             if (isWindowStashed && firstStashedPane) {
@@ -967,6 +1001,7 @@ export function Sidebar({
                             }
                           }}
                           onDoubleClick={(e) => {
+                            if (isWindowRenaming) return
                             e.preventDefault()
                             e.stopPropagation()
                             startRenameWindow(p.project_id, w.window_id)
@@ -979,7 +1014,9 @@ export function Sidebar({
                                 : 'Click to focus window'
                           }
                           aria-label={
-                            isWindowStashed
+                            isWindowRenaming
+                              ? undefined
+                              : isWindowStashed
                               ? `Revive ${w.name || w.window_id}`
                               : hasVisibleExitedPanes
                                 ? `Reopen ${w.name || w.window_id}`
@@ -990,16 +1027,17 @@ export function Sidebar({
                             className={`dot dot--sm ${statusDotClass(windowStatus(w), isWindowStashed)}`}
                             aria-hidden
                           />
-                          {windowRenameDraft?.window_id === w.window_id ? (
+                          {isWindowRenaming ? (
                             <input
                               ref={windowRenameInputRef}
                               className="tree-rename-input"
+                              aria-label={`Rename window ${w.name || w.window_id}`}
                               value={windowRenameDraft.name}
                               onClick={(e) => e.stopPropagation()}
                               onChange={(e) =>
                                 setWindowRenameDraft((d) => d && { ...d, name: e.target.value })
                               }
-                              onBlur={commitWindowRename}
+                              onBlur={windowRenameFocusLoss.schedule}
                               onKeyDown={(e) => {
                                 e.stopPropagation()
                                 if (e.key === 'Enter') {
@@ -1007,6 +1045,7 @@ export function Sidebar({
                                   commitWindowRename()
                                 } else if (e.key === 'Escape') {
                                   e.preventDefault()
+                                  windowRenameFocusLoss.cancel()
                                   setWindowRenameDraft(null)
                                 }
                               }}
@@ -1019,7 +1058,7 @@ export function Sidebar({
                               ? 'Reopen'
                               : w.tabs.filter((t) => !t.stashed).length}
                           </span>
-                        </button>
+                        </WindowLabel>
                         <div
                           className={`tree-menu-wrap ${openWindowMenuKey === menuKey ? 'is-open' : ''}`}
                         >
@@ -1155,10 +1194,11 @@ export function Sidebar({
                                           (draft) => draft && { ...draft, name: e.target.value },
                                         )
                                       }
-                                      onBlur={commitPaneRename}
+                                      onBlur={paneRenameFocusLoss.schedule}
                                       onKeyDown={(e) => {
                                         if (e.key === 'Escape') {
                                           e.preventDefault()
+                                          paneRenameFocusLoss.cancel()
                                           setPaneRenameDraft(null)
                                         }
                                       }}
