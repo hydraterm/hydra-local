@@ -10,6 +10,8 @@
 //! Storage is local-only: a single versioned JSON file at `<base>/settings/settings.json`. There is
 //! no daemon connection, no process spawn, no renderer/window, and no shared record store. The
 //! settings dir is created `0700` and the file written `0600` (Unix) via temp-file + atomic rename.
+//! Writers hold the shared settings lock from the first read through the returned effective state;
+//! atomic readers remain lock-free. The owner-local lock file survives resets of the JSON file.
 //!
 //! Keep all field names snake_case and every value deterministic so the JSON is stable across runs.
 //! New fields must be backward-additive and covered by tests.
@@ -17,6 +19,10 @@
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
+
+mod writer;
+#[cfg(test)]
+mod writer_tests;
 
 /// The on-disk settings schema version. A file with a different `schema_version` is treated as
 /// foreign: `settings show` ignores it and reports defaults (with a `settings_warning`), and
@@ -950,6 +956,7 @@ pub struct SettingsSetSuccess {
 pub fn set_font_size_px(base: &Path, value: u32) -> Result<SettingsSetSuccess, SettingsFailure> {
     validate_font_size_px(value).map_err(|reason| SettingsFailure::new("bad_usage", reason))?;
 
+    let writer = writer::SettingsWriteGuard::acquire(base)?;
     let path = settings_file_path(base);
     // Guard against clobbering a foreign/unreadable file. An absent file or an honored
     // current-schema file is fine to (re)write. Preserve every existing sibling override (theme +
@@ -967,7 +974,8 @@ pub fn set_font_size_px(base: &Path, value: u32) -> Result<SettingsSetSuccess, S
 
     if changed {
         next.appearance.font_size_px = value;
-        write_settings_atomic(base, &next).map_err(|err| SettingsFailure::new("io_error", err))?;
+        write_settings_atomic(base, &next, &writer)
+            .map_err(|err| SettingsFailure::new("io_error", err))?;
     }
 
     let settings = effective_settings(base);
@@ -994,6 +1002,7 @@ pub fn set_theme(base: &Path, theme: &str) -> Result<SettingsSetSuccess, Setting
     let theme =
         validate_theme(theme).map_err(|reason| SettingsFailure::new("bad_usage", reason))?;
 
+    let writer = writer::SettingsWriteGuard::acquire(base)?;
     let path = settings_file_path(base);
     let (changed, mut next) = match load_persisted(&path) {
         LoadedSettings::Absent => (true, default_persisted()),
@@ -1008,7 +1017,8 @@ pub fn set_theme(base: &Path, theme: &str) -> Result<SettingsSetSuccess, Setting
 
     if changed {
         next.appearance.theme = theme.clone();
-        write_settings_atomic(base, &next).map_err(|err| SettingsFailure::new("io_error", err))?;
+        write_settings_atomic(base, &next, &writer)
+            .map_err(|err| SettingsFailure::new("io_error", err))?;
     }
 
     let settings = effective_settings(base);
@@ -1086,6 +1096,7 @@ pub fn set_chrome_default(
     key: ChromeDefaultKey,
     value: bool,
 ) -> Result<SettingsSetSuccess, SettingsFailure> {
+    let writer = writer::SettingsWriteGuard::acquire(base)?;
     let path = settings_file_path(base);
     let (changed, mut next) = match load_persisted(&path) {
         LoadedSettings::Absent => (true, default_persisted()),
@@ -1102,7 +1113,8 @@ pub fn set_chrome_default(
 
     if changed {
         key.apply(&mut next.chrome, value);
-        write_settings_atomic(base, &next).map_err(|err| SettingsFailure::new("io_error", err))?;
+        write_settings_atomic(base, &next, &writer)
+            .map_err(|err| SettingsFailure::new("io_error", err))?;
     }
 
     let settings = effective_settings(base);
@@ -1171,6 +1183,7 @@ pub fn set_workspace_consent(
     key: WorkspaceConsentKey,
     value: bool,
 ) -> Result<SettingsSetSuccess, SettingsFailure> {
+    let writer = writer::SettingsWriteGuard::acquire(base)?;
     let path = settings_file_path(base);
     let (changed, mut next) = match load_persisted(&path) {
         LoadedSettings::Absent => (true, default_persisted()),
@@ -1187,7 +1200,8 @@ pub fn set_workspace_consent(
 
     if changed {
         key.apply(&mut next.workspace, value);
-        write_settings_atomic(base, &next).map_err(|err| SettingsFailure::new("io_error", err))?;
+        write_settings_atomic(base, &next, &writer)
+            .map_err(|err| SettingsFailure::new("io_error", err))?;
     }
 
     let settings = effective_settings(base);
@@ -1217,6 +1231,7 @@ pub fn set_workspace_default_policy(
     let policy = validate_workspace_policy(policy).map_err(|reason| {
         SettingsFailure::new("bad_usage", format!("invalid workspace policy: {reason}"))
     })?;
+    let writer = writer::SettingsWriteGuard::acquire(base)?;
     let path = settings_file_path(base);
     let (changed, mut next) = match load_persisted(&path) {
         LoadedSettings::Absent => (true, default_persisted()),
@@ -1234,7 +1249,8 @@ pub fn set_workspace_default_policy(
 
     if changed {
         next.workspace.default_policy = Some(policy.clone());
-        write_settings_atomic(base, &next).map_err(|err| SettingsFailure::new("io_error", err))?;
+        write_settings_atomic(base, &next, &writer)
+            .map_err(|err| SettingsFailure::new("io_error", err))?;
     }
 
     let settings = effective_settings(base);
@@ -1265,6 +1281,7 @@ pub fn set_shell_default_argv(
     let argv = validate_shell_default_argv(&serde_json::json!(argv).to_string())
         .map_err(|reason| SettingsFailure::new("bad_usage", reason))?;
 
+    let writer = writer::SettingsWriteGuard::acquire(base)?;
     let path = settings_file_path(base);
     let (changed, mut next) = match load_persisted(&path) {
         LoadedSettings::Absent => (true, default_persisted()),
@@ -1282,7 +1299,8 @@ pub fn set_shell_default_argv(
 
     if changed {
         next.shell.default_argv = Some(argv.clone());
-        write_settings_atomic(base, &next).map_err(|err| SettingsFailure::new("io_error", err))?;
+        write_settings_atomic(base, &next, &writer)
+            .map_err(|err| SettingsFailure::new("io_error", err))?;
     }
 
     let settings = effective_settings(base);
@@ -1321,7 +1339,7 @@ pub enum SettingsResetTarget {
 /// (`action:"reset"`).
 ///
 /// Behavior:
-/// - No settings file: succeeds with `changed:false` and reports pure defaults (no file is created).
+/// - No settings file: succeeds with `changed:false` and reports pure defaults (no JSON is created).
 /// - Honored file: clear the target field (appearance back to its default, chrome override back to
 ///   `None`) while preserving every sibling. If the result is entirely at defaults (both appearance
 ///   fields default AND no chrome override recorded), delete `settings.json` (best-effort; a delete
@@ -1332,6 +1350,7 @@ pub fn reset_appearance_setting(
     base: &Path,
     target: SettingsResetTarget,
 ) -> Result<SettingsSetSuccess, SettingsFailure> {
+    let writer = writer::SettingsWriteGuard::acquire(base)?;
     let path = settings_file_path(base);
 
     let changed = match load_persisted(&path) {
@@ -1396,9 +1415,10 @@ pub fn reset_appearance_setting(
             };
 
             if persisted_is_all_default(&next) {
-                remove_settings_file(&path).map_err(|err| SettingsFailure::new("io_error", err))?;
+                remove_settings_file(&path, &writer)
+                    .map_err(|err| SettingsFailure::new("io_error", err))?;
             } else if changed {
-                write_settings_atomic(base, &next)
+                write_settings_atomic(base, &next, &writer)
                     .map_err(|err| SettingsFailure::new("io_error", err))?;
             }
             changed
@@ -1468,7 +1488,7 @@ pub fn reset_appearance_setting(
 /// (`action:"reset"`), but identifies the target as every setting via `key:"*"` and `value: null`.
 ///
 /// Behavior:
-/// - No settings file: succeeds with `changed:false` (nothing to remove; no file is created).
+/// - No settings file: succeeds with `changed:false` (nothing to remove; no JSON is created).
 /// - Honored current-schema file: delete it and report `changed:true`. The containing settings
 ///   directory and any unrelated sibling files are left untouched.
 /// - Foreign/unreadable file: refuses with `settings_conflict` and never removes it — the same
@@ -1478,12 +1498,14 @@ pub fn reset_appearance_setting(
 /// The reported `settings` always reflect the post-reset state: built-in defaults for appearance,
 /// chrome, and shell.
 pub fn reset_all_settings(base: &Path) -> Result<SettingsSetSuccess, SettingsFailure> {
+    let writer = writer::SettingsWriteGuard::acquire(base)?;
     let path = settings_file_path(base);
 
     let changed = match load_persisted(&path) {
         LoadedSettings::Absent => false,
         LoadedSettings::Honored(_) => {
-            remove_settings_file(&path).map_err(|err| SettingsFailure::new("io_error", err))?;
+            remove_settings_file(&path, &writer)
+                .map_err(|err| SettingsFailure::new("io_error", err))?;
             true
         }
         LoadedSettings::Warn(message) => {
@@ -1510,7 +1532,7 @@ pub fn reset_all_settings(base: &Path) -> Result<SettingsSetSuccess, SettingsFai
 
 /// Remove the settings file. A missing file is not an error (a no-op reset leaves nothing to delete);
 /// any other error is surfaced. The containing settings directory is intentionally left in place.
-fn remove_settings_file(path: &Path) -> Result<(), String> {
+fn remove_settings_file(path: &Path, _writer: &writer::SettingsWriteGuard) -> Result<(), String> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1521,7 +1543,11 @@ fn remove_settings_file(path: &Path) -> Result<(), String> {
 /// Atomically write the settings file: ensure `<base>/settings` exists (`0700` on Unix), write a
 /// uniquely-named temp file in that dir, set it `0600` (Unix), then rename it over the destination.
 /// Rename within the same directory is atomic on POSIX, so readers never observe a partial file.
-fn write_settings_atomic(base: &Path, settings: &PersistedSettings) -> Result<(), String> {
+fn write_settings_atomic(
+    base: &Path,
+    settings: &PersistedSettings,
+    _writer: &writer::SettingsWriteGuard,
+) -> Result<(), String> {
     let dir = settings_dir(base);
     create_dir_private(&dir).map_err(|err| format!("create settings dir: {err}"))?;
 
