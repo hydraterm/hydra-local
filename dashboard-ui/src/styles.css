@@ -1725,8 +1725,8 @@ body.is-resizing-sidebar .sidebar-resizer::before {
 .window-tab-group:hover,
 .window-tab-group:focus-within {
   flex-grow: 2.5;
-  min-width: 140px;
-  max-width: 280px;
+  min-width: min(140px, 100%);
+  max-width: min(280px, 100%);
 }
 .window-tab {
   display: inline-flex;
@@ -1837,6 +1837,48 @@ body.is-resizing-sidebar .sidebar-resizer::before {
   text-overflow: ellipsis;
   max-width: none;
 }
+.window-tab-group.is-renaming {
+  min-width: min(180px, 100%);
+  max-width: min(320px, 100%);
+  transition: none;
+  scroll-snap-align: start;
+}
+.window-tab__rename {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  flex: 1 1 0;
+  min-width: 0;
+  height: 30px;
+  padding: 0 4px;
+}
+.window-tab__rename input {
+  width: 100%;
+  min-width: 0;
+  height: 24px;
+  box-sizing: border-box;
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  background: #101116;
+  color: #fff;
+  font: inherit;
+  outline-offset: -2px;
+}
+.window-tab__rename:has(.window-tab__rename-status) input {
+  height: 18px;
+}
+.window-tab__rename-status {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  line-height: 12px;
+  color: #b5becd;
+}
+.window-tab__rename.has-error .window-tab__rename-status {
+  color: #ff9ea9;
+}
 .window-tabs__left {
   display: flex;
   flex: 1 1 0;
@@ -1850,6 +1892,9 @@ body.is-resizing-sidebar .sidebar-resizer::before {
 }
 .window-tabs__left::-webkit-scrollbar {
   display: none;
+}
+.window-tabs__left:has(.is-renaming) {
+  scroll-snap-type: x mandatory;
 }
 .window-tab__agents {
   display: inline-flex;

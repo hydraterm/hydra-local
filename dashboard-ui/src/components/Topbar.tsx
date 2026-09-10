@@ -1,4 +1,4 @@
-import { useEffect, useState, type FocusEvent, type KeyboardEvent } from 'react'
+import { useEffect, useRef, useState, type FocusEvent, type KeyboardEvent } from 'react'
 import type {
   AgentKind,
   DashboardModel,
@@ -8,6 +8,7 @@ import type {
 } from '../types/model'
 import { bridge } from '../ipc/bridge'
 import { AgentBadge } from './AgentBadge'
+import { InlineWindowRename } from './InlineWindowRename'
 
 type Props = {
   project: ProjectCardView
@@ -113,6 +114,14 @@ export function Topbar({
     ? focusWindowControl(focusedWindow.project.project_id, focusedWindow.window.window_id)
     : NEW_WINDOW_CONTROL
   const [requestedTabStop, setRequestedTabStop] = useState(defaultTabStop)
+  const [renaming, setRenaming] = useState<string | null>(null)
+  const restoreFocusRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (
+      renaming && !windows.some(({ project: owner, window }) =>
+        focusWindowControl(owner.project_id, window.window_id) === renaming)
+    ) setRenaming(null)
+  }, [renaming, windows])
   useEffect(() => setRequestedTabStop(defaultTabStop), [defaultTabStop])
   const availableControls = windows.flatMap(({ project: owner, window }) => [
     focusWindowControl(owner.project_id, window.window_id),
@@ -178,6 +187,8 @@ export function Topbar({
     >
       <div className="window-tabs__left">
         {windows.map(({ project: owner, window: w }) => {
+          const controlId = focusWindowControl(owner.project_id, w.window_id)
+          const isRenaming = renaming === controlId
           const isActive =
             owner.project_id === project.project_id && w.window_id === focusedWindowId
           const agents = windowAgents(w.tabs)
@@ -185,27 +196,61 @@ export function Topbar({
           return (
             <span
               key={`${owner.project_id}:${w.window_id}`}
-              className={`window-tab-group ${isActive ? 'is-active' : ''}`}
+              className={`window-tab-group ${isActive ? 'is-active' : ''} ${isRenaming ? 'is-renaming' : ''}`}
             >
-              <button
-                type="button"
-                aria-pressed={isActive}
-                aria-label={`Focus ${w.name || w.window_id} in ${owner.name}`}
-                data-toolbar-control={focusWindowControl(owner.project_id, w.window_id)}
-                tabIndex={tabIndexFor(focusWindowControl(owner.project_id, w.window_id))}
-                className={`window-tab ${isActive ? 'is-active' : ''}`}
-                title={`${owner.name} · ${w.name || w.window_id} — ${w.tabs.filter((t) => !t.stashed).length} pane(s)`}
-                onClick={() => onFocusWindow(owner.project_id, w.window_id)}
-              >
-                {agents.length > 0 && (
-                  <span className="window-tab__agents">
-                    {agents.map((a) => (
-                      <AgentBadge key={a} agent={a} size={12} />
-                    ))}
+              {isRenaming ? (
+                <InlineWindowRename
+                  projectId={owner.project_id}
+                  windowId={w.window_id}
+                  name={w.name || w.window_id}
+                  onFinish={(restoreFocus) => {
+                    if (restoreFocus) restoreFocusRef.current = controlId
+                    setRenaming(null)
+                  }}
+                />
+              ) : (
+                <button
+                  ref={(node) => {
+                    if (node && restoreFocusRef.current === controlId) {
+                      restoreFocusRef.current = null
+                      node.focus()
+                    }
+                  }}
+                  type="button"
+                  aria-keyshortcuts="F2"
+                  aria-pressed={isActive}
+                  aria-label={`Focus ${w.name || w.window_id} in ${owner.name}`}
+                  data-toolbar-control={focusWindowControl(owner.project_id, w.window_id)}
+                  tabIndex={tabIndexFor(focusWindowControl(owner.project_id, w.window_id))}
+                  className={`window-tab ${isActive ? 'is-active' : ''}`}
+                  title={`${owner.name} · ${w.name || w.window_id} — ${w.tabs.filter((t) => !t.stashed).length} pane(s)`}
+                  onClick={() => onFocusWindow(owner.project_id, w.window_id)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'F2') {
+                      event.preventDefault()
+                      event.stopPropagation()
+                      setRenaming(controlId)
+                    }
+                  }}
+                >
+                  {agents.length > 0 && (
+                    <span className="window-tab__agents">
+                      {agents.map((a) => (
+                        <AgentBadge key={a} agent={a} size={12} />
+                      ))}
+                    </span>
+                  )}
+                  <span
+                    className="window-tab__name"
+                    onDoubleClick={(event) => {
+                      event.stopPropagation()
+                      setRenaming(controlId)
+                    }}
+                  >
+                    {w.name || w.window_id}
                   </span>
-                )}
-                <span className="window-tab__name">{w.name || w.window_id}</span>
-              </button>
+                </button>
+              )}
               <button
                 type="button"
                 className="window-tab__close"

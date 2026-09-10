@@ -111,6 +111,7 @@ export type Intent =
   | { type: 'focusWindow'; project_id: string; window_id: string }
   | {
       type: 'updateWindow'
+      request_id?: string
       project_id: string
       window_id: string
       name?: string
@@ -232,12 +233,17 @@ declare global {
       requestId: string, ok: boolean, message: string | null,
     ) => void
     __HYDRA_DASHBOARD_APPLY_SIDEBAR_STATE__?: (state: NativeSidebarState) => void
+    __HYDRA_DASHBOARD_RESOLVE_WINDOW_RENAME__?: (
+      requestId: string,
+      result: WindowRenameResult,
+    ) => void
     __HYDRA_PENDING_SIDEBAR_STATE__?: NativeSidebarState
   }
 }
 
 export type LaunchPreflightResult = { ok: boolean; message: string | null; code: string | null }
 type LaunchMutationResult = { ok: boolean; message: string | null }
+export type WindowRenameResult = { ok: boolean; name: string | null; message: string | null }
 export type NativeSidebarState = {
   width_logical_px: number
   last_expanded_width_logical_px: number
@@ -263,6 +269,11 @@ let nextHiddenSessionRequestId = 1
 let nextLaunchPreflightRequestId = 1
 let nextLaunchMutationRequestId = 1
 const launchMutationRequests = new Map<string, (result: LaunchMutationResult) => void>()
+let nextWindowRenameRequestId = 1
+const windowRenameRequests = new Map<
+  string,
+  { resolve: (result: WindowRenameResult) => void; timeoutId: number }
+>()
 // A WebView reload creates a fresh JS page while a delayed native callback from the old page may
 // still arrive. A page-unique epoch prevents its request id from colliding with the new page's
 // counters and resolving the wrong promise.
@@ -979,6 +990,48 @@ export const bridge = {
     root?: string
   }): void {
     postIntent({ type: 'updateWindow', ...input })
+  },
+
+  renameWindow(input: {
+    project_id: string
+    window_id: string
+    name: string
+  }): Promise<WindowRenameResult> {
+    if (
+      !host()?.postIntent && !window.ipc?.postMessage &&
+      !window.webkit?.messageHandlers?.ipc?.postMessage
+    ) {
+      return Promise.resolve({
+        ok: false, name: null, message: 'Hydra desktop connection is unavailable.',
+      })
+    }
+    window.__HYDRA_DASHBOARD_RESOLVE_WINDOW_RENAME__ = (requestId, result) => {
+      const pending = windowRenameRequests.get(requestId)
+      if (!pending) return
+      windowRenameRequests.delete(requestId)
+      window.clearTimeout(pending.timeoutId)
+      pending.resolve(result)
+    }
+    const request_id = nextNativeRequestId('window-rename', nextWindowRenameRequestId++)
+    return new Promise((resolve) => {
+      const timeoutId = window.setTimeout(() => {
+        windowRenameRequests.delete(request_id)
+        resolve({
+          ok: false, name: null,
+          message: 'Save is not confirmed. Your draft is kept; check the window name before retrying.',
+        })
+      }, 8_000)
+      windowRenameRequests.set(request_id, { resolve, timeoutId })
+      try {
+        postIntent({ type: 'updateWindow', request_id, ...input })
+      } catch {
+        windowRenameRequests.delete(request_id)
+        window.clearTimeout(timeoutId)
+        resolve({
+          ok: false, name: null, message: 'Window rename could not reach Hydra. Your draft is kept.',
+        })
+      }
+    })
   },
 
   stashWindow(project_id: string, window_id: string): void {

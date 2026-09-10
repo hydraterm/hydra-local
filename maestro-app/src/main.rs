@@ -87,6 +87,8 @@ mod history_discovery;
 mod launch_mutation;
 mod launch_preflight;
 mod viewport_navigation;
+#[cfg(test)]
+mod window_rename_tests;
 
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixStream;
@@ -644,7 +646,7 @@ fn react_chrome_allowed_fields(intent_type: &str) -> Option<&'static [&'static s
         "focusWindow" | "stashWindow" | "removeWindow" => &["project_id", "window_id"],
         "saveLayoutPreset" => &["project_id", "window_id", "preset_id", "name"],
         "openLayoutPreset" => &["project_id", "preset_id", "window_id"],
-        "updateWindow" => &["project_id", "window_id", "name", "root"],
+        "updateWindow" => &["request_id", "project_id", "window_id", "name", "root"],
         "updatePane" => &["project_id", "window_id", "tab_id", "name"],
         "stashPane" | "removePane" => &["project_id", "window_id", "tab_id"],
         "beginStashedPaneDrag" | "focusSessionOrPane" => {
@@ -898,6 +900,8 @@ enum ReactChromeIntent {
     },
     #[serde(rename = "updateWindow")]
     UpdateWindow {
+        #[serde(default)]
+        request_id: Option<String>,
         project_id: String,
         window_id: String,
         name: Option<String>,
@@ -5943,6 +5947,47 @@ fn react_launch_preflight_response_fields(
     match result {
         Ok(()) => (true, None, None),
         Err(error) => (false, Some(error.code()), Some(error.user_message())),
+    }
+}
+
+fn respond_react_window_rename(
+    tab_runtime: &mut RendererTabRuntime,
+    request_id: &str,
+    result: Result<Option<String>, String>,
+) {
+    let result = match result {
+        Ok(name) => serde_json::json!({ "ok": true, "name": name, "message": null }),
+        Err(message) => serde_json::json!({ "ok": false, "name": null, "message": message }),
+    };
+    let request = serde_json::to_string(request_id).expect("request id serializes");
+    let script =
+        format!("window.__HYDRA_DASHBOARD_RESOLVE_WINDOW_RENAME__?.({request}, {result});");
+    if let Err(error) = tab_runtime.evaluate_react_chrome_script(script) {
+        eprintln!("attach-tab: React window rename response could not reach chrome: {error}");
+    }
+}
+
+fn apply_react_window_rename(
+    paths: &AppPaths,
+    project_id: &str,
+    window_id: &str,
+    name: &str,
+) -> Result<maestro_shell::WindowLayout, maestro_shell::WindowLayoutError> {
+    let name = unique_window_name(paths, project_id, window_id, name);
+    WindowLayoutService::new(paths).rename_window(window_id, &name, now_ms())
+}
+
+fn decline_react_window_rename_json(
+    tab_runtime: &mut RendererTabRuntime,
+    json: &str,
+    reason: &str,
+) {
+    if let Ok(ReactChromeIntent::UpdateWindow {
+        request_id: Some(id),
+        ..
+    }) = parse_react_chrome_intent(json)
+    {
+        respond_react_window_rename(tab_runtime, &id, Err(reason.into()));
     }
 }
 
@@ -14641,6 +14686,11 @@ fn spawn_window_event_listener(
                             &json,
                             "The viewport is still changing. No new window or pane was started.",
                         );
+                        decline_react_window_rename_json(
+                            &mut tab_runtime,
+                            &json,
+                            "The viewport is still changing. The window was not renamed.",
+                        );
                         pending_navigation.retain_pending_json(
                             &json,
                             listener_window_context.is_bound(),
@@ -15244,6 +15294,11 @@ fn spawn_window_event_listener(
                             &mut tab_runtime,
                             &json,
                             "No active viewport is available. No new window or pane was started.",
+                        );
+                        decline_react_window_rename_json(
+                            &mut tab_runtime,
+                            &json,
+                            "No active viewport is available. The window was not renamed.",
                         );
                     }
                     Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -16213,6 +16268,18 @@ fn spawn_window_event_listener(
                     if !listener_window_context.is_bound()
                         && react_chrome_intent_requires_window_context(&intent)
                     {
+                        if let ReactChromeIntent::UpdateWindow {
+                            request_id: Some(id),
+                            ..
+                        } = &intent
+                        {
+                            respond_react_window_rename(
+                                &mut tab_runtime,
+                                id,
+                                Err("Window rename is unavailable without an attached window."
+                                    .into()),
+                            );
+                        }
                         let intent_name = serde_json::from_str::<serde_json::Value>(&json)
                             .ok()
                             .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned))
@@ -16225,6 +16292,17 @@ fn spawn_window_event_listener(
                         continue;
                     }
                     if product_recovery_blocks_react_intent(&intent, &listener_window_id) {
+                        if let ReactChromeIntent::UpdateWindow {
+                            request_id: Some(id),
+                            ..
+                        } = &intent
+                        {
+                            respond_react_window_rename(
+                                &mut tab_runtime,
+                                id,
+                                Err("The recovery window cannot be renamed.".into()),
+                            );
+                        }
                         launch_mutation::reject(
                             &mut tab_runtime,
                             launch_mutation::request_id(&intent),
@@ -17338,41 +17416,42 @@ fn spawn_window_event_listener(
                             }
                         }
                         ReactChromeIntent::UpdateWindow {
+                            request_id,
                             project_id,
                             window_id,
                             name,
                             root,
                         } => {
+                            let mut rename_result = Ok(None);
                             if let Some(name) =
                                 name.as_deref().map(str::trim).filter(|s| !s.is_empty())
                             {
-                                // Unique window name within the project (self excluded → rename-to-self is a no-op).
-                                let name = unique_window_name(
+                                match apply_react_window_rename(
                                     &listener_paths,
                                     &project_id,
                                     &window_id,
                                     name,
-                                );
-                                match WindowLayoutService::new(&listener_paths).rename_window(
-                                    &window_id,
-                                    &name,
-                                    now_ms(),
                                 ) {
                                     Ok(updated) => {
+                                        rename_result = Ok(updated.name.clone());
                                         if window_id == listener_window_id {
                                             let new_strip_tabs =
                                                 maestro_app::live_tab_records_json(&updated.tabs);
                                             listener_selection =
-                                                maestro_app::selection_from_strip_tabs(&new_strip_tabs);
+                                                maestro_app::selection_from_strip_tabs(
+                                                    &new_strip_tabs,
+                                                );
                                             listener_strip_tabs = new_strip_tabs;
                                         }
                                         eprintln!(
                                             "attach-tab: React updateWindow renamed project={project_id:?} window={window_id:?} name={name:?}"
                                         );
                                     }
-                                    Err(e) => eprintln!(
-                                        "attach-tab: React updateWindow rename failed project={project_id:?} window={window_id:?}: {e}"
-                                    ),
+                                    Err(e) => {
+                                        let message = format!("Could not rename window: {e}");
+                                        eprintln!("attach-tab: React updateWindow: {message}");
+                                        rename_result = Err(message);
+                                    }
                                 }
                             }
                             if let Some(root) = root.as_deref() {
@@ -17385,6 +17464,13 @@ fn spawn_window_event_listener(
                                 &mut tab_runtime,
                                 "updateWindow",
                             );
+                            if let Some(request_id) = request_id {
+                                respond_react_window_rename(
+                                    &mut tab_runtime,
+                                    &request_id,
+                                    rename_result,
+                                );
+                            }
                         }
                         ReactChromeIntent::StashWindow {
                             project_id,
