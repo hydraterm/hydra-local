@@ -281,6 +281,7 @@ pub struct CommandPaletteArgs {
 /// of the three configurable `chrome.*_default` overrides (a parsed `true`/`false` bool).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SettingsSetTarget {
+    CopyOnSelect(bool),
     FontSizePx(u32),
     Theme(String),
     TopTabBarDefault(bool),
@@ -898,6 +899,7 @@ pub fn usage() -> &'static str {
      \x20\x20maestro-app settings set chrome.dashboard_status_default <true|false> [--base <dir>]\n\
      \x20\x20maestro-app settings set chrome.dashboard_panel_default <true|false> [--base <dir>]\n\
      \x20\x20maestro-app settings set chrome.picker_overlay_default <true|false> [--base <dir>]\n\
+     \x20\x20maestro-app settings set chrome.copy_on_select <true|false> [--base <dir>]\n\
      \x20\x20maestro-app settings set shell.default_argv '<json-array>' [--base <dir>]\n\
      \x20\x20maestro-app settings set workspace.default_policy <scratch_cwd|worktree|repo_write> [--base <dir>]\n\
      \x20\x20maestro-app settings set workspace.worktree_requires_consent <true|false> [--base <dir>]\n\
@@ -1203,19 +1205,20 @@ fn parse_settings<'a>(
 /// messages. The four `chrome.*_default` keys cover the configurable chrome defaults;
 /// `chrome.picker_overlay_default` is foreground-only (it only takes effect for the in-process
 /// foreground renderer; `--no-run-renderer`/detached always resolve the overlay false).
-const SETTINGS_SETTABLE_KEYS: [&str; 10] = [
+const SETTINGS_SETTABLE_KEYS: [&str; 11] = [
     "appearance.font_size_px",
     "appearance.theme",
     "chrome.top_tab_bar_default",
     "chrome.dashboard_status_default",
     "chrome.dashboard_panel_default",
     "chrome.picker_overlay_default",
+    "chrome.copy_on_select",
     "shell.default_argv",
     "workspace.default_policy",
     "workspace.worktree_requires_consent",
     "workspace.repo_write_requires_consent",
 ];
-const SETTINGS_KEYS_HINT: &str = "settable: 'appearance.font_size_px', 'appearance.theme', 'chrome.top_tab_bar_default', 'chrome.dashboard_status_default', 'chrome.dashboard_panel_default', 'chrome.picker_overlay_default', 'shell.default_argv', 'workspace.default_policy', 'workspace.worktree_requires_consent', 'workspace.repo_write_requires_consent'";
+const SETTINGS_KEYS_HINT: &str = "settable: 'appearance.font_size_px', 'appearance.theme', 'chrome.top_tab_bar_default', 'chrome.dashboard_status_default', 'chrome.dashboard_panel_default', 'chrome.picker_overlay_default', 'chrome.copy_on_select', 'shell.default_argv', 'workspace.default_policy', 'workspace.worktree_requires_consent', 'workspace.repo_write_requires_consent'";
 
 /// Parse a `chrome.*_default` value: exactly `true` or `false`. Any other token is `bad_usage`.
 fn parse_settings_bool(key: &str, raw: &str) -> Result<bool, ParseError> {
@@ -1237,6 +1240,7 @@ fn parse_settings_bool(key: &str, raw: &str) -> Result<bool, ParseError> {
 /// an unexpected positional value after the key are all parse errors.
 fn reset_target_for_key(key: &str) -> Option<crate::SettingsResetTarget> {
     Some(match key {
+        "chrome.copy_on_select" => crate::SettingsResetTarget::CopyOnSelect,
         "appearance.font_size_px" => crate::SettingsResetTarget::FontSizePx,
         "appearance.theme" => crate::SettingsResetTarget::Theme,
         "chrome.top_tab_bar_default" => crate::SettingsResetTarget::TopTabBarDefault,
@@ -1380,6 +1384,9 @@ fn parse_settings_set<'a>(
         "appearance.theme" => {
             let theme = crate::validate_theme(raw_value).map_err(ParseError::new)?;
             SettingsSetTarget::Theme(theme)
+        }
+        "chrome.copy_on_select" => {
+            SettingsSetTarget::CopyOnSelect(parse_settings_bool(key, raw_value)?)
         }
         "chrome.top_tab_bar_default" => {
             SettingsSetTarget::TopTabBarDefault(parse_settings_bool(key, raw_value)?)
@@ -4956,6 +4963,29 @@ mod tests {
         let args = settings_set(off);
         assert_eq!(args.target, SettingsSetTarget::TopTabBarDefault(false));
         assert_eq!(args.base, None);
+    }
+
+    #[test]
+    fn copy_on_select_cli_set_and_reset_are_strict_boolean_settings() {
+        for (value, enabled) in [("true", true), ("false", false)] {
+            let args = settings_set(
+                parse_args(&argv(&["settings", "set", "chrome.copy_on_select", value])).unwrap(),
+            );
+            assert_eq!(args.target, SettingsSetTarget::CopyOnSelect(enabled));
+        }
+        let reset = settings_reset(
+            parse_args(&argv(&["settings", "reset", "chrome.copy_on_select"])).unwrap(),
+        );
+        assert_eq!(
+            reset.selection,
+            SettingsResetSelection::Key(crate::SettingsResetTarget::CopyOnSelect)
+        );
+        assert!(
+            parse_args(&argv(&["settings", "set", "chrome.copy_on_select", "yes",]))
+                .unwrap_err()
+                .to_string()
+                .contains("must be 'true' or 'false'")
+        );
     }
 
     #[test]

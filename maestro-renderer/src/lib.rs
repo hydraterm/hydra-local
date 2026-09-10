@@ -2874,7 +2874,8 @@ impl SettingsEditDraftValidation {
 /// The renderer-local editable settings keys that accept a boolean (`true`/`false`) default. These
 /// mirror the `maestro-app` `chrome.*_default` setting keys; the renderer cannot depend on
 /// `maestro-app`, so the names are kept in sync here and only used to validate (never to write).
-const SETTINGS_CHROME_BOOL_KEYS: [&str; 4] = [
+const SETTINGS_CHROME_BOOL_KEYS: [&str; 5] = [
+    "chrome.copy_on_select",
     "chrome.top_tab_bar_default",
     "chrome.dashboard_status_default",
     "chrome.dashboard_panel_default",
@@ -9371,6 +9372,10 @@ pub enum UserEvent {
     SetFilePathInput {
         file_path_input: Option<RendererFilePathInput>,
     },
+    /// Copy a completed Hydra-owned selection; default off. Clipboard write only.
+    SetCopyOnSelect {
+        enabled: bool,
+    },
     /// Re-apply the renderer font size to the already-running window. Stores it on `App.font_size_px`
     /// (so a not-yet-created renderer launches with it) and, when a renderer exists, re-measures the
     /// cell in place and reflows the PTY through the existing window-resize path. Changes cell metrics
@@ -9553,6 +9558,8 @@ pub enum RendererCommand {
     SetFilePathInput {
         file_path_input: Option<RendererFilePathInput>,
     },
+    /// Set the opt-in local selection-copy behavior, without changing PTYs or selection text.
+    SetCopyOnSelect { enabled: bool },
     /// Re-apply the renderer `font_size_px` to the already-running window. Translated to
     /// [`UserEvent::SetFontSize`]. Unlike [`SetTheme`](RendererCommand::SetTheme) this DOES change cell
     /// metrics and therefore grid geometry: the renderer re-measures the cell and the app reflows the
@@ -9651,6 +9658,7 @@ pub fn user_event_for_command(command: RendererCommand) -> UserEvent {
         RendererCommand::SetFilePathInput { file_path_input } => {
             UserEvent::SetFilePathInput { file_path_input }
         }
+        RendererCommand::SetCopyOnSelect { enabled } => UserEvent::SetCopyOnSelect { enabled },
         RendererCommand::SetFontSize { px } => UserEvent::SetFontSize { px },
         RendererCommand::SetReactChromeWidth { width_logical_px } => {
             UserEvent::SetReactChromeWidth { width_logical_px }
@@ -11963,6 +11971,8 @@ struct App {
     sel_anchor: Option<CellPos>,
     sel_focus: Option<CellPos>,
     selecting: bool,
+    copy_on_select: bool,
+    copy_drag_started: bool,
     // Last cursor position (physical pixels) for hit-testing on press/move. macOS file drops do
     // not trust this cache: child WebViews can own drag motion, so they query the global pointer
     // at delivery time.
@@ -12158,6 +12168,8 @@ impl App {
             sel_anchor: None,
             sel_focus: None,
             selecting: false,
+            copy_on_select: false,
+            copy_drag_started: false,
             cursor_px: (0.0, 0.0),
             hovered_terminal_link: None,
             terminal_link_click_in_progress: false,
@@ -16869,6 +16881,9 @@ impl App {
                     h.request_redraw();
                 }
             }
+            UserEvent::SetCopyOnSelect { enabled } => {
+                self.copy_on_select = enabled;
+            }
             UserEvent::SetFontSize { px } => {
                 // The app is the sole authority over the live font size. Record it on `App.font_size_px`
                 // so a renderer not yet created (window pending) launches with it. When a renderer
@@ -17283,6 +17298,14 @@ impl App {
                     MouseButton::Middle => Some(MouseBtn::Middle),
                     MouseButton::Right => Some(MouseBtn::Right),
                     _ => None,
+                };
+                // Consume the gesture before ANY chrome/TUI early return. A reporting-owned
+                // release can never leave a stale local drag eligible for a later clipboard write.
+                let completed_copy_drag = if button == MouseButton::Left {
+                    let started = std::mem::take(&mut self.copy_drag_started);
+                    state == ElementState::Released && started
+                } else {
+                    false
                 };
                 // Picker overlay is a foreground MODAL: while shown it owns the whole window and
                 // consumes EVERY mouse event so nothing falls through to the tab strip, dashboard
@@ -18126,6 +18149,8 @@ impl App {
                             if self.sel_anchor == self.sel_focus {
                                 self.clear_selection();
                                 self.request_redraw();
+                            } else if self.copy_on_select && completed_copy_drag {
+                                self.copy_selection();
                             }
                         }
                     }
@@ -19772,6 +19797,7 @@ impl App {
         self.sel_anchor = None;
         self.sel_focus = None;
         self.selecting = false;
+        self.copy_drag_started = false;
         self.sel_generation = None;
         self.sel_session_id = None;
     }
@@ -19786,6 +19812,7 @@ impl App {
         self.sel_anchor = pos;
         self.sel_focus = pos;
         self.selecting = true;
+        self.copy_drag_started = pos.is_some();
         self.hovered_terminal_link = None;
         self.sel_session_id = pos.map(|_| self.focused_session_id());
         self.sel_generation = self.sel_session_id.as_deref().and_then(|id| {
@@ -33832,6 +33859,9 @@ mod command_channel_tests {
                     None => forwarded.push("file-path-input:clear".to_string()),
                 },
                 UserEvent::SetFontSize { px } => forwarded.push(format!("font-size:{px}")),
+                UserEvent::SetCopyOnSelect { enabled } => {
+                    forwarded.push(format!("copy-on-select:{enabled}"))
+                }
                 UserEvent::SetReactChromeModel { model_json } => {
                     forwarded.push(format!("react-model:{model_json}"))
                 }
@@ -37651,6 +37681,8 @@ mod shortcut_hint_overlay_tests {
 // ============================================================================
 #[cfg(test)]
 mod terminal_selection_ownership_tests {
+    mod copy_on_select;
+
     #[cfg(target_os = "macos")]
     use std::cell::RefCell;
     #[cfg(target_os = "macos")]

@@ -1656,6 +1656,14 @@ impl RendererTabRuntime {
         self.controller.set_settings_edit_draft(draft)
     }
 
+    /// Apply the opt-in clipboard setting without changing terminal or viewport ownership.
+    pub fn set_copy_on_select(&self, enabled: bool) -> Result<(), TabSwitchError> {
+        self.controller
+            .sender
+            .send(maestro_renderer::RendererCommand::SetCopyOnSelect { enabled })
+            .map_err(|_| TabSwitchError::RendererControlClosed)
+    }
+
     /// Hand out a narrow, theme-only command handle that owns a CLONE of this runtime's renderer
     /// command sender. A background settings watcher can keep this and drive live theme swaps
     /// WITHOUT owning (or borrowing) the whole [`RendererTabRuntime`], which the foreground listener

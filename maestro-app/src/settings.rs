@@ -64,6 +64,7 @@ pub const DEFAULT_FONT_SIZE_PX: u32 = 16;
 /// picker overlay remain explicit opt-ins (default OFF).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ChromeDefaults {
+    pub copy_on_select: bool,
     pub top_tab_bar_default: bool,
     pub dashboard_status_default: bool,
     pub dashboard_panel_default: bool,
@@ -137,6 +138,7 @@ impl ChromeDefaults {
     /// The built-in foreground chrome defaults.
     pub fn built_in() -> Self {
         Self {
+            copy_on_select: false,
             top_tab_bar_default: true,
             dashboard_status_default: true,
             dashboard_panel_default: false,
@@ -433,6 +435,24 @@ pub fn build_settings_panel_lines(settings: &EffectiveSettings) -> SettingsPanel
         ),
     );
 
+    // Keep the input toggle in the visible settings rows, before report-only policy rows.
+    let copy_on_select = settings.chrome.copy_on_select.to_string();
+    emit(
+        if settings.chrome.copy_on_select {
+            "[x] Copy on select (Enter toggles)"
+        } else {
+            "[ ] Copy on select (Enter toggles)"
+        },
+        copy_on_select.clone(),
+        SettingsPanelRow::editable(
+            "input.copy_on_select",
+            "input",
+            "Copy on select (Enter toggles)",
+            copy_on_select,
+            "chrome.copy_on_select",
+        ),
+    );
+
     // Shell (editable). The fallback line is reported when no argv is configured; the row is still
     // editable because `shell.default_argv` is a settable key (its value is just unset here).
     let shell_argv = match &settings.shell.default_argv {
@@ -621,12 +641,14 @@ pub struct PersistedAppearance {
 }
 
 /// The persisted foreground-chrome overrides. Each field is `Option<bool>` so an absent key reports
-/// the built-in default and only an explicitly-set value overrides it. All four chrome defaults now
+/// the built-in default and only an explicitly-set value overrides it. Chrome defaults now
 /// have explicit CLI enable/disable controls and are configurable here. Note `picker_overlay_default`
 /// only affects the foreground in-process renderer: it never makes `--no-run-renderer` or a detached
 /// renderer resolve the picker overlay true (see [`crate::resolve_attach_tab_chrome`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedChrome {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_on_select: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_tab_bar_default: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -683,6 +705,7 @@ fn default_persisted() -> PersistedSettings {
 fn persisted_is_all_default(p: &PersistedSettings) -> bool {
     p.appearance.font_size_px == DEFAULT_FONT_SIZE_PX
         && p.appearance.theme == BUILT_IN_THEME
+        && p.chrome.copy_on_select.is_none()
         && p.chrome.top_tab_bar_default.is_none()
         && p.chrome.dashboard_status_default.is_none()
         && p.chrome.dashboard_panel_default.is_none()
@@ -836,6 +859,9 @@ pub fn effective_settings(base: impl AsRef<Path>) -> EffectiveSettings {
         LoadedSettings::Honored(persisted) => {
             appearance.font_size_px = persisted.appearance.font_size_px;
             appearance.theme = persisted.appearance.theme;
+            if let Some(value) = persisted.chrome.copy_on_select {
+                chrome.copy_on_select = value;
+            }
             if let Some(v) = persisted.chrome.top_tab_bar_default {
                 chrome.top_tab_bar_default = v;
             }
@@ -999,13 +1025,14 @@ pub fn set_theme(base: &Path, theme: &str) -> Result<SettingsSetSuccess, Setting
     })
 }
 
-/// Which configurable chrome default a `settings set chrome.*` write targets. All four chrome defaults
+/// Which configurable chrome default a `settings set chrome.*` write targets. Chrome defaults
 /// now have explicit CLI enable/disable controls (`--top-tab-bar`/`--no-top-tab-bar`,
 /// `--dashboard-status`/`--no-dashboard-status`, `--dashboard-panel`/`--no-dashboard-panel`,
 /// `--picker-overlay`/`--no-picker-overlay`) and are configurable. The `PickerOverlay` default only
 /// affects the foreground in-process renderer (`--no-run-renderer`/detached never resolve it true).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChromeDefaultKey {
+    CopyOnSelect,
     TopTabBar,
     DashboardStatus,
     DashboardPanel,
@@ -1016,6 +1043,7 @@ impl ChromeDefaultKey {
     /// The fully-qualified settings key string reported in the `set` success.
     fn key(self) -> &'static str {
         match self {
+            ChromeDefaultKey::CopyOnSelect => "chrome.copy_on_select",
             ChromeDefaultKey::TopTabBar => "chrome.top_tab_bar_default",
             ChromeDefaultKey::DashboardStatus => "chrome.dashboard_status_default",
             ChromeDefaultKey::DashboardPanel => "chrome.dashboard_panel_default",
@@ -1026,6 +1054,7 @@ impl ChromeDefaultKey {
     /// The existing override value on a persisted file (`None` when not set).
     fn current(self, chrome: &PersistedChrome) -> Option<bool> {
         match self {
+            ChromeDefaultKey::CopyOnSelect => chrome.copy_on_select,
             ChromeDefaultKey::TopTabBar => chrome.top_tab_bar_default,
             ChromeDefaultKey::DashboardStatus => chrome.dashboard_status_default,
             ChromeDefaultKey::DashboardPanel => chrome.dashboard_panel_default,
@@ -1036,6 +1065,7 @@ impl ChromeDefaultKey {
     /// Apply `value` as the override on a persisted file.
     fn apply(self, chrome: &mut PersistedChrome, value: bool) {
         match self {
+            ChromeDefaultKey::CopyOnSelect => chrome.copy_on_select = Some(value),
             ChromeDefaultKey::TopTabBar => chrome.top_tab_bar_default = Some(value),
             ChromeDefaultKey::DashboardStatus => chrome.dashboard_status_default = Some(value),
             ChromeDefaultKey::DashboardPanel => chrome.dashboard_panel_default = Some(value),
@@ -1270,9 +1300,10 @@ pub fn set_shell_default_argv(
 }
 
 /// Which override a `settings reset` clears back to its built-in default. Covers the two appearance
-/// overrides, the three configurable chrome defaults, and the shell default argv.
+/// overrides, configurable chrome defaults, and the shell default argv.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsResetTarget {
+    CopyOnSelect,
     FontSizePx,
     Theme,
     TopTabBarDefault,
@@ -1315,6 +1346,11 @@ pub fn reset_appearance_setting(
                 SettingsResetTarget::Theme => {
                     let was_default = next.appearance.theme == BUILT_IN_THEME;
                     next.appearance.theme = BUILT_IN_THEME.to_string();
+                    !was_default
+                }
+                SettingsResetTarget::CopyOnSelect => {
+                    let was_default = next.chrome.copy_on_select.is_none();
+                    next.chrome.copy_on_select = None;
                     !was_default
                 }
                 SettingsResetTarget::TopTabBarDefault => {
@@ -1381,6 +1417,7 @@ pub fn reset_appearance_setting(
             serde_json::json!(DEFAULT_FONT_SIZE_PX),
         ),
         SettingsResetTarget::Theme => ("appearance.theme", serde_json::json!(BUILT_IN_THEME)),
+        SettingsResetTarget::CopyOnSelect => ("chrome.copy_on_select", serde_json::json!(false)),
         SettingsResetTarget::TopTabBarDefault => (
             "chrome.top_tab_bar_default",
             serde_json::json!(ChromeDefaults::built_in().top_tab_bar_default),
@@ -1543,6 +1580,39 @@ fn write_file_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn copy_on_select_persists_reloads_and_resets_without_changing_other_settings() {
+        let tmp = TempBase::new("copy-on-select");
+        assert!(!effective_settings(&tmp.path).chrome.copy_on_select);
+        assert!(!settings_file_path(&tmp.path).exists());
+        set_chrome_default(&tmp.path, ChromeDefaultKey::CopyOnSelect, true).unwrap();
+        let enabled = effective_settings(&tmp.path);
+        assert!(enabled.chrome.copy_on_select);
+        let panel = build_settings_panel_lines(&enabled);
+        let row = panel
+            .rows
+            .iter()
+            .find(|row| row.id == "input.copy_on_select")
+            .unwrap();
+        assert_eq!(row.setting_key, Some("chrome.copy_on_select"));
+        assert_eq!(row.value, "true");
+        assert!(row.editable);
+        assert!(panel
+            .lines
+            .iter()
+            .any(|line| line == "[x] Copy on select (Enter toggles): true"));
+        set_chrome_default(&tmp.path, ChromeDefaultKey::PickerOverlay, true).unwrap();
+        set_chrome_default(&tmp.path, ChromeDefaultKey::CopyOnSelect, false).unwrap();
+        assert!(!effective_settings(&tmp.path).chrome.copy_on_select);
+        set_chrome_default(&tmp.path, ChromeDefaultKey::CopyOnSelect, true).unwrap();
+        reset_appearance_setting(&tmp.path, SettingsResetTarget::CopyOnSelect).unwrap();
+        let reset = effective_settings(&tmp.path);
+        assert!(!reset.chrome.copy_on_select);
+        assert!(reset.chrome.picker_overlay_default);
+        reset_appearance_setting(&tmp.path, SettingsResetTarget::PickerOverlayDefault).unwrap();
+        assert!(!settings_file_path(&tmp.path).exists());
+    }
+
     use super::*;
 
     /// A unique scratch base dir under the OS temp dir; removed on drop.
@@ -2569,25 +2639,26 @@ mod tests {
         assert_eq!(panel.lines[7], "chrome.dashboard_panel: false");
         assert_eq!(panel.lines[8], "chrome.picker_overlay: false");
         assert_eq!(
-            panel.lines[9],
+            panel.lines[10],
             "shell.default_argv: (unset; $SHELL/sh fallback)"
         );
-        assert_eq!(panel.lines[10], "workspace.default_policy: scratch_cwd");
-        assert_eq!(panel.lines[11], "workspace.worktree_requires_consent: true");
+        assert_eq!(panel.lines[9], "[ ] Copy on select (Enter toggles): false");
+        assert_eq!(panel.lines[11], "workspace.default_policy: scratch_cwd");
+        assert_eq!(panel.lines[12], "workspace.worktree_requires_consent: true");
         assert_eq!(
-            panel.lines[12],
+            panel.lines[13],
             "workspace.repo_write_requires_consent: true"
         );
         assert_eq!(
-            panel.lines[13],
+            panel.lines[14],
             "safety.private_dev_socket_by_default: true"
         );
         assert_eq!(
-            panel.lines[14],
+            panel.lines[15],
             "safety.destructive_worktree_cleanup_requires_confirm: true"
         );
         assert_eq!(
-            panel.lines[15],
+            panel.lines[16],
             "safety.repo_write_requires_explicit_consent: true"
         );
 
@@ -2730,6 +2801,7 @@ mod tests {
         "chrome.dashboard_status_default",
         "chrome.dashboard_panel_default",
         "chrome.picker_overlay_default",
+        "chrome.copy_on_select",
         "shell.default_argv",
         "workspace.default_policy",
         "workspace.worktree_requires_consent",

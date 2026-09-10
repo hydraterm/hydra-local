@@ -333,6 +333,7 @@ fn settings_panel_activation_status_label(
 /// validation-only / not-saved behavior even when its draft value would parse.
 fn settings_panel_writable_chrome_key(setting_key: &str) -> Option<ChromeDefaultKey> {
     match setting_key {
+        "chrome.copy_on_select" => Some(ChromeDefaultKey::CopyOnSelect),
         "chrome.top_tab_bar_default" => Some(ChromeDefaultKey::TopTabBar),
         "chrome.dashboard_status_default" => Some(ChromeDefaultKey::DashboardStatus),
         "chrome.dashboard_panel_default" => Some(ChromeDefaultKey::DashboardPanel),
@@ -341,8 +342,61 @@ fn settings_panel_writable_chrome_key(setting_key: &str) -> Option<ChromeDefault
     }
 }
 
+fn sync_copy_on_select_setting(
+    runtime: &RendererTabRuntime,
+    base: &std::path::Path,
+    last: &mut bool,
+) -> Result<(), maestro_app::TabSwitchError> {
+    let enabled = effective_settings(base).chrome.copy_on_select;
+    if enabled != *last {
+        runtime.set_copy_on_select(enabled)?;
+        *last = enabled;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod copy_on_select_setting_tests {
+    use super::*;
+
+    #[test]
+    fn copy_on_select_sync_seeds_reopened_windows_and_only_sends_actual_changes() {
+        let base = tempfile::tempdir().unwrap();
+        let (runtime, commands) = RendererTabRuntime::new();
+        let mut last = false;
+        sync_copy_on_select_setting(&runtime, base.path(), &mut last).unwrap();
+        assert!(commands.try_recv().is_err());
+        set_chrome_default(base.path(), ChromeDefaultKey::CopyOnSelect, true).unwrap();
+        sync_copy_on_select_setting(&runtime, base.path(), &mut last).unwrap();
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            maestro_renderer::RendererCommand::SetCopyOnSelect { enabled: true }
+        ));
+        sync_copy_on_select_setting(&runtime, base.path(), &mut last).unwrap();
+        assert!(commands.try_recv().is_err());
+        let (reopened, reopened_commands) = RendererTabRuntime::new();
+        sync_copy_on_select_setting(&reopened, base.path(), &mut false).unwrap();
+        assert!(matches!(
+            reopened_commands.try_recv().unwrap(),
+            maestro_renderer::RendererCommand::SetCopyOnSelect { enabled: true }
+        ));
+        reset_appearance_setting(base.path(), maestro_app::SettingsResetTarget::CopyOnSelect)
+            .unwrap();
+        sync_copy_on_select_setting(&runtime, base.path(), &mut last).unwrap();
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            maestro_renderer::RendererCommand::SetCopyOnSelect { enabled: false }
+        ));
+        assert!(commands.try_recv().is_err());
+        drop(commands);
+        set_chrome_default(base.path(), ChromeDefaultKey::CopyOnSelect, true).unwrap();
+        assert!(sync_copy_on_select_setting(&runtime, base.path(), &mut last).is_err());
+        assert!(!last, "a failed send is not marked as applied");
+    }
+}
+
 /// Outcome of app-side revalidation of a submitted settings edit draft. The app does NOT trust the
-/// renderer as the persistence authority: it re-checks both the key (the four chrome boolean keys plus
+/// renderer as the persistence authority: it re-checks both the key (the chrome boolean keys plus
 /// `appearance.theme` / `appearance.font_size_px` are writable) and the value (a boolean,
 /// a recognized theme id, or an in-range font-size integer) before any write.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2154,6 +2208,9 @@ fn run_settings_set(args: SettingsSetArgs) -> Result<String, SettingsFailure> {
     let success = match args.target {
         SettingsSetTarget::FontSizePx(px) => set_font_size_px(&base, px)?,
         SettingsSetTarget::Theme(theme) => set_theme(&base, &theme)?,
+        SettingsSetTarget::CopyOnSelect(value) => {
+            set_chrome_default(&base, ChromeDefaultKey::CopyOnSelect, value)?
+        }
         SettingsSetTarget::TopTabBarDefault(value) => {
             set_chrome_default(&base, ChromeDefaultKey::TopTabBar, value)?
         }
@@ -14346,8 +14403,21 @@ fn spawn_window_event_listener(
         }
         let mut history_results_due_after_event = false;
         let mut handoff_shutdown_deadline: Option<Instant> = None;
+        let mut last_copy_on_select = false;
+        let _ = sync_copy_on_select_setting(&tab_runtime, &listener_base, &mut last_copy_on_select);
+        let mut last_input_settings_check = Instant::now();
         let mut pending_navigation = viewport_navigation::PendingNavigation::default();
         loop {
+            if !listener_stop.load(Ordering::Acquire)
+                && last_input_settings_check.elapsed() >= Duration::from_millis(500)
+            {
+                let _ = sync_copy_on_select_setting(
+                    &tab_runtime,
+                    &listener_base,
+                    &mut last_copy_on_select,
+                );
+                last_input_settings_check = Instant::now();
+            }
             let preserved_navigation_event = match pending_navigation.drain_frontier(
                 &renderer_events_rx,
                 &listener_stop,
@@ -20859,6 +20929,36 @@ fn spawn_window_event_listener(
                     setting_key,
                     editable,
                 } => {
+                    if editable
+                        && row_id == "input.copy_on_select"
+                        && setting_key.as_deref() == Some("chrome.copy_on_select")
+                    {
+                        let enabled = !effective_settings(&listener_base).chrome.copy_on_select;
+                        match set_chrome_default(
+                            &listener_base,
+                            ChromeDefaultKey::CopyOnSelect,
+                            enabled,
+                        ) {
+                            Ok(_) => {
+                                let _ = sync_copy_on_select_setting(
+                                    &tab_runtime,
+                                    &listener_base,
+                                    &mut last_copy_on_select,
+                                );
+                                let panel =
+                                    build_settings_panel_lines(&effective_settings(&listener_base));
+                                let _ = tab_runtime
+                                    .set_dashboard_panel(Some(settings_panel_to_renderer(&panel)));
+                            }
+                            Err(_) => {
+                                let label = format!(
+                                    "{listener_base_status_label} · Copy on select was not saved"
+                                );
+                                let _ = tab_runtime.set_status_label(Some(label));
+                            }
+                        }
+                        continue;
+                    }
                     eprintln!(
                         "attach-tab: settings-panel row activated (no mutation): \
                                  index={row_index} id={row_id} key={} editable={editable}",
