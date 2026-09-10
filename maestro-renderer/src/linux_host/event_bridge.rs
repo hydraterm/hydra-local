@@ -142,16 +142,22 @@ pub fn host_button(button: u32) -> HostPointerButton {
     }
 }
 
-/// A GDK scroll event → the neutral scroll delta. GTK smooth scrolling reports pixel-ish deltas; the discrete
-/// Up/Down/Left/Right directions map to one line each (sign matching winit: up = +1 line on Y). The neutral
-/// `Lines`/`Pixels` split is preserved so the renderer's wheel accumulator behaves as on macOS.
+/// GDK3 smooth deltas are fractional scroll steps, not pixels: Wayland normalizes the
+/// axis value and X11 divides by the device's scroll increment. Keep those fractions
+/// in line units, matching discrete wheel steps, rather than applying the macOS
+/// pixel-to-line conversion a second time. Positive neutral Y means up into history.
 pub fn host_scroll(event: &gdk::EventScroll) -> HostScrollDelta {
-    match event.direction() {
+    host_scroll_delta(event.direction(), event.delta())
+}
+
+fn host_scroll_delta(direction: gdk::ScrollDirection, (dx, dy): (f64, f64)) -> HostScrollDelta {
+    match direction {
         gdk::ScrollDirection::Smooth => {
-            let (dx, dy) = event.delta();
-            // GDK smooth deltas grow DOWN/RIGHT positive; winit pixel deltas grow the opposite way for Y
-            // (scroll up = positive). Negate to match the renderer's expected sign.
-            HostScrollDelta::Pixels { x: -dx, y: -dy }
+            // GDK grows DOWN/RIGHT positive; preserve the existing neutral signs.
+            HostScrollDelta::Lines {
+                x: -dx as f32,
+                y: -dy as f32,
+            }
         }
         gdk::ScrollDirection::Up => HostScrollDelta::Lines { x: 0.0, y: 1.0 },
         gdk::ScrollDirection::Down => HostScrollDelta::Lines { x: 0.0, y: -1.0 },
@@ -245,6 +251,91 @@ mod tests {
         assert_eq!(host_button(2), HostPointerButton::Middle);
         assert_eq!(host_button(3), HostPointerButton::Right);
         assert_eq!(host_button(8), HostPointerButton::Other);
+    }
+
+    fn accumulate_scroll(
+        wheel: &mut crate::client::WheelAccumulator,
+        delta: HostScrollDelta,
+    ) -> i64 {
+        match delta {
+            HostScrollDelta::Lines { y, .. } => wheel.add_lines(f64::from(y)),
+            HostScrollDelta::Pixels { y, .. } => wheel.add_pixels(y),
+        }
+    }
+
+    #[test]
+    fn gtk3_smooth_wheel_detents_reach_renderer_without_pixel_attenuation() {
+        for (dy, expected) in [(-1.0, 1), (1.0, -1)] {
+            let mut wheel = crate::client::WheelAccumulator::default();
+            for _ in 0..16 {
+                assert_eq!(
+                    accumulate_scroll(
+                        &mut wheel,
+                        host_scroll_delta(gdk::ScrollDirection::Smooth, (0.0, dy)),
+                    ),
+                    expected,
+                    "each normalized GDK detent is one line, not one sixteenth"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gtk3_fractional_scroll_preserves_residue_and_stop_is_not_a_reset() {
+        let mut wheel = crate::client::WheelAccumulator::default();
+        for dy in [-0.25, -0.25, 0.0, -0.25] {
+            assert_eq!(
+                accumulate_scroll(
+                    &mut wheel,
+                    host_scroll_delta(gdk::ScrollDirection::Smooth, (0.0, dy)),
+                ),
+                0
+            );
+        }
+        assert_eq!(
+            accumulate_scroll(
+                &mut wheel,
+                host_scroll_delta(gdk::ScrollDirection::Smooth, (0.0, -0.25)),
+            ),
+            1
+        );
+        for expected in [0, 0, 0, -1] {
+            assert_eq!(
+                accumulate_scroll(
+                    &mut wheel,
+                    host_scroll_delta(gdk::ScrollDirection::Smooth, (0.0, 0.25)),
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn gtk3_smooth_and_discrete_directions_use_the_same_line_units() {
+        for (direction, smooth) in [
+            (gdk::ScrollDirection::Up, (0.0, -1.0)),
+            (gdk::ScrollDirection::Down, (0.0, 1.0)),
+            (gdk::ScrollDirection::Left, (-1.0, 0.0)),
+            (gdk::ScrollDirection::Right, (1.0, 0.0)),
+        ] {
+            assert_eq!(
+                host_scroll_delta(direction, (0.0, 0.0)),
+                host_scroll_delta(gdk::ScrollDirection::Smooth, smooth),
+            );
+        }
+    }
+
+    #[test]
+    fn gtk3_unit_fix_leaves_true_pixel_scroll_conversion_unchanged() {
+        let mut wheel = crate::client::WheelAccumulator::default();
+        assert_eq!(
+            accumulate_scroll(&mut wheel, HostScrollDelta::Pixels { x: 0.0, y: 15.0 }),
+            0
+        );
+        assert_eq!(
+            accumulate_scroll(&mut wheel, HostScrollDelta::Pixels { x: 0.0, y: 1.0 }),
+            1
+        );
     }
 
     #[test]

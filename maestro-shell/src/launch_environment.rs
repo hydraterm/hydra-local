@@ -108,11 +108,21 @@ pub fn login_shell_argv_with(
         .map(|arg| shell_quote_login_arg(arg))
         .collect::<Vec<_>>()
         .join(" ");
+    // XPC_FLAGS is libxpc's process-internal state, not a terminal/user preference. A retained
+    // macOS daemon can pass its "reentrancy avoided" state (0x2) to new shells. In a fresh
+    // executable that disables system-service lookups, including DNS and browser launching.
+    // Clear it after shell startup too: the login shell may itself inherit that state. Do not
+    // change the user's HOME, provider config, sandbox, network policy, or approval choices.
+    let process_context_reset = if cfg!(target_os = "macos") {
+        "unset XPC_FLAGS; "
+    } else {
+        ""
+    };
     vec![
         login_shell.to_string(),
         LOGIN_SHELL_COMMAND_FLAGS.to_string(),
         format!(
-            "unset NO_COLOR; export TERM=xterm-256color COLORTERM=truecolor CLICOLOR=1 FORCE_COLOR=1; {command}"
+            "{process_context_reset}unset NO_COLOR; export TERM=xterm-256color COLORTERM=truecolor CLICOLOR=1 FORCE_COLOR=1; {command}"
         ),
     ]
 }
@@ -264,5 +274,50 @@ mod tests {
             });
         assert!(argv[2].contains("'opencode'"));
         assert!(!argv[2].contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn provider_shell_resets_only_macos_internal_xpc_state() {
+        for provider in LOGIN_SHELL_PROVIDERS {
+            let argv = login_shell_argv_with(
+                &[(*provider).to_string()],
+                "/bin/test-shell",
+                &env(BTreeMap::new()),
+                |_| false,
+            );
+            assert_eq!(
+                argv[2].starts_with("unset XPC_FLAGS; "),
+                cfg!(target_os = "macos"),
+                "provider={provider}"
+            );
+            assert!(argv[2].ends_with(&format!("'{provider}'")));
+            assert!(!argv[2].contains("unset HOME"));
+            assert!(!argv[2].contains("unset CODEX_HOME"));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launched_child_drops_xpc_flags_without_changing_user_environment() {
+        let argv = login_shell_argv_with(
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "test -z \"${XPC_FLAGS+x}\" && test \"$HYDRA_TEST_USER_SETTING\" = kept".into(),
+            ],
+            "/bin/sh",
+            &env(BTreeMap::new()),
+            |_| false,
+        );
+        let status = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .env("XPC_FLAGS", "0x2")
+            .env("HYDRA_TEST_USER_SETTING", "kept")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("launch the ordinary login-shell path");
+        assert!(status.success());
     }
 }
