@@ -137,6 +137,7 @@ pub(crate) enum LaunchPreflightError {
     NonCanonicalCommandCase(SupportedAgentExecutable),
     InvalidWorkingDirectory,
     Missing(SupportedAgentExecutable),
+    MissingWithHistoryStore(SupportedAgentExecutable),
     MissingCommand,
     MutationDaemonUnavailable,
     ProbeUnavailable(SupportedAgentExecutable),
@@ -151,6 +152,7 @@ impl LaunchPreflightError {
             Self::NonCanonicalCommandCase(_) => "agent_command_case_invalid",
             Self::InvalidWorkingDirectory => "launch_cwd_invalid",
             Self::Missing(_) => "agent_executable_missing",
+            Self::MissingWithHistoryStore(_) => "agent_history_executable_missing",
             Self::MissingCommand => "launch_executable_missing",
             Self::MutationDaemonUnavailable => "daemon_mutation_unavailable",
             Self::ProbeUnavailable(_) => "agent_preflight_unavailable",
@@ -177,6 +179,10 @@ impl LaunchPreflightError {
             }
             Self::Missing(agent) => format!(
                 "{} is not installed or is unavailable in your login shell. Install it or choose Terminal.",
+                agent.display_name()
+            ),
+            Self::MissingWithHistoryStore(agent) => format!(
+                "Hydra found {}'s history storage, but couldn't find its command on your login-shell PATH. Check the installation or PATH.",
                 agent.display_name()
             ),
             Self::MissingCommand => {
@@ -721,7 +727,26 @@ fn validated_cwd(cwd: &Path, home: Option<&Path>) -> Result<PathBuf, LaunchPrefl
 impl AgentExecutableProbe for LoginShellAgentProbe {
     fn probe(&self, target: &ProbeTarget, cwd: &Path) -> Result<bool, LaunchPreflightError> {
         match target {
-            ProbeTarget::LoginShell(agent) => self.login_shell_has(*agent, cwd),
+            ProbeTarget::LoginShell(agent) => {
+                let available = self.login_shell_has(*agent, cwd)?;
+                if !available {
+                    use maestro_local_services::agent_history::{
+                        provider_history_store_presence, HistoryStorePresence,
+                    };
+                    let history_agent = match agent {
+                        SupportedAgentExecutable::Antigravity => "antigravity",
+                        SupportedAgentExecutable::Kiro => "kiro",
+                        SupportedAgentExecutable::Cursor => "cursor",
+                        _ => agent.command(),
+                    };
+                    if provider_history_store_presence(history_agent, self.home.as_deref())
+                        == HistoryStorePresence::Present
+                    {
+                        return Err(LaunchPreflightError::MissingWithHistoryStore(*agent));
+                    }
+                }
+                Ok(available)
+            }
             ProbeTarget::ProcessPathCommand(command) => {
                 Ok(process_path_executable(command, cwd).is_some())
             }
@@ -867,6 +892,135 @@ mod tests {
 
     struct StubProbe {
         available: bool,
+    }
+
+    fn missing_binary_probe(home: &Path) -> LoginShellAgentProbe {
+        let login_shell = home.join("missing-provider-shell");
+        std::fs::write(&login_shell, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&login_shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+        LoginShellAgentProbe {
+            login_shell,
+            home: Some(home.to_path_buf()),
+        }
+    }
+
+    #[test]
+    fn real_missing_provider_probe_distinguishes_store_presence_without_folder_claim() {
+        let root = tempfile::tempdir().unwrap();
+        let probe = missing_binary_probe(root.path());
+        let check = || {
+            preflight_with_home(
+                Some("codex"),
+                Some("claude"),
+                root.path(),
+                Some(root.path()),
+                &probe,
+            )
+        };
+        std::fs::create_dir_all(root.path().join(".claude/projects")).unwrap();
+        assert_eq!(
+            check(),
+            Err(LaunchPreflightError::Missing(
+                SupportedAgentExecutable::Codex
+            ))
+        );
+        // An empty store for another folder is deliberately enough for store presence, never a
+        // claim that the selected folder has a resumable session (visible or hidden).
+        std::fs::create_dir_all(root.path().join(".codex/sessions/another-folder")).unwrap();
+        let error = check().unwrap_err();
+        assert_eq!(
+            error,
+            LaunchPreflightError::MissingWithHistoryStore(SupportedAgentExecutable::Codex)
+        );
+        assert_eq!(error.code(), "agent_history_executable_missing");
+        let message = error.user_message();
+        assert_eq!(message, "Hydra found Codex's history storage, but couldn't find its command on your login-shell PATH. Check the installation or PATH.");
+        assert!(!message.contains("folder"));
+        assert!(error.to_string().len() < 256);
+        assert!(!message.contains(root.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn history_presence_keeps_custom_direct_cwd_and_probe_errors_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let mut probe = missing_binary_probe(root.path());
+        std::fs::create_dir_all(root.path().join(".claude/projects")).unwrap();
+        let direct = root.path().join("claude");
+        assert_eq!(
+            probe.probe(
+                &ProbeTarget::DirectPath {
+                    agent: SupportedAgentExecutable::Claude,
+                    path: direct
+                },
+                root.path()
+            ),
+            Ok(false)
+        );
+        assert_eq!(
+            preflight_with_home(
+                Some("./missing-wrapper"),
+                Some("claude"),
+                root.path(),
+                Some(root.path()),
+                &probe
+            ),
+            Err(LaunchPreflightError::MissingCommand)
+        );
+        assert_eq!(
+            preflight_with_home(
+                Some("claude"),
+                None,
+                &root.path().join("missing-cwd"),
+                Some(root.path()),
+                &probe
+            ),
+            Err(LaunchPreflightError::InvalidWorkingDirectory)
+        );
+        probe.login_shell = root.path().join("missing-shell");
+        assert_eq!(
+            preflight_with_home(Some("claude"), None, root.path(), Some(root.path()), &probe),
+            Err(LaunchPreflightError::ProbeUnavailable(
+                SupportedAgentExecutable::Claude
+            ))
+        );
+    }
+
+    #[test]
+    fn canonical_provider_names_map_to_existing_history_adapters() {
+        let root = tempfile::tempdir().unwrap();
+        let probe = missing_binary_probe(root.path());
+        for (selected, command, store, agent) in [
+            (
+                "antigravity",
+                "agy",
+                ".gemini/antigravity-cli",
+                SupportedAgentExecutable::Antigravity,
+            ),
+            (
+                "kiro",
+                "kiro-cli chat",
+                ".kiro/sessions/cli",
+                SupportedAgentExecutable::Kiro,
+            ),
+            (
+                "cursor",
+                "agent",
+                ".cursor/projects",
+                SupportedAgentExecutable::Cursor,
+            ),
+        ] {
+            std::fs::create_dir_all(root.path().join(store)).unwrap();
+            assert_eq!(
+                preflight_with_home(
+                    Some(command),
+                    Some(selected),
+                    root.path(),
+                    Some(root.path()),
+                    &probe
+                ),
+                Err(LaunchPreflightError::MissingWithHistoryStore(agent))
+            );
+        }
     }
 
     #[test]

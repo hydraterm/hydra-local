@@ -15,6 +15,9 @@ use maestro_shell::paths::{AppPaths, RecordKind};
 use maestro_shell::records::{LaunchSpec, SessionRecord, WindowLayout};
 use maestro_shell::store::{load_all, LoadOutcome};
 
+mod store_presence;
+pub use store_presence::{provider_history_store_presence, HistoryStorePresence};
+
 #[derive(Clone, Debug, Serialize)]
 pub struct AgentHistorySession {
     pub id: String,
