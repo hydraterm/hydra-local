@@ -74,7 +74,8 @@ export type Intent =
       name: string
     }
   | { type: 'updateProjectOrder'; ordered_project_ids: string[] }
-  | { type: 'updateWindowOrder'; project_id: string; ordered_window_ids: string[] }
+  | { type: 'updateWindowOrder'; request_id?: string; project_id: string; ordered_window_ids: string[] }
+  | { type: 'reorderWindowPresentation'; request_id: string; ordered_window_ids: string[] }
   | {
       type: 'createProject'
       name: string
@@ -237,6 +238,7 @@ declare global {
       requestId: string,
       result: WindowRenameResult,
     ) => void
+    __HYDRA_DASHBOARD_RESOLVE_WINDOW_ORDER__?: (requestId: string, result: WindowOrderResult) => void
     __HYDRA_PENDING_SIDEBAR_STATE__?: NativeSidebarState
   }
 }
@@ -244,6 +246,9 @@ declare global {
 export type LaunchPreflightResult = { ok: boolean; message: string | null; code: string | null }
 type LaunchMutationResult = { ok: boolean; message: string | null }
 export type WindowRenameResult = { ok: boolean; name: string | null; message: string | null }
+export type WindowOrderResult =
+  | { status: 'saved' }
+  | { status: 'failed' | 'partial' | 'unconfirmed'; message: string }
 export type NativeSidebarState = {
   width_logical_px: number
   last_expanded_width_logical_px: number
@@ -270,6 +275,10 @@ let nextLaunchPreflightRequestId = 1
 let nextLaunchMutationRequestId = 1
 const launchMutationRequests = new Map<string, (result: LaunchMutationResult) => void>()
 let nextWindowRenameRequestId = 1
+let nextWindowOrderRequestId = 1
+const windowOrderRequests = new Map<
+  string, { resolve: (result: WindowOrderResult) => void; timeoutId: number }
+>()
 const windowRenameRequests = new Map<
   string,
   { resolve: (result: WindowRenameResult) => void; timeoutId: number }
@@ -288,6 +297,36 @@ const requestPageEpoch = (() => {
 
 function nextNativeRequestId(prefix: string, sequence: number): string {
   return `${prefix}-${requestPageEpoch}-${sequence}`
+}
+
+function requestWindowOrder(order: string[], projectId?: string): Promise<WindowOrderResult> {
+  if (!host()?.postIntent && !window.ipc?.postMessage && !window.webkit?.messageHandlers?.ipc?.postMessage) {
+    return Promise.resolve({ status: 'failed', message: 'Hydra desktop connection is unavailable.' })
+  }
+  window.__HYDRA_DASHBOARD_RESOLVE_WINDOW_ORDER__ = (requestId, result) => {
+    const pending = windowOrderRequests.get(requestId)
+    if (!pending) return
+    windowOrderRequests.delete(requestId)
+    window.clearTimeout(pending.timeoutId)
+    pending.resolve(result)
+  }
+  const request_id = nextNativeRequestId('window-order', nextWindowOrderRequestId++)
+  return new Promise((resolve) => {
+    const timeoutId = window.setTimeout(() => {
+      windowOrderRequests.delete(request_id)
+      resolve({ status: 'unconfirmed', message: 'Order save is not confirmed. Check the current order before retrying.' })
+    }, 8_000)
+    windowOrderRequests.set(request_id, { resolve, timeoutId })
+    try {
+      postIntent(projectId === undefined
+        ? { type: 'reorderWindowPresentation', request_id, ordered_window_ids: order }
+        : { type: 'updateWindowOrder', request_id, project_id: projectId, ordered_window_ids: order })
+    } catch {
+      windowOrderRequests.delete(request_id)
+      window.clearTimeout(timeoutId)
+      resolve({ status: 'failed', message: 'Window order could not reach Hydra.' })
+    }
+  })
 }
 
 const launchPreflightRequests = new Map<
@@ -475,6 +514,7 @@ function folderSessionMutation(
 const MUTATION_INTENTS = new Set([
   'createProject', 'deleteProject', 'updateProject', 'updateProjectOrder',
   'createWindow', 'updateWindow', 'removeWindow', 'stashWindow', 'updateWindowOrder',
+  'reorderWindowPresentation',
   'splitPane', 'removePane', 'stashPane', 'updatePane', 'reviveSession', 'reviveWindow',
   'completeStashedPaneDrop', 'openLayoutPreset', 'saveLayoutPreset',
 ])
@@ -699,8 +739,12 @@ export const bridge = {
     postIntent({ type: 'updateProjectOrder', ordered_project_ids })
   },
 
-  updateWindowOrder(project_id: string, ordered_window_ids: string[]): void {
-    postIntent({ type: 'updateWindowOrder', project_id, ordered_window_ids })
+  updateWindowOrder(project_id: string, ordered_window_ids: string[]): Promise<WindowOrderResult> {
+    return requestWindowOrder(ordered_window_ids, project_id)
+  },
+
+  reorderWindowPresentation(ordered_window_ids: string[]): Promise<WindowOrderResult> {
+    return requestWindowOrder(ordered_window_ids)
   },
 
   createProject(input: {

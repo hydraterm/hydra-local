@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { act, create, type ReactTestRenderer } from 'react-test-renderer'
 import { Sidebar } from './components/Sidebar'
 import { mockDashboardModel } from './data/mock'
+import { bridge } from './ipc/bridge'
 
 type Kind = 'project' | 'window' | 'pane'
 let renderer: ReactTestRenderer | null = null
@@ -13,10 +14,10 @@ const names = {
   pane: ['claude — dashboard', 'codex — renderer'],
 }
 
-function sidebar(collapsed = false): JSX.Element {
+function sidebar(collapsed = false, order = vi.fn()): JSX.Element {
   return <Sidebar model={structuredClone(mockDashboardModel)} selectedId="sample_workspace"
     focusedWindowId="w-main" collapsed={collapsed} onSelect={vi.fn()} onReorder={vi.fn()}
-    onWindowReorder={vi.fn()} onFocusWindow={vi.fn()}
+    onWindowReorder={order} onFocusWindow={vi.fn()}
     onFocusPane={vi.fn()} />
 }
 
@@ -86,6 +87,27 @@ afterEach(() => {
   vi.clearAllTimers()
   vi.useRealTimers()
   vi.restoreAllMocks()
+})
+
+it('shows a partial sidebar order save without moving a window into another project or retrying', async () => {
+  mount()
+  act(() => renderer!.update(sidebar(false, vi.fn(bridge.updateWindowOrder))))
+  const source = renderer!.root.find((node) => node.props.className === 'tree-window__name' && node.children.join('') === 'Dashboard build')
+  const target = renderer!.root.find((node) => node.props.className === 'tree-window__name' && node.children.join('') === 'Release checks')
+  const dataTransfer = { types: ['application/x-hydra-window-id'], setData: vi.fn(), getData: () => 'w-main' }
+  const sourceRow = source.parent!.parent!
+  act(() => sourceRow.props.onDragStart({ dataTransfer, stopPropagation: vi.fn() }))
+  act(() => target.parent!.parent!.parent!.props.onDrop({
+    dataTransfer, preventDefault: vi.fn(), stopPropagation: vi.fn(), clientY: 90,
+    currentTarget: { getBoundingClientRect: () => ({ top: 0, height: 100 }) },
+  }))
+  const request = intents.find((intent) => intent.type === 'updateWindowOrder')!
+  expect(request).toMatchObject({ project_id: 'sample_workspace', ordered_window_ids: ['w-2', 'w-main', 'w-stash'] })
+  await act(async () => {
+    window.__HYDRA_DASHBOARD_RESOLVE_WINDOW_ORDER__!(String(request.request_id), { status: 'partial', message: 'Project order accepted; global save failed.' })
+  })
+  expect(renderer!.root.findByProps({ className: 'sidebar__order-status' }).children).toEqual(['Project order accepted; global save failed.'])
+  expect(intents.filter((intent) => intent.type === 'updateWindowOrder')).toHaveLength(1)
 })
 
 describe.each(['project', 'window', 'pane'] as const)('sidebar %s deferred rename', (kind) => {

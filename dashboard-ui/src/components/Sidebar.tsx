@@ -8,7 +8,7 @@ import type {
   ProjectDetail,
   SessionStatus,
 } from '../types/model'
-import { bridge } from '../ipc/bridge'
+import { bridge, type WindowOrderResult } from '../ipc/bridge'
 import { AgentBadge } from './AgentBadge'
 import { useDeferredFocusLoss } from './useDeferredFocusLoss'
 
@@ -64,7 +64,7 @@ type Props = {
   onToggleCollapsed?: (event: React.MouseEvent<HTMLButtonElement>) => void
   onSelect: (projectId: string) => void
   onReorder: (orderedIds: string[]) => void
-  onWindowReorder: (projectId: string, orderedWindowIds: string[]) => void
+  onWindowReorder: (projectId: string, orderedWindowIds: string[]) => Promise<WindowOrderResult>
   onFocusWindow: (projectId: string, windowId: string) => void
   onFocusPane: (projectId: string, windowId: string, tabId: string, sessionId: string) => void
 }
@@ -348,6 +348,8 @@ export function Sidebar({
   }
 
   const WINDOW_DND_MIME = 'application/x-hydra-window-id'
+  const orderPending = useRef(false)
+  const [orderStatus, setOrderStatus] = useState<{ message: string; error: boolean } | null>(null)
 
   const windowDropEdge = (
     e: React.DragEvent<HTMLElement>,
@@ -379,7 +381,7 @@ export function Sidebar({
     toId: string,
     edge: 'before' | 'after',
   ): void => {
-    if (fromId === toId) return
+    if (orderPending.current || fromId === toId) return
     const ids = windows.map((w) => w.window_id)
     const from = ids.indexOf(fromId)
     let to = ids.indexOf(toId)
@@ -389,7 +391,12 @@ export function Sidebar({
     if (from < to) to -= 1
     if (edge === 'after') to += 1
     next.splice(to, 0, moved)
-    onWindowReorder(projectId, next)
+    orderPending.current = true
+    setOrderStatus({ message: 'Saving window order…', error: false })
+    void onWindowReorder(projectId, next).then((result) => {
+      orderPending.current = false
+      setOrderStatus(result.status === 'saved' ? null : { message: result.message, error: true })
+    })
   }
 
   const armStashedPaneDrag = (
@@ -1361,6 +1368,11 @@ export function Sidebar({
       </div>
 
       <div className="sidebar__footer">
+        {orderStatus && (
+          <div className="sidebar__order-status" role={orderStatus.error ? 'alert' : 'status'}>
+            {orderStatus.message}
+          </div>
+        )}
         <div
           className="sidebar__update-status"
           role="status"

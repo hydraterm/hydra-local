@@ -90,6 +90,7 @@ mod viewport_navigation;
 mod window_order_maintenance;
 #[cfg(test)]
 mod window_order_projection_tests;
+mod window_order_requests;
 #[cfg(test)]
 mod window_rename_tests;
 
@@ -678,7 +679,8 @@ fn react_chrome_allowed_fields(intent_type: &str) -> Option<&'static [&'static s
         "openEditProjectDialog" | "openWindowDialog" => &["project_id"],
         "setSidebarWidth" => &["width"],
         "updateProjectOrder" => &["ordered_project_ids"],
-        "updateWindowOrder" => &["project_id", "ordered_window_ids"],
+        "updateWindowOrder" => &["request_id", "project_id", "ordered_window_ids"],
+        "reorderWindowPresentation" => &["request_id", "ordered_window_ids"],
         "dashboardRuntimeError" => &["message", "source", "line"],
         _ => return None,
     })
@@ -1036,7 +1038,13 @@ enum ReactChromeIntent {
     UpdateProjectOrder { ordered_project_ids: Vec<String> },
     #[serde(rename = "updateWindowOrder")]
     UpdateWindowOrder {
+        request_id: Option<String>,
         project_id: String,
+        ordered_window_ids: Vec<String>,
+    },
+    #[serde(rename = "reorderWindowPresentation")]
+    ReorderWindowPresentation {
+        request_id: String,
         ordered_window_ids: Vec<String>,
     },
     #[serde(rename = "dashboardRuntimeError")]
@@ -1196,6 +1204,7 @@ fn react_chrome_intent_requires_window_context(intent: &ReactChromeIntent) -> bo
         | FocusTerminal
         | UpdateProjectOrder { .. }
         | UpdateWindowOrder { .. }
+        | ReorderWindowPresentation { .. }
         | DashboardRuntimeError { .. } => false,
     }
 }
@@ -1311,12 +1320,18 @@ fn product_recovery_blocks_react_intent(
         UpdateWindowOrder {
             project_id,
             ordered_window_ids,
+            ..
         } => {
             project_id == PRODUCT_RECOVERY_PROJECT_ID
                 || ordered_window_ids
                     .iter()
                     .any(|window_id| window_id == PRODUCT_RECOVERY_WINDOW_ID)
         }
+        ReorderWindowPresentation {
+            ordered_window_ids, ..
+        } => ordered_window_ids
+            .iter()
+            .any(|window_id| window_id == PRODUCT_RECOVERY_WINDOW_ID),
         _ => false,
     };
     if targets_reserved_topology {
@@ -14491,7 +14506,19 @@ fn spawn_window_event_listener(
         let mut pending_navigation = viewport_navigation::PendingNavigation::default();
         let mut window_order_maintenance =
             window_order_maintenance::WindowOrderMaintenance::default();
+        let mut window_order_requests = window_order_requests::WindowOrderRequests::default();
         loop {
+            if !listener_stop.load(Ordering::Acquire)
+                && window_order_requests.poll(&mut tab_runtime)
+            {
+                last_sent_react_model = None;
+                refresh_react_chrome_dashboard_with_focused(
+                    &listener_paths,
+                    &mut tab_runtime,
+                    listener_focused_tab_id.as_deref(),
+                    "window-order-save",
+                );
+            }
             // Explicit lifecycle work, not a side effect of reading a dashboard. One persistent
             // metadata worker skips unchanged state and keeps settings-lock waits off this thread.
             // Check outside the idle branch so continuous terminal events cannot starve discovery.
@@ -14755,6 +14782,11 @@ fn spawn_window_event_listener(
                             listener_window_context.is_bound(),
                             &listener_window_id,
                             stopping,
+                        );
+                        window_order_requests::decline_json(
+                            &mut tab_runtime,
+                            &json,
+                            "The viewport is still changing. No window order was applied.",
                         );
                         continue;
                     }
@@ -15358,6 +15390,11 @@ fn spawn_window_event_listener(
                             &mut tab_runtime,
                             &json,
                             "No active viewport is available. The window was not renamed.",
+                        );
+                        window_order_requests::decline_json(
+                            &mut tab_runtime,
+                            &json,
+                            "No active viewport is available. No window order was applied.",
                         );
                     }
                     Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -16355,6 +16392,11 @@ fn spawn_window_event_listener(
                         continue;
                     }
                     if product_recovery_blocks_react_intent(&intent, &listener_window_id) {
+                        window_order_requests::decline(
+                            &mut tab_runtime,
+                            &intent,
+                            "Recovery windows cannot be reordered.",
+                        );
                         if let ReactChromeIntent::UpdateWindow {
                             request_id: Some(id),
                             ..
@@ -19060,28 +19102,36 @@ fn spawn_window_event_listener(
                             }
                         }
                         ReactChromeIntent::UpdateWindowOrder {
+                            request_id,
                             project_id,
                             ordered_window_ids,
                         } => {
-                            match maestro_shell::ProjectService::new(&listener_paths)
-                                .reorder_owned_windows(&project_id, &ordered_window_ids, now_ms())
-                            {
-                                Ok(_) => {
-                                    refresh_react_chrome_dashboard(
-                                        &listener_paths,
-                                        &mut tab_runtime,
-                                        "updateWindowOrder",
-                                    );
-                                    eprintln!(
-                                        "attach-tab: React updateWindowOrder persisted project={project_id:?} ids={ordered_window_ids:?}"
-                                    );
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "attach-tab: React updateWindowOrder failed project={project_id:?} ids={ordered_window_ids:?} (non-fatal): {e}"
-                                    );
-                                }
-                            }
+                            window_order_requests.submit(
+                                &listener_paths,
+                                &mut tab_runtime,
+                                request_id,
+                                Some(&project_id),
+                                ordered_window_ids,
+                            );
+                            // SQL may already be accepted even when starting the JSON save fails.
+                            last_sent_react_model = None;
+                            refresh_react_chrome_dashboard(
+                                &listener_paths,
+                                &mut tab_runtime,
+                                "updateWindowOrder",
+                            );
+                        }
+                        ReactChromeIntent::ReorderWindowPresentation {
+                            request_id,
+                            ordered_window_ids,
+                        } => {
+                            window_order_requests.submit(
+                                &listener_paths,
+                                &mut tab_runtime,
+                                Some(request_id),
+                                None,
+                                ordered_window_ids,
+                            );
                         }
                     }
                 }

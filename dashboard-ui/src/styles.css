@@ -1731,6 +1731,18 @@ body.is-resizing-sidebar .sidebar-resizer::before {
   min-width: 72px;
   max-width: 250px;
 }
+.window-tab-group.drop-before {
+  box-shadow: inset 3px 0 #7eafff;
+}
+.window-tab-group.drop-after {
+  box-shadow: inset -3px 0 #7eafff;
+}
+.sidebar__order-status {
+  padding: 6px 8px;
+  color: #f6c778;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
 .window-tab-group:hover,
 .window-tab-group:focus-within {
   flex-grow: 2.5;

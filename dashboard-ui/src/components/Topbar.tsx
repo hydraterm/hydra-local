@@ -128,6 +128,10 @@ export function Topbar({
     : NEW_WINDOW_CONTROL
   const [requestedTabStop, setRequestedTabStop] = useState(defaultTabStop)
   const [renaming, setRenaming] = useState<string | null>(null)
+  const orderPending = useRef(false)
+  const [orderStatus, setOrderStatus] = useState<{ message: string; error: boolean } | null>(null)
+  const [dragWindow, setDragWindow] = useState<string | null>(null)
+  const [dropTarget, setDropTarget] = useState<{ id: string; edge: 'before' | 'after' } | null>(null)
   const restoreFocusRef = useRef<string | null>(null)
   useEffect(() => {
     if (
@@ -148,6 +152,21 @@ export function Topbar({
     ? requestedTabStop
     : defaultTabStop
   const tabIndexFor = (controlId: string): 0 | -1 => (tabStop === controlId ? 0 : -1)
+
+  const moveWindow = (fromId: string, toId: string, edge: 'before' | 'after'): void => {
+    if (orderPending.current || fromId === toId) return
+    const ids = windows.map(({ window }) => window.window_id)
+    if (!ids.includes(fromId) || !ids.includes(toId)) return
+    const next = ids.filter((id) => id !== fromId)
+    next.splice(next.indexOf(toId) + (edge === 'after' ? 1 : 0), 0, fromId)
+    if (next.every((id, index) => id === ids[index])) return
+    orderPending.current = true
+    setOrderStatus({ message: 'Saving window order…', error: false })
+    void bridge.reorderWindowPresentation(next).then((result) => {
+      orderPending.current = false
+      setOrderStatus(result.status === 'saved' ? null : { message: result.message, error: true })
+    })
+  }
 
   const handOffFocusBeforeClose = (
     closingProjectId: string,
@@ -198,6 +217,11 @@ export function Topbar({
       onKeyDown={(event) => moveToolbarFocus(event, setRequestedTabStop)}
       onFocusCapture={(event) => keepToolbarTabStop(event, setRequestedTabStop)}
     >
+      {orderStatus && (
+        <span className="window-tabs__order-warning" role={orderStatus.error ? 'alert' : 'status'} title={orderStatus.message}>
+          {orderStatus.message}
+        </span>
+      )}
       {windowOrderWarning && (
         <span className="window-tabs__order-warning" role="status" title={windowOrderWarning}>
           {windowOrderWarning}
@@ -214,7 +238,23 @@ export function Topbar({
           return (
             <span
               key={`${owner.project_id}:${w.window_id}`}
-              className={`window-tab-group ${isActive ? 'is-active' : ''} ${isRenaming ? 'is-renaming' : ''}`}
+              className={`window-tab-group ${isActive ? 'is-active' : ''} ${isRenaming ? 'is-renaming' : ''} ${dropTarget?.id === w.window_id ? `drop-${dropTarget.edge}` : ''}`}
+              onDragOver={(event) => {
+                if (!dragWindow || orderPending.current) return
+                event.preventDefault()
+                const rect = event.currentTarget.getBoundingClientRect()
+                setDropTarget({ id: w.window_id, edge: event.clientX < rect.left + rect.width / 2 ? 'before' : 'after' })
+              }}
+              onDragLeave={() => setDropTarget(null)}
+              onDrop={(event) => {
+                event.preventDefault()
+                if (dragWindow) {
+                  const rect = event.currentTarget.getBoundingClientRect()
+                  moveWindow(dragWindow, w.window_id, event.clientX < rect.left + rect.width / 2 ? 'before' : 'after')
+                }
+                setDragWindow(null)
+                setDropTarget(null)
+              }}
             >
               {isRenaming ? (
                 <InlineWindowRename
@@ -235,15 +275,30 @@ export function Topbar({
                     }
                   }}
                   type="button"
-                  aria-keyshortcuts="F2"
+                  aria-keyshortcuts="F2 Alt+Shift+ArrowLeft Alt+Shift+ArrowRight"
+                  draggable={!orderPending.current}
+                  onDragStart={(event) => {
+                    event.dataTransfer.setData('application/x-hydra-topbar-window-id', w.window_id)
+                    event.dataTransfer.effectAllowed = 'move'
+                    setDragWindow(w.window_id)
+                  }}
+                  onDragEnd={() => { setDragWindow(null); setDropTarget(null) }}
                   aria-pressed={isActive}
                   aria-label={`Focus ${w.name || w.window_id} in ${owner.name}`}
                   data-toolbar-control={focusWindowControl(owner.project_id, w.window_id)}
                   tabIndex={tabIndexFor(focusWindowControl(owner.project_id, w.window_id))}
                   className={`window-tab ${isActive ? 'is-active' : ''}`}
-                  title={`${owner.name} · ${w.name || w.window_id} — ${w.tabs.filter((t) => !t.stashed).length} pane(s)`}
+                  title={`${owner.name} · ${w.name || w.window_id} — ${w.tabs.filter((t) => !t.stashed).length} pane(s). Drag or Alt+Shift+Left/Right to reorder.`}
                   onClick={() => onFocusWindow(owner.project_id, w.window_id)}
                   onKeyDown={(event) => {
+                    if (event.altKey && event.shiftKey && ['ArrowLeft', 'ArrowRight'].includes(event.key)) {
+                      event.preventDefault()
+                      event.stopPropagation()
+                      const offset = event.key === 'ArrowLeft' ? -1 : 1
+                      const neighbor = windows[windows.findIndex(({ window }) => window.window_id === w.window_id) + offset]
+                      if (neighbor) moveWindow(w.window_id, neighbor.window.window_id, offset < 0 ? 'before' : 'after')
+                      return
+                    }
                     if (event.key === 'F2') {
                       event.preventDefault()
                       event.stopPropagation()

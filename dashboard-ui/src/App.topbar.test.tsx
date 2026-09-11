@@ -48,6 +48,54 @@ afterEach(() => {
 })
 
 describe('native topbar semantics and intents', () => {
+  it.each(['before', 'after'] as const)('drags across projects to the %s edge without changing active focus', async (edge) => {
+    const intents: Array<Record<string, unknown>> = []
+    installWindow(intents)
+    await mount()
+    const source = renderer!.root.findByProps({ 'aria-label': 'Focus Analytics report in Sample Analytics' })
+    const target = renderer!.root.findByProps({ 'aria-label': 'Focus Dashboard build in Sample Workspace' })
+    act(() => source.props.onDragStart({ dataTransfer: { setData: vi.fn() } }))
+    const event = {
+      preventDefault: vi.fn(), clientX: edge === 'before' ? 10 : 90,
+      currentTarget: { getBoundingClientRect: () => ({ left: 0, width: 100 }) },
+    }
+    act(() => target.parent!.props.onDragOver(event))
+    expect(target.parent!.props.className).toContain(`drop-${edge}`)
+    act(() => target.parent!.props.onDrop(event))
+    expect(intents).toHaveLength(1)
+    const request = intents[0]
+    expect(request).toEqual({
+      type: 'reorderWindowPresentation', request_id: expect.any(String),
+      ordered_window_ids: edge === 'before' ? ['w-sample', 'w-main', 'w-2'] : ['w-main', 'w-sample', 'w-2'],
+    })
+    expect(target.props['aria-pressed']).toBe(true)
+    await act(async () => {
+      window.__HYDRA_DASHBOARD_RESOLVE_WINDOW_ORDER__!(String(request.request_id), { status: 'saved' })
+    })
+    expect(renderer!.root.findAllByProps({ role: 'alert' })).toHaveLength(0)
+  })
+
+  it('uses modified arrows for order, retains native failure, and does not intercept ordinary focus keys', async () => {
+    const intents: Array<Record<string, unknown>> = []
+    installWindow(intents)
+    await mount()
+    const button = renderer!.root.findByProps({ 'aria-label': 'Focus Dashboard build in Sample Workspace' })
+    const event = { key: 'ArrowRight', altKey: false, shiftKey: false, preventDefault: vi.fn(), stopPropagation: vi.fn() }
+    act(() => button.props.onKeyDown(event))
+    expect(event.preventDefault).not.toHaveBeenCalled()
+    expect(intents).toEqual([])
+    act(() => button.props.onKeyDown({ ...event, altKey: true, shiftKey: true }))
+    expect(intents[0]).toEqual({ type: 'reorderWindowPresentation', request_id: expect.any(String), ordered_window_ids: ['w-2', 'w-main', 'w-sample'] })
+    act(() => button.props.onKeyDown({ ...event, altKey: true, shiftKey: true }))
+    expect(intents).toHaveLength(1)
+    await act(async () => {
+      window.__HYDRA_DASHBOARD_RESOLVE_WINDOW_ORDER__!(String(intents[0].request_id), { status: 'failed', message: 'Settings could not be saved.' })
+    })
+    expect(renderer!.root.findByProps({ role: 'alert' }).children).toEqual(['Settings could not be saved.'])
+    expect(button.props['aria-pressed']).toBe(true)
+    expect(intents).toHaveLength(1)
+  })
+
   it.each(['?chrome=topbar', ''])(
     'shows the native order-save warning without retrying creation on %s',
     async (search) => {
