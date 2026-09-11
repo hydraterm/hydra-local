@@ -765,12 +765,14 @@ export const bridge = {
     const request_id = nextNativeRequestId('folder', nextFolderRequestId++)
     return new Promise((resolve) => {
       folderPickers.set(request_id, resolve)
-      window.setTimeout(() => {
-        if (!folderPickers.has(request_id)) return
+      // A native modal waits for the person, not a background operation. Only its correlated
+      // selection/cancellation resolves this request; browsing for longer must not discard it.
+      try {
+        postIntent({ type: 'pickProjectFolder', request_id })
+      } catch (error) {
         folderPickers.delete(request_id)
-        resolve(null)
-      }, 60_000)
-      postIntent({ type: 'pickProjectFolder', request_id })
+        throw error
+      }
     })
   },
 
