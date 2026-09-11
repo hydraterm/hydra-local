@@ -235,6 +235,8 @@ export interface DashboardModel {
   active_project: ActiveProjectRef | null
   active_window_id?: string | null
   active_tab_id?: string | null
+  /** Observed windows in saved cross-project presentation order; absent on older hosts. */
+  global_window_order?: string[]
   projects: ProjectCardView[]
   counts: TaskCounts
   attention_count: number

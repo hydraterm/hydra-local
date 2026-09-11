@@ -48,6 +48,35 @@ afterEach(() => {
 })
 
 describe('native topbar semantics and intents', () => {
+  it.each(['?chrome=topbar', ''])(
+    'projects saved cross-project order on %s without changing focus or ownership',
+    async (search) => {
+      const intents: Array<Record<string, unknown>> = []
+      const model = structuredClone(mockDashboardModel)
+      model.global_window_order = ['missing', 'w-2', 'w-sample', 'w-main']
+      model.active_window_id = 'w-main'
+      model.active_tab_id = 'tab-claude'
+      installWindow(intents, search, model)
+      await mount()
+      const toolbar = renderer!.root.findByProps({ role: 'toolbar' })
+      const focusButtons = toolbar.findAll((node) =>
+        typeof node.props['aria-label'] === 'string' && node.props['aria-label'].startsWith('Focus '),
+      )
+      expect(focusButtons.map((button) => button.props['aria-label'])).toEqual([
+        'Focus Release checks in Sample Workspace',
+        'Focus Analytics report in Sample Analytics',
+        'Focus Dashboard build in Sample Workspace',
+      ])
+      expect(focusButtons.map((button) => button.props['aria-pressed'])).toEqual([false, false, true])
+      expect(intents).toEqual([])
+      act(() => focusButtons[1].props.onClick())
+      expect(intents[intents.length - 1]).toEqual({
+        type: 'focusWindow', project_id: 'sample', window_id: 'w-sample',
+      })
+      expect(model.global_window_order).toEqual(['missing', 'w-2', 'w-sample', 'w-main'])
+    },
+  )
+
   it('uses honest toolbar/button semantics and exposes every action by name', async () => {
     const intents: Array<Record<string, unknown>> = []
     installWindow(intents)

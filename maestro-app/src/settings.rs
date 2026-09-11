@@ -12,6 +12,7 @@
 //! settings dir is created `0700` and the file written `0600` (Unix) via temp-file + atomic rename.
 //! Writers hold the shared settings lock from the first read through the returned effective state;
 //! atomic readers remain lock-free. The owner-local lock file survives resets of the JSON file.
+//! An optional global window-order vector is layout state, not a preference: resets preserve it.
 //!
 //! Keep all field names snake_case and every value deterministic so the JSON is stable across runs.
 //! New fields must be backward-additive and covered by tests.
@@ -20,7 +21,11 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
 
+mod window_order;
 mod writer;
+pub use window_order::{
+    apply_window_presentation_order, reorder_window_presentation, WindowOrderSuccess,
+};
 #[cfg(test)]
 mod writer_tests;
 
@@ -624,6 +629,10 @@ pub struct PersistedSettings {
     pub shell: PersistedShell,
     #[serde(default)]
     pub workspace: PersistedWorkspace,
+    /// Presentation order only, never project ownership or session lifecycle authority.
+    /// Preference resets preserve this layout state; an absent field retains legacy seeding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_window_order: Option<Vec<String>>,
 }
 
 /// The persisted shell overrides. `default_argv` is `Option<Vec<String>>` so an absent key keeps the
@@ -702,12 +711,13 @@ fn default_persisted() -> PersistedSettings {
         chrome: PersistedChrome::default(),
         shell: PersistedShell::default(),
         workspace: PersistedWorkspace::default(),
+        global_window_order: None,
     }
 }
 
 /// Whether a persisted-settings value is entirely at the built-in defaults: appearance equals the
-/// built-in font/theme AND no chrome override is recorded. When true after a reset, the settings file
-/// is deleted rather than rewritten so an all-default state leaves no file behind.
+/// built-in font/theme with no preference overrides or saved layout. Only this state may delete
+/// the settings file after a reset; window ordering must survive preference resets.
 fn persisted_is_all_default(p: &PersistedSettings) -> bool {
     p.appearance.font_size_px == DEFAULT_FONT_SIZE_PX
         && p.appearance.theme == BUILT_IN_THEME
@@ -720,6 +730,7 @@ fn persisted_is_all_default(p: &PersistedSettings) -> bool {
         && p.workspace.default_policy.is_none()
         && p.workspace.worktree_requires_consent.is_none()
         && p.workspace.repo_write_requires_consent.is_none()
+        && p.global_window_order.is_none()
 }
 
 /// Validate a candidate `appearance.font_size_px` value. Accepts the inclusive
@@ -944,6 +955,9 @@ pub struct SettingsSetSuccess {
     pub base_dir: String,
     pub settings_path: String,
     pub settings: EffectiveSettings,
+    /// Present only when a preference reset preserved an existing saved window layout.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout_preserved: Option<bool>,
 }
 
 /// Persist `appearance.font_size_px` under the resolved `base`, then return a deterministic success
@@ -989,6 +1003,7 @@ pub fn set_font_size_px(base: &Path, value: u32) -> Result<SettingsSetSuccess, S
         base_dir: base.to_string_lossy().to_string(),
         settings_path: path.to_string_lossy().to_string(),
         settings,
+        layout_preserved: None,
     })
 }
 
@@ -1032,6 +1047,7 @@ pub fn set_theme(base: &Path, theme: &str) -> Result<SettingsSetSuccess, Setting
         base_dir: base.to_string_lossy().to_string(),
         settings_path: path.to_string_lossy().to_string(),
         settings,
+        layout_preserved: None,
     })
 }
 
@@ -1128,6 +1144,7 @@ pub fn set_chrome_default(
         base_dir: base.to_string_lossy().to_string(),
         settings_path: path.to_string_lossy().to_string(),
         settings,
+        layout_preserved: None,
     })
 }
 
@@ -1215,6 +1232,7 @@ pub fn set_workspace_consent(
         base_dir: base.to_string_lossy().to_string(),
         settings_path: path.to_string_lossy().to_string(),
         settings,
+        layout_preserved: None,
     })
 }
 
@@ -1264,6 +1282,7 @@ pub fn set_workspace_default_policy(
         base_dir: base.to_string_lossy().to_string(),
         settings_path: path.to_string_lossy().to_string(),
         settings,
+        layout_preserved: None,
     })
 }
 
@@ -1314,6 +1333,7 @@ pub fn set_shell_default_argv(
         base_dir: base.to_string_lossy().to_string(),
         settings_path: path.to_string_lossy().to_string(),
         settings,
+        layout_preserved: None,
     })
 }
 
@@ -1342,7 +1362,7 @@ pub enum SettingsResetTarget {
 /// - No settings file: succeeds with `changed:false` and reports pure defaults (no JSON is created).
 /// - Honored file: clear the target field (appearance back to its default, chrome override back to
 ///   `None`) while preserving every sibling. If the result is entirely at defaults (both appearance
-///   fields default AND no chrome override recorded), delete `settings.json` (best-effort; a delete
+///   fields default, no preference overrides and no saved layout), delete `settings.json` (a delete
 ///   error is `io_error`); otherwise rewrite the file atomically. `changed` is `false` when the target
 ///   already held its default.
 /// - Foreign/unreadable file: refuses with `settings_conflict` (never overwrites or deletes it).
@@ -1353,9 +1373,11 @@ pub fn reset_appearance_setting(
     let writer = writer::SettingsWriteGuard::acquire(base)?;
     let path = settings_file_path(base);
 
+    let mut layout_preserved = None;
     let changed = match load_persisted(&path) {
         LoadedSettings::Absent => false,
         LoadedSettings::Honored(mut next) => {
+            layout_preserved = next.global_window_order.is_some().then_some(true);
             let changed = match target {
                 SettingsResetTarget::FontSizePx => {
                     let was_default = next.appearance.font_size_px == DEFAULT_FONT_SIZE_PX;
@@ -1480,17 +1502,18 @@ pub fn reset_appearance_setting(
         base_dir: base.to_string_lossy().to_string(),
         settings_path: path.to_string_lossy().to_string(),
         settings,
+        layout_preserved,
     })
 }
 
-/// Reset ALL persisted local settings back to built-in defaults under the resolved `base` by removing
-/// the honored schema-v1 settings file. Local-only and mirrors the per-key reset output shape
+/// Reset ALL persisted preferences back to built-in defaults, preserving global window layout.
+/// Remove the honored schema-v1 file only when it has no layout state. Mirrors per-key output
 /// (`action:"reset"`), but identifies the target as every setting via `key:"*"` and `value: null`.
 ///
 /// Behavior:
 /// - No settings file: succeeds with `changed:false` (nothing to remove; no JSON is created).
-/// - Honored current-schema file: delete it and report `changed:true`. The containing settings
-///   directory and any unrelated sibling files are left untouched.
+/// - Honored current-schema file: preserve layout while clearing preferences, or delete the file
+///   when no layout exists. A layout-only file is unchanged. Unrelated sibling files stay untouched.
 /// - Foreign/unreadable file: refuses with `settings_conflict` and never removes it — the same
 ///   deterministic guard the per-key reset and `set` paths use, so reset-all never destroys a file it
 ///   cannot prove it owns.
@@ -1501,12 +1524,25 @@ pub fn reset_all_settings(base: &Path) -> Result<SettingsSetSuccess, SettingsFai
     let writer = writer::SettingsWriteGuard::acquire(base)?;
     let path = settings_file_path(base);
 
+    let mut layout_preserved = None;
     let changed = match load_persisted(&path) {
         LoadedSettings::Absent => false,
-        LoadedSettings::Honored(_) => {
-            remove_settings_file(&path, &writer)
-                .map_err(|err| SettingsFailure::new("io_error", err))?;
-            true
+        LoadedSettings::Honored(existing) => {
+            if existing.global_window_order.is_some() {
+                layout_preserved = Some(true);
+                let mut next = default_persisted();
+                next.global_window_order = existing.global_window_order.clone();
+                let changed = next != existing;
+                if changed {
+                    write_settings_atomic(base, &next, &writer)
+                        .map_err(|err| SettingsFailure::new("io_error", err))?;
+                }
+                changed
+            } else {
+                remove_settings_file(&path, &writer)
+                    .map_err(|err| SettingsFailure::new("io_error", err))?;
+                true
+            }
         }
         LoadedSettings::Warn(message) => {
             return Err(SettingsFailure::new(
@@ -1527,6 +1563,7 @@ pub fn reset_all_settings(base: &Path) -> Result<SettingsSetSuccess, SettingsFai
         base_dir: base.to_string_lossy().to_string(),
         settings_path: path.to_string_lossy().to_string(),
         settings,
+        layout_preserved,
     })
 }
 

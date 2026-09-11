@@ -14,6 +14,7 @@ type Props = {
   project: ProjectCardView
   projects: ProjectCardView[]
   details: DashboardModel['details']
+  windowOrder?: DashboardModel['global_window_order']
   focusedWindowId: string | null
   activeTabId: string | null
   onFocusWindow: (projectId: string, windowId: string) => void
@@ -92,6 +93,7 @@ export function Topbar({
   project,
   projects,
   details,
+  windowOrder,
   focusedWindowId,
   activeTabId,
   onFocusWindow,
@@ -102,6 +104,15 @@ export function Topbar({
       .filter(isVisibleWindow)
       .map((window) => ({ project: owner, window })),
   )
+  if (windowOrder) {
+    const ranks = new Map(windowOrder.map((id, index) => [id, index]))
+    // Sort observed owned rows only: stale/hidden IDs cannot manufacture a window or change owner.
+    // Stable sort leaves windows unknown to an older projection in their existing relative order.
+    windows.sort((left, right) =>
+      (ranks.get(left.window.window_id) ?? windowOrder.length) -
+      (ranks.get(right.window.window_id) ?? windowOrder.length),
+    )
+  }
   const globalVisibleWindowCount = windows.length
   const focusedWindow = windows.find(
     ({ project: owner, window }) =>

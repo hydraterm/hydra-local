@@ -265,8 +265,8 @@ pub use cli::{
     ProjectReorderArgs, ProjectUpdateArgs, SettingsCommand, SettingsResetArgs,
     SettingsResetSelection, SettingsSetArgs, SettingsSetTarget, SettingsShowArgs,
     WindowAttentionArgs, WindowCommand, WindowCreateArgs, WindowOpenTabArgs, WindowPinTabArgs,
-    WindowRenameTabArgs, WindowReorderTabsArgs, WindowShowArgs, WindowSplitTabArgs,
-    WindowTabRefArgs, WindowViewArgs, WorktreeCleanupArgs, WorktreeListArgs,
+    WindowRenameTabArgs, WindowReorderArgs, WindowReorderTabsArgs, WindowShowArgs,
+    WindowSplitTabArgs, WindowTabRefArgs, WindowViewArgs, WorktreeCleanupArgs, WorktreeListArgs,
 };
 
 // ---- command-palette action catalog --------------------------------------------------------
@@ -286,18 +286,20 @@ pub use command_palette::{
 // base path, merge persisted overrides for `settings show`, and persist `settings set`, and so
 // tests can construct/serialize them through the crate root.
 pub use settings::{
-    build_settings_panel_lines, effective_settings, renderer_font_size_px, renderer_theme_id,
-    reset_all_settings, reset_appearance_setting, set_chrome_default, set_font_size_px,
-    set_shell_default_argv, set_theme, set_workspace_consent, set_workspace_default_policy,
-    settings_dir, settings_file_path, settings_shell_default_argv, validate_font_size_px,
+    apply_window_presentation_order, build_settings_panel_lines, effective_settings,
+    renderer_font_size_px, renderer_theme_id, reorder_window_presentation, reset_all_settings,
+    reset_appearance_setting, set_chrome_default, set_font_size_px, set_shell_default_argv,
+    set_theme, set_workspace_consent, set_workspace_default_policy, settings_dir,
+    settings_file_path, settings_shell_default_argv, validate_font_size_px,
     validate_shell_default_argv, validate_theme, validate_workspace_policy, AppearanceDefaults,
     ChromeDefaultKey, ChromeDefaults, EffectiveSettings, PersistedAppearance, PersistedChrome,
     PersistedSettings, PersistedShell, PersistedWorkspace, SafetyDefaults, SettingsFailure,
     SettingsPanelLines, SettingsPanelRow, SettingsResetTarget, SettingsSetSuccess, ShellDefaults,
-    WorkspaceConsentKey, WorkspaceDefaults, BUILT_IN_THEME, DEFAULT_FONT_SIZE_PX, MAX_FONT_SIZE_PX,
-    MIN_FONT_SIZE_PX, SETTINGS_PANEL_LINE_MAX, SETTINGS_SCHEMA_VERSION, SUPPORTED_THEMES,
-    SUPPORTED_WORKSPACE_POLICIES, THEME_BUILT_IN_DARK, THEME_HIGH_CONTRAST_DARK,
-    WORKSPACE_POLICY_REPO_WRITE, WORKSPACE_POLICY_SCRATCH_CWD, WORKSPACE_POLICY_WORKTREE,
+    WindowOrderSuccess, WorkspaceConsentKey, WorkspaceDefaults, BUILT_IN_THEME,
+    DEFAULT_FONT_SIZE_PX, MAX_FONT_SIZE_PX, MIN_FONT_SIZE_PX, SETTINGS_PANEL_LINE_MAX,
+    SETTINGS_SCHEMA_VERSION, SUPPORTED_THEMES, SUPPORTED_WORKSPACE_POLICIES, THEME_BUILT_IN_DARK,
+    THEME_HIGH_CONTRAST_DARK, WORKSPACE_POLICY_REPO_WRITE, WORKSPACE_POLICY_SCRATCH_CWD,
+    WORKSPACE_POLICY_WORKTREE,
 };
 
 // Re-export shared app constants so library/binary/package tests use one set of product identities.

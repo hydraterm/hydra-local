@@ -88,6 +88,8 @@ mod launch_mutation;
 mod launch_preflight;
 mod viewport_navigation;
 #[cfg(test)]
+mod window_order_projection_tests;
+#[cfg(test)]
 mod window_rename_tests;
 
 use std::os::unix::fs::DirBuilderExt;
@@ -2375,6 +2377,14 @@ fn run_window(window: WindowCommand) -> ! {
             .map(|s| serde_json::to_string(&s).expect("WindowLayoutSuccess serializes")),
         WindowCommand::ReorderTabs(args) => run_window_reorder_tabs(args)
             .map(|s| serde_json::to_string(&s).expect("WindowLayoutSuccess serializes")),
+        WindowCommand::Reorder(args) => {
+            let (paths, _) = window_base(args.base);
+            maestro_app::reorder_window_presentation(&paths, &args.order)
+                .map(|value| serde_json::to_string(&value).expect("WindowOrderSuccess serializes"))
+                .map_err(|error| {
+                    WindowFailure::new("window reorder", error.error_kind, error.message)
+                })
+        }
         WindowCommand::Attention(args) => run_window_attention(*args)
             .map(|s| serde_json::to_string(&s).expect("WindowLayoutSuccess serializes")),
         WindowCommand::AttentionClear(args) => run_window_attention_clear(args)
@@ -2878,9 +2888,25 @@ fn dashboard_react_model_with_active_and_report(
     session_report: Option<&maestro_shell::ReconcileReport>,
 ) -> serde_json::Value {
     let mut model = match DashboardSnapshotService::new(paths).snapshot(session_report) {
-        Ok(snapshot) => {
+        Ok(mut snapshot) => {
+            let order = maestro_app::apply_window_presentation_order(paths, &mut snapshot);
             let session_agents = session_agent_index(paths);
-            dashboard_react_model_from_snapshot_with_sessions(&snapshot, &session_agents)
+            let mut model =
+                dashboard_react_model_from_snapshot_with_sessions(&snapshot, &session_agents);
+            // Presentation order must not expose unassigned/recovery identities that the
+            // ordinary project projection intentionally keeps native-only.
+            let visible_ids: std::collections::HashSet<&str> = snapshot
+                .projects
+                .iter()
+                .filter(|project| project.project_id != PRODUCT_RECOVERY_PROJECT_ID)
+                .flat_map(|project| project.windows.iter())
+                .map(|window| window.window_id.as_str())
+                .collect();
+            model["global_window_order"] = serde_json::json!(order
+                .into_iter()
+                .filter(|id| visible_ids.contains(id.as_str()))
+                .collect::<Vec<_>>());
+            model
         }
         Err(err) => {
             eprintln!("hydra-dashboard snapshot failed: {err}");
@@ -8426,7 +8452,8 @@ fn first_visible_window_id_except(
     DashboardSnapshotService::new(paths)
         .snapshot(None)
         .ok()
-        .and_then(|snapshot| {
+        .and_then(|mut snapshot| {
+            let order = maestro_app::apply_window_presentation_order(paths, &mut snapshot);
             let first_visible = |project: &maestro_shell::ProjectSnapshot| {
                 if project.project_id == PRODUCT_RECOVERY_PROJECT_ID {
                     return None;
@@ -8456,7 +8483,8 @@ fn first_visible_window_id_except(
                             project.project_id != preferred_project_id
                                 && project.project_id != PRODUCT_RECOVERY_PROJECT_ID
                         })
-                        .find_map(first_visible)
+                        .filter_map(first_visible)
+                        .min_by_key(|target| order.iter().position(|id| id == &target.window_id))
                 })
         })
 }
@@ -12905,7 +12933,8 @@ fn run_launch_foreground_with_new_tab(
     // launch-time top panel in place (non-fatal); the dock just stays absent.
     if launch_struct.dashboard_panel.is_some() && !startup_handoff_pending {
         match DashboardSnapshotService::new(paths).snapshot(None) {
-            Ok(snapshot) => {
+            Ok(mut snapshot) => {
+                maestro_app::apply_window_presentation_order(paths, &mut snapshot);
                 let dock = build_dock_model(
                     &snapshot,
                     false,
@@ -13058,7 +13087,8 @@ fn run_launch_foreground_unbound(
         // the recorded launch path. Buffered on the mpsc until the renderer drains it. Non-fatal on error.
         if launch_struct.dashboard_panel.is_some() && !startup_handoff_pending {
             match DashboardSnapshotService::new(paths).snapshot(None) {
-                Ok(snapshot) => {
+                Ok(mut snapshot) => {
+                    maestro_app::apply_window_presentation_order(paths, &mut snapshot);
                     let dock = build_dock_model(
                         &snapshot,
                         false,
@@ -14308,7 +14338,8 @@ fn project_listener_dock_after_claim(
         return;
     }
     match DashboardSnapshotService::new(paths).snapshot(None) {
-        Ok(snapshot) => {
+        Ok(mut snapshot) => {
+            maestro_app::apply_window_presentation_order(paths, &mut snapshot);
             let dock = build_dock_model(
                 &snapshot,
                 false,
@@ -16196,7 +16227,11 @@ fn spawn_window_event_listener(
                         }
                         Ok(_) => {
                             match DashboardSnapshotService::new(&listener_paths).snapshot(None) {
-                                Ok(snapshot) => {
+                                Ok(mut snapshot) => {
+                                    maestro_app::apply_window_presentation_order(
+                                        &listener_paths,
+                                        &mut snapshot,
+                                    );
                                     if listener_dock_enabled {
                                         // Dock-owning window: re-project the tree into the dock with
                                         // the current expand state and re-push it; the top panel stays
@@ -19032,7 +19067,11 @@ fn spawn_window_event_listener(
                             listener_expanded_projects.insert(project_id.clone());
                         }
                         match DashboardSnapshotService::new(&listener_paths).snapshot(None) {
-                            Ok(snapshot) => {
+                            Ok(mut snapshot) => {
+                                maestro_app::apply_window_presentation_order(
+                                    &listener_paths,
+                                    &mut snapshot,
+                                );
                                 let dock = build_dock_model(
                                     &snapshot,
                                     listener_dock_collapsed,
@@ -19061,7 +19100,11 @@ fn spawn_window_event_listener(
                     if listener_dock_enabled {
                         listener_dock_collapsed = !listener_dock_collapsed;
                         match DashboardSnapshotService::new(&listener_paths).snapshot(None) {
-                            Ok(snapshot) => {
+                            Ok(mut snapshot) => {
+                                maestro_app::apply_window_presentation_order(
+                                    &listener_paths,
+                                    &mut snapshot,
+                                );
                                 let dock = build_dock_model(
                                     &snapshot,
                                     listener_dock_collapsed,

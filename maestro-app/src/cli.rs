@@ -351,8 +351,8 @@ pub struct WorktreeListArgs {
     pub base: Option<PathBuf>,
 }
 
-/// One of the four headless `window` subcommands. Each is daemon-free and operates only on the
-/// persisted `WindowLayout` store under `--base`.
+/// Headless `window` subcommands. Each is daemon-free; `reorder` changes profile presentation
+/// settings, while the existing commands operate on persisted window/pane records under `--base`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WindowCommand {
     /// `window create --window-id <id> [--base <dir>]`: create a new empty window layout.
@@ -381,6 +381,9 @@ pub enum WindowCommand {
     /// `window reorder-tabs --window-id <id> --order <tab1,tab2,...> [--base <dir>]`: reorder the
     /// tabs to an exact permutation of the existing ids.
     ReorderTabs(WindowReorderTabsArgs),
+    /// `window reorder --order <window1,window2,...> [--base <dir>]`: reorder this current
+    /// subset within its global presentation slots; unmentioned windows keep their positions.
+    Reorder(WindowReorderArgs),
     /// `window attention --window-id <id> --tab-id <id> --attention <state> --unseen <true|false>
     /// [--source <source>] [--since-ms <u64>] [--base <dir>]`: update a single tab's persisted
     /// attention object, preserving order.
@@ -471,6 +474,13 @@ pub struct WindowPinTabArgs {
 pub struct WindowReorderTabsArgs {
     pub window_id: Option<String>,
     pub order: Option<Vec<String>>,
+    pub base: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WindowReorderArgs {
+    /// Current IDs to permute within their existing global slots, not a pane/tab list.
+    pub order: Vec<String>,
     pub base: Option<PathBuf>,
 }
 
@@ -886,6 +896,7 @@ pub fn usage() -> &'static str {
      \x20\x20maestro-app window rename-tab --window-id <id> --tab-id <id> --title <text> [--base <dir>]\n\
      \x20\x20maestro-app window pin-tab --window-id <id> --tab-id <id> --pinned <true|false> [--base <dir>]\n\
      \x20\x20maestro-app window reorder-tabs --window-id <id> --order <tab1,tab2,...> [--base <dir>]\n\
+     \x20\x20maestro-app window reorder --order <window1,window2,...> [--base <dir>]\n\
      \x20\x20maestro-app window attention --window-id <id> --tab-id <id> --attention <state> --unseen <true|false> [--source <source>] [--since-ms <u64>] [--base <dir>]\n\
      \x20\x20maestro-app window attention-clear --window-id <id> --tab-id <id> [--base <dir>]\n\
      \x20\x20maestro-app attach-tab --window-id <id> --tab-id <id> [FLAGS]\n\
@@ -930,11 +941,11 @@ pub fn usage() -> &'static str {
      safety.* policy keys stay report-only and cannot be relaxed via settings);\n\
      'settings reset' clears one override back to its built-in default (font_size_px -> 16, theme ->\n\
      built_in_dark, chrome defaults -> ON, shell.default_argv -> unset/$SHELL fallback), preserving\n\
-     non-default siblings and removing\n\
-     <base>/settings/settings.json entirely once every override is back to its default. With --all\n\
-     (mutually exclusive with a key), 'settings reset' restores ALL local settings to built-in\n\
-     defaults by removing the settings file in one step; an absent file reports changed:false and a\n\
-     foreign/unsupported file is refused (left untouched). Both\n\
+     non-default siblings and saved global window layout. With --all (mutually exclusive with a\n\
+     key), every preference returns to its built-in default; window order stays unchanged and\n\
+     layout_preserved:true reports a retained layout. The file is removed only when neither\n\
+     overrides nor layout remain. An absent file reports changed:false; foreign/unsupported files\n\
+     are refused (left untouched). Both\n\
      'set' and 'reset' are local-only settings-file mutations on the versioned JSON file at\n\
      <base>/settings/settings.json (0700 dir, 0600 file, atomic temp+rename) and print one success\n\
      JSON value. All three connect to no daemon, spawn nothing, open no renderer, and read/write no\n\
@@ -2856,7 +2867,7 @@ fn parse_window<'a>(
     let Some(sub) = iter.next() else {
         return Err(ParseError::new(
             "window requires a subcommand (expected 'create', 'show', 'open-tab', 'split-tab', \
-             'view', 'close-tab', 'rename-tab', 'pin-tab', 'reorder-tabs', or 'attention')",
+             'view', 'close-tab', 'rename-tab', 'pin-tab', 'reorder', 'reorder-tabs', or 'attention')",
         ));
     };
     match sub.as_str() {
@@ -2869,11 +2880,12 @@ fn parse_window<'a>(
         "rename-tab" => parse_window_rename_tab(iter).map(WindowCommand::RenameTab),
         "pin-tab" => parse_window_pin_tab(iter).map(WindowCommand::PinTab),
         "reorder-tabs" => parse_window_reorder_tabs(iter).map(WindowCommand::ReorderTabs),
+        "reorder" => parse_window_reorder(iter).map(WindowCommand::Reorder),
         "attention" => parse_window_attention(iter).map(|a| WindowCommand::Attention(Box::new(a))),
         "attention-clear" => parse_window_attention_clear(iter).map(WindowCommand::AttentionClear),
         other => Err(ParseError::new(format!(
             "unknown window subcommand '{other}' (expected 'create', 'show', 'open-tab', \
-             'split-tab', 'view', 'close-tab', 'rename-tab', 'pin-tab', 'reorder-tabs', \
+             'split-tab', 'view', 'close-tab', 'rename-tab', 'pin-tab', 'reorder', 'reorder-tabs', \
              'attention', or 'attention-clear')"
         ))),
     }
@@ -3367,6 +3379,44 @@ fn parse_window_reorder_tabs<'a>(
     if out.order.is_none() {
         return Err(ParseError::new(
             "window reorder-tabs requires --order <tab1,tab2,...>",
+        ));
+    }
+    Ok(out)
+}
+
+fn parse_window_reorder<'a>(
+    mut iter: impl Iterator<Item = &'a String>,
+) -> Result<WindowReorderArgs, ParseError> {
+    let mut out = WindowReorderArgs::default();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--order" => {
+                if !out.order.is_empty() {
+                    return Err(ParseError::new("window --order may be given at most once"));
+                }
+                let raw = value_for(&mut iter, "--order")?;
+                out.order = raw.split(',').map(str::to_string).collect();
+                let mut seen = std::collections::HashSet::new();
+                for id in &out.order {
+                    maestro_shell::AppPaths::with_base(".")
+                        .record_path(maestro_shell::RecordKind::WindowLayout, id)
+                        .map_err(|error| ParseError::new(error.to_string()))?;
+                    if !seen.insert(id) {
+                        return Err(ParseError::new("duplicate window id in requested order"));
+                    }
+                }
+            }
+            "--base" => set_window_base(&mut out.base, value_for(&mut iter, "--base")?)?,
+            other => {
+                return Err(ParseError::new(format!(
+                    "unknown window reorder flag '{other}'"
+                )))
+            }
+        }
+    }
+    if out.order.is_empty() {
+        return Err(ParseError::new(
+            "window reorder requires --order <window1,window2,...>",
         ));
     }
     Ok(out)
