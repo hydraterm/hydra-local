@@ -237,6 +237,8 @@ export interface DashboardModel {
   active_tab_id?: string | null
   /** Observed windows in saved cross-project presentation order; absent on older hosts. */
   global_window_order?: string[]
+  /** A window may exist even when saving its separate presentation order failed. */
+  window_order_warning?: string
   projects: ProjectCardView[]
   counts: TaskCounts
   attention_count: number

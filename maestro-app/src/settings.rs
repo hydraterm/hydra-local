@@ -24,7 +24,8 @@ use std::path::{Path, PathBuf};
 mod window_order;
 mod writer;
 pub use window_order::{
-    apply_window_presentation_order, reorder_window_presentation, WindowOrderSuccess,
+    apply_window_presentation_order, reconcile_window_presentation_order,
+    reorder_window_presentation, WindowOrderSuccess,
 };
 #[cfg(test)]
 mod writer_tests;

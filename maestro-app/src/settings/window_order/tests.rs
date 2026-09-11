@@ -3,6 +3,9 @@ use maestro_shell::{store, AttentionState, NewProject, ProjectService, WindowLay
 use std::sync::mpsc;
 use std::time::Duration;
 
+#[path = "maintenance_tests.rs"]
+mod maintenance_tests;
+
 fn ids(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).into()).collect()
 }

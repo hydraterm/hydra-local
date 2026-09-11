@@ -1704,6 +1704,15 @@ body.is-resizing-sidebar .sidebar-resizer::before {
   flex: 0 0 0;
   min-width: 0;
 }
+.window-tabs__order-warning {
+  flex: 0 0 auto;
+  max-width: min(240px, 25vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #f6c778;
+  font-size: 12px;
+}
 .window-tab-group {
   display: inline-flex;
   align-items: center;

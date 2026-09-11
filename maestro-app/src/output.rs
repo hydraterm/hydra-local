@@ -458,6 +458,9 @@ pub struct WindowLayoutSuccess {
     pub base: String,
     pub window_id: String,
     pub tabs: Vec<WindowTabJson>,
+    /// Creation succeeded; only the separate presentation-order save failed. Never retry create.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_order_warning: Option<String>,
 }
 
 impl WindowLayoutSuccess {
@@ -473,6 +476,7 @@ impl WindowLayoutSuccess {
             base,
             window_id,
             tabs,
+            window_order_warning: None,
         }
     }
 }

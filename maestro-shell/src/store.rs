@@ -502,6 +502,23 @@ pub fn window_project_owners(
     Ok(rows)
 }
 
+/// Current window IDs in insertion order, solely for appending presentation metadata. Ordinary
+/// record updates retain rowid; deletion/recreation does not make this an incarnation authority.
+/// The connection guard is released before the caller can write its separate settings file.
+pub fn window_ids_in_creation_order(paths: &AppPaths) -> Result<Vec<String>, StoreError> {
+    let arc = crate::db::conn_for(paths.base()).map_err(StoreError::from_db)?;
+    let conn = arc.lock().unwrap();
+    let mut stmt = conn
+        .prepare("SELECT window_id FROM windows ORDER BY rowid")
+        .map_err(|error| StoreError::Db(error.to_string()))?;
+    let rows = stmt
+        .query_map([], |row| row.get(0))
+        .map_err(|error| StoreError::Db(error.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| StoreError::Db(error.to_string()))?;
+    Ok(rows)
+}
+
 /// Delete a record by id. FK `ON DELETE CASCADE` removes its children (deleting a project cascades to its workspaces,
 /// sessions, windows, tabs, agent_tasks, and project-scoped presets; deleting a window cascades to its tabs). Returns
 /// whether a row was removed (idempotent — a missing id is `Ok(false)`). Replaces the old `fs::remove_file`.

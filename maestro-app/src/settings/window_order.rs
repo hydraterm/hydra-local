@@ -1,4 +1,4 @@
-//! Profile-wide presentation order. Project ownership and activation never write this vector.
+//! Profile-wide presentation order. It never changes project ownership or pane order.
 
 use super::*;
 use maestro_shell::{AppPaths, DashboardSnapshot, DashboardSnapshotService, RecordKind};
@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 /// Apply saved presentation order to an already observed dashboard, without writing preferences
 /// or records. Project hierarchy/recency and each window's pane order remain unchanged. The
 /// returned cross-project order contains only observed IDs; absent saved IDs stay on disk.
-/// Unseen windows follow the observed legacy order until an explicit order save includes them.
+/// Unseen windows follow the observed legacy order until lifecycle maintenance includes them.
 pub fn apply_window_presentation_order(
     paths: &AppPaths,
     snapshot: &mut DashboardSnapshot,
@@ -67,6 +67,62 @@ pub struct WindowOrderSuccess {
     pub changed: bool,
     /// Currently observed windows in the saved global order; absent entries stay on disk.
     pub window_order: Vec<String>,
+}
+
+/// Explicit lifecycle maintenance, never called by a snapshot/projection reader. Seed the legacy
+/// presentation once, then append unseen current IDs in insertion order without pruning saved IDs.
+/// `created_window` is supplied only after a successful CLI create: on the first seed that new row
+/// follows the older cohort rather than being inserted into its project's legacy slots.
+///
+/// The settings lock covers read/modify/atomic save. SQL guards do not cross JSON I/O. This is not
+/// an ownership transaction: concurrent creates are caught next time, and absent IDs stay saved.
+pub fn reconcile_window_presentation_order(
+    paths: &AppPaths,
+    created_window: Option<&str>,
+) -> Result<bool, SettingsFailure> {
+    let writer = writer::SettingsWriteGuard::acquire(paths.base())?;
+    let mut next = match load_persisted(&settings_file_path(paths.base())) {
+        LoadedSettings::Absent => default_persisted(),
+        LoadedSettings::Honored(existing) => existing,
+        LoadedSettings::Warn(message) => {
+            return Err(SettingsFailure::new("settings_conflict", message));
+        }
+    };
+    let current = maestro_shell::store::window_ids_in_creation_order(paths)
+        .map_err(|error| SettingsFailure::new("window_order_failed", error.to_string()))?;
+    validate_ids(paths, &current)?;
+    let mut order = match &next.global_window_order {
+        Some(saved) => {
+            validate_ids(paths, saved)
+                .map_err(|error| SettingsFailure::new("settings_conflict", error.message))?;
+            saved.clone()
+        }
+        None if current.is_empty() => return Ok(false),
+        None => {
+            let snapshot = DashboardSnapshotService::new(paths)
+                .snapshot(None)
+                .map_err(|error| SettingsFailure::new("window_order_failed", error.to_string()))?;
+            snapshot
+                .projects
+                .iter()
+                .flat_map(|project| project.windows.iter())
+                .chain(snapshot.unassigned_windows.iter())
+                .map(|window| &window.window_id)
+                .filter(|id| created_window != Some(id.as_str()))
+                .cloned()
+                .collect()
+        }
+    };
+    let mut known: HashSet<String> = order.iter().cloned().collect();
+    order.extend(current.into_iter().filter(|id| known.insert(id.clone())));
+    validate_ids(paths, &order)?;
+    if next.global_window_order.as_ref() == Some(&order) {
+        return Ok(false);
+    }
+    next.global_window_order = Some(order);
+    write_settings_atomic(paths.base(), &next, &writer)
+        .map_err(|error| SettingsFailure::new("io_error", error))?;
+    Ok(true)
 }
 
 /// Reorder a nonempty current subset within its global slots. Unmentioned, hidden, stashed and

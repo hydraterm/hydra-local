@@ -87,6 +87,7 @@ mod history_discovery;
 mod launch_mutation;
 mod launch_preflight;
 mod viewport_navigation;
+mod window_order_maintenance;
 #[cfg(test)]
 mod window_order_projection_tests;
 #[cfg(test)]
@@ -2421,7 +2422,12 @@ fn run_window_create(args: WindowCreateArgs) -> Result<WindowLayoutSuccess, Wind
     let layout = WindowLayoutService::new(&paths)
         .create_empty(&window_id, now_ms())
         .map_err(|e| window_failure("window create", e))?;
-    Ok(layout_success("window create", base, layout))
+    let mut success = layout_success("window create", base, layout);
+    if let Err(error) = maestro_app::reconcile_window_presentation_order(&paths, Some(&window_id)) {
+        success.window_order_warning =
+            Some(format!("Window order wasn't saved: {}", error.message));
+    }
+    Ok(success)
 }
 
 fn run_window_show(args: WindowShowArgs) -> Result<WindowLayoutSuccess, WindowFailure> {
@@ -14483,7 +14489,29 @@ fn spawn_window_event_listener(
         let _ = sync_copy_on_select_setting(&tab_runtime, &listener_base, &mut last_copy_on_select);
         let mut last_input_settings_check = Instant::now();
         let mut pending_navigation = viewport_navigation::PendingNavigation::default();
+        let mut window_order_maintenance =
+            window_order_maintenance::WindowOrderMaintenance::default();
         loop {
+            // Explicit lifecycle work, not a side effect of reading a dashboard. One persistent
+            // metadata worker skips unchanged state and keeps settings-lock waits off this thread.
+            // Check outside the idle branch so continuous terminal events cannot starve discovery.
+            if let Some(result) = window_order_maintenance.poll(
+                &listener_paths,
+                !listener_stop.load(Ordering::Acquire)
+                    && listener_activated
+                    && listener_window_context.is_bound()
+                    && !tab_runtime.handoff_is_pending(),
+            ) {
+                if window_order_maintenance::apply_result(&mut tab_runtime, result) {
+                    last_sent_react_model = None;
+                    refresh_react_chrome_dashboard_with_focused(
+                        &listener_paths,
+                        &mut tab_runtime,
+                        listener_focused_tab_id.as_deref(),
+                        "window-order-maintenance",
+                    );
+                }
+            }
             if !listener_stop.load(Ordering::Acquire)
                 && last_input_settings_check.elapsed() >= Duration::from_millis(500)
             {

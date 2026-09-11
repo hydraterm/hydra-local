@@ -49,6 +49,22 @@ afterEach(() => {
 
 describe('native topbar semantics and intents', () => {
   it.each(['?chrome=topbar', ''])(
+    'shows the native order-save warning without retrying creation on %s',
+    async (search) => {
+      const intents: Array<Record<string, unknown>> = []
+      const model = structuredClone(mockDashboardModel)
+      model.window_order_warning = "Window order wasn't saved: atomic rename failed"
+      installWindow(intents, search, model)
+      await mount()
+      const warning = renderer!.root.findByProps({ className: 'window-tabs__order-warning' })
+      expect(warning.props.role).toBe('status')
+      expect(warning.props.title).toBe(model.window_order_warning)
+      expect(warning.children).toEqual([model.window_order_warning])
+      expect(intents).toEqual([])
+    },
+  )
+
+  it.each(['?chrome=topbar', ''])(
     'projects saved cross-project order on %s without changing focus or ownership',
     async (search) => {
       const intents: Array<Record<string, unknown>> = []

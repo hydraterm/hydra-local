@@ -11,6 +11,49 @@ fn run(base: &std::path::Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn create_appends_and_returns_identity_even_when_order_save_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    for id in ["z-first", "a-second"] {
+        let output = run(temp.path(), &["window", "create", "--window-id", id]);
+        assert!(output.status.success());
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["window_id"], id);
+        assert!(result.get("window_order_warning").is_none());
+    }
+    let file = maestro_app::settings_file_path(temp.path());
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(
+        saved["global_window_order"],
+        serde_json::json!(["z-first", "a-second"])
+    );
+    std::fs::write(&file, "broken json").unwrap();
+    let output = run(
+        temp.path(),
+        &["window", "create", "--window-id", "created-once"],
+    );
+    assert!(
+        output.status.success(),
+        "metadata failure must not invite creation retry"
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["window_id"], "created-once");
+    assert!(result["window_order_warning"]
+        .as_str()
+        .unwrap()
+        .contains("settings file malformed"));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "broken json");
+    let shown = run(
+        temp.path(),
+        &["window", "show", "--window-id", "created-once"],
+    );
+    assert!(shown.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(result["window_id"], "created-once");
+    assert!(result.get("window_order_warning").is_none());
+}
+
+#[test]
 fn global_window_cli_persists_subset_order_across_processes_and_keeps_tab_command_distinct() {
     let temp = tempfile::tempdir().unwrap();
     for id in ["a", "b", "c"] {

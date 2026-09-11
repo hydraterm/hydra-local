@@ -740,6 +740,7 @@ export function App(): JSX.Element {
             projects={model.projects}
             details={model.details}
             windowOrder={model.global_window_order}
+            windowOrderWarning={model.window_order_warning}
             focusedWindowId={focusedWindow?.window_id ?? null}
             activeTabId={model.active_tab_id ?? null}
             onFocusWindow={focusWindow}
@@ -806,6 +807,7 @@ export function App(): JSX.Element {
               projects={model.projects}
               details={model.details}
               windowOrder={model.global_window_order}
+              windowOrderWarning={model.window_order_warning}
               focusedWindowId={focusedWindow?.window_id ?? null}
               activeTabId={model.active_tab_id ?? null}
               onFocusWindow={focusWindow}

@@ -1257,6 +1257,7 @@ impl<S: RendererCommandSink> TabSwitchController<S> {
 pub struct RendererTabRuntime {
     controller: TabSwitchController<std::sync::mpsc::Sender<maestro_renderer::RendererCommand>>,
     renderer_events: Option<std::sync::mpsc::Sender<maestro_renderer::RendererEvent>>,
+    window_order_warning: Option<String>,
 }
 
 impl RendererTabRuntime {
@@ -1271,6 +1272,7 @@ impl RendererTabRuntime {
             Self {
                 controller: TabSwitchController::new(tx),
                 renderer_events: None,
+                window_order_warning: None,
             },
             rx,
         )
@@ -1573,8 +1575,22 @@ impl RendererTabRuntime {
         &mut self,
         model: &serde_json::Value,
     ) -> Result<(), TabSwitchError> {
-        let model_json = serde_json::to_string(model).expect("dashboard model serializes");
+        let model_json = if let Some(warning) = &self.window_order_warning {
+            let mut model = model.clone();
+            model["window_order_warning"] = serde_json::json!(warning);
+            serde_json::to_string(&model)
+        } else {
+            serde_json::to_string(model)
+        }
+        .expect("dashboard model serializes");
         self.controller.set_react_chrome_model(model_json)
+    }
+
+    /// Local presentation status only; preserve it across every ordinary dashboard refresh.
+    pub fn set_window_order_warning(&mut self, warning: Option<String>) -> bool {
+        let changed = self.window_order_warning != warning;
+        self.window_order_warning = warning;
+        changed
     }
 
     /// Evaluate a host-owned callback script in the embedded React chrome, delegated to the

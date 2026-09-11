@@ -15,6 +15,7 @@ type Props = {
   projects: ProjectCardView[]
   details: DashboardModel['details']
   windowOrder?: DashboardModel['global_window_order']
+  windowOrderWarning?: DashboardModel['window_order_warning']
   focusedWindowId: string | null
   activeTabId: string | null
   onFocusWindow: (projectId: string, windowId: string) => void
@@ -94,6 +95,7 @@ export function Topbar({
   projects,
   details,
   windowOrder,
+  windowOrderWarning,
   focusedWindowId,
   activeTabId,
   onFocusWindow,
@@ -196,6 +198,11 @@ export function Topbar({
       onKeyDown={(event) => moveToolbarFocus(event, setRequestedTabStop)}
       onFocusCapture={(event) => keepToolbarTabStop(event, setRequestedTabStop)}
     >
+      {windowOrderWarning && (
+        <span className="window-tabs__order-warning" role="status" title={windowOrderWarning}>
+          {windowOrderWarning}
+        </span>
+      )}
       <div className="window-tabs__left">
         {windows.map(({ project: owner, window: w }) => {
           const controlId = focusWindowControl(owner.project_id, w.window_id)
