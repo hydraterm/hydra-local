@@ -362,7 +362,17 @@ where
 /// Codex sets `NO_COLOR=1` for its own command output; inheriting that value made
 /// full-screen programs such as htop monochrome even though the PTY truthfully
 /// advertises xterm-256color support.
-const TERMINAL_ENV_REMOVALS: &[&str] = &["NO_COLOR"];
+// macOS XPC state belongs to the daemon process, not to its children. Inheriting XPC_FLAGS=0x2
+// disables system-service lookups in fresh executables, including hostname resolution. Clear it
+// before starting any shell or direct command; the provider login wrapper runs too late for shell
+// startup and is not used for ordinary terminal sessions. Keep user proxy/configuration intact.
+const TERMINAL_ENV_REMOVALS: &[&str] = &[
+    "NO_COLOR",
+    #[cfg(target_os = "macos")]
+    "XPC_FLAGS",
+    #[cfg(target_os = "macos")]
+    "XPC_SERVICE_NAME",
+];
 
 /// A typed headless request pins account authority to passwd HOME/SHELL. Remove the standard
 /// alternate-home and noninteractive-shell startup redirects inherited from a long-lived user

@@ -412,3 +412,76 @@ fn typed_child_environment_overrides_daemon_environment_and_restart() {
     drop(killer);
     std::fs::remove_dir_all(&root).expect("remove isolated environment fixture");
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_sessions_drop_daemon_xpc_context_before_startup_and_restart() {
+    let sock = std::env::temp_dir().join(format!(
+        "hydra-xpc-env-{}-{}.sock",
+        std::process::id(),
+        unique()
+    ));
+    let child = Command::new(env!("CARGO_BIN_EXE_pty-daemon"))
+        .arg(&sock)
+        .env("XPC_FLAGS", "0x2")
+        .env(
+            "XPC_SERVICE_NAME",
+            "application.com.hydraterms.hydra.fixture",
+        )
+        .env("HTTPS_PROXY", "http://proxy.invalid:8080")
+        .env("NO_PROXY", "localhost,example.invalid")
+        .env("CODEX_HOME", "/fixture/provider-config")
+        .spawn()
+        .expect("spawn daemon with inherited macOS process context");
+    let killer = Killer(child);
+    let mut stream = connect(&sock);
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let script = concat!(
+        "if test -z \"${XPC_FLAGS+x}\" && test -z \"${XPC_SERVICE_NAME+x}\"; ",
+        "then echo XPC_CONTEXT_CLEAN; else echo XPC_CONTEXT_LEAKED; fi; ",
+        "if test \"$HTTPS_PROXY\" = http://proxy.invalid:8080 ",
+        "&& test \"$NO_PROXY\" = localhost,example.invalid ",
+        "&& test \"$CODEX_HOME\" = /fixture/provider-config; ",
+        "then echo USER_SETTINGS_PRESERVED; else echo USER_SETTINGS_CHANGED; fi; "
+    );
+
+    // These are ordinary shell starts, without the provider login-shell wrapper. Restarting
+    // through the same retained daemon must use the same clean child environment.
+    for restart in [false, true] {
+        let done = format!("XPC_DIAG_DONE_{restart}");
+        let script = format!("{script}echo {done}");
+        send_value(
+            &mut stream,
+            serde_json::json!({
+                "op": "start_session", "id": "xpc-env-session", "cwd": "/tmp",
+                "command": "/bin/sh", "args": ["-c", script], "cols": 100, "rows": 24,
+                "restart_exited": restart
+            }),
+        );
+        send_value(
+            &mut stream,
+            serde_json::json!({"op":"attach", "id":"xpc-env-session", "want_raw_output":true}),
+        );
+        let out = collect_output_until(&mut reader, &done, Duration::from_secs(10));
+        assert!(
+            out.contains("XPC_CONTEXT_CLEAN"),
+            "restart={restart}: {out}"
+        );
+        assert!(
+            out.contains("USER_SETTINGS_PRESERVED"),
+            "restart={restart}: {out}"
+        );
+        wait_for_session_exit(
+            &mut stream,
+            &mut reader,
+            "xpc-env-session",
+            Duration::from_secs(5),
+        );
+        send_value(
+            &mut stream,
+            serde_json::json!({"op":"detach", "id":"xpc-env-session"}),
+        );
+    }
+    drop(killer);
+    std::fs::remove_file(sock).expect("remove isolated daemon socket");
+}

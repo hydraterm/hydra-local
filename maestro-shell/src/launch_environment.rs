@@ -108,13 +108,15 @@ pub fn login_shell_argv_with(
         .map(|arg| shell_quote_login_arg(arg))
         .collect::<Vec<_>>()
         .join(" ");
-    // XPC_FLAGS is libxpc's process-internal state, not a terminal/user preference. A retained
-    // macOS daemon can pass its "reentrancy avoided" state (0x2) to new shells. In a fresh
-    // executable that disables system-service lookups, including DNS and browser launching.
-    // Clear it after shell startup too: the login shell may itself inherit that state. Do not
-    // change the user's HOME, provider config, sandbox, network policy, or approval choices.
+    // XPC_FLAGS and XPC_SERVICE_NAME are libxpc's process-internal state, not terminal/user
+    // preferences. A retained macOS daemon can pass its "reentrancy avoided" state (0x2) and its
+    // owning service name to new shells. In a fresh executable that disables system-service
+    // lookups, including DNS and browser launching: a provider inheriting XPC_SERVICE_NAME fails
+    // every hostname with "nodename nor servname provided" while the same lookup succeeds outside
+    // the app. Clear both after shell startup too: the login shell may itself inherit that state.
+    // Do not change the user's HOME, provider config, sandbox, network policy, or approval choices.
     let process_context_reset = if cfg!(target_os = "macos") {
-        "unset XPC_FLAGS; "
+        "unset XPC_FLAGS XPC_SERVICE_NAME; "
     } else {
         ""
     };
@@ -286,7 +288,7 @@ mod tests {
                 |_| false,
             );
             assert_eq!(
-                argv[2].starts_with("unset XPC_FLAGS; "),
+                argv[2].starts_with("unset XPC_FLAGS XPC_SERVICE_NAME; "),
                 cfg!(target_os = "macos"),
                 "provider={provider}"
             );
@@ -303,7 +305,7 @@ mod tests {
             &[
                 "/bin/sh".into(),
                 "-c".into(),
-                "test -z \"${XPC_FLAGS+x}\" && test \"$HYDRA_TEST_USER_SETTING\" = kept".into(),
+                "test -z \"${XPC_FLAGS+x}\" && test -z \"${XPC_SERVICE_NAME+x}\" && test \"$HYDRA_TEST_USER_SETTING\" = kept".into(),
             ],
             "/bin/sh",
             &env(BTreeMap::new()),
@@ -312,6 +314,7 @@ mod tests {
         let status = std::process::Command::new(&argv[0])
             .args(&argv[1..])
             .env("XPC_FLAGS", "0x2")
+            .env("XPC_SERVICE_NAME", "application.com.hydraterms.hydra.1.2")
             .env("HYDRA_TEST_USER_SETTING", "kept")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
