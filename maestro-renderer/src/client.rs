@@ -1256,14 +1256,20 @@ pub fn scroll_key_action_for(
 /// display artifact, not part of the authoritative generation/revision timeline. We carry
 /// the source `generation`/`revision` purely so the overlay can show them and so a stale
 /// window (wrong generation) can be rejected by the caller before this is built.
+type CopyRows = (
+    Vec<Vec<Cell>>,
+    Option<Vec<maestro_protocol::row_copy::RowCopy>>,
+);
+
 fn scrollback_snapshot(
     generation: SessionGeneration,
     revision: Revision,
-    rows: Vec<Vec<Cell>>,
+    (rows, row_copy): CopyRows,
 ) -> GridSnapshot {
     let row_count = rows.len();
     let cols = rows.first().map(|r| r.len()).unwrap_or(0);
     GridSnapshot {
+        row_copy,
         version: crate::sync::SUPPORTED_VERSION,
         generation,
         revision,
@@ -1327,7 +1333,7 @@ fn apply_scrollback_rows(
         revision,
         history_len,
         offset_from_top,
-        rows,
+        (rows, None),
     )
 }
 
@@ -1338,7 +1344,7 @@ fn apply_scrollback_payload(
     revision: Revision,
     history_len: u32,
     offset_from_top: u32,
-    rows: Vec<Vec<Cell>>,
+    (rows, row_copy): CopyRows,
 ) -> bool {
     // ScrollbackRows are request replies on the ordered connection. Always retire the one admitted
     // request before applying generation gates: an old-generation reply after a new Grid must release
@@ -1355,10 +1361,16 @@ fn apply_scrollback_payload(
     if discard_metadata {
         return false;
     }
-    if !crate::wire::terminal_link_cells_within_cap(&rows) {
+    if !crate::wire::terminal_link_cells_within_cap(&rows)
+        || !crate::wire::row_copy_cells_valid(&rows, row_copy.as_deref())
+    {
         return false;
     }
-    let snap = Arc::new(scrollback_snapshot(generation.clone(), revision, rows));
+    let snap = Arc::new(scrollback_snapshot(
+        generation.clone(),
+        revision,
+        (rows, row_copy),
+    ));
     // We now KNOW the history length (distinct from the `None` bootstrap state).
     sb.history_len = Some(history_len);
     // No history at all (the bootstrap request found an empty scrollback): snap back to
@@ -3135,7 +3147,7 @@ impl Shared {
         revision: Revision,
         history_len: u32,
         offset_from_top: u32,
-        rows: Vec<Vec<Cell>>,
+        rows: CopyRows,
     ) -> bool {
         if self.connection_is_closed() {
             return false;
@@ -3401,7 +3413,7 @@ impl Shared {
         revision: Revision,
         history_len: u32,
         offset_from_top: u32,
-        rows: Vec<Vec<Cell>>,
+        rows: CopyRows,
     ) -> bool {
         self.with_current_pane_store(token, PaneKind::Sibling, |entry| {
             let live_generation = entry.grid.as_ref().map(|g| g.generation.clone());
@@ -3479,7 +3491,7 @@ impl Shared {
                 revision,
                 history_len,
                 offset_from_top,
-                rows,
+                (rows, None),
             )
     }
 
@@ -3941,7 +3953,7 @@ impl Shared {
         revision: Revision,
         history_len: u32,
         offset_from_top: u32,
-        rows: Vec<Vec<Cell>>,
+        rows: CopyRows,
     ) -> bool {
         self.with_current_pane_store(token, PaneKind::Pane, |entry| {
             let live_generation = entry.grid.as_ref().map(|g| g.generation.clone());
@@ -4010,7 +4022,7 @@ impl Shared {
                 revision,
                 history_len,
                 offset_from_top,
-                rows,
+                (rows, None),
             )
     }
 
@@ -5049,6 +5061,7 @@ fn handle_pane_event_for_binding(
             history_len,
             offset_from_top,
             rows,
+            row_copy,
             ..
         } => {
             let repaint = shared.commit_pane_scrollback(
@@ -5057,7 +5070,7 @@ fn handle_pane_event_for_binding(
                 revision,
                 history_len,
                 offset_from_top,
-                rows,
+                (rows, row_copy),
             );
             // Consuming even a stale/mismatched reply releases the route's single in-flight slot.
             // Retry the one coalesced latest owner intent without waiting for another daemon event.
@@ -6052,6 +6065,7 @@ fn handle_event_for_binding(
             history_len,
             offset_from_top,
             rows,
+            row_copy,
         } => {
             // The accept/reject + state-update decision is pure (no proxy/event loop), so
             // it is unit-tested directly. We only translate its result into a wake here.
@@ -6062,7 +6076,7 @@ fn handle_event_for_binding(
                     revision,
                     history_len,
                     offset_from_top,
-                    rows,
+                    (rows, row_copy),
                 );
                 let _ = proxy.send(UserEvent::OutboundWritable);
                 if repaint {
@@ -6221,6 +6235,7 @@ fn handle_sibling_event_for_binding(
             history_len,
             offset_from_top,
             rows,
+            row_copy,
             ..
         } => {
             let repaint = shared.commit_sibling_scrollback(
@@ -6229,7 +6244,7 @@ fn handle_sibling_event_for_binding(
                 revision,
                 history_len,
                 offset_from_top,
-                rows,
+                (rows, row_copy),
             );
             let _ = proxy.send(UserEvent::OutboundWritable);
             if repaint {
@@ -8826,6 +8841,7 @@ mod scrollback_view_tests {
         let rows_cells: Vec<Vec<Cell>> =
             (0..rows).map(|i| row(&format!("live{i}"), cols)).collect();
         GridSnapshot {
+            row_copy: None,
             version: crate::sync::SUPPORTED_VERSION,
             generation: SessionGeneration(gen.to_string()),
             revision: Revision(100),
@@ -9170,7 +9186,7 @@ mod scrollback_view_tests {
             historical: Some(Arc::new(scrollback_snapshot(
                 SessionGeneration("g".into()),
                 Revision(1),
-                hist_rows(40, 6),
+                (hist_rows(40, 6), None),
             ))),
             historical_generation: Some(SessionGeneration("g".into())),
             ..ScrollbackState::default()
@@ -9238,7 +9254,7 @@ mod scrollback_view_tests {
             Revision(2),
             100,
             5,
-            hist_rows(40, 6),
+            (hist_rows(40, 6), None),
         ));
         assert_reset(&shared.scrollback.lock().unwrap());
         assert!(shared.scrollback.lock().unwrap().admitted_request.is_none());
@@ -9288,7 +9304,7 @@ mod scrollback_view_tests {
             historical: Some(Arc::new(scrollback_snapshot(
                 SessionGeneration("g".into()),
                 Revision(1),
-                hist_rows(40, 6),
+                (hist_rows(40, 6), None),
             ))),
             historical_generation: None,
             ..ScrollbackState::default()
@@ -9300,6 +9316,57 @@ mod scrollback_view_tests {
     }
 
     // --- 7: ScrollbackRows for wrong session / generation ignored -----------
+
+    #[test]
+    fn row_copy_history_owns_dimensions_revision_and_clears_absence() {
+        use maestro_protocol::row_copy::RowCopy;
+        let generation = SessionGeneration("gen-a".into());
+        let mut sb = ScrollbackState::default();
+        let metadata = vec![RowCopy {
+            starts_line: Some(false),
+            soft_wrap: false,
+            excluded_columns: vec![],
+        }];
+        for (revision, row_copy) in [(50, Some(metadata.clone())), (51, None)] {
+            let intent = sb.advance_intent().unwrap();
+            sb.view_offset = 1;
+            sb.admitted_request = Some((intent, 1, generation.clone()));
+            assert!(apply_scrollback_payload(
+                Some(generation.clone()),
+                &mut sb,
+                generation.clone(),
+                Revision(revision),
+                100,
+                1,
+                (vec![vec![cell("h"), cell(" ")]], row_copy.clone())
+            ));
+            let snap = sb.historical.as_ref().unwrap();
+            assert_eq!(
+                (snap.cols, snap.rows, snap.revision),
+                (2, 1, Revision(revision))
+            );
+            assert_eq!(snap.row_copy, row_copy);
+        }
+        let old = sb.historical.clone();
+        let intent = sb.advance_intent().unwrap();
+        sb.admitted_request = Some((intent, 1, generation.clone()));
+        let mut bad = metadata;
+        bad[0].excluded_columns = vec![0];
+        assert!(!apply_scrollback_payload(
+            Some(generation.clone()),
+            &mut sb,
+            generation,
+            Revision(52),
+            900,
+            1,
+            (vec![vec![cell("h")]], Some(bad))
+        ));
+        assert!(Arc::ptr_eq(
+            sb.historical.as_ref().unwrap(),
+            old.as_ref().unwrap()
+        ));
+        assert_eq!(sb.history_len, Some(100));
+    }
 
     #[test]
     fn scrollback_rows_over_terminal_hyperlink_cell_cap_are_rejected() {
@@ -9318,10 +9385,13 @@ mod scrollback_view_tests {
             Revision(50),
             100,
             1,
-            vec![vec![
-                linked;
-                maestro_protocol::MAX_TERMINAL_LINK_CELLS_PER_FRAME + 1
-            ]],
+            (
+                vec![vec![
+                    linked;
+                    maestro_protocol::MAX_TERMINAL_LINK_CELLS_PER_FRAME + 1
+                ]],
+                None
+            ),
         ));
         assert!(scrollback.admitted_request.is_none());
         assert!(scrollback.historical.is_none());
@@ -9400,7 +9470,7 @@ mod scrollback_view_tests {
             Revision(50),
             10,
             5,
-            hist_rows(40, 6),
+            (hist_rows(40, 6), None),
         ));
         assert!(
             scrollback.admitted_request.is_none(),
@@ -9417,7 +9487,7 @@ mod scrollback_view_tests {
             Revision(51),
             100,
             9,
-            hist_rows(40, 6),
+            (hist_rows(40, 6), None),
         ));
         assert!(scrollback.admitted_request.is_none());
         assert_eq!(scrollback.view_offset, 9);
@@ -9612,7 +9682,7 @@ mod scrollback_view_tests {
             sb.historical = Some(Arc::new(scrollback_snapshot(
                 SessionGeneration("gen-a".into()),
                 Revision(1),
-                hist_rows(40, 6),
+                (hist_rows(40, 6), None),
             )));
             sb.historical_generation = Some(SessionGeneration("gen-a".into()));
         }
@@ -10004,6 +10074,7 @@ mod reader_terminal_failure_tests {
 
     fn grid(generation: &str, revision: u64) -> GridSnapshot {
         GridSnapshot {
+            row_copy: None,
             version: crate::sync::SUPPORTED_VERSION,
             generation: SessionGeneration(generation.to_string()),
             revision: Revision(revision),
@@ -10029,6 +10100,7 @@ mod reader_terminal_failure_tests {
     fn damage(id: &str, generation: &str, base: u64, revision: u64) -> crate::wire::DamageFrame {
         use crate::wire::{CursorState, DamageOp, ModeState, DAMAGE_SCHEMA};
         crate::wire::DamageFrame {
+            row_copy: None,
             schema: DAMAGE_SCHEMA,
             id: id.to_string(),
             generation: SessionGeneration(generation.to_string()),
@@ -11752,6 +11824,7 @@ mod rebind_tests {
 
     fn grid(gen: &str, rev: u64) -> GridSnapshot {
         GridSnapshot {
+            row_copy: None,
             version: crate::sync::SUPPORTED_VERSION,
             generation: SessionGeneration(gen.to_string()),
             revision: Revision(rev),
@@ -11812,6 +11885,7 @@ mod rebind_tests {
         let mut blank = cell();
         blank.text = " ".to_string();
         crate::wire::DamageFrame {
+            row_copy: None,
             schema: crate::wire::DAMAGE_SCHEMA,
             id: id.to_string(),
             generation: SessionGeneration(gen.to_string()),
@@ -12465,6 +12539,7 @@ mod rebind_tests {
     fn damage_frame(id: &str, gen: &str, base: u64, rev: u64) -> crate::wire::DamageFrame {
         use crate::wire::{CursorState, DamageOp, ModeState};
         crate::wire::DamageFrame {
+            row_copy: None,
             schema: crate::wire::DAMAGE_SCHEMA,
             id: id.to_string(),
             generation: SessionGeneration(gen.to_string()),
@@ -12971,7 +13046,7 @@ mod rebind_tests {
             Revision(10),
             20,
             4,
-            vec![vec![cell(), cell()]],
+            (vec![vec![cell(), cell()]], None),
         ));
         assert!(shared.scrollback.lock().unwrap().admitted_request.is_none());
         assert_eq!(
@@ -12997,7 +13072,7 @@ mod rebind_tests {
             Revision(11),
             30,
             2,
-            vec![vec![cell(), cell()]],
+            (vec![vec![cell(), cell()]], None),
         ));
         let painted = shared
             .pane_paint("primary", "primary")
@@ -13041,7 +13116,7 @@ mod rebind_tests {
             Revision(10),
             20,
             4,
-            vec![vec![cell(), cell()]],
+            (vec![vec![cell(), cell()]], None),
         ));
         shared.with_pane_scrollback("pane-x", "primary", |scrollback| {
             assert!(scrollback.admitted_request.is_none());
@@ -13056,7 +13131,7 @@ mod rebind_tests {
             Revision(11),
             30,
             2,
-            vec![vec![cell(), cell()]],
+            (vec![vec![cell(), cell()]], None),
         ));
         let painted = shared.pane_paint("pane-x", "primary").paint_grid().unwrap();
         assert_eq!(painted.generation.0, "gen-b");
@@ -13260,6 +13335,7 @@ mod user_event_sender_tests {
 
     fn grid(gen: &str, rev: u64) -> GridSnapshot {
         GridSnapshot {
+            row_copy: None,
             version: crate::sync::SUPPORTED_VERSION,
             generation: SessionGeneration(gen.to_string()),
             revision: Revision(rev),
@@ -13333,6 +13409,7 @@ mod user_event_sender_tests {
     fn damage_frame(id: &str, gen: &str, base: u64, rev: u64) -> crate::wire::DamageFrame {
         use crate::wire::{CursorState, DamageOp, ModeState};
         crate::wire::DamageFrame {
+            row_copy: None,
             schema: crate::wire::DAMAGE_SCHEMA,
             id: id.to_string(),
             generation: SessionGeneration(gen.to_string()),
@@ -13564,6 +13641,7 @@ mod user_event_sender_tests {
             "s-a",
             DaemonEvent::ScrollbackRows {
                 id: "s-a".to_string(),
+                row_copy: None,
                 generation: SessionGeneration("gen-a".to_string()),
                 revision: Revision(1),
                 history_len: 10,
@@ -13607,6 +13685,7 @@ mod user_event_sender_tests {
             "s-a",
             DaemonEvent::ScrollbackRows {
                 id: "s-a".to_string(),
+                row_copy: None,
                 generation: SessionGeneration("gen-b".to_string()),
                 revision: Revision(1),
                 history_len: 10,
@@ -13701,6 +13780,7 @@ mod user_event_sender_tests {
             "s-a",
             DaemonEvent::ScrollbackRows {
                 id: "s-a".to_string(),
+                row_copy: None,
                 generation: SessionGeneration("gen-a".to_string()),
                 revision: Revision(1),
                 history_len: 10,
@@ -13759,6 +13839,7 @@ mod user_event_sender_tests {
             "s-a",
             DaemonEvent::ScrollbackRows {
                 id: "s-a".to_string(),
+                row_copy: None,
                 generation: SessionGeneration("gen-a".to_string()),
                 revision: Revision(1),
                 history_len: 10,

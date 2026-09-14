@@ -1206,6 +1206,7 @@ async fn handle_request(
                     history_len: read.history_len as u32,
                     offset_from_top: read.offset_from_top as u32,
                     rows: read.rows,
+                    row_copy: read.row_copy,
                 })
                 .await;
         }

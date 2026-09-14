@@ -271,6 +271,7 @@ pub fn snapshot(revision: u64, cursor_shape: CursorShape) -> GridSnapshot {
     }
 
     GridSnapshot {
+        row_copy: None,
         version: crate::sync::SUPPORTED_VERSION,
         generation: SessionGeneration("00000000-0000-0000-0000-0000scene".to_string()),
         revision: Revision(revision),
@@ -397,6 +398,7 @@ pub fn stress_snapshot(mode: StressMode, revision: u64) -> GridSnapshot {
     }
 
     GridSnapshot {
+        row_copy: None,
         version: crate::sync::SUPPORTED_VERSION,
         generation: SessionGeneration("00000000-0000-0000-0000-00stress".to_string()),
         revision: Revision(revision),

@@ -400,6 +400,19 @@ mod tests {
     const DAEMON_GRID_LINE: &str = r#"{"ev":"grid","id":"s1","grid":{"version":2,"generation":"11111111-1111-1111-1111-111111111111","revision":5,"base_revision":4,"cols":3,"rows":1,"rows_cells":[[{"text":"界","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"width":2},{"text":"","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"width":0},{"text":"x","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"width":1}]],"cursor_line":0,"cursor_col":2,"cursor_visible":true,"cursor_shape":"beam","alt_screen":true,"app_cursor":true,"bracketed_paste":true,"focus_reporting":true,"mouse_report":true,"mouse_drag":true,"mouse_motion":true,"mouse_sgr":true}}"#;
 
     #[test]
+    fn row_copy_fields_do_not_change_shell_identity_decoding() {
+        let mut value: serde_json::Value = serde_json::from_str(DAEMON_GRID_LINE).unwrap();
+        value["grid"]["row_copy"] =
+            serde_json::json!([{ "soft_wrap": true, "excluded_columns": [] }]);
+        let ShellEvent::Grid { grid, .. } = ShellEvent::from_line(&value.to_string()).unwrap()
+        else {
+            panic!("grid")
+        };
+        assert_eq!(grid.generation, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(grid.revision, Some(5));
+    }
+
+    #[test]
     fn decodes_grid_generation_from_full_daemon_snapshot() {
         let ev = ShellEvent::from_line(DAEMON_GRID_LINE).unwrap();
         match ev {

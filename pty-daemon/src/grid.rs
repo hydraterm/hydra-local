@@ -148,7 +148,8 @@ const WORST_CASE_FRAME_HYPERLINK_BYTES: usize =
 const SNAPSHOT_HEADER_BYTES: usize = 4 * 1024;
 
 /// Maximum total cells (cols * rows) whose worst-case JSON snapshot is GUARANTEED to
-/// fit within `protocol::MAX_LINE_BYTES` (the framing cap), with a 2x safety margin.
+/// fit within `protocol::MAX_LINE_BYTES` (the framing cap). The legacy cell/link
+/// budget reserves half the cap; optional row-copy metadata spends that headroom.
 /// A snapshot is shipped as ONE newline-delimited JSON line, so a grid that would
 /// serialize past the line cap can never cross the socket — it would be dropped as a
 /// framing violation. We therefore bound the grid that the daemon will ACCEPT to this
@@ -162,7 +163,7 @@ pub const MAX_SNAPSHOT_CELLS: usize = (crate::protocol::MAX_LINE_BYTES / 2
     / WORST_CASE_CELL_BYTES;
 
 // Compile-time proof of the derivation: the budget is positive and its worst-case
-// serialized footprint stays within the line cap with the 2x safety margin. If a future
+// serialized cell/link component stays within half the line cap. If a future
 // edit to the inputs breaks this, the crate fails to compile rather than shipping an
 // un-shippable grid budget.
 const _: () = {
@@ -172,6 +173,15 @@ const _: () = {
             + SNAPSHOT_HEADER_BYTES
             + WORST_CASE_FRAME_HYPERLINK_BYTES
             <= crate::protocol::MAX_LINE_BYTES / 2
+    );
+    // Row metadata and a RowSpan envelope per row also fit the smaller damage cap.
+    assert!(
+        MAX_SNAPSHOT_CELLS * WORST_CASE_CELL_BYTES
+            + SNAPSHOT_HEADER_BYTES
+            + WORST_CASE_FRAME_HYPERLINK_BYTES
+            + maestro_protocol::row_copy::row_copy_max_bytes(2000, MAX_SNAPSHOT_CELLS)
+            + 2000 * 80
+            <= crate::protocol::MAX_DAMAGE_BYTES
     );
 };
 
@@ -597,6 +607,8 @@ pub struct GridSnapshot {
     pub rows: usize,
     /// Visible cells, top-to-bottom, each row exactly `cols` cells wide.
     pub rows_cells: Vec<Vec<Cell>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_copy: Option<Vec<maestro_protocol::row_copy::RowCopy>>,
     pub cursor_line: usize,
     pub cursor_col: usize,
     /// Whether the terminal currently shows its cursor (DECTCEM / `Mode::SHOW_CURSOR`).
@@ -967,6 +979,7 @@ impl TermGrid {
         }
         let cursor = grid.cursor.point;
         GridSnapshot {
+            row_copy: None,
             version: SNAPSHOT_VERSION,
             generation: self.generation,
             revision: self.revision,
@@ -1052,6 +1065,7 @@ impl TermGrid {
         }
 
         ScrollbackRead {
+            row_copy: None,
             generation: self.generation,
             revision: self.revision,
             history_len: history,
@@ -1064,6 +1078,7 @@ impl TermGrid {
 /// The result of a read-only scrollback query (see `TermGrid::scrollback`). Carries
 /// structured rows plus the identity/clamp metadata the daemon echoes on the wire.
 pub struct ScrollbackRead {
+    pub row_copy: Option<Vec<maestro_protocol::row_copy::RowCopy>>,
     pub generation: SessionGeneration,
     pub revision: Revision,
     /// Total history rows available when the window was read.
@@ -1667,7 +1682,7 @@ pub fn generate_damage(prev: &GridSnapshot, next: &GridSnapshot) -> DamageGen {
     // behavior). Computed once and reused for the change test and the RowSpan diff.
     let candidates = candidate_rows(prev, next);
     let grid_changed = grid_changed_hinted(prev, next, &candidates);
-    let any_change = grid_changed || header_changed(prev, next);
+    let any_change = grid_changed || header_changed(prev, next) || prev.row_copy != next.row_copy;
 
     // A real damage frame must STRICTLY advance the revision (it represents >= 1 committed
     // mutation). If there is any visible/header change but the revision did not advance,
@@ -1696,6 +1711,7 @@ pub fn generate_damage(prev: &GridSnapshot, next: &GridSnapshot) -> DamageGen {
                     .all(|row| row.iter().all(|c| c == fill));
             if uniform_blank {
                 return DamageGen::Frame(DamageFrame {
+                    row_copy: next.row_copy.clone(),
                     schema: DAMAGE_SCHEMA,
                     id: SessionId(String::new()),
                     generation: next.generation,
@@ -1785,6 +1801,7 @@ pub fn generate_damage(prev: &GridSnapshot, next: &GridSnapshot) -> DamageGen {
                     });
                     if applied_ok && verify == next.rows_cells {
                         return DamageGen::Frame(DamageFrame {
+                            row_copy: next.row_copy.clone(),
                             schema: DAMAGE_SCHEMA,
                             id: SessionId(String::new()),
                             generation: next.generation,
@@ -1806,8 +1823,9 @@ pub fn generate_damage(prev: &GridSnapshot, next: &GridSnapshot) -> DamageGen {
     if ops.is_empty() {
         // No cell changed. A cursor/mode-only change is still real damage (empty ops,
         // fresh header, advances the revision); identical header → genuinely nothing.
-        if header_changed(prev, next) {
+        if header_changed(prev, next) || prev.row_copy != next.row_copy {
             return DamageGen::Frame(DamageFrame {
+                row_copy: next.row_copy.clone(),
                 schema: DAMAGE_SCHEMA,
                 id: SessionId(String::new()),
                 generation: next.generation,
@@ -1824,6 +1842,7 @@ pub fn generate_damage(prev: &GridSnapshot, next: &GridSnapshot) -> DamageGen {
     }
 
     DamageGen::Frame(DamageFrame {
+        row_copy: next.row_copy.clone(),
         schema: DAMAGE_SCHEMA,
         id: SessionId(String::new()),
         generation: next.generation,
@@ -1899,6 +1918,7 @@ pub fn apply_damage_for_test(base: &mut GridSnapshot, frame: &DamageFrame) {
     base.mouse_drag = frame.modes.mouse_drag;
     base.mouse_motion = frame.modes.mouse_motion;
     base.mouse_sgr = frame.modes.mouse_sgr;
+    base.row_copy = frame.row_copy.clone();
     base.base_revision = frame.base_revision;
     base.revision = frame.revision;
 }
@@ -2323,6 +2343,7 @@ mod damage_gen_tests {
         let rows = MAX_DAMAGE_OPS + 5;
         let blank_row = || vec![blank_cell(); cols];
         let prev = GridSnapshot {
+            row_copy: None,
             version: SNAPSHOT_VERSION,
             generation: SessionGeneration::new(),
             revision: Revision(1),
@@ -2376,6 +2397,7 @@ mod damage_gen_tests {
         let gen = SessionGeneration::new();
         // prev: all default-styled blanks.
         let prev = GridSnapshot {
+            row_copy: None,
             version: SNAPSHOT_VERSION,
             generation: gen,
             revision: Revision(1),
@@ -2444,6 +2466,7 @@ mod damage_gen_tests {
         let rows = 2usize;
         let gen = SessionGeneration::new();
         let prev = GridSnapshot {
+            row_copy: None,
             version: SNAPSHOT_VERSION,
             generation: gen,
             revision: Revision(1),
@@ -2496,6 +2519,7 @@ mod damage_gen_tests {
         // this guards the function against a malformed input pair.)
         let gen = SessionGeneration::new();
         let prev = GridSnapshot {
+            row_copy: None,
             version: SNAPSHOT_VERSION,
             generation: gen,
             revision: Revision(5),
@@ -2562,6 +2586,7 @@ mod damage_gen_tests {
             })
             .collect::<Vec<_>>();
         GridSnapshot {
+            row_copy: None,
             version: SNAPSHOT_VERSION,
             generation: SessionGeneration::new(),
             revision: Revision(rev),
@@ -2592,6 +2617,137 @@ mod damage_gen_tests {
         n.generation = prev.generation;
         n.base_revision = prev.revision;
         n
+    }
+
+    #[test]
+    fn row_copy_all_damage_shapes_and_full_envelope_budget() {
+        use maestro_protocol::row_copy::RowCopy;
+        let metadata = RowCopy {
+            starts_line: None,
+            soft_wrap: false,
+            excluded_columns: vec![],
+        };
+        let prev = grid_from_rows(&["aaa", "bbb", "ccc", "ddd"], 10);
+        for rows in [
+            ["   "; 4],
+            ["bbb", "ccc", "ddd", "eee"],
+            ["axa", "bbb", "ccc", "ddd"],
+        ] {
+            let mut next = next_of(&prev, &rows);
+            next.row_copy = Some(vec![metadata.clone(); 4]);
+            let DamageGen::Frame(frame) = generate_damage(&prev, &next) else {
+                panic!("frame")
+            };
+            assert_eq!(frame.row_copy, next.row_copy);
+        }
+        assert!(fits_snapshot_budget(175, 175));
+        for (cols, rows) in [(15, 2000), (2000, 15), (175, 175), (119, 256)] {
+            let mut grid = grid_from_rows(&vec![" ".repeat(cols).as_str(); rows], 1);
+            let copy = RowCopy {
+                excluded_columns: (0..cols as u16).collect(),
+                ..metadata.clone()
+            };
+            grid.row_copy = Some(vec![copy; rows]);
+            for cell in grid
+                .rows_cells
+                .iter_mut()
+                .flatten()
+                .take(maestro_protocol::MAX_TERMINAL_LINK_CELLS_PER_FRAME)
+            {
+                cell.hyperlink = Some(CompactString::from(format!(
+                    "https://budget.example/{}",
+                    "x".repeat(maestro_protocol::MAX_TERMINAL_URL_BYTES - 23)
+                )));
+            }
+            let mut envelope = serde_json::json!({ "ev": "grid", "id": "budget-fixture", "grid": grid,
+                "output_generation": "11111111111141118111111111111111" });
+            assert!(
+                serde_json::to_vec(&envelope).unwrap().len() + 1 < crate::protocol::MAX_LINE_BYTES
+            );
+            // The full metadata-inclusive damage bound is tighter than the line bound.
+            let frame = DamageFrame {
+                schema: DAMAGE_SCHEMA,
+                id: SessionId("budget-fixture".into()),
+                generation: grid.generation,
+                base_revision: Revision(0),
+                revision: Revision(1),
+                cols: cols as u16,
+                rows: rows as u16,
+                cursor: cursor_state_of(&grid),
+                modes: mode_state_of(&grid),
+                row_copy: grid.row_copy.clone(),
+                ops: grid
+                    .rows_cells
+                    .iter()
+                    .enumerate()
+                    .map(|(row, cells)| DamageOp::RowSpan {
+                        row: row as u16,
+                        start: 0,
+                        cells: cells.clone(),
+                    })
+                    .collect(),
+            };
+            envelope = serde_json::json!({ "ev": "damage", "frame": frame });
+            envelope["output_generation"] = serde_json::json!("11111111111141118111111111111111");
+            let bytes = serde_json::to_vec(&envelope).unwrap().len() + 1;
+            assert!(
+                bytes < crate::protocol::MAX_DAMAGE_BYTES,
+                "{cols}x{rows}: {bytes}"
+            );
+            envelope["frame"]
+                .as_object_mut()
+                .unwrap()
+                .remove("row_copy");
+            let metadata_bytes = bytes - (serde_json::to_vec(&envelope).unwrap().len() + 1);
+            eprintln!("row-copy budget {cols}x{rows}: damage={bytes}, metadata={metadata_bytes}");
+            if rows <= usize::from(MAX_SCROLLBACK_ROWS_PER_REQUEST) {
+                let history = crate::protocol::DaemonEvent::ScrollbackRows {
+                    id: SessionId("budget-fixture".into()),
+                    generation: grid.generation,
+                    revision: grid.revision,
+                    history_len: 5000,
+                    offset_from_top: 1,
+                    rows: grid.rows_cells,
+                    row_copy: grid.row_copy,
+                };
+                assert!(
+                    serde_json::to_vec(&history).unwrap().len() + 128
+                        < crate::protocol::MAX_LINE_BYTES
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn row_copy_metadata_only_emits_without_row_stamp_changes() {
+        use maestro_protocol::row_copy::RowCopy;
+        let prev = grid_from_rows(&["   ", "   "], 10);
+        let mut next = next_of(&prev, &["   ", "   "]);
+        next.row_copy = Some(vec![
+            RowCopy {
+                starts_line: None,
+                soft_wrap: false,
+                excluded_columns: vec![2]
+            };
+            2
+        ]);
+        let DamageGen::Frame(frame) = generate_damage(&prev, &next) else {
+            panic!("metadata change needs frame")
+        };
+        assert!(frame.ops.is_empty());
+        assert_eq!(frame.row_copy, next.row_copy);
+        next.revision = prev.revision;
+        assert_eq!(generate_damage(&prev, &next), DamageGen::Resync);
+        next.revision = Revision(9);
+        assert_eq!(generate_damage(&prev, &next), DamageGen::Resync);
+        next.revision = Revision(11);
+        let mut cleared = next.clone();
+        cleared.revision = Revision(12);
+        cleared.row_copy = None;
+        let DamageGen::Frame(frame) = generate_damage(&next, &cleared) else {
+            panic!("absence needs frame")
+        };
+        assert_eq!(frame.row_copy, None);
     }
 
     #[test]

@@ -177,13 +177,14 @@ fn rejected_native_copy_shows_actionable_status_without_claiming_success() {
 fn startup_preferences_apply_before_first_copy_with_or_without_live_command_channels() {
     // The same entrypoint accepts channels for normal windows and None for retained
     // attach-only windows. Both apply these preferences before entering the host loop.
-    let _entrypoint: fn(
+    type ClipboardEntrypoint = fn(
         crate::RendererLaunch,
         Option<std::sync::mpsc::Receiver<crate::RendererCommand>>,
         Option<std::sync::mpsc::Sender<crate::RendererEvent>>,
         bool,
         bool,
-    ) -> Result<(), crate::RendererRunError> = crate::run_renderer_with_clipboard_settings;
+    ) -> Result<(), crate::RendererRunError>;
+    let _entrypoint: ClipboardEntrypoint = crate::run_renderer_with_clipboard_settings;
     for retained_read_only in [false, true] {
         let (mut app, shared) = app_with_primary_grid();
         let writes = super::copy_on_select::record_copies(&mut app);

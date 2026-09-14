@@ -240,6 +240,8 @@ pub struct GridSnapshot {
     pub cols: usize,
     pub rows: usize,
     pub rows_cells: Vec<Vec<Cell>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_copy: Option<Vec<maestro_protocol::row_copy::RowCopy>>,
     pub cursor_line: usize,
     pub cursor_col: usize,
     pub cursor_visible: bool,
@@ -267,6 +269,24 @@ pub struct GridSnapshot {
     /// SGR extended mouse encoding (DECSET 1006).
     #[serde(default)]
     pub mouse_sgr: bool,
+}
+
+/// Copy metadata may exclude only genuine blank width-one placeholder cells.
+pub(crate) fn row_copy_cells_valid(
+    rows: &[Vec<Cell>],
+    metadata: Option<&[maestro_protocol::row_copy::RowCopy]>,
+) -> bool {
+    let cols = rows.first().map_or(0, Vec::len);
+    rows.iter().all(|row| row.len() == cols)
+        && maestro_protocol::row_copy::row_copy_valid(metadata, cols, rows.len())
+        && metadata.is_none_or(|metadata| {
+            metadata.iter().enumerate().all(|(index, row)| {
+                row.excluded_columns.iter().all(|col| {
+                    let cell = &rows[index][usize::from(*col)];
+                    cell.width == 1 && cell.text == " "
+                })
+            })
+        })
 }
 
 /// Renderer-side enforcement of the shared OSC 8 cell budget. The daemon applies
@@ -548,6 +568,7 @@ pub enum DamageInvalid {
     BadRevisionOrder { base: u64, rev: u64 },
     CursorOutOfBounds { line: usize, col: usize },
     BadCell { op: usize },
+    BadRowCopy,
 }
 
 /// Absolute post-frame cursor state on a damage frame. Mirror of daemon `CursorState`.
@@ -616,6 +637,8 @@ pub struct DamageFrame {
     pub cursor: CursorState,
     pub modes: ModeState,
     pub ops: Vec<DamageOp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_copy: Option<Vec<maestro_protocol::row_copy::RowCopy>>,
 }
 
 impl DamageFrame {
@@ -623,6 +646,13 @@ impl DamageFrame {
     /// daemon's `DamageFrame::validate`: schema, dims, allocation caps, RowSpan
     /// bounds, half-open scroll constraints, revision ordering.
     pub fn validate(&self) -> Result<(), DamageInvalid> {
+        if !maestro_protocol::row_copy::row_copy_valid(
+            self.row_copy.as_deref(),
+            self.cols as usize,
+            self.rows as usize,
+        ) {
+            return Err(DamageInvalid::BadRowCopy);
+        }
         if self.schema != DAMAGE_SCHEMA {
             return Err(DamageInvalid::UnsupportedSchema { got: self.schema });
         }
@@ -820,6 +850,8 @@ pub enum DaemonEvent {
         history_len: u32,
         offset_from_top: u32,
         rows: Vec<Vec<Cell>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        row_copy: Option<Vec<maestro_protocol::row_copy::RowCopy>>,
     },
     /// We IGNORE `data` (raw PTY bytes). `revision` is read only as a cheap
     /// "grid changed" signal to drive poll cadence.
@@ -966,6 +998,7 @@ mod tests {
 
     fn dmg_frame(ops: Vec<DamageOp>) -> DamageFrame {
         DamageFrame {
+            row_copy: None,
             schema: DAMAGE_SCHEMA,
             id: "s1".into(),
             generation: SessionGeneration("11111111-1111-1111-1111-111111111111".into()),
@@ -1623,6 +1656,7 @@ mod tests {
     fn scrollback_rows_event_round_trips_with_ev_tag() {
         let ev = DaemonEvent::ScrollbackRows {
             id: "s1".into(),
+            row_copy: None,
             generation: SessionGeneration("11111111-1111-1111-1111-111111111111".into()),
             revision: Revision(99),
             history_len: 5000,
@@ -1663,6 +1697,7 @@ mod tests {
         let grid_cell_json = serde_json::to_string(&c).unwrap();
         let ev = DaemonEvent::ScrollbackRows {
             id: "s1".into(),
+            row_copy: None,
             generation: SessionGeneration("11111111-1111-1111-1111-111111111111".into()),
             revision: Revision(1),
             history_len: 1,
@@ -1698,6 +1733,7 @@ mod tests {
                 history_len,
                 offset_from_top,
                 rows,
+                ..
             } => {
                 assert_eq!(id, "s1");
                 assert_eq!(
@@ -1734,6 +1770,37 @@ mod tests {
     /// shape ever drifts from the daemon's (renamed/added/reordered field), decoding here
     /// fails and the product would be dead-on-attach. Keep the two literals in lockstep.
     const CROSS_WIRE_GRID_JSON: &str = r#"{"ev":"grid","id":"s1","grid":{"version":2,"generation":"11111111-1111-1111-1111-111111111111","revision":5,"base_revision":4,"cols":3,"rows":1,"rows_cells":[[{"text":"界","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"width":2},{"text":"","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"width":0},{"text":"x","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"hyperlink":"https://grid.example.test/x","width":1}]],"cursor_line":0,"cursor_col":2,"cursor_visible":true,"cursor_shape":"beam","alt_screen":true,"app_cursor":true,"bracketed_paste":true,"focus_reporting":true,"mouse_report":true,"mouse_drag":true,"mouse_motion":true,"mouse_sgr":true}}"#;
+
+    #[test]
+    fn row_copy_cross_wire_addition_and_null_absence() {
+        for (json, field, rows) in [
+            (CROSS_WIRE_GRID_JSON, "grid", 1),
+            (CROSS_WIRE_DAMAGE_JSON, "frame", 4),
+            (CROSS_WIRE_SCROLLBACK_JSON, "", 1),
+        ] {
+            let mut value: serde_json::Value = serde_json::from_str(json).unwrap();
+            let payload = if field.is_empty() {
+                &mut value
+            } else {
+                &mut value[field]
+            };
+            payload["row_copy"] = serde_json::json!(vec![
+                serde_json::json!({
+                "starts_line": false, "soft_wrap": true, "excluded_columns": [] });
+                rows
+            ]);
+            let decoded: DaemonEvent = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(decoded).unwrap(), value);
+            let payload = if field.is_empty() {
+                &mut value
+            } else {
+                &mut value[field]
+            };
+            payload["row_copy"] = serde_json::Value::Null;
+            let decoded: DaemonEvent = serde_json::from_value(value).unwrap();
+            assert_eq!(serde_json::to_string(&decoded).unwrap(), json);
+        }
+    }
 
     #[test]
     fn cross_wire_grid_decodes_in_renderer_mirror() {

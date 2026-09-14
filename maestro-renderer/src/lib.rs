@@ -21012,6 +21012,7 @@ mod retained_v2_startup_admission_tests {
 
     fn retained_grid() -> GridSnapshot {
         GridSnapshot {
+            row_copy: None,
             version: crate::sync::SUPPORTED_VERSION,
             generation: SessionGeneration("retained-v2-generation".into()),
             revision: Revision(1),
@@ -23216,6 +23217,7 @@ mod split_frame_tests {
             width: 1,
         };
         GridSnapshot {
+            row_copy: None,
             version: crate::sync::SUPPORTED_VERSION,
             generation: SessionGeneration("gen-C".to_string()),
             revision: Revision(1),
@@ -35698,6 +35700,7 @@ mod command_palette_activation_tests {
         mouse_report: bool,
     ) -> GridSnapshot {
         GridSnapshot {
+            row_copy: None,
             version: crate::sync::SUPPORTED_VERSION,
             generation: SessionGeneration(generation.to_string()),
             revision: Revision(1),
@@ -37977,6 +37980,7 @@ mod terminal_selection_ownership_tests {
             rows_cells[0][index] = cell(&ch.to_string());
         }
         GridSnapshot {
+            row_copy: None,
             version: crate::sync::SUPPORTED_VERSION,
             generation: SessionGeneration(generation.to_string()),
             revision: Revision(1),
@@ -39005,6 +39009,7 @@ mod linux_clipboard_tests {
         let row: Vec<Cell> = text.chars().map(|c| cell(&c.to_string())).collect();
         let cols = row.len().max(1);
         GridSnapshot {
+            row_copy: None,
             version: crate::sync::SUPPORTED_VERSION,
             generation: SessionGeneration(generation.to_string()),
             revision: Revision(1),
@@ -39479,6 +39484,7 @@ mod idle_wake_delivery_tests {
             width: 1,
         };
         *shared.grid.lock().unwrap() = Some(Arc::new(GridSnapshot {
+            row_copy: None,
             version: crate::sync::SUPPORTED_VERSION,
             generation: SessionGeneration("idle-wake-generation".to_string()),
             revision: Revision(1),

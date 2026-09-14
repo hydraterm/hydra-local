@@ -30,6 +30,7 @@ pub mod endpoint;
 pub mod event;
 pub mod ids;
 pub mod request;
+pub mod row_copy;
 pub mod terminal_link;
 
 pub use channel::{ChannelEvent, ChannelEventKind};

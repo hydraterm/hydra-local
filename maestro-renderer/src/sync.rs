@@ -222,6 +222,11 @@ impl SyncState {
         }
         validate_dimensions(snap)?;
         validate_wide_layout(snap)?;
+        if !crate::wire::row_copy_cells_valid(&snap.rows_cells, snap.row_copy.as_deref()) {
+            return Err(Reject::DamageInvalid {
+                reason: crate::wire::DamageInvalid::BadRowCopy,
+            });
+        }
 
         let gen = &snap.generation;
         let rev = snap.revision;
@@ -388,6 +393,8 @@ impl SyncState {
         // Carry the frame's absolute post-frame state onto the scratch. Empty-ops
         // frames reach here too, so a cursor/mode-only advance still lands.
         scratch.revision = frame.revision;
+        // A complete post-frame vector replaces the old one; absent means unknown.
+        scratch.row_copy = frame.row_copy.clone();
         scratch.base_revision = frame.base_revision;
         scratch.cursor_line = frame.cursor.line;
         scratch.cursor_col = frame.cursor.col;
@@ -406,6 +413,13 @@ impl SyncState {
         // dangling wide lead/spacer at a span boundary. Validate before committing.
         if let Err(reason) = validate_wide_layout(&scratch) {
             return DamageOutcome::Resync { reason };
+        }
+        if !crate::wire::row_copy_cells_valid(&scratch.rows_cells, scratch.row_copy.as_deref()) {
+            return DamageOutcome::Resync {
+                reason: Reject::DamageInvalid {
+                    reason: crate::wire::DamageInvalid::BadRowCopy,
+                },
+            };
         }
 
         // Advance our baseline to the frame's revision; the caller commits `scratch`.
@@ -786,6 +800,7 @@ mod tests {
         let rows = rows_cells.len();
         let cols = rows_cells.first().map(|r| r.len()).unwrap_or(0);
         GridSnapshot {
+            row_copy: None,
             version: SUPPORTED_VERSION,
             generation: SessionGeneration(gen.to_string()),
             revision: Revision(rev),
@@ -1227,6 +1242,7 @@ mod tests {
         ops: Vec<DamageOp>,
     ) -> DamageFrame {
         DamageFrame {
+            row_copy: None,
             schema: crate::wire::DAMAGE_SCHEMA,
             id: SESSION.to_string(),
             generation: SessionGeneration(gen.to_string()),
@@ -1254,6 +1270,90 @@ mod tests {
             .iter()
             .map(|r| r.iter().map(|c| c.text.clone()).collect())
             .collect()
+    }
+
+    #[test]
+    fn row_copy_replacement_and_corruption_are_transactional() {
+        use maestro_protocol::row_copy::RowCopy;
+        let mut s = st();
+        let mut held = baseline(&mut s, "gen-a", 10);
+        let mut frame = dmg("gen-a", 10, 11, 3, 2, vec![]);
+        frame.row_copy = Some(vec![
+            RowCopy {
+                starts_line: None,
+                soft_wrap: false,
+                excluded_columns: vec![2]
+            };
+            2
+        ]);
+        let DamageOutcome::Applied(next) = s.on_damage(SESSION, &frame, &held) else {
+            panic!("metadata-only damage")
+        };
+        assert_eq!(next.rows_cells, held.rows_cells);
+        assert_eq!(next.row_copy, frame.row_copy);
+        held = *next;
+        frame.base_revision = Revision(11);
+        frame.revision = Revision(12);
+        frame.row_copy = None;
+        let DamageOutcome::Applied(cleared) = s.on_damage(SESSION, &frame, &held) else {
+            panic!("absence clears")
+        };
+        assert_eq!(cleared.row_copy, None);
+        for (generation, base, cols) in [("gen-b", 10, 3), ("gen-a", 9, 3), ("gen-a", 10, 4)] {
+            let mut s = st();
+            let held = baseline(&mut s, "gen-a", 10);
+            let mut stale = dmg(generation, base, 11, cols, 2, vec![]);
+            stale.row_copy = Some(vec![
+                RowCopy {
+                    starts_line: None,
+                    soft_wrap: false,
+                    excluded_columns: vec![]
+                };
+                2
+            ]);
+            assert!(!matches!(
+                s.on_damage(SESSION, &stale, &held),
+                DamageOutcome::Applied(_)
+            ));
+            assert_eq!(held.row_copy, None);
+        }
+        for excluded in [vec![3], vec![0, 0], vec![2, 1], vec![0]] {
+            let mut s = st();
+            let held = baseline(&mut s, "gen-a", 10);
+            let saved = held.clone();
+            let mut bad = dmg(
+                "gen-a",
+                10,
+                11,
+                3,
+                2,
+                vec![DamageOp::RowSpan {
+                    row: 0,
+                    start: 0,
+                    cells: vec![cell(1, "x")],
+                }],
+            );
+            bad.row_copy = Some(vec![
+                RowCopy {
+                    starts_line: None,
+                    soft_wrap: false,
+                    excluded_columns: excluded
+                };
+                2
+            ]);
+            assert!(!matches!(
+                s.on_damage(SESSION, &bad, &held),
+                DamageOutcome::Applied(_)
+            ));
+            assert_eq!(
+                serde_json::to_value(&held).unwrap(),
+                serde_json::to_value(&saved).unwrap()
+            );
+            let mut bad_grid = saved;
+            bad_grid.rows_cells[0][0] = cell(1, "x");
+            bad_grid.row_copy = bad.row_copy;
+            assert!(s.on_grid(SESSION, &bad_grid).is_err());
+        }
     }
 
     #[test]

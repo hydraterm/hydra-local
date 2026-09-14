@@ -113,6 +113,10 @@ const _: () = {
         MAX_SNAPSHOT_CELLS * SCROLLBACK_WORST_CASE_CELL_BYTES
             + SCROLLBACK_HEADER_BYTES
             + SCROLLBACK_WORST_CASE_HYPERLINK_BYTES
+            + maestro_protocol::row_copy::row_copy_max_bytes(
+                MAX_SCROLLBACK_ROWS_PER_REQUEST as usize,
+                MAX_SNAPSHOT_CELLS
+            )
             <= MAX_LINE_BYTES
     );
 };
@@ -124,31 +128,54 @@ const _: () = {
 #[allow(dead_code)]
 pub enum DamageInvalid {
     /// `schema` is not one we model.
-    UnsupportedSchema { got: u32 },
+    UnsupportedSchema {
+        got: u32,
+    },
     /// cols/rows are zero or exceed the maximum.
-    BadDimensions { reason: &'static str },
+    BadDimensions {
+        reason: &'static str,
+    },
     /// `ops.len()` exceeds `MAX_DAMAGE_OPS`.
-    TooManyOps { got: usize },
+    TooManyOps {
+        got: usize,
+    },
     /// Total RowSpan cells exceed `MAX_DAMAGE_CELLS`.
-    TooManyCells { got: usize },
+    TooManyCells {
+        got: usize,
+    },
     /// A RowSpan references a row >= rows, or its span runs past `cols`.
-    RowSpanOutOfBounds { op: usize },
+    RowSpanOutOfBounds {
+        op: usize,
+    },
     /// A RowSpan carries zero cells — an empty span is a no-op and never a valid
     /// damage payload; the sender must omit it rather than ship an empty op.
-    EmptyRowSpan { op: usize },
+    EmptyRowSpan {
+        op: usize,
+    },
     /// A scroll region violates `top < bottom_exclusive <= rows`, `lines > 0`, or
     /// `lines <= region height`.
-    BadScrollRegion { op: usize },
+    BadScrollRegion {
+        op: usize,
+    },
     /// `base_revision >= revision` — a damage frame must STRICTLY advance the
     /// revision (it represents at least one committed mutation). Equal or backwards
     /// is structurally impossible; treat as corrupt.
-    BadRevisionOrder { base: u64, rev: u64 },
+    BadRevisionOrder {
+        base: u64,
+        rev: u64,
+    },
     /// The post-frame cursor position lies outside the frame's `cols`/`rows`.
-    CursorOutOfBounds { line: usize, col: usize },
+    CursorOutOfBounds {
+        line: usize,
+        col: usize,
+    },
     /// A cell violates the width/text invariant: `width` must be 0 (wide spacer,
     /// empty text), 1 (normal), or 2 (wide lead); a width-0 cell must have empty
     /// text. `op` is the op index; for `ClearAll` it is the op carrying the cell.
-    BadCell { op: usize },
+    BadCell {
+        op: usize,
+    },
+    BadRowCopy,
 }
 
 /// Cursor state carried on a damage frame header. Absolute post-frame state (not a
@@ -244,6 +271,8 @@ pub struct DamageFrame {
     pub modes: ModeState,
     /// Ordered structured changes.
     pub ops: Vec<DamageOp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_copy: Option<Vec<maestro_protocol::row_copy::RowCopy>>,
 }
 
 impl DamageFrame {
@@ -257,6 +286,13 @@ impl DamageFrame {
     /// concern, not pure frame validity.
     #[allow(dead_code)]
     pub fn validate(&self) -> Result<(), DamageInvalid> {
+        if !maestro_protocol::row_copy::row_copy_valid(
+            self.row_copy.as_deref(),
+            self.cols as usize,
+            self.rows as usize,
+        ) {
+            return Err(DamageInvalid::BadRowCopy);
+        }
         if self.schema != DAMAGE_SCHEMA {
             return Err(DamageInvalid::UnsupportedSchema { got: self.schema });
         }
@@ -497,6 +533,8 @@ pub enum DaemonEvent {
         /// Rows top-to-bottom, each exactly `cols` cells wide. SAME `Cell` model as
         /// `GridSnapshot::rows_cells` — never raw bytes.
         rows: Vec<Vec<Cell>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        row_copy: Option<Vec<maestro_protocol::row_copy::RowCopy>>,
     },
     /// Structured incremental damage for a session's grid. Carries the
     /// `base_revision -> revision` change as structured ops (never raw bytes). The forwarder emits this LIVE after each
@@ -612,6 +650,7 @@ mod damage_tests {
 
     fn frame(ops: Vec<DamageOp>) -> DamageFrame {
         DamageFrame {
+            row_copy: None,
             schema: DAMAGE_SCHEMA,
             id: SessionId("s1".into()),
             generation: SessionGeneration::new(),
@@ -1059,6 +1098,7 @@ mod damage_tests {
     fn scrollback_rows_event_round_trips_with_ev_tag() {
         let ev = DaemonEvent::ScrollbackRows {
             id: SessionId("s1".into()),
+            row_copy: None,
             generation: SessionGeneration::new(),
             revision: Revision(99),
             history_len: 5000,
@@ -1100,6 +1140,7 @@ mod damage_tests {
         let grid_cell_json = serde_json::to_string(&c).unwrap();
         let ev = DaemonEvent::ScrollbackRows {
             id: SessionId("s1".into()),
+            row_copy: None,
             generation: SessionGeneration::new(),
             revision: Revision(1),
             history_len: 1,
@@ -1166,6 +1207,37 @@ mod damage_tests {
     /// `mouse_report`/`mouse_drag`/`mouse_motion`/`mouse_sgr` set — fails one of the paired
     /// tests instead of silently decoding to a wrong (defaulted-`false`) value.
     pub(crate) const CROSS_WIRE_GRID_JSON: &str = r#"{"ev":"grid","id":"s1","grid":{"version":2,"generation":"11111111-1111-1111-1111-111111111111","revision":5,"base_revision":4,"cols":3,"rows":1,"rows_cells":[[{"text":"界","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"width":2},{"text":"","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"width":0},{"text":"x","fg":{"kind":"named","name":"foreground"},"bg":{"kind":"named","name":"background"},"bold":false,"italic":false,"underline":"none","inverse":false,"strikeout":false,"dim":false,"hidden":false,"hyperlink":"https://grid.example.test/x","width":1}]],"cursor_line":0,"cursor_col":2,"cursor_visible":true,"cursor_shape":"beam","alt_screen":true,"app_cursor":true,"bracketed_paste":true,"focus_reporting":true,"mouse_report":true,"mouse_drag":true,"mouse_motion":true,"mouse_sgr":true}}"#;
+
+    #[test]
+    fn row_copy_cross_wire_addition_and_null_absence() {
+        for (json, field, rows) in [
+            (CROSS_WIRE_GRID_JSON, "grid", 1),
+            (CROSS_WIRE_DAMAGE_JSON, "frame", 4),
+            (CROSS_WIRE_SCROLLBACK_JSON, "", 1),
+        ] {
+            let mut value: serde_json::Value = serde_json::from_str(json).unwrap();
+            let payload = if field.is_empty() {
+                &mut value
+            } else {
+                &mut value[field]
+            };
+            payload["row_copy"] = serde_json::json!(vec![
+                serde_json::json!({
+                "starts_line": false, "soft_wrap": true, "excluded_columns": [] });
+                rows
+            ]);
+            let decoded: DaemonEvent = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(decoded).unwrap(), value);
+            let payload = if field.is_empty() {
+                &mut value
+            } else {
+                &mut value[field]
+            };
+            payload["row_copy"] = serde_json::Value::Null;
+            let decoded: DaemonEvent = serde_json::from_value(value).unwrap();
+            assert_eq!(serde_json::to_string(&decoded).unwrap(), json);
+        }
+    }
 
     #[test]
     fn cross_wire_daemon_emits_canonical_grid() {
