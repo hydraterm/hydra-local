@@ -86,6 +86,8 @@
 mod history_discovery;
 mod launch_mutation;
 mod launch_preflight;
+#[cfg(target_os = "macos")]
+mod macos_process_context;
 mod viewport_navigation;
 mod window_order_maintenance;
 #[cfg(test)]
@@ -1559,6 +1561,18 @@ fn active_window_is_product_recovery(active_window_id: &str) -> bool {
 }
 
 fn main() {
+    #[cfg(target_os = "macos")]
+    if let Err(error) = macos_process_context::ensure_clean_start() {
+        let failure = LaunchFailure::new(
+            "native_service_environment",
+            format!("could not restart Hydra with clean macOS process context: {error}"),
+        );
+        eprintln!(
+            "{}",
+            serde_json::to_string(&failure).expect("LaunchFailure serializes")
+        );
+        std::process::exit(1);
+    }
     // DB-write log net: attribute every store mutation this process makes to "desktop-app" (the agent tags its own).
     maestro_shell::write_trace::set_writer_tag("desktop-app");
     let args: Vec<String> = std::env::args().skip(1).collect();

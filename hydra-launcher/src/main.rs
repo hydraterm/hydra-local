@@ -43,6 +43,19 @@ struct LaunchPlan {
 }
 
 impl LaunchPlan {
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.app_binary);
+        command.args(self.command_args());
+        // libxpc caches process-owned launch context before Rust main. Remove it on the exec
+        // boundary, not inside the GUI after AppKit has already inherited the launcher's state.
+        // User environment (HOME, PATH, proxy/provider settings and permissions) stays inherited.
+        #[cfg(target_os = "macos")]
+        command
+            .env_remove("XPC_FLAGS")
+            .env_remove("XPC_SERVICE_NAME");
+        command
+    }
+
     fn command_args(&self) -> Vec<OsString> {
         let mut args = FIXED_LAUNCH_ARGS
             .iter()
@@ -96,8 +109,8 @@ fn run() -> io::Result<()> {
     log.flush()?;
 
     let stdout = log.try_clone()?;
-    let error = Command::new(&plan.app_binary)
-        .args(plan.command_args())
+    let error = plan
+        .command()
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(log))
         .exec();
@@ -378,6 +391,39 @@ mod tests {
                 ])
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn gui_exec_removes_only_macos_process_context_and_preserves_argv() {
+        let plan = build_launch_plan(
+            Path::new("/Applications/Hydra.app/Contents/MacOS/Hydra"),
+            env_lookup(&[("TMPDIR", "/private/tmp/user/")]),
+            501,
+            vec![
+                OsString::from("--title"),
+                OsString::from("Hydra custom title"),
+            ],
+        )
+        .unwrap();
+        let command = plan.command();
+        assert_eq!(command.get_program(), plan.app_binary.as_os_str());
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            plan.command_args()
+                .iter()
+                .map(OsString::as_os_str)
+                .collect::<Vec<_>>()
+        );
+        let expected: Vec<(&OsStr, Option<&OsStr>)> = if cfg!(target_os = "macos") {
+            vec![
+                (OsStr::new("XPC_FLAGS"), None),
+                (OsStr::new("XPC_SERVICE_NAME"), None),
+            ]
+        } else {
+            vec![]
+        };
+        assert_eq!(command.get_envs().collect::<Vec<_>>(), expected);
+        assert_eq!(command.get_current_dir(), None);
     }
 
     #[test]
