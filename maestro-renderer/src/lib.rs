@@ -17065,9 +17065,6 @@ impl App {
                 if let Some(r) = self.renderer.as_mut() {
                     r.set_winsize_owner_remote(remote);
                 }
-                self.resize.invalidate_last_sent();
-                self.schedule_resize();
-                self.schedule_resize_refit();
                 if let Some(h) = self.host.as_ref() {
                     h.request_redraw();
                 }
@@ -17078,19 +17075,27 @@ impl App {
                 remote_winsize,
                 remote_owned_sessions,
             } => {
-                self.external_winsize_sessions = if available {
+                let next_owned_sessions = if available {
                     normalize_external_viewport_sessions(remote_owned_sessions)
                 } else {
                     std::collections::HashSet::new()
                 };
+                let ownership_changed = self.external_winsize_sessions != next_owned_sessions;
+                self.external_winsize_sessions = next_owned_sessions;
                 if let Some(r) = self.renderer.as_mut() {
                     r.set_remote_controls_available(available);
                     r.set_remote_open(available && open);
                     r.set_winsize_owner_remote(available && remote_winsize);
                 }
-                self.resize.invalidate_last_sent();
-                self.schedule_resize();
-                self.schedule_resize_refit();
+                // Status is refreshed periodically even when ownership is unchanged. A refit
+                // resets scrollback and deliberately nudges the PTY size, making TUIs reflow.
+                // Only an actual ownership transition needs that geometry work; refreshing
+                // connection controls must not pull a reader back to the live bottom.
+                if ownership_changed {
+                    self.resize.invalidate_last_sent();
+                    self.schedule_resize();
+                    self.schedule_resize_refit();
+                }
                 if let Some(h) = self.host.as_ref() {
                     h.request_redraw();
                 }
@@ -37897,6 +37902,7 @@ mod shortcut_hint_overlay_tests {
 mod terminal_selection_ownership_tests {
     mod copy_on_select;
     mod program_clipboard;
+    mod scroll_projection;
     mod word_selection;
 
     #[cfg(target_os = "macos")]
