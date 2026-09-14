@@ -5,6 +5,10 @@
 //! paints a snapshot of this grid; it never re-parses bytes, so it cannot
 //! disagree about the screen.
 
+#[cfg(test)]
+#[path = "grid_row_copy_tests.rs"]
+mod row_copy_tests;
+
 use crate::ids::SessionId;
 use crate::protocol::{
     CursorState, DamageFrame, DamageOp, ModeState, DAMAGE_SCHEMA, MAX_DAMAGE_CELLS, MAX_DAMAGE_OPS,
@@ -968,6 +972,7 @@ impl TermGrid {
         let cursor_shape: CursorShape = self.term.cursor_style().shape.into();
 
         let mut rows_cells = Vec::with_capacity(self.rows);
+        let mut row_copy = Vec::with_capacity(self.rows);
         let mut hyperlink_cells_remaining = maestro_protocol::MAX_TERMINAL_LINK_CELLS_PER_FRAME;
         for row in 0..self.rows {
             rows_cells.push(line_to_cells(
@@ -976,10 +981,11 @@ impl TermGrid {
                 self.cols,
                 &mut hyperlink_cells_remaining,
             ));
+            row_copy.push(line_copy_metadata(grid, Line(row as i32), self.cols));
         }
         let cursor = grid.cursor.point;
         GridSnapshot {
-            row_copy: None,
+            row_copy: Some(row_copy),
             version: SNAPSHOT_VERSION,
             generation: self.generation,
             revision: self.revision,
@@ -1053,6 +1059,7 @@ impl TermGrid {
         let row_count = max_rows.min(available);
 
         let mut rows = Vec::with_capacity(row_count);
+        let mut row_copy = Vec::with_capacity(row_count);
         let mut hyperlink_cells_remaining = maestro_protocol::MAX_TERMINAL_LINK_CELLS_PER_FRAME;
         for i in 0..row_count {
             let line = Line(-(offset as i32) + i as i32);
@@ -1062,10 +1069,11 @@ impl TermGrid {
                 cols,
                 &mut hyperlink_cells_remaining,
             ));
+            row_copy.push(line_copy_metadata(grid, line, cols));
         }
 
         ScrollbackRead {
-            row_copy: None,
+            row_copy: Some(row_copy),
             generation: self.generation,
             revision: self.revision,
             history_len: history,
@@ -1153,6 +1161,31 @@ fn trim_alacritty_cell_text(cell: &mut AlacrittyCell) -> bool {
     cell.set_underline_color(underline_color);
     cell.set_hyperlink(hyperlink);
     true
+}
+
+/// Read alongside cells under the caller's same TermGrid borrow/lock and revision.
+/// Never infer a line origin from an empty history: eviction/clear may have lost it.
+/// Metadata is scanned independently of damage stamps since Alacritty can remove a
+/// previous row's leading-wide placeholder without marking that row's cells dirty.
+fn line_copy_metadata(
+    grid: &alacritty_terminal::grid::Grid<AlacrittyCell>,
+    line: Line,
+    cols: usize,
+) -> maestro_protocol::row_copy::RowCopy {
+    let last = Column(cols - 1);
+    maestro_protocol::row_copy::RowCopy {
+        starts_line: (line > grid.topmost_line())
+            .then(|| !grid[line - 1i32][last].flags.contains(Flags::WRAPLINE)),
+        soft_wrap: grid[line][last].flags.contains(Flags::WRAPLINE),
+        excluded_columns: (0..cols)
+            .filter(|&col| {
+                grid[line][Column(col)]
+                    .flags
+                    .contains(Flags::LEADING_WIDE_CHAR_SPACER)
+            })
+            .map(|col| col as u16)
+            .collect(),
+    }
 }
 
 fn line_to_cells(
