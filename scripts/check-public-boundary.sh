@@ -64,7 +64,7 @@ allowed_root_entries = {
     "hydra-launcher", "maestro-app",
     "maestro-extension-api", "maestro-local-services", "maestro-protocol",
     "maestro-renderer", "maestro-shell", "packaging", "pty-daemon", "rust-toolchain.toml",
-    "scripts",
+    "scripts", "examples",
 }
 unexpected_root = sorted(path.name for path in root.iterdir() if path.name not in allowed_root_entries)
 if unexpected_root:
@@ -75,6 +75,7 @@ allowed_docs = {
     "assets/hydra-local-demo.gif",
     "public-private-boundary.md",
     "third-party-licensing.md",
+    "developer/local-control-quickstart.md",
 }
 unexpected_docs = sorted(
     str(path.relative_to(root / "docs"))
@@ -83,6 +84,19 @@ unexpected_docs = sorted(
 )
 if unexpected_docs:
     raise SystemExit(f"public-boundary: ERROR: unexpected documentation files: {unexpected_docs}")
+
+allowed_examples = {
+    "local-control/demo.py",
+    "local-control/hydra_client.py",
+    "local-control/test_hydra_client.py",
+}
+unexpected_examples = sorted(
+    str(path.relative_to(root / "examples"))
+    for path in (root / "examples").rglob("*")
+    if path.is_file() and str(path.relative_to(root / "examples")) not in allowed_examples
+)
+if unexpected_examples:
+    raise SystemExit(f"public-boundary: ERROR: unexpected example files: {unexpected_examples}")
 
 source_paths = [path for path in root.rglob("*") if ".git" not in path.relative_to(root).parts]
 for path in sorted(source_paths):
