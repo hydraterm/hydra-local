@@ -30,7 +30,7 @@ impl crate::Clipboard for ClipboardRecorder {
     }
 }
 
-fn record_copies(app: &mut App) -> Rc<RefCell<Vec<String>>> {
+pub(super) fn record_copies(app: &mut App) -> Rc<RefCell<Vec<String>>> {
     let writes = Rc::new(RefCell::new(Vec::new()));
     let recorder = ClipboardRecorder(writes.clone());
     #[cfg(target_os = "linux")]
@@ -195,4 +195,28 @@ fn copy_on_select_does_not_add_middle_click_copy_or_paste() {
     }
     assert_eq!(writes.borrow().len(), 1);
     assert!(shared.drain_test_requests().is_empty());
+}
+
+#[test]
+fn copy_on_select_copies_an_explicit_single_character_word_once() {
+    let (mut app, shared) = app_with_primary_grid();
+    let writes = record_copies(&mut app);
+    *shared.grid.lock().unwrap() = Some(Arc::new(grid("primary-gen", 20, 6, "x y")));
+    app.handle_user_event(UserEvent::SetCopyOnSelect { enabled: true });
+    let now = Instant::now();
+    let pos = CellPos { col: 0, row: 0 };
+    app.begin_local_selection_gesture(Some(pos), now);
+    release(&mut app);
+    assert!(writes.borrow().is_empty());
+    app.begin_local_selection_gesture(Some(pos), now + Duration::from_millis(100));
+    release(&mut app);
+    assert_eq!(&*writes.borrow(), &["x"]);
+    release(&mut app);
+    assert_eq!(writes.borrow().len(), 1);
+    app.begin_local_selection_gesture(
+        Some(CellPos { col: 2, row: 0 }),
+        now + Duration::from_millis(700),
+    );
+    release(&mut app);
+    assert_eq!(writes.borrow().len(), 1);
 }

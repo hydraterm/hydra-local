@@ -75,6 +75,7 @@ mod render;
 mod scene;
 mod sync;
 mod terminal_links;
+mod terminal_selection;
 mod theme;
 mod wire;
 
@@ -11950,6 +11951,8 @@ struct App {
     // calls (redraw/size/scale/cursor/title/attention/IME) go through this, never through a toolkit type.
     host: Option<Box<dyn HostServices>>,
     renderer: Option<Renderer>,
+    #[cfg(test)]
+    test_cell_size_logical: Option<(f32, f32)>,
     // Input state.
     modifiers: HostModifiers,
     #[cfg(not(target_os = "linux"))]
@@ -11970,6 +11973,8 @@ struct App {
     // change/Escape.
     sel_anchor: Option<CellPos>,
     sel_focus: Option<CellPos>,
+    sel_word_anchor: Option<(CellPos, CellPos)>,
+    last_selection_click: Option<(Instant, CellPos, String, String)>,
     selecting: bool,
     copy_on_select: bool,
     copy_drag_started: bool,
@@ -12155,6 +12160,8 @@ impl App {
             window: None,
             host: None,
             renderer: None,
+            #[cfg(test)]
+            test_cell_size_logical: None,
             modifiers: HostModifiers::default(),
             #[cfg(not(target_os = "linux"))]
             clipboard: Box::new(SystemClipboard::new()),
@@ -12167,6 +12174,8 @@ impl App {
             pending_file_drop: None,
             sel_anchor: None,
             sel_focus: None,
+            sel_word_anchor: None,
+            last_selection_click: None,
             selecting: false,
             copy_on_select: false,
             copy_drag_started: false,
@@ -17271,7 +17280,7 @@ impl App {
                     return HostControl::Continue;
                 }
                 if self.selecting {
-                    self.sel_focus = self.hit_test(self.cursor_px);
+                    self.extend_local_selection(self.hit_test(self.cursor_px));
                     self.request_redraw();
                 }
             }
@@ -17292,6 +17301,13 @@ impl App {
                     ElementState::Pressed
                 } else {
                     ElementState::Released
+                };
+                // Any intervening chrome, non-left, or application-owned press breaks a terminal
+                // double click. Only the local left-press path restores and advances this record.
+                let previous_selection_click = if pressed {
+                    self.last_selection_click.take()
+                } else {
+                    None
                 };
                 let btn = match button {
                     MouseButton::Left => Some(MouseBtn::Left),
@@ -18139,15 +18155,18 @@ impl App {
                     match state {
                         ElementState::Pressed => {
                             let pos = self.hit_test(self.cursor_px);
-                            self.begin_local_selection(pos);
+                            self.last_selection_click = previous_selection_click;
+                            self.begin_local_selection_gesture(pos, Instant::now());
                             self.request_redraw();
                         }
                         ElementState::Released => {
                             self.selecting = false;
                             // A zero-distance click (press == release on same cell)
                             // is not a selection — clear it so Cmd-C is a no-op.
-                            if self.sel_anchor == self.sel_focus {
+                            if self.sel_anchor == self.sel_focus && self.sel_word_anchor.is_none() {
+                                let last_click = self.last_selection_click.take();
                                 self.clear_selection();
+                                self.last_selection_click = last_click;
                                 self.request_redraw();
                             } else if self.copy_on_select && completed_copy_drag {
                                 self.copy_selection();
@@ -19265,10 +19284,14 @@ impl App {
     /// `None` (it is renderer chrome, not a grid cell). `None` if the
     /// renderer/grid is not ready.
     fn hit_test(&self, (x, y): (f32, f32)) -> Option<CellPos> {
-        let r = self.renderer.as_ref()?;
+        let cell_size = self.renderer.as_ref().map(Renderer::cell_size_logical);
+        // Native event tests supply metrics without creating a GPU/window. All pointer geometry
+        // below remains the same code used with the real renderer's authoritative cell size.
+        #[cfg(test)]
+        let cell_size = cell_size.or(self.test_cell_size_logical);
+        let (cw, ch) = cell_size?;
         let w = self.host.as_ref()?;
         let scale = w.scale_factor() as f32;
-        let (cw, ch) = r.cell_size_logical();
         let origin_x = self.terminal_grid_origin_x_px();
         let origin_y = self.grid_top_offset_px();
         // The symmetric split path paints every PTY from a pane-local grid into an ABSOLUTE
@@ -19788,7 +19811,7 @@ impl App {
             return None;
         }
         match (self.sel_anchor, self.sel_focus) {
-            (Some(a), Some(b)) if a != b => Some((a, b)),
+            (Some(a), Some(b)) if a != b || self.sel_word_anchor.is_some() => Some((a, b)),
             _ => None,
         }
     }
@@ -19796,6 +19819,8 @@ impl App {
     fn clear_selection(&mut self) {
         self.sel_anchor = None;
         self.sel_focus = None;
+        self.sel_word_anchor = None;
+        self.last_selection_click = None;
         self.selecting = false;
         self.copy_drag_started = false;
         self.sel_generation = None;
@@ -19811,6 +19836,7 @@ impl App {
         self.last_reported_cell = None;
         self.sel_anchor = pos;
         self.sel_focus = pos;
+        self.sel_word_anchor = None;
         self.selecting = true;
         self.copy_drag_started = pos.is_some();
         self.hovered_terminal_link = None;
@@ -19821,6 +19847,84 @@ impl App {
                 .paint_grid()
                 .map(|grid| grid.generation.0.clone())
         });
+    }
+
+    fn begin_local_selection_gesture(&mut self, pos: Option<CellPos>, now: Instant) {
+        let previous = self.last_selection_click.take();
+        if self.modifiers.shift && pos.is_some() && self.current_selection().is_some() {
+            self.mouse_held = None;
+            self.last_reported_cell = None;
+            self.sel_focus = pos;
+            self.sel_word_anchor = None;
+            self.selecting = true;
+            self.copy_drag_started = true;
+            self.hovered_terminal_link = None;
+            return;
+        }
+        self.begin_local_selection(pos);
+        let (Some(pos), Some(owner), Some(generation)) = (
+            pos,
+            self.sel_session_id.clone(),
+            self.sel_generation.clone(),
+        ) else {
+            return;
+        };
+        let double_click = previous.is_some_and(|(at, cell, old_owner, old_generation)| {
+            now.saturating_duration_since(at) <= Duration::from_millis(500)
+                && cell == pos
+                && old_owner == owner
+                && old_generation == generation
+        });
+        self.last_selection_click = Some((now, pos, owner, generation));
+        if double_click {
+            if let Some((start, end)) = self.word_selection_at(pos) {
+                self.sel_anchor = Some(start);
+                self.sel_focus = Some(end);
+                self.sel_word_anchor = Some((start, end));
+            }
+        }
+    }
+
+    fn word_selection_at(&self, pos: CellPos) -> Option<(CellPos, CellPos)> {
+        let owner = self.sel_session_id.as_deref()?;
+        let grid = self.focused_pane_grid(owner)?;
+        let (local, origin) = if let Some(layout) = self.current_split_layout() {
+            let pane = layout.panes.iter().find(|pane| pane.session_id == owner)?;
+            let content = pane_content_region_for_layout(pane.region, layout.panes.len());
+            (
+                pane_local_cellpos(pos, content),
+                CellPos {
+                    col: content.col as usize,
+                    row: content.row as usize,
+                },
+            )
+        } else if owner == self.session_id {
+            (pos, CellPos { col: 0, row: 0 })
+        } else {
+            return None;
+        };
+        let (start, end) = terminal_selection::word_range(&grid.rows_cells, local)?;
+        let absolute = |cell: CellPos| CellPos {
+            col: cell.col + origin.col,
+            row: cell.row + origin.row,
+        };
+        Some((absolute(start), absolute(end)))
+    }
+
+    fn extend_local_selection(&mut self, pos: Option<CellPos>) {
+        if let (Some((start, end)), Some(pos)) = (self.sel_word_anchor, pos) {
+            if let Some((word_start, word_end)) = self.word_selection_at(pos) {
+                if (pos.row, pos.col) < (start.row, start.col) {
+                    self.sel_anchor = Some(end);
+                    self.sel_focus = Some(word_start);
+                } else {
+                    self.sel_anchor = Some(start);
+                    self.sel_focus = Some(word_end);
+                }
+                return;
+            }
+        }
+        self.sel_focus = pos;
     }
 
     /// Copy the current selection to the clipboard. No-op (returns without
@@ -20198,7 +20302,8 @@ impl App {
 
         // Invalidate a selection whose grid generation no longer matches what we are
         // about to paint (content was replaced, e.g. a new session or alt-screen swap).
-        if matches!((self.sel_anchor, self.sel_focus), (Some(a), Some(b)) if a != b) {
+        if matches!((self.sel_anchor, self.sel_focus), (Some(a), Some(b)) if a != b || self.sel_word_anchor.is_some())
+        {
             let owner_matches_focus = self
                 .sel_session_id
                 .as_deref()
@@ -37682,6 +37787,7 @@ mod shortcut_hint_overlay_tests {
 #[cfg(test)]
 mod terminal_selection_ownership_tests {
     mod copy_on_select;
+    mod word_selection;
 
     #[cfg(target_os = "macos")]
     use std::cell::RefCell;
