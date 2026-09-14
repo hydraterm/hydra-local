@@ -1,6 +1,6 @@
 # Trademarks
 
-The Apache License 2.0 applies to source code, not to trademarks.
+The MIT License applies to first-party source code, not to trademarks.
 
 Hydra, HydraTerms, and the Hydra and HydraTerms logos are names and marks of HydraTerms Limited.
 The licence for this repository does not grant permission to use those names or logos in a way that

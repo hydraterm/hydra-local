@@ -159,8 +159,8 @@ if set(packages) != expected:
 for name, package in packages.items():
     if package.get("publish") != []:
         raise SystemExit(f"public-boundary: ERROR: {name} is publishable to a registry")
-    if package.get("license") != "Apache-2.0":
-        raise SystemExit(f"public-boundary: ERROR: {name} does not declare Apache-2.0")
+    if package.get("license") != "MIT":
+        raise SystemExit(f"public-boundary: ERROR: {name} does not declare MIT")
     manifest = pathlib.Path(package["manifest_path"]).resolve()
     try:
         manifest.relative_to(root)

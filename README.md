@@ -63,7 +63,7 @@ be launched and resumed through their CLIs, but Hydra does not read their histor
 ## Open source and Hydra Remote
 
 This repository contains Hydra's local desktop. You can inspect it, build it, fork it and propose
-changes under the Apache License 2.0.
+changes under the [MIT License](LICENSE).
 
 Hydra Remote is a separate hosted product. Its desktop agent, browser client, coordination service,
 relays, identity, entitlement and billing systems are not in this repository and are not open
@@ -128,9 +128,12 @@ Do not report vulnerabilities in a public issue. Follow [SECURITY.md](SECURITY.m
 
 ## Licence and marks
 
-Hydra's local desktop is licensed under the Apache License 2.0. That licence does not include the
-private Hydra Remote implementation or hosted service, and it grants no rights to HydraTerms names
-or logos. See [TRADEMARKS.md](TRADEMARKS.md).
+Hydra's first-party local desktop code is licensed under the [MIT License](LICENSE). That licence
+does not include the private Hydra Remote implementation or hosted service, and it grants no rights
+to HydraTerms names or logos. See [TRADEMARKS.md](TRADEMARKS.md).
+
+Third-party dependencies retain their own licences; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Previously published Apache-2.0 versions remain available under their original licence grants.
 
 ## Sponsor
 

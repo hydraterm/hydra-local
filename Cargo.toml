@@ -13,7 +13,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-license = "Apache-2.0"
+license = "MIT"
 # MSRV: 1.88. Current locked security/runtime dependencies (including `time`
 # and `home`) require 1.88, so CI verifies the real floor instead of advertising
 # an older toolchain that Cargo can no longer build.

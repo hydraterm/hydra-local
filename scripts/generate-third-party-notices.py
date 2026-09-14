@@ -83,7 +83,7 @@ def main() -> int:
     lines = [
         "# Third-party notices",
         "",
-        "Hydra Local is Apache-2.0 licensed. It depends on third-party software under the terms",
+        "Hydra Local's first-party code is MIT licensed. It depends on third-party software under the terms",
         "listed below. This inventory is generated from the exact locked Rust and dashboard",
         "dependency graphs; it does not change or replace any upstream licence.",
         "",

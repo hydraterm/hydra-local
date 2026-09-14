@@ -1,11 +1,11 @@
 # Third-party notices
 
-Hydra Local is Apache-2.0 licensed. It depends on third-party software under the terms
+Hydra Local's first-party code is MIT licensed. It depends on third-party software under the terms
 listed below. This inventory is generated from the exact locked Rust and dashboard
 dependency graphs; it does not change or replace any upstream licence.
 
 - `Cargo.lock` SHA-256: `c93e103136f24c8987191887f79f2ba54be7ed6dbfdec874754105f2a70abeed`
-- `dashboard-ui/package-lock.json` SHA-256: `49a9dabee131279e14f73874fef9c0c74358c3300d4c3d6d6e70db72cacbb22f`
+- `dashboard-ui/package-lock.json` SHA-256: `1b24584cf696a0a1993ec68a943b0a361116b7e765e9c2cd464a19e4da140401`
 - Rust dependency versions: 543
 - npm dependency versions: 188
 
