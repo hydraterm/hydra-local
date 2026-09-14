@@ -24,6 +24,12 @@ const LOGIN_SHELL_PROVIDERS: &[&str] = &[
 pub trait LaunchEnvLookup {
     fn shell_utf8(&self) -> Option<String>;
     fn home_os(&self) -> Option<OsString>;
+    fn path_os(&self) -> Option<OsString> {
+        None
+    }
+    fn selected_provider_path(&self, _provider: &str) -> Option<PathBuf> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -36,6 +42,10 @@ impl LaunchEnvLookup for ProcessLaunchEnv {
 
     fn home_os(&self) -> Option<OsString> {
         std::env::var_os("HOME")
+    }
+
+    fn path_os(&self) -> Option<OsString> {
+        std::env::var_os("PATH")
     }
 }
 
@@ -60,7 +70,7 @@ pub fn shell_quote_login_arg(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
-fn is_executable_file(path: &Path) -> bool {
+pub(crate) fn is_executable_file(path: &Path) -> bool {
     if !path.metadata().map(|meta| meta.is_file()).unwrap_or(false) {
         return false;
     }
@@ -72,8 +82,9 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 /// Build the exact login-shell argv used by both fresh App launches and durable KnownSafe replay.
-/// OpenCode's documented per-user installation path is preferred only when it exists and is
-/// executable for the current user; every other command is resolved by the login shell's PATH.
+/// A current prepared executable is used verbatim. Otherwise the login-shell command remains
+/// authoritative, with conventional per-user installation fallbacks; OpenCode retains its existing
+/// native-install preference. Later replay deliberately resolves again without rewriting its recipe.
 pub fn login_shell_argv(argv: &[String], env: &impl LaunchEnvLookup) -> Vec<String> {
     login_shell_argv_with(argv, &login_shell_program(env), env, is_executable_file)
 }
@@ -87,7 +98,14 @@ pub fn login_shell_argv_with(
     executable: impl Fn(&Path) -> bool,
 ) -> Vec<String> {
     let mut resolved = argv.to_vec();
-    if resolved
+    let selected = resolved
+        .first()
+        .and_then(|provider| env.selected_provider_path(provider));
+    if let Some(selected) = selected {
+        if let Some(path) = selected.to_str() {
+            resolved[0] = path.to_owned();
+        }
+    } else if resolved
         .first()
         .is_some_and(|command| command == "opencode")
     {
@@ -103,11 +121,30 @@ pub fn login_shell_argv_with(
             resolved[0] = candidate;
         }
     }
-    let command = resolved
+    let mut command = resolved
         .iter()
         .map(|arg| shell_quote_login_arg(arg))
         .collect::<Vec<_>>()
         .join(" ");
+    if resolved.first() == argv.first() {
+        if let Some(provider) = argv.first() {
+            if let Some(fallback) =
+                crate::provider_executable::provider_fallback(provider, env, &executable)
+            {
+                let mut fallback_argv = resolved.clone();
+                fallback_argv[0] = fallback.to_str().expect("validated UTF-8 path").to_owned();
+                let fallback_command = fallback_argv
+                    .iter()
+                    .map(|arg| shell_quote_login_arg(arg))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                command = format!(
+                    "if command -v {} >/dev/null 2>&1; then {command}; else {fallback_command}; fi",
+                    shell_quote_login_arg(provider)
+                );
+            }
+        }
+    }
     // XPC_FLAGS and XPC_SERVICE_NAME are libxpc's process-internal state, not terminal/user
     // preferences. A retained macOS daemon can pass its "reentrancy avoided" state (0x2) and its
     // owning service name to new shells. In a fresh executable that disables system-service

@@ -19,18 +19,14 @@
 // preflight surface while the library intentionally consumes only the prepared-argv reprobe.
 #![allow(dead_code)]
 
+use std::cell::RefCell;
 use std::ffi::CString;
 use std::fmt;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
-
-const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
-const PROBE_POLL: Duration = Duration::from_millis(20);
 
 // Keep preflight and both local/remote PTY launch paths on one platform policy.
+#[cfg(test)]
 pub(crate) use maestro_local_services::LOGIN_SHELL_COMMAND_FLAGS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -586,6 +582,19 @@ trait AgentExecutableProbe {
 struct LoginShellAgentProbe {
     login_shell: PathBuf,
     home: Option<PathBuf>,
+    selected: RefCell<Option<maestro_shell::ProviderExecutable>>,
+}
+
+impl maestro_shell::LaunchEnvLookup for LoginShellAgentProbe {
+    fn shell_utf8(&self) -> Option<String> {
+        self.login_shell.to_str().map(str::to_owned)
+    }
+    fn home_os(&self) -> Option<std::ffi::OsString> {
+        self.home.as_ref().map(|home| home.as_os_str().to_owned())
+    }
+    fn path_os(&self) -> Option<std::ffi::OsString> {
+        std::env::var_os("PATH")
+    }
 }
 
 impl LoginShellAgentProbe {
@@ -603,12 +612,8 @@ impl LoginShellAgentProbe {
         Self {
             login_shell,
             home: std::env::var_os("HOME").map(PathBuf::from),
+            selected: RefCell::new(None),
         }
-    }
-
-    fn known_opencode_path(&self) -> Option<PathBuf> {
-        let path = self.home.as_ref()?.join(".opencode/bin/opencode");
-        is_executable_file(&path).then_some(path)
     }
 
     fn login_shell_has(
@@ -616,39 +621,17 @@ impl LoginShellAgentProbe {
         agent: SupportedAgentExecutable,
         cwd: &Path,
     ) -> Result<bool, LaunchPreflightError> {
-        if agent == SupportedAgentExecutable::OpenCode && self.known_opencode_path().is_some() {
-            return Ok(true);
+        use maestro_shell::{ProviderLookupError, ProviderResolution};
+        *self.selected.borrow_mut() = None;
+        let resolution = maestro_shell::resolve_provider_executable(agent.command(), cwd, self)
+            .map_err(|error| match error {
+                ProviderLookupError::Unavailable => LaunchPreflightError::ProbeUnavailable(agent),
+                ProviderLookupError::TimedOut => LaunchPreflightError::ProbeTimedOut(agent),
+            })?;
+        if let Some(ProviderResolution::Executable(selected)) = &resolution {
+            *self.selected.borrow_mut() = Some(selected.clone());
         }
-        // `agent.command()` is selected from a closed enum, never user input. The fixed command is
-        // therefore safe to pass to the shared shell mode, and stdout/stderr are discarded so
-        // profiles cannot leak values into application logs or the dashboard.
-        let check = format!("command -v {} >/dev/null 2>&1", agent.command());
-        let mut child = Command::new(&self.login_shell)
-            .arg(LOGIN_SHELL_COMMAND_FLAGS)
-            .arg(check)
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|_| LaunchPreflightError::ProbeUnavailable(agent))?;
-        let deadline = Instant::now() + PROBE_TIMEOUT;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => return Ok(status.success()),
-                Ok(None) if Instant::now() < deadline => thread::sleep(PROBE_POLL),
-                Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(LaunchPreflightError::ProbeTimedOut(agent));
-                }
-                Err(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(LaunchPreflightError::ProbeUnavailable(agent));
-                }
-            }
-        }
+        Ok(resolution.is_some())
     }
 }
 
@@ -806,15 +789,42 @@ pub(crate) fn preflight(
 
 /// Validate a launch and return its parsed explicit argv, if one was supplied. Bare custom commands
 /// are materialized to an absolute executable here so the durable recipe never depends on the
-/// retained daemon's environment. Canonical agents intentionally remain bare because their real
-/// launch is wrapped in the user's login shell later.
+/// retained daemon's environment. Canonical agents retain their provider identity here; the full
+/// preparation carries their selected executable separately for the current launch attempt.
 pub(crate) fn prepare(
     resolved_command: Option<&str>,
     selected_agent: Option<&str>,
     cwd: &Path,
 ) -> Result<Option<Vec<String>>, LaunchPreflightError> {
+    prepare_with_provider(resolved_command, selected_agent, cwd)
+        .map(|prepared| prepared.explicit_argv)
+}
+
+pub(crate) struct PreparedLaunch {
+    pub explicit_argv: Option<Vec<String>>,
+    pub provider_executable: Option<maestro_shell::ProviderExecutable>,
+}
+
+pub(crate) fn prepare_with_provider(
+    resolved_command: Option<&str>,
+    selected_agent: Option<&str>,
+    cwd: &Path,
+) -> Result<PreparedLaunch, LaunchPreflightError> {
+    prepare_with_probe(
+        resolved_command,
+        selected_agent,
+        cwd,
+        LoginShellAgentProbe::from_process_env(),
+    )
+}
+
+fn prepare_with_probe(
+    resolved_command: Option<&str>,
+    selected_agent: Option<&str>,
+    cwd: &Path,
+    probe: LoginShellAgentProbe,
+) -> Result<PreparedLaunch, LaunchPreflightError> {
     let resolved_command = normalized_resolved_command(resolved_command, selected_agent);
-    let probe = LoginShellAgentProbe::from_process_env();
     preflight_with_home(
         resolved_command,
         selected_agent,
@@ -824,7 +834,10 @@ pub(crate) fn prepare(
     )?;
 
     let Some(command) = resolved_command else {
-        return Ok(None);
+        return Ok(PreparedLaunch {
+            explicit_argv: None,
+            provider_executable: probe.selected.into_inner(),
+        });
     };
     let cwd = validated_cwd(cwd, probe.home.as_deref())?;
     let mut argv = split_command_line(command)?;
@@ -848,7 +861,22 @@ pub(crate) fn prepare(
         }
         Some(ProbeTarget::LoginShell(_)) | None => {}
     }
-    Ok(Some(argv))
+    Ok(PreparedLaunch {
+        explicit_argv: Some(argv),
+        provider_executable: probe.selected.into_inner(),
+    })
+}
+
+pub(crate) fn reprobe_selected_provider(
+    argv: &[String],
+    selected: &maestro_shell::ProviderExecutable,
+) -> Result<(), LaunchPreflightError> {
+    let provider = argv.first().ok_or(LaunchPreflightError::MalformedCommand)?;
+    if selected.remains_executable_for(provider) {
+        Ok(())
+    } else {
+        Err(LaunchPreflightError::MissingCommand)
+    }
 }
 
 /// Re-probe one already-materialized source argv at the exact cwd that will be sealed into a
@@ -901,6 +929,7 @@ mod tests {
         LoginShellAgentProbe {
             login_shell,
             home: Some(home.to_path_buf()),
+            selected: RefCell::new(None),
         }
     }
 
@@ -1037,10 +1066,35 @@ mod tests {
         let probe = LoginShellAgentProbe {
             login_shell: fake_shell,
             home: Some(root.path().to_path_buf()),
+            selected: RefCell::new(None),
         };
         assert!(probe
             .login_shell_has(SupportedAgentExecutable::Codex, root.path())
             .unwrap());
+    }
+
+    #[test]
+    fn known_root_preparation_keeps_provider_grammar_and_selected_executable_separate() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join(".local/bin/claude");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let prepared = prepare_with_probe(
+            Some("claude --resume owned-conversation"),
+            Some("claude"),
+            root.path(),
+            missing_binary_probe(root.path()),
+        )
+        .unwrap();
+        let argv = prepared.explicit_argv.unwrap();
+        assert_eq!(argv, ["claude", "--resume", "owned-conversation"]);
+        let selected = prepared.provider_executable.unwrap();
+        assert_eq!(selected.path_for("claude"), Some(executable.as_path()));
+        assert!(reprobe_selected_provider(&argv, &selected).is_ok());
+        assert!(reprobe_selected_provider(&["codex".into()], &selected).is_err());
+        std::fs::remove_file(executable).unwrap();
+        assert!(reprobe_selected_provider(&argv, &selected).is_err());
     }
 
     #[test]

@@ -110,6 +110,7 @@ pub use launch_environment::{
     login_shell_program, shell_quote_login_arg, LaunchEnvLookup, ProcessLaunchEnv,
     LOGIN_SHELL_COMMAND_FLAGS,
 };
+mod provider_executable;
 pub use layout_preset::{
     plan_preset_restore, LayoutPresetError, LayoutPresetService, PresetRestoreAction,
     PresetRestoreSlot,
@@ -120,6 +121,10 @@ pub use policy::{resolved_cwd, ResolvedCwd, WorkspacePolicy};
 pub use project::{
     ConditionalCreatedProjectDelete, CreatedProject, NewProject, ProjectCreationReceipt,
     ProjectDeletionPlan, ProjectDeletionResult, ProjectService, ProjectServiceError, ProjectUpdate,
+};
+pub use provider_executable::{
+    resolve_provider_executable, ProviderExecutable, ProviderLookupError, ProviderResolution,
+    SelectedProviderLaunchEnv,
 };
 pub use records::{
     AgentTask, AgentTaskState, Attention, AttentionSource, AttentionState, LaunchSpec,

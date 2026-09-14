@@ -560,11 +560,6 @@ impl PreparedWorkspace {
         {
             return Err(WorkspaceExecError::InvalidPreparedSessionSpec);
         }
-        let source_launch = if kind == SessionKind::Agent {
-            noncanonicalizable_agent_launch(argv)
-        } else {
-            crate::redact::adhoc_launch_spec(argv)
-        };
         let login_shell_agent = kind == SessionKind::Agent
             && argv
                 .first()
@@ -572,7 +567,19 @@ impl PreparedWorkspace {
         let wire_argv = if login_shell_agent {
             crate::launch_environment::login_shell_argv(argv, env)
         } else {
-            argv.to_vec()
+            let mut exact = argv.to_vec();
+            if let Some(path) = env.selected_provider_path(&exact[0]) {
+                exact[0] = path
+                    .into_os_string()
+                    .into_string()
+                    .map_err(|_| WorkspaceExecError::InvalidPreparedSessionSpec)?;
+            }
+            exact
+        };
+        let source_launch = if kind == SessionKind::Agent {
+            noncanonicalizable_agent_launch(argv)
+        } else {
+            crate::redact::adhoc_launch_spec(&wire_argv)
         };
         let (command, args) = wire_argv
             .split_first()

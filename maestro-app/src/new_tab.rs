@@ -237,6 +237,7 @@ pub struct NewTabPreparedStart {
 /// boundary.
 pub struct NewTabForegroundLaunch {
     kind: NewTabForegroundLaunchKind,
+    provider_executable: Option<maestro_shell::ProviderExecutable>,
 }
 
 enum NewTabForegroundLaunchKind {
@@ -260,8 +261,17 @@ enum NewTabForegroundLaunchKind {
 }
 
 impl NewTabForegroundLaunch {
+    pub fn with_provider_executable(
+        mut self,
+        executable: Option<maestro_shell::ProviderExecutable>,
+    ) -> Self {
+        self.provider_executable = executable;
+        self
+    }
+
     pub fn shell_adhoc(argv: &[String]) -> Self {
         Self {
+            provider_executable: None,
             kind: NewTabForegroundLaunchKind::ShellAdHoc {
                 argv: argv.to_vec(),
             },
@@ -271,6 +281,7 @@ impl NewTabForegroundLaunch {
     pub fn agent_adhoc(source_argv: Vec<String>, selected_agent: Option<String>) -> Option<Self> {
         let command = source_argv.first()?;
         (!command.trim().is_empty()).then_some(Self {
+            provider_executable: None,
             kind: NewTabForegroundLaunchKind::AgentAdHoc {
                 source_argv,
                 selected_agent,
@@ -285,6 +296,7 @@ impl NewTabForegroundLaunch {
     ) -> Option<Self> {
         maestro_shell::is_strict_prepared_provider_launch(&provider_id, &source_argv).then_some(
             Self {
+                provider_executable: None,
                 kind: NewTabForegroundLaunchKind::Provider {
                     provider_id,
                     source_argv,
@@ -301,6 +313,7 @@ impl NewTabForegroundLaunch {
     ) -> Option<Self> {
         maestro_shell::is_valid_prepared_provider_custom_adhoc(&provider_id, &source_argv)
             .then_some(Self {
+                provider_executable: None,
                 kind: NewTabForegroundLaunchKind::ProviderCustomAdHoc {
                     provider_id,
                     source_argv,
@@ -363,20 +376,44 @@ impl NewTabForegroundLaunch {
     where
         R: FnMut(&[String], Option<&str>, &Path) -> Result<(), NewTabStartParamsError>,
     {
+        let env = maestro_shell::SelectedProviderLaunchEnv {
+            env: &maestro_shell::ProcessLaunchEnv,
+            selected: self.provider_executable.as_ref(),
+        };
+        let mut check = |argv: &[String], agent: Option<&str>| {
+            if let Some(selected) = env.selected {
+                crate::launch_preflight::reprobe_selected_provider(argv, selected)
+                    .map_err(|_| NewTabStartParamsError::PreparedLaunch)
+            } else {
+                reprobe(argv, agent, &prepared.cwd)
+            }
+        };
         match self.kind {
-            NewTabForegroundLaunchKind::ShellAdHoc { argv } => prepared
-                .adhoc_session_spec(maestro_shell::SessionKind::Shell, &argv, cols, rows, now_ms)
-                .map_err(|_| NewTabStartParamsError::PreparedLaunch),
+            NewTabForegroundLaunchKind::ShellAdHoc { argv } => {
+                if env.selected.is_some() {
+                    check(&argv, None)?;
+                }
+                prepared
+                    .adhoc_session_spec_with_env(
+                        maestro_shell::SessionKind::Shell,
+                        &argv,
+                        &env,
+                        cols,
+                        rows,
+                        now_ms,
+                    )
+                    .map_err(|_| NewTabStartParamsError::PreparedLaunch)
+            }
             NewTabForegroundLaunchKind::AgentAdHoc {
                 source_argv,
                 selected_agent,
             } => {
-                reprobe(&source_argv, selected_agent.as_deref(), &prepared.cwd)?;
+                check(&source_argv, selected_agent.as_deref())?;
                 prepared
                     .adhoc_session_spec_with_env(
                         maestro_shell::SessionKind::Agent,
                         &source_argv,
-                        &maestro_shell::ProcessLaunchEnv,
+                        &env,
                         cols,
                         rows,
                         now_ms,
@@ -388,16 +425,9 @@ impl NewTabForegroundLaunch {
                 source_argv,
                 selected_agent,
             } => {
-                reprobe(&source_argv, Some(&selected_agent), &prepared.cwd)?;
+                check(&source_argv, Some(&selected_agent))?;
                 prepared
-                    .provider_session_spec(
-                        &provider_id,
-                        &source_argv,
-                        &maestro_shell::ProcessLaunchEnv,
-                        cols,
-                        rows,
-                        now_ms,
-                    )
+                    .provider_session_spec(&provider_id, &source_argv, &env, cols, rows, now_ms)
                     .map_err(|_| NewTabStartParamsError::PreparedLaunch)
             }
             NewTabForegroundLaunchKind::ProviderCustomAdHoc {
@@ -405,12 +435,12 @@ impl NewTabForegroundLaunch {
                 source_argv,
                 selected_agent,
             } => {
-                reprobe(&source_argv, Some(&selected_agent), &prepared.cwd)?;
+                check(&source_argv, Some(&selected_agent))?;
                 prepared
                     .provider_custom_adhoc_session_spec(
                         &provider_id,
                         &source_argv,
-                        &maestro_shell::ProcessLaunchEnv,
+                        &env,
                         cols,
                         rows,
                         now_ms,
@@ -4947,6 +4977,77 @@ mod tests {
             session_id,
             "/tmp/maestro-scratch/sess",
         )
+    }
+
+    #[test]
+    fn selected_provider_carrier_seals_without_repeating_path_lookup() {
+        use std::os::unix::fs::PermissionsExt;
+        struct OwnedEnv(PathBuf);
+        impl maestro_shell::LaunchEnvLookup for OwnedEnv {
+            fn shell_utf8(&self) -> Option<String> {
+                Some(self.0.join("shell").to_str().unwrap().into())
+            }
+            fn home_os(&self) -> Option<std::ffi::OsString> {
+                Some(self.0.as_os_str().to_owned())
+            }
+            fn path_os(&self) -> Option<std::ffi::OsString> {
+                Some("/usr/bin:/bin".into())
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let env = OwnedEnv(root.path().to_owned());
+        let executable = root.path().join(".local/bin/claude");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        for (path, text) in [
+            (&executable, "#!/bin/sh\nexit 0\n"),
+            (
+                &root.path().join("shell"),
+                "#!/bin/sh\nexec /bin/sh -c \"$2\"\n",
+            ),
+        ] {
+            std::fs::write(path, text).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let Some(maestro_shell::ProviderResolution::Executable(selected)) =
+            maestro_shell::resolve_provider_executable("claude", root.path(), &env).unwrap()
+        else {
+            panic!("owned selection")
+        };
+        let prepared = maestro_shell::PreparedWorkspace::unsealed(
+            maestro_shell::WorkspacePolicy::ScratchCwd,
+            "owned-workspace",
+            "owned-session",
+            root.path(),
+        );
+        for params in [
+            vec![],
+            vec!["--resume".to_owned(), "owned-conversation".to_owned()],
+        ] {
+            let mut source = vec!["claude".to_owned()];
+            source.extend(params);
+            let launch = NewTabForegroundLaunch::provider("claude".into(), source, "claude".into())
+                .unwrap()
+                .with_provider_executable(Some(selected.clone()));
+            assert!(launch
+                .into_session_spec_with_reprobe(&prepared, 80, 24, 1, |_, _, _| panic!(
+                    "must not rediscover a selected executable"
+                ))
+                .is_ok());
+        }
+        std::fs::remove_file(executable).unwrap();
+        let launch = NewTabForegroundLaunch::provider(
+            "claude".into(),
+            vec!["claude".into()],
+            "claude".into(),
+        )
+        .unwrap()
+        .with_provider_executable(Some(selected));
+        assert!(matches!(
+            launch.into_session_spec_with_reprobe(&prepared, 80, 24, 1, |_, _, _| panic!(
+                "missing selected executable must not fall back"
+            )),
+            Err(NewTabStartParamsError::PreparedLaunch)
+        ));
     }
 
     #[test]

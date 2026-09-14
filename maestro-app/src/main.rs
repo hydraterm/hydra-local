@@ -3983,35 +3983,68 @@ enum PreparedReactFreshLaunch {
         kind: SessionKind,
         source_argv: Vec<String>,
         selected_agent: Option<String>,
+        provider_executable: Option<maestro_shell::ProviderExecutable>,
     },
     Provider {
         provider_id: String,
         source_argv: Vec<String>,
         selected_agent: String,
         allow_custom_adhoc: bool,
+        provider_executable: Option<maestro_shell::ProviderExecutable>,
     },
 }
 
 impl PreparedReactFreshLaunch {
+    fn select_executable(&mut self, selected: Option<maestro_shell::ProviderExecutable>) {
+        match self {
+            Self::AdHoc {
+                provider_executable,
+                ..
+            }
+            | Self::Provider {
+                provider_executable,
+                ..
+            } => *provider_executable = selected,
+        }
+    }
+
     fn seal_at_prepared_cwd(
         &self,
         prepared: &maestro_shell::PreparedWorkspace,
         now_ms: u64,
     ) -> Result<maestro_shell::PreparedSessionSpec, String> {
-        let (source_argv, selected_agent) = match self {
+        let (source_argv, selected_agent, executable) = match self {
             Self::AdHoc {
                 source_argv,
                 selected_agent,
+                provider_executable,
                 ..
-            } => (source_argv.as_slice(), selected_agent.as_deref()),
+            } => (
+                source_argv.as_slice(),
+                selected_agent.as_deref(),
+                provider_executable.as_ref(),
+            ),
             Self::Provider {
                 source_argv,
                 selected_agent,
+                provider_executable,
                 ..
-            } => (source_argv.as_slice(), Some(selected_agent.as_str())),
+            } => (
+                source_argv.as_slice(),
+                Some(selected_agent.as_str()),
+                provider_executable.as_ref(),
+            ),
         };
-        launch_preflight::reprobe_prepared_argv(source_argv, selected_agent, &prepared.cwd)
-            .map_err(|error| format!("prepared cwd launch reprobe: {}", error.code()))?;
+        (if let Some(executable) = executable {
+            launch_preflight::reprobe_selected_provider(source_argv, executable)
+        } else {
+            launch_preflight::reprobe_prepared_argv(source_argv, selected_agent, &prepared.cwd)
+        })
+        .map_err(|error| format!("prepared cwd launch reprobe: {}", error.code()))?;
+        let env = maestro_shell::SelectedProviderLaunchEnv {
+            env: &maestro_shell::ProcessLaunchEnv,
+            selected: executable,
+        };
         match self {
             Self::AdHoc {
                 kind, source_argv, ..
@@ -4019,7 +4052,7 @@ impl PreparedReactFreshLaunch {
                 .adhoc_session_spec_with_env(
                     *kind,
                     source_argv,
-                    &maestro_shell::ProcessLaunchEnv,
+                    &env,
                     DEFAULT_COLS,
                     DEFAULT_ROWS,
                     now_ms,
@@ -4033,7 +4066,7 @@ impl PreparedReactFreshLaunch {
             } => match prepared.provider_session_spec(
                 provider_id,
                 source_argv,
-                &maestro_shell::ProcessLaunchEnv,
+                &env,
                 DEFAULT_COLS,
                 DEFAULT_ROWS,
                 now_ms,
@@ -4043,7 +4076,7 @@ impl PreparedReactFreshLaunch {
                     .provider_custom_adhoc_session_spec(
                         provider_id,
                         source_argv,
-                        &maestro_shell::ProcessLaunchEnv,
+                        &env,
                         DEFAULT_COLS,
                         DEFAULT_ROWS,
                         now_ms,
@@ -4065,14 +4098,17 @@ impl PreparedReactFreshLaunch {
                 kind,
                 source_argv,
                 selected_agent,
+                provider_executable,
             } => match kind {
                 SessionKind::Shell => Some((
                     maestro_app::NewTabLaunchSource::DefaultShellDev,
-                    maestro_app::NewTabForegroundLaunch::shell_adhoc(&source_argv),
+                    maestro_app::NewTabForegroundLaunch::shell_adhoc(&source_argv)
+                        .with_provider_executable(provider_executable),
                 )),
                 SessionKind::Agent => Some((
                     maestro_app::NewTabLaunchSource::PreparedAgentAdHoc,
-                    maestro_app::NewTabForegroundLaunch::agent_adhoc(source_argv, selected_agent)?,
+                    maestro_app::NewTabForegroundLaunch::agent_adhoc(source_argv, selected_agent)?
+                        .with_provider_executable(provider_executable),
                 )),
             },
             Self::Provider {
@@ -4080,13 +4116,15 @@ impl PreparedReactFreshLaunch {
                 source_argv,
                 selected_agent,
                 allow_custom_adhoc,
+                provider_executable,
             } => {
                 if maestro_shell::is_strict_prepared_provider_launch(&provider_id, &source_argv) {
                     let launch = maestro_app::NewTabForegroundLaunch::provider(
                         provider_id.clone(),
                         source_argv,
                         selected_agent,
-                    )?;
+                    )?
+                    .with_provider_executable(provider_executable);
                     Some((
                         maestro_app::NewTabLaunchSource::KnownSafeSpec {
                             launch_spec_id: provider_id,
@@ -4098,7 +4136,8 @@ impl PreparedReactFreshLaunch {
                         provider_id,
                         source_argv,
                         selected_agent,
-                    )?;
+                    )?
+                    .with_provider_executable(provider_executable);
                     Some((maestro_app::NewTabLaunchSource::PreparedAgentAdHoc, launch))
                 } else {
                     None
@@ -4130,6 +4169,7 @@ fn prepared_react_fresh_launch(
                         source_argv,
                         selected_agent: selected_agent.to_string(),
                         allow_custom_adhoc,
+                        provider_executable: None,
                     });
                 }
                 if !allow_custom_adhoc {
@@ -4139,6 +4179,7 @@ fn prepared_react_fresh_launch(
                     kind,
                     source_argv,
                     selected_agent: Some(selected_agent.to_string()),
+                    provider_executable: None,
                 });
             }
         }
@@ -4156,6 +4197,7 @@ fn prepared_react_fresh_launch(
             kind,
             source_argv,
             selected_agent: selected_agent.map(str::to_string),
+            provider_executable: None,
         });
     }
     None
@@ -6023,7 +6065,7 @@ fn prepare_react_agent_launch(
     cwd: &Path,
     socket_path: &Path,
 ) -> Result<PreparedReactAgentLaunch, launch_preflight::LaunchPreflightError> {
-    let explicit_argv = launch_preflight::prepare(resolved_command, agent, cwd)?;
+    let prepared = launch_preflight::prepare_with_provider(resolved_command, agent, cwd)?;
     // Bind the exact mutation-protocol proof and live-id inventory to one authenticated daemon
     // connection. Fresh callers must reject every id in this snapshot before publishing a
     // SessionRecord; otherwise ordinary focus would attach to a foreign daemon-only PTY instead
@@ -6044,13 +6086,15 @@ fn prepare_react_agent_launch(
         .map(|id| id.0)
         .collect();
     Ok(PreparedReactAgentLaunch {
-        explicit_argv,
+        explicit_argv: prepared.explicit_argv,
+        provider_executable: prepared.provider_executable,
         known_daemon_session_ids,
     })
 }
 
 struct PreparedReactAgentLaunch {
     explicit_argv: Option<Vec<String>>,
+    provider_executable: Option<maestro_shell::ProviderExecutable>,
     known_daemon_session_ids: std::collections::HashSet<String>,
 }
 
@@ -16893,7 +16937,7 @@ fn spawn_window_event_listener(
                                     &fallback_argv,
                                     prepared.explicit_argv.as_deref(),
                                 );
-                                let Some(launch) = prepared_react_fresh_launch(
+                                let Some(mut launch) = prepared_react_fresh_launch(
                                     kind,
                                     &launch,
                                     source_argv,
@@ -16907,6 +16951,7 @@ fn spawn_window_event_listener(
                                     );
                                     continue;
                                 };
+                                launch.select_executable(prepared.provider_executable);
                                 Some((launch, prepared.known_daemon_session_ids))
                             } else {
                                 None
@@ -17354,7 +17399,7 @@ fn spawn_window_event_listener(
                                 &fallback_argv,
                                 prepared.explicit_argv.as_deref(),
                             );
-                            let Some(launch) = prepared_react_fresh_launch(
+                            let Some(mut launch) = prepared_react_fresh_launch(
                                 kind,
                                 &launch,
                                 source_argv,
@@ -17369,6 +17414,7 @@ fn spawn_window_event_listener(
                                 ));
                                 continue;
                             };
+                            launch.select_executable(prepared.provider_executable);
                             if !listener_window_context.is_bound() {
                                 launch_mutation::reject(&mut tab_runtime, request_id.as_deref(), format!(
                                     "hydra-dashboard intent createWindow unavailable without a bound renderer; no fresh graph was written project={project_id:?}"
@@ -19054,7 +19100,7 @@ fn spawn_window_event_listener(
                                         &fallback_argv,
                                         prepared_launch.explicit_argv.as_deref(),
                                     );
-                                let Some(launch) = prepared_react_fresh_launch(
+                                let Some(mut launch) = prepared_react_fresh_launch(
                                     kind,
                                     &launch_metadata,
                                     source_argv,
@@ -19068,6 +19114,7 @@ fn spawn_window_event_listener(
                                     );
                                     continue;
                                 };
+                                launch.select_executable(prepared_launch.provider_executable);
                                 let Some((plan_source, foreground_launch)) =
                                     launch.into_new_tab_launch()
                                 else {
@@ -23348,6 +23395,80 @@ mod react_session_insert_only_tests {
     }
 
     #[test]
+    fn prepared_react_provider_carrier_preserves_exact_executable_and_conversation() {
+        use std::os::unix::fs::PermissionsExt;
+        struct OwnedEnv(PathBuf);
+        impl maestro_shell::LaunchEnvLookup for OwnedEnv {
+            fn shell_utf8(&self) -> Option<String> {
+                Some(self.0.join("shell").to_str().unwrap().into())
+            }
+            fn home_os(&self) -> Option<std::ffi::OsString> {
+                Some(self.0.as_os_str().to_owned())
+            }
+            fn path_os(&self) -> Option<std::ffi::OsString> {
+                Some("/usr/bin:/bin".into())
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join(".local/bin/claude");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        for (path, text) in [
+            (&executable, "#!/bin/sh\nexit 0\n"),
+            (
+                &root.path().join("shell"),
+                "#!/bin/sh\nexec /bin/sh -c \"$2\"\n",
+            ),
+        ] {
+            std::fs::write(path, text).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let Some(maestro_shell::ProviderResolution::Executable(selected)) =
+            maestro_shell::resolve_provider_executable(
+                "claude",
+                root.path(),
+                &OwnedEnv(root.path().to_owned()),
+            )
+            .unwrap()
+        else {
+            panic!("owned selection")
+        };
+        let (_, launch, source) = prepared_react_session_launch(
+            Some("claude --resume owned-conversation"),
+            Some("claude"),
+            None,
+            None,
+            &[],
+            None,
+        );
+        let mut carrier = prepared_react_fresh_launch(
+            SessionKind::Agent,
+            &launch,
+            source.clone(),
+            Some("claude"),
+            false,
+        )
+        .unwrap();
+        carrier.select_executable(Some(selected.clone()));
+        assert!(
+            matches!(&carrier, PreparedReactFreshLaunch::Provider { source_argv, provider_executable: Some(value), .. } if source_argv == &source && value == &selected)
+        );
+        let prepared = maestro_shell::PreparedWorkspace::unsealed(
+            maestro_shell::WorkspacePolicy::ScratchCwd,
+            "owned-workspace",
+            "owned-session",
+            root.path(),
+        );
+        assert!(carrier.seal_at_prepared_cwd(&prepared, 1).is_ok());
+        assert!(carrier.into_new_tab_launch().is_some());
+        std::fs::remove_file(executable).unwrap();
+        let mut missing =
+            prepared_react_fresh_launch(SessionKind::Agent, &launch, source, Some("claude"), false)
+                .unwrap();
+        missing.select_executable(Some(selected));
+        assert!(missing.seal_at_prepared_cwd(&prepared, 1).is_err());
+    }
+
+    #[test]
     fn malformed_provider_selector_cannot_become_new_tab_custom_adhoc() {
         let source = vec!["claude".to_string(), "--continue=foreign".to_string()];
         let launch = LaunchSpec::AdHocRedacted {
@@ -23419,6 +23540,7 @@ mod react_session_insert_only_tests {
             kind: SessionKind::Shell,
             source_argv: vec!["/bin/sh".into(), "-l".into()],
             selected_agent: None,
+            provider_executable: None,
         }
     }
 
