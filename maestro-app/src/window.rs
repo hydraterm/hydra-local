@@ -1680,6 +1680,14 @@ impl RendererTabRuntime {
             .map_err(|_| TabSwitchError::RendererControlClosed)
     }
 
+    /// Apply the user's program-copy preference without changing terminal ownership.
+    pub fn set_program_clipboard(&self, enabled: bool) -> Result<(), TabSwitchError> {
+        self.controller
+            .sender
+            .send(maestro_renderer::RendererCommand::SetProgramClipboard { enabled })
+            .map_err(|_| TabSwitchError::RendererControlClosed)
+    }
+
     /// Hand out a narrow, theme-only command handle that owns a CLONE of this runtime's renderer
     /// command sender. A background settings watcher can keep this and drive live theme swaps
     /// WITHOUT owning (or borrowing) the whole [`RendererTabRuntime`], which the foreground listener

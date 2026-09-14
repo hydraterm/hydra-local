@@ -77,6 +77,7 @@ pub const DEFAULT_FONT_SIZE_PX: u32 = 16;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ChromeDefaults {
     pub copy_on_select: bool,
+    pub allow_program_clipboard: bool,
     pub top_tab_bar_default: bool,
     pub dashboard_status_default: bool,
     pub dashboard_panel_default: bool,
@@ -151,6 +152,7 @@ impl ChromeDefaults {
     pub fn built_in() -> Self {
         Self {
             copy_on_select: false,
+            allow_program_clipboard: true,
             top_tab_bar_default: true,
             dashboard_status_default: true,
             dashboard_panel_default: false,
@@ -465,6 +467,23 @@ pub fn build_settings_panel_lines(settings: &EffectiveSettings) -> SettingsPanel
         ),
     );
 
+    let allow_program_clipboard = settings.chrome.allow_program_clipboard.to_string();
+    emit(
+        if settings.chrome.allow_program_clipboard {
+            "[x] Allow terminal apps to copy text (Enter toggles)"
+        } else {
+            "[ ] Allow terminal apps to copy text (Enter toggles)"
+        },
+        allow_program_clipboard.clone(),
+        SettingsPanelRow::editable(
+            "input.allow_program_clipboard",
+            "input",
+            "Allow terminal apps to copy text (Enter toggles)",
+            allow_program_clipboard,
+            "chrome.allow_program_clipboard",
+        ),
+    );
+
     // Shell (editable). The fallback line is reported when no argv is configured; the row is still
     // editable because `shell.default_argv` is a settable key (its value is just unset here).
     let shell_argv = match &settings.shell.default_argv {
@@ -665,6 +684,8 @@ pub struct PersistedAppearance {
 pub struct PersistedChrome {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copy_on_select: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_program_clipboard: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_tab_bar_default: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -723,6 +744,7 @@ fn persisted_is_all_default(p: &PersistedSettings) -> bool {
     p.appearance.font_size_px == DEFAULT_FONT_SIZE_PX
         && p.appearance.theme == BUILT_IN_THEME
         && p.chrome.copy_on_select.is_none()
+        && p.chrome.allow_program_clipboard.is_none()
         && p.chrome.top_tab_bar_default.is_none()
         && p.chrome.dashboard_status_default.is_none()
         && p.chrome.dashboard_panel_default.is_none()
@@ -879,6 +901,9 @@ pub fn effective_settings(base: impl AsRef<Path>) -> EffectiveSettings {
             appearance.theme = persisted.appearance.theme;
             if let Some(value) = persisted.chrome.copy_on_select {
                 chrome.copy_on_select = value;
+            }
+            if let Some(value) = persisted.chrome.allow_program_clipboard {
+                chrome.allow_program_clipboard = value;
             }
             if let Some(v) = persisted.chrome.top_tab_bar_default {
                 chrome.top_tab_bar_default = v;
@@ -1060,6 +1085,7 @@ pub fn set_theme(base: &Path, theme: &str) -> Result<SettingsSetSuccess, Setting
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChromeDefaultKey {
     CopyOnSelect,
+    AllowProgramClipboard,
     TopTabBar,
     DashboardStatus,
     DashboardPanel,
@@ -1071,6 +1097,7 @@ impl ChromeDefaultKey {
     fn key(self) -> &'static str {
         match self {
             ChromeDefaultKey::CopyOnSelect => "chrome.copy_on_select",
+            ChromeDefaultKey::AllowProgramClipboard => "chrome.allow_program_clipboard",
             ChromeDefaultKey::TopTabBar => "chrome.top_tab_bar_default",
             ChromeDefaultKey::DashboardStatus => "chrome.dashboard_status_default",
             ChromeDefaultKey::DashboardPanel => "chrome.dashboard_panel_default",
@@ -1082,6 +1109,7 @@ impl ChromeDefaultKey {
     fn current(self, chrome: &PersistedChrome) -> Option<bool> {
         match self {
             ChromeDefaultKey::CopyOnSelect => chrome.copy_on_select,
+            ChromeDefaultKey::AllowProgramClipboard => chrome.allow_program_clipboard,
             ChromeDefaultKey::TopTabBar => chrome.top_tab_bar_default,
             ChromeDefaultKey::DashboardStatus => chrome.dashboard_status_default,
             ChromeDefaultKey::DashboardPanel => chrome.dashboard_panel_default,
@@ -1093,6 +1121,7 @@ impl ChromeDefaultKey {
     fn apply(self, chrome: &mut PersistedChrome, value: bool) {
         match self {
             ChromeDefaultKey::CopyOnSelect => chrome.copy_on_select = Some(value),
+            ChromeDefaultKey::AllowProgramClipboard => chrome.allow_program_clipboard = Some(value),
             ChromeDefaultKey::TopTabBar => chrome.top_tab_bar_default = Some(value),
             ChromeDefaultKey::DashboardStatus => chrome.dashboard_status_default = Some(value),
             ChromeDefaultKey::DashboardPanel => chrome.dashboard_panel_default = Some(value),
@@ -1343,6 +1372,7 @@ pub fn set_shell_default_argv(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsResetTarget {
     CopyOnSelect,
+    AllowProgramClipboard,
     FontSizePx,
     Theme,
     TopTabBarDefault,
@@ -1393,6 +1423,11 @@ pub fn reset_appearance_setting(
                 SettingsResetTarget::CopyOnSelect => {
                     let was_default = next.chrome.copy_on_select.is_none();
                     next.chrome.copy_on_select = None;
+                    !was_default
+                }
+                SettingsResetTarget::AllowProgramClipboard => {
+                    let was_default = next.chrome.allow_program_clipboard.is_none();
+                    next.chrome.allow_program_clipboard = None;
                     !was_default
                 }
                 SettingsResetTarget::TopTabBarDefault => {
@@ -1461,6 +1496,9 @@ pub fn reset_appearance_setting(
         ),
         SettingsResetTarget::Theme => ("appearance.theme", serde_json::json!(BUILT_IN_THEME)),
         SettingsResetTarget::CopyOnSelect => ("chrome.copy_on_select", serde_json::json!(false)),
+        SettingsResetTarget::AllowProgramClipboard => {
+            ("chrome.allow_program_clipboard", serde_json::json!(true))
+        }
         SettingsResetTarget::TopTabBarDefault => (
             "chrome.top_tab_bar_default",
             serde_json::json!(ChromeDefaults::built_in().top_tab_bar_default),
@@ -1644,6 +1682,35 @@ fn write_file_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn program_clipboard_defaults_on_and_persists_user_choice_and_reset() {
+        let tmp = TempBase::new("program-clipboard");
+        assert!(effective_settings(&tmp.path).chrome.allow_program_clipboard);
+        set_chrome_default(&tmp.path, ChromeDefaultKey::CopyOnSelect, true).unwrap();
+        set_chrome_default(&tmp.path, ChromeDefaultKey::AllowProgramClipboard, false).unwrap();
+        let disabled = effective_settings(&tmp.path);
+        assert!(!disabled.chrome.allow_program_clipboard);
+        assert!(disabled.chrome.copy_on_select);
+        let panel = build_settings_panel_lines(&disabled);
+        let row = panel
+            .rows
+            .iter()
+            .find(|row| row.id == "input.allow_program_clipboard")
+            .unwrap();
+        assert_eq!(row.setting_key, Some("chrome.allow_program_clipboard"));
+        assert_eq!(row.value, "false");
+        assert!(row.editable);
+        set_chrome_default(&tmp.path, ChromeDefaultKey::AllowProgramClipboard, true).unwrap();
+        assert!(effective_settings(&tmp.path).chrome.allow_program_clipboard);
+        set_chrome_default(&tmp.path, ChromeDefaultKey::AllowProgramClipboard, false).unwrap();
+        reset_appearance_setting(&tmp.path, SettingsResetTarget::AllowProgramClipboard).unwrap();
+        let reset = effective_settings(&tmp.path);
+        assert!(reset.chrome.allow_program_clipboard);
+        assert!(reset.chrome.copy_on_select);
+        reset_appearance_setting(&tmp.path, SettingsResetTarget::CopyOnSelect).unwrap();
+        assert!(!settings_file_path(&tmp.path).exists());
+    }
+
     #[test]
     fn copy_on_select_persists_reloads_and_resets_without_changing_other_settings() {
         let tmp = TempBase::new("copy-on-select");
@@ -2703,26 +2770,30 @@ mod tests {
         assert_eq!(panel.lines[7], "chrome.dashboard_panel: false");
         assert_eq!(panel.lines[8], "chrome.picker_overlay: false");
         assert_eq!(
-            panel.lines[10],
+            panel.lines[11],
             "shell.default_argv: (unset; $SHELL/sh fallback)"
         );
         assert_eq!(panel.lines[9], "[ ] Copy on select (Enter toggles): false");
-        assert_eq!(panel.lines[11], "workspace.default_policy: scratch_cwd");
-        assert_eq!(panel.lines[12], "workspace.worktree_requires_consent: true");
         assert_eq!(
-            panel.lines[13],
+            panel.lines[10],
+            "[x] Allow terminal apps to copy text (Enter toggles): true"
+        );
+        assert_eq!(panel.lines[12], "workspace.default_policy: scratch_cwd");
+        assert_eq!(panel.lines[13], "workspace.worktree_requires_consent: true");
+        assert_eq!(
+            panel.lines[14],
             "workspace.repo_write_requires_consent: true"
         );
         assert_eq!(
-            panel.lines[14],
+            panel.lines[15],
             "safety.private_dev_socket_by_default: true"
         );
         assert_eq!(
-            panel.lines[15],
+            panel.lines[16],
             "safety.destructive_worktree_cleanup_requires_confirm: true"
         );
         assert_eq!(
-            panel.lines[16],
+            panel.lines[17],
             "safety.repo_write_requires_explicit_consent: true"
         );
 
@@ -2866,6 +2937,7 @@ mod tests {
         "chrome.dashboard_panel_default",
         "chrome.picker_overlay_default",
         "chrome.copy_on_select",
+        "chrome.allow_program_clipboard",
         "shell.default_argv",
         "workspace.default_policy",
         "workspace.worktree_requires_consent",

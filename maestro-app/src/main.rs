@@ -342,6 +342,7 @@ fn settings_panel_activation_status_label(
 fn settings_panel_writable_chrome_key(setting_key: &str) -> Option<ChromeDefaultKey> {
     match setting_key {
         "chrome.copy_on_select" => Some(ChromeDefaultKey::CopyOnSelect),
+        "chrome.allow_program_clipboard" => Some(ChromeDefaultKey::AllowProgramClipboard),
         "chrome.top_tab_bar_default" => Some(ChromeDefaultKey::TopTabBar),
         "chrome.dashboard_status_default" => Some(ChromeDefaultKey::DashboardStatus),
         "chrome.dashboard_panel_default" => Some(ChromeDefaultKey::DashboardPanel),
@@ -350,15 +351,21 @@ fn settings_panel_writable_chrome_key(setting_key: &str) -> Option<ChromeDefault
     }
 }
 
-fn sync_copy_on_select_setting(
+fn sync_clipboard_settings(
     runtime: &RendererTabRuntime,
     base: &std::path::Path,
-    last: &mut bool,
+    last: &mut Option<bool>,
+    last_program: &mut Option<bool>,
 ) -> Result<(), maestro_app::TabSwitchError> {
-    let enabled = effective_settings(base).chrome.copy_on_select;
-    if enabled != *last {
+    let chrome = effective_settings(base).chrome;
+    let enabled = chrome.copy_on_select;
+    if Some(enabled) != *last {
         runtime.set_copy_on_select(enabled)?;
-        *last = enabled;
+        *last = Some(enabled);
+    }
+    if Some(chrome.allow_program_clipboard) != *last_program {
+        runtime.set_program_clipboard(chrome.allow_program_clipboard)?;
+        *last_program = Some(chrome.allow_program_clipboard);
     }
     Ok(())
 }
@@ -368,29 +375,102 @@ mod copy_on_select_setting_tests {
     use super::*;
 
     #[test]
+    fn program_clipboard_listener_seeds_both_values_even_when_they_are_defaults() {
+        let base = tempfile::tempdir().unwrap();
+        for enabled in [false, true] {
+            set_chrome_default(
+                base.path(),
+                ChromeDefaultKey::AllowProgramClipboard,
+                enabled,
+            )
+            .unwrap();
+            let (runtime, commands) = RendererTabRuntime::new();
+            let mut copy = None;
+            let mut program = None;
+            sync_clipboard_settings(&runtime, base.path(), &mut copy, &mut program).unwrap();
+            assert!(matches!(
+                commands.try_recv().unwrap(),
+                maestro_renderer::RendererCommand::SetCopyOnSelect { enabled: false }
+            ));
+            assert!(
+                matches!(commands.try_recv().unwrap(), maestro_renderer::RendererCommand::SetProgramClipboard { enabled: actual } if actual == enabled)
+            );
+            assert_eq!(copy, Some(false));
+            assert_eq!(program, Some(enabled));
+            sync_clipboard_settings(&runtime, base.path(), &mut copy, &mut program).unwrap();
+            assert!(commands.try_recv().is_err());
+        }
+        let (runtime, commands) = RendererTabRuntime::new();
+        drop(commands);
+        let mut copy = None;
+        let mut program = None;
+        assert!(sync_clipboard_settings(&runtime, base.path(), &mut copy, &mut program).is_err());
+        assert_eq!((copy, program), (None, None));
+    }
+
+    #[test]
+    fn program_clipboard_sync_seeds_disabled_choice_and_propagates_reset() {
+        let base = tempfile::tempdir().unwrap();
+        let (runtime, commands) = RendererTabRuntime::new();
+        let mut last = Some(true);
+        sync_clipboard_settings(&runtime, base.path(), &mut Some(false), &mut last).unwrap();
+        assert!(commands.try_recv().is_err());
+        set_chrome_default(base.path(), ChromeDefaultKey::AllowProgramClipboard, false).unwrap();
+        sync_clipboard_settings(&runtime, base.path(), &mut Some(false), &mut last).unwrap();
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            maestro_renderer::RendererCommand::SetProgramClipboard { enabled: false }
+        ));
+        sync_clipboard_settings(&runtime, base.path(), &mut Some(false), &mut last).unwrap();
+        assert!(commands.try_recv().is_err());
+        let (reopened, reopened_commands) = RendererTabRuntime::new();
+        sync_clipboard_settings(&reopened, base.path(), &mut Some(false), &mut Some(true)).unwrap();
+        assert!(matches!(
+            reopened_commands.try_recv().unwrap(),
+            maestro_renderer::RendererCommand::SetProgramClipboard { enabled: false }
+        ));
+        reset_appearance_setting(
+            base.path(),
+            maestro_app::SettingsResetTarget::AllowProgramClipboard,
+        )
+        .unwrap();
+        sync_clipboard_settings(&runtime, base.path(), &mut Some(false), &mut last).unwrap();
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            maestro_renderer::RendererCommand::SetProgramClipboard { enabled: true }
+        ));
+        drop(commands);
+        set_chrome_default(base.path(), ChromeDefaultKey::AllowProgramClipboard, false).unwrap();
+        assert!(
+            sync_clipboard_settings(&runtime, base.path(), &mut Some(false), &mut last).is_err()
+        );
+        assert_eq!(last, Some(true), "a failed send is not marked applied");
+    }
+
+    #[test]
     fn copy_on_select_sync_seeds_reopened_windows_and_only_sends_actual_changes() {
         let base = tempfile::tempdir().unwrap();
         let (runtime, commands) = RendererTabRuntime::new();
-        let mut last = false;
-        sync_copy_on_select_setting(&runtime, base.path(), &mut last).unwrap();
+        let mut last = Some(false);
+        sync_clipboard_settings(&runtime, base.path(), &mut last, &mut Some(true)).unwrap();
         assert!(commands.try_recv().is_err());
         set_chrome_default(base.path(), ChromeDefaultKey::CopyOnSelect, true).unwrap();
-        sync_copy_on_select_setting(&runtime, base.path(), &mut last).unwrap();
+        sync_clipboard_settings(&runtime, base.path(), &mut last, &mut Some(true)).unwrap();
         assert!(matches!(
             commands.try_recv().unwrap(),
             maestro_renderer::RendererCommand::SetCopyOnSelect { enabled: true }
         ));
-        sync_copy_on_select_setting(&runtime, base.path(), &mut last).unwrap();
+        sync_clipboard_settings(&runtime, base.path(), &mut last, &mut Some(true)).unwrap();
         assert!(commands.try_recv().is_err());
         let (reopened, reopened_commands) = RendererTabRuntime::new();
-        sync_copy_on_select_setting(&reopened, base.path(), &mut false).unwrap();
+        sync_clipboard_settings(&reopened, base.path(), &mut Some(false), &mut Some(true)).unwrap();
         assert!(matches!(
             reopened_commands.try_recv().unwrap(),
             maestro_renderer::RendererCommand::SetCopyOnSelect { enabled: true }
         ));
         reset_appearance_setting(base.path(), maestro_app::SettingsResetTarget::CopyOnSelect)
             .unwrap();
-        sync_copy_on_select_setting(&runtime, base.path(), &mut last).unwrap();
+        sync_clipboard_settings(&runtime, base.path(), &mut last, &mut Some(true)).unwrap();
         assert!(matches!(
             commands.try_recv().unwrap(),
             maestro_renderer::RendererCommand::SetCopyOnSelect { enabled: false }
@@ -398,8 +478,10 @@ mod copy_on_select_setting_tests {
         assert!(commands.try_recv().is_err());
         drop(commands);
         set_chrome_default(base.path(), ChromeDefaultKey::CopyOnSelect, true).unwrap();
-        assert!(sync_copy_on_select_setting(&runtime, base.path(), &mut last).is_err());
-        assert!(!last, "a failed send is not marked as applied");
+        assert!(
+            sync_clipboard_settings(&runtime, base.path(), &mut last, &mut Some(true)).is_err()
+        );
+        assert_eq!(last, Some(false), "a failed send is not marked as applied");
     }
 }
 
@@ -2246,6 +2328,9 @@ fn run_settings_set(args: SettingsSetArgs) -> Result<String, SettingsFailure> {
         SettingsSetTarget::Theme(theme) => set_theme(&base, &theme)?,
         SettingsSetTarget::CopyOnSelect(value) => {
             set_chrome_default(&base, ChromeDefaultKey::CopyOnSelect, value)?
+        }
+        SettingsSetTarget::AllowProgramClipboard(value) => {
+            set_chrome_default(&base, ChromeDefaultKey::AllowProgramClipboard, value)?
         }
         SettingsSetTarget::TopTabBarDefault(value) => {
             set_chrome_default(&base, ChromeDefaultKey::TopTabBar, value)?
@@ -12656,27 +12741,34 @@ fn run_launch(launch: LaunchArgs) -> Result<LaunchSuccess, LaunchFailure> {
             if let Some(guard) = attachment_handoff_guard.as_mut() {
                 guard.cancel_now();
             }
-            maestro_renderer::run_renderer(maestro_renderer::RendererLaunch {
-                socket_path: outcome.socket_path.to_string_lossy().into_owned(),
-                session_id: session_id.clone(),
-                attachment_handoff: None,
-                exact_viewport: None,
-                window_title: Some(window_title.clone()),
-                status_label: Some(status_label.clone()),
-                tab_strip: launch_tab_strip
-                    .as_ref()
-                    .map(maestro_app::renderer_tab_strip),
-                top_tab_bar: chrome.top_tab_bar,
-                dashboard_panel: launch_dashboard_panel.clone(),
-                picker: None,
-                command_palette: None,
-                font_size_px: Some(renderer_font_size_px),
-                theme: Some(
-                    maestro_renderer::RendererTheme::parse(&renderer_theme_id)
-                        .expect("persisted appearance.theme is a validated renderer theme id"),
-                ),
-                react_chrome: launch_react_chrome.clone(),
-            })
+            let clipboard_settings = effective_settings(paths.base()).chrome;
+            maestro_renderer::run_renderer_with_clipboard_settings(
+                maestro_renderer::RendererLaunch {
+                    socket_path: outcome.socket_path.to_string_lossy().into_owned(),
+                    session_id: session_id.clone(),
+                    attachment_handoff: None,
+                    exact_viewport: None,
+                    window_title: Some(window_title.clone()),
+                    status_label: Some(status_label.clone()),
+                    tab_strip: launch_tab_strip
+                        .as_ref()
+                        .map(maestro_app::renderer_tab_strip),
+                    top_tab_bar: chrome.top_tab_bar,
+                    dashboard_panel: launch_dashboard_panel.clone(),
+                    picker: None,
+                    command_palette: None,
+                    font_size_px: Some(renderer_font_size_px),
+                    theme: Some(
+                        maestro_renderer::RendererTheme::parse(&renderer_theme_id)
+                            .expect("persisted appearance.theme is a validated renderer theme id"),
+                    ),
+                    react_chrome: launch_react_chrome.clone(),
+                },
+                None,
+                None,
+                clipboard_settings.copy_on_select,
+                clipboard_settings.allow_program_clipboard,
+            )
             .map_err(|error| {
                 LaunchFailure::new(
                     "renderer_run_failed",
@@ -13024,10 +13116,13 @@ fn run_launch_foreground_with_new_tab(
     );
 
     let owner_events = renderer_events_tx.clone();
-    let render_result = maestro_renderer::run_renderer_with_commands_and_events(
+    let clipboard_settings = effective_settings(paths.base()).chrome;
+    let render_result = maestro_renderer::run_renderer_with_clipboard_settings(
         launch_struct,
-        tab_commands,
-        renderer_events_tx,
+        Some(tab_commands),
+        Some(renderer_events_tx),
+        clipboard_settings.copy_on_select,
+        clipboard_settings.allow_program_clipboard,
     );
     let render_error = render_result
         .err()
@@ -13225,10 +13320,13 @@ fn run_launch_foreground_unbound(
         );
 
         let owner_events = renderer_events_tx.clone();
-        let render_result = maestro_renderer::run_renderer_with_commands_and_events(
+        let clipboard_settings = effective_settings(paths.base()).chrome;
+        let render_result = maestro_renderer::run_renderer_with_clipboard_settings(
             launch_struct,
-            tab_commands,
-            renderer_events_tx,
+            Some(tab_commands),
+            Some(renderer_events_tx),
+            clipboard_settings.copy_on_select,
+            clipboard_settings.allow_program_clipboard,
         );
         let render_error = render_result
             .err()
@@ -14514,8 +14612,16 @@ fn spawn_window_event_listener(
         }
         let mut history_results_due_after_event = false;
         let mut handoff_shutdown_deadline: Option<Instant> = None;
-        let mut last_copy_on_select = false;
-        let _ = sync_copy_on_select_setting(&tab_runtime, &listener_base, &mut last_copy_on_select);
+        // Always seed both preferences from one listener snapshot. Defaults are
+        // not evidence of what the independently bootstrapped renderer applied.
+        let mut last_copy_on_select = None;
+        let mut last_program_clipboard = None;
+        let _ = sync_clipboard_settings(
+            &tab_runtime,
+            &listener_base,
+            &mut last_copy_on_select,
+            &mut last_program_clipboard,
+        );
         let mut last_input_settings_check = Instant::now();
         let mut pending_navigation = viewport_navigation::PendingNavigation::default();
         let mut window_order_maintenance =
@@ -14556,10 +14662,11 @@ fn spawn_window_event_listener(
             if !listener_stop.load(Ordering::Acquire)
                 && last_input_settings_check.elapsed() >= Duration::from_millis(500)
             {
-                let _ = sync_copy_on_select_setting(
+                let _ = sync_clipboard_settings(
                     &tab_runtime,
                     &listener_base,
                     &mut last_copy_on_select,
+                    &mut last_program_clipboard,
                 );
                 last_input_settings_check = Instant::now();
             }
@@ -21150,21 +21257,30 @@ fn spawn_window_event_listener(
                     setting_key,
                     editable,
                 } => {
-                    if editable
-                        && row_id == "input.copy_on_select"
-                        && setting_key.as_deref() == Some("chrome.copy_on_select")
-                    {
-                        let enabled = !effective_settings(&listener_base).chrome.copy_on_select;
-                        match set_chrome_default(
-                            &listener_base,
-                            ChromeDefaultKey::CopyOnSelect,
-                            enabled,
-                        ) {
+                    let input_toggle = match (editable, row_id.as_str(), setting_key.as_deref()) {
+                        (true, "input.copy_on_select", Some("chrome.copy_on_select")) => {
+                            Some(ChromeDefaultKey::CopyOnSelect)
+                        }
+                        (
+                            true,
+                            "input.allow_program_clipboard",
+                            Some("chrome.allow_program_clipboard"),
+                        ) => Some(ChromeDefaultKey::AllowProgramClipboard),
+                        _ => None,
+                    };
+                    if let Some(key) = input_toggle {
+                        let chrome = effective_settings(&listener_base).chrome;
+                        let enabled = match key {
+                            ChromeDefaultKey::CopyOnSelect => !chrome.copy_on_select,
+                            _ => !chrome.allow_program_clipboard,
+                        };
+                        match set_chrome_default(&listener_base, key, enabled) {
                             Ok(_) => {
-                                let _ = sync_copy_on_select_setting(
+                                let _ = sync_clipboard_settings(
                                     &tab_runtime,
                                     &listener_base,
                                     &mut last_copy_on_select,
+                                    &mut last_program_clipboard,
                                 );
                                 let panel =
                                     build_settings_panel_lines(&effective_settings(&listener_base));
@@ -21173,7 +21289,7 @@ fn spawn_window_event_listener(
                             }
                             Err(_) => {
                                 let label = format!(
-                                    "{listener_base_status_label} · Copy on select was not saved"
+                                    "{listener_base_status_label} · Clipboard preference was not saved"
                                 );
                                 let _ = tab_runtime.set_status_label(Some(label));
                             }
@@ -21955,32 +22071,39 @@ fn run_attach_tab(args: AttachTabArgs) -> Result<AttachTabSuccess, AttachTabFail
         }
         RendererMode::Foreground if retained_attach_only => {
             renderer_started = true;
-            maestro_renderer::run_renderer(maestro_renderer::RendererLaunch {
-                socket_path: reconcile.socket_path.to_string_lossy().into_owned(),
-                session_id: session_id.clone(),
-                attachment_handoff: None,
-                exact_viewport: None,
-                window_title: Some(window_title.clone()),
-                status_label: Some(status_label.clone()),
-                tab_strip: Some(maestro_app::renderer_tab_strip(&tab_strip)),
-                top_tab_bar: chrome.top_tab_bar,
-                dashboard_panel: dashboard_panel_lines
-                    .as_ref()
-                    .map(dashboard_panel_to_renderer)
-                    .or_else(|| {
-                        settings_panel_lines
-                            .as_ref()
-                            .map(settings_panel_to_renderer)
-                    }),
-                picker: picker_overlay_model,
-                command_palette: command_palette_overlay_model,
-                font_size_px: Some(renderer_font_size_px),
-                theme: Some(
-                    maestro_renderer::RendererTheme::parse(&renderer_theme_id)
-                        .expect("persisted appearance.theme is a validated renderer theme id"),
-                ),
-                react_chrome: renderer_react_chrome(&paths),
-            })
+            let clipboard_settings = effective_settings(paths.base()).chrome;
+            maestro_renderer::run_renderer_with_clipboard_settings(
+                maestro_renderer::RendererLaunch {
+                    socket_path: reconcile.socket_path.to_string_lossy().into_owned(),
+                    session_id: session_id.clone(),
+                    attachment_handoff: None,
+                    exact_viewport: None,
+                    window_title: Some(window_title.clone()),
+                    status_label: Some(status_label.clone()),
+                    tab_strip: Some(maestro_app::renderer_tab_strip(&tab_strip)),
+                    top_tab_bar: chrome.top_tab_bar,
+                    dashboard_panel: dashboard_panel_lines
+                        .as_ref()
+                        .map(dashboard_panel_to_renderer)
+                        .or_else(|| {
+                            settings_panel_lines
+                                .as_ref()
+                                .map(settings_panel_to_renderer)
+                        }),
+                    picker: picker_overlay_model,
+                    command_palette: command_palette_overlay_model,
+                    font_size_px: Some(renderer_font_size_px),
+                    theme: Some(
+                        maestro_renderer::RendererTheme::parse(&renderer_theme_id)
+                            .expect("persisted appearance.theme is a validated renderer theme id"),
+                    ),
+                    react_chrome: renderer_react_chrome(&paths),
+                },
+                None,
+                None,
+                clipboard_settings.copy_on_select,
+                clipboard_settings.allow_program_clipboard,
+            )
             .map_err(|error| {
                 AttachTabFailure::new(
                     "renderer_failed",
@@ -22147,7 +22270,8 @@ fn run_attach_tab(args: AttachTabArgs) -> Result<AttachTabSuccess, AttachTabFail
             );
 
             let owner_events = renderer_events_tx.clone();
-            let render_result = maestro_renderer::run_renderer_with_commands_and_events(
+            let clipboard_settings = effective_settings(paths.base()).chrome;
+            let render_result = maestro_renderer::run_renderer_with_clipboard_settings(
                 maestro_renderer::RendererLaunch {
                     socket_path: reconcile.socket_path.to_string_lossy().into_owned(),
                     session_id: session_id.clone(),
@@ -22180,8 +22304,10 @@ fn run_attach_tab(args: AttachTabArgs) -> Result<AttachTabSuccess, AttachTabFail
                     ),
                     react_chrome: renderer_react_chrome(&paths),
                 },
-                tab_commands,
-                renderer_events_tx,
+                Some(tab_commands),
+                Some(renderer_events_tx),
+                clipboard_settings.copy_on_select,
+                clipboard_settings.allow_program_clipboard,
             );
             let render_error = render_result
                 .err()

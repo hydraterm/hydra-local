@@ -2875,8 +2875,9 @@ impl SettingsEditDraftValidation {
 /// The renderer-local editable settings keys that accept a boolean (`true`/`false`) default. These
 /// mirror the `maestro-app` `chrome.*_default` setting keys; the renderer cannot depend on
 /// `maestro-app`, so the names are kept in sync here and only used to validate (never to write).
-const SETTINGS_CHROME_BOOL_KEYS: [&str; 5] = [
+const SETTINGS_CHROME_BOOL_KEYS: [&str; 6] = [
     "chrome.copy_on_select",
+    "chrome.allow_program_clipboard",
     "chrome.top_tab_bar_default",
     "chrome.dashboard_status_default",
     "chrome.dashboard_panel_default",
@@ -9377,6 +9378,10 @@ pub enum UserEvent {
     SetCopyOnSelect {
         enabled: bool,
     },
+    /// Allow the focused terminal program to copy text through OSC 52; default on.
+    SetProgramClipboard {
+        enabled: bool,
+    },
     /// Re-apply the renderer font size to the already-running window. Stores it on `App.font_size_px`
     /// (so a not-yet-created renderer launches with it) and, when a renderer exists, re-measures the
     /// cell in place and reflows the PTY through the existing window-resize path. Changes cell metrics
@@ -9454,7 +9459,9 @@ pub enum RendererCommand {
     ClearViewport,
     /// Rebind the single renderer viewport to a different daemon session (the future
     /// tab-switch primitive). Translated to [`UserEvent::AttachSession`] with the same id.
-    AttachSession { session_id: String },
+    AttachSession {
+        session_id: String,
+    },
     /// Rebind through one immutable all-pane lifetime cohort. The strip supplies presentation and
     /// geometry only for that same cohort; it cannot authorize additional membership.
     AttachExactViewport {
@@ -9471,19 +9478,27 @@ pub enum RendererCommand {
     /// Replace (`Some`) or clear (`None`) the read-only tab-strip overlay. Translated to
     /// [`UserEvent::SetTabStrip`]. Updating the displayed strip and switching the active
     /// session are deliberately separate operations: this never rebinds the viewport.
-    SetTabStrip { tab_strip: Option<RendererTabStrip> },
+    SetTabStrip {
+        tab_strip: Option<RendererTabStrip>,
+    },
     /// Show (`Some`) or hide (`None`) the read-only project/workspace picker overlay. Translated to
     /// [`UserEvent::SetPickerOverlay`]. Browse only: showing the picker never rebinds the viewport,
     /// grants consent, launches a session, or changes cwd.
-    SetPickerOverlay { picker: Option<RendererPickerModel> },
+    SetPickerOverlay {
+        picker: Option<RendererPickerModel>,
+    },
     /// Replace (`Some`) or clear (`None`) the app-owned status label prefixed onto the overlay.
     /// Translated to [`UserEvent::SetStatusLabel`]. Display only: never rebinds the viewport, mutates
     /// any record, or contacts a daemon.
-    SetStatusLabel { status_label: Option<String> },
+    SetStatusLabel {
+        status_label: Option<String>,
+    },
     /// Re-apply the renderer color `theme` to the already-running window. Translated to
     /// [`UserEvent::SetTheme`]. Display only: swaps the instance palette and repaints; never rebinds
     /// the viewport, changes cell metrics/PTY geometry, mutates any record, or contacts a daemon.
-    SetTheme { theme: RendererTheme },
+    SetTheme {
+        theme: RendererTheme,
+    },
     /// Replace (`Some`) or clear (`None`) the display-only command-palette result line. Translated to
     /// [`UserEvent::SetCommandPaletteResult`]. Display only: shows one bounded, sanitized `result: …`
     /// line in the open palette overlay; it never rebinds the viewport, dismisses the overlay, runs
@@ -9517,10 +9532,14 @@ pub enum RendererCommand {
     },
     /// Set the remote-access toggle UI state (drives the tab-bar button label + green/dark status dot).
     /// Backward-compatible display projection only; it grants no authority and persists nothing.
-    SetRemoteOpen { open: bool },
+    SetRemoteOpen {
+        open: bool,
+    },
     /// Set the winsize-owner toggle UI state. Backward-compatible display projection only; per-pane
     /// ownership comes from the negotiated extension snapshot and is held only in memory.
-    SetWinsizeOwner { remote: bool },
+    SetWinsizeOwner {
+        remote: bool,
+    },
     /// Atomically project a negotiated optional Remote extension snapshot. When `available` is false,
     /// Remote controls are hidden and all viewport ownership falls back to local.
     SetRemoteExtensionState {
@@ -9533,7 +9552,9 @@ pub enum RendererCommand {
     /// [`UserEvent::SetDock`]. `Some` stores the model and repaints so the grid X inset recomputes;
     /// `None` clears it. Display-only beyond the PTY column-count seam: it never rebinds the viewport,
     /// runs anything, touches command-palette state/settings/records, or contacts a daemon.
-    SetDock { dock: Option<RendererDockModel> },
+    SetDock {
+        dock: Option<RendererDockModel>,
+    },
     /// Set (`Some(preview)`) or clear (`None`) the read-only file-preview pane. Translated to
     /// [`UserEvent::SetFilePreview`]. `Some(preview)` stores the supplied [`RendererFilePreview`] and
     /// repaints; `None` clears it. The preview is drawn as a non-modal overlay band over the grid (the
@@ -9560,25 +9581,38 @@ pub enum RendererCommand {
         file_path_input: Option<RendererFilePathInput>,
     },
     /// Set the opt-in local selection-copy behavior, without changing PTYs or selection text.
-    SetCopyOnSelect { enabled: bool },
+    SetCopyOnSelect {
+        enabled: bool,
+    },
+    SetProgramClipboard {
+        enabled: bool,
+    },
     /// Re-apply the renderer `font_size_px` to the already-running window. Translated to
     /// [`UserEvent::SetFontSize`]. Unlike [`SetTheme`](RendererCommand::SetTheme) this DOES change cell
     /// metrics and therefore grid geometry: the renderer re-measures the cell and the app reflows the
     /// PTY through the existing window-resize path. It never rebinds the viewport, mutates any record,
     /// or contacts a daemon directly; an identical size is an idempotent no-op.
-    SetFontSize { px: u32 },
+    SetFontSize {
+        px: u32,
+    },
     /// Resize the embedded React chrome sidebar in logical pixels. Translated to
     /// [`UserEvent::SetReactChromeWidth`]. This changes chrome geometry and therefore PTY columns, but
     /// never rebinds sessions, mutates records, or contacts the daemon except through the resize path.
-    SetReactChromeWidth { width_logical_px: u32 },
+    SetReactChromeWidth {
+        width_logical_px: u32,
+    },
     /// Return input focus from host-owned dashboard chrome to the native terminal surface.
     FocusTerminal,
     /// Push a fresh JSON dashboard model into the embedded React chrome WebView. Translated to
     /// [`UserEvent::SetReactChromeModel`]. Display/chrome only: the app remains the model authority.
-    SetReactChromeModel { model_json: String },
+    SetReactChromeModel {
+        model_json: String,
+    },
     /// Show or hide the full-window React overlay WebView. Translated to
     /// [`UserEvent::SetReactChromeOverlayVisible`].
-    SetReactChromeOverlayVisible { visible: bool },
+    SetReactChromeOverlayVisible {
+        visible: bool,
+    },
     /// Evaluate a host-owned script in the embedded React chrome WebView. Translated to
     /// [`UserEvent::EvaluateReactChromeScript`]. Display/chrome only: used for small request/response
     /// callbacks from native app chrome to React chrome.
@@ -9588,16 +9622,24 @@ pub enum RendererCommand {
     },
     /// Open a native folder picker for the embedded React chrome. Translated to
     /// [`UserEvent::PickReactChromeFolder`].
-    PickReactChromeFolder { request_id: String },
+    PickReactChromeFolder {
+        request_id: String,
+    },
     /// Set or clear the stashed-pane drag that originated in React chrome. Translated to
     /// [`UserEvent::SetStashedPaneDrag`].
     SetStashedPaneDrag {
         drag: Option<RendererStashedPaneDrag>,
     },
     /// Move the stashed-pane drag preview to a React-reported window-coordinate position.
-    MoveStashedPaneDragTo { x: i32, y: i32 },
+    MoveStashedPaneDragTo {
+        x: i32,
+        y: i32,
+    },
     /// Complete a stashed-pane drag at a React-reported window-coordinate position.
-    CompleteStashedPaneDropAt { x: i32, y: i32 },
+    CompleteStashedPaneDropAt {
+        x: i32,
+        y: i32,
+    },
 }
 
 /// Translate a public [`RendererCommand`] into the internal [`UserEvent`] the event loop
@@ -9660,6 +9702,9 @@ pub fn user_event_for_command(command: RendererCommand) -> UserEvent {
             UserEvent::SetFilePathInput { file_path_input }
         }
         RendererCommand::SetCopyOnSelect { enabled } => UserEvent::SetCopyOnSelect { enabled },
+        RendererCommand::SetProgramClipboard { enabled } => {
+            UserEvent::SetProgramClipboard { enabled }
+        }
         RendererCommand::SetFontSize { px } => UserEvent::SetFontSize { px },
         RendererCommand::SetReactChromeWidth { width_logical_px } => {
             UserEvent::SetReactChromeWidth { width_logical_px }
@@ -11977,6 +12022,9 @@ struct App {
     last_selection_click: Option<(Instant, CellPos, String, String)>,
     selecting: bool,
     copy_on_select: bool,
+    allow_program_clipboard: bool,
+    window_focused: bool,
+    clipboard_write_failed: bool,
     copy_drag_started: bool,
     // Last cursor position (physical pixels) for hit-testing on press/move. macOS file drops do
     // not trust this cache: child WebViews can own drag motion, so they query the global pointer
@@ -12178,6 +12226,9 @@ impl App {
             last_selection_click: None,
             selecting: false,
             copy_on_select: false,
+            allow_program_clipboard: true,
+            window_focused: false,
+            clipboard_write_failed: false,
             copy_drag_started: false,
             cursor_px: (0.0, 0.0),
             hovered_terminal_link: None,
@@ -13016,14 +13067,32 @@ impl App {
     /// Linux delegates to the GTK host and never constructs arboard's X11-only Unix backend.
     fn store_clipboard_text(&mut self, text: String) {
         #[cfg(target_os = "linux")]
-        {
-            if let Some(host) = self.clipboard_host.as_ref() {
-                let _ = host.set_text(&text);
-            }
-        }
+        let accepted = self
+            .clipboard_host
+            .as_ref()
+            .is_some_and(|host| host.set_text(&text));
         #[cfg(not(target_os = "linux"))]
-        {
-            let _ = self.clipboard.write_text(text);
+        let accepted = self.clipboard.write_text(text);
+        if self.clipboard_write_failed == accepted {
+            self.clipboard_write_failed = !accepted;
+            self.request_redraw();
+        }
+    }
+
+    fn set_initial_clipboard_settings(
+        &mut self,
+        copy_on_select: bool,
+        allow_program_clipboard: bool,
+    ) {
+        self.copy_on_select = copy_on_select;
+        self.allow_program_clipboard = allow_program_clipboard;
+    }
+
+    fn clipboard_status_label(&self) -> Option<&str> {
+        if self.clipboard_write_failed {
+            Some("Copy failed: OS clipboard unavailable. Restart Hydra, then copy again.")
+        } else {
+            self.status_label.as_deref()
         }
     }
 
@@ -16730,13 +16799,18 @@ impl App {
                 }
             }
             UserEvent::TerminalClipboardStore { binding, text } => {
-                // OSC 52 store is bounded by the daemon and treated exactly like
-                // an explicit copy: renderer-local OS clipboard access only. It
-                // is opt-in because remote/untrusted programs must not silently
-                // overwrite the user's system clipboard.
-                if self.viewport_is_bound()
+                // Program copy is a visible, default-on user preference. Only the
+                // focused, current session may write; stale/background output has
+                // no clipboard authority. Clipboard queries remain daemon-owned.
+                let session_id = match &binding {
+                    client::ViewportBindingToken::Active(token) => &token.session_id,
+                    client::ViewportBindingToken::Pane { session_id, .. } => session_id,
+                };
+                if self.allow_program_clipboard
+                    && self.window_focused
+                    && self.viewport_is_bound()
                     && self.shared.viewport_token_is_current(&binding)
-                    && std::env::var("HYDRA_ALLOW_OSC52").as_deref() == Ok("1")
+                    && *session_id == self.focused_session_id()
                 {
                     self.store_clipboard_text(text);
                 }
@@ -16892,6 +16966,9 @@ impl App {
             }
             UserEvent::SetCopyOnSelect { enabled } => {
                 self.copy_on_select = enabled;
+            }
+            UserEvent::SetProgramClipboard { enabled } => {
+                self.allow_program_clipboard = enabled;
             }
             UserEvent::SetFontSize { px } => {
                 // The app is the sole authority over the live font size. Record it on `App.font_size_px`
@@ -17126,6 +17203,11 @@ impl App {
             HostEvent::RedrawRequested | HostEvent::CloseRequested
         ) {
             self.frame_recovery.rearm_from_external_event();
+        }
+        // Native focus can arrive before the first exact viewport. Retain this host
+        // fact even while terminal interaction is inert; it grants no PTY authority.
+        if let HostEvent::Focused(focused) = &event {
+            self.window_focused = *focused;
         }
         // With no exact viewport authority, all terminal/modal interaction is inert. Resize/scale and
         // redraw still maintain/present the native surface, and Close must always work; everything that
@@ -20218,7 +20300,7 @@ impl App {
         };
         let overlay = {
             let base = compose_overlay_with_tabs(
-                self.status_label.as_deref(),
+                self.clipboard_status_label(),
                 bottom_tab_text,
                 &overlay_base,
             );
@@ -20570,7 +20652,7 @@ const RUNTIME_WINDOW_AUTOSIZE: bool = false;
 /// - On some platforms `run_app` does not return until the application terminates, so
 ///   treat this as "run the renderer to completion", not a quick helper.
 pub fn run_renderer(launch: RendererLaunch) -> Result<(), RendererRunError> {
-    run_renderer_impl(launch, None, None)
+    run_renderer_impl(launch, None, None, None)
 }
 
 /// Like [`run_renderer`], but also wires an EXTERNAL [`RendererCommand`] receiver into the
@@ -20590,7 +20672,7 @@ pub fn run_renderer_with_commands(
     launch: RendererLaunch,
     commands: std::sync::mpsc::Receiver<RendererCommand>,
 ) -> Result<(), RendererRunError> {
-    run_renderer_impl(launch, Some(commands), None)
+    run_renderer_impl(launch, Some(commands), None, None)
 }
 
 /// Like [`run_renderer_with_commands`], but ALSO wires an outbound [`RendererEvent`] sender so
@@ -20609,7 +20691,25 @@ pub fn run_renderer_with_commands_and_events(
     commands: std::sync::mpsc::Receiver<RendererCommand>,
     events: std::sync::mpsc::Sender<RendererEvent>,
 ) -> Result<(), RendererRunError> {
-    run_renderer_impl(launch, Some(commands), Some(events))
+    run_renderer_impl(launch, Some(commands), Some(events), None)
+}
+
+/// App-owned preferences must be applied before the first buffered terminal event,
+/// not raced against the asynchronous command bridge. Bare renderer callers keep
+/// the same defaults; later settings changes use the normal typed commands.
+pub fn run_renderer_with_clipboard_settings(
+    launch: RendererLaunch,
+    commands: Option<std::sync::mpsc::Receiver<RendererCommand>>,
+    events: Option<std::sync::mpsc::Sender<RendererEvent>>,
+    copy_on_select: bool,
+    allow_program_clipboard: bool,
+) -> Result<(), RendererRunError> {
+    run_renderer_impl(
+        launch,
+        commands,
+        events,
+        Some((copy_on_select, allow_program_clipboard)),
+    )
 }
 
 /// Shared renderer runtime backing [`run_renderer`] (no external channels),
@@ -20619,6 +20719,7 @@ fn run_renderer_impl(
     launch: RendererLaunch,
     commands: Option<std::sync::mpsc::Receiver<RendererCommand>>,
     events: Option<std::sync::mpsc::Sender<RendererEvent>>,
+    clipboard_settings: Option<(bool, bool)>,
 ) -> Result<(), RendererRunError> {
     let RendererLaunch {
         socket_path,
@@ -20796,6 +20897,9 @@ fn run_renderer_impl(
         theme,
     );
     app.events = AppRendererEvents(renderer_events);
+    if let Some((copy_on_select, allow_program_clipboard)) = clipboard_settings {
+        app.set_initial_clipboard_settings(copy_on_select, allow_program_clipboard);
+    }
     app.viewport_event_gate = viewport_event_gate;
     app.exact_viewport = exact_viewport.clone();
     if let Some(handoff) = attachment_handoff {
@@ -33967,6 +34071,9 @@ mod command_channel_tests {
                 UserEvent::SetCopyOnSelect { enabled } => {
                     forwarded.push(format!("copy-on-select:{enabled}"))
                 }
+                UserEvent::SetProgramClipboard { enabled } => {
+                    forwarded.push(format!("program-clipboard:{enabled}"))
+                }
                 UserEvent::SetReactChromeModel { model_json } => {
                     forwarded.push(format!("react-model:{model_json}"))
                 }
@@ -37787,6 +37894,7 @@ mod shortcut_hint_overlay_tests {
 #[cfg(test)]
 mod terminal_selection_ownership_tests {
     mod copy_on_select;
+    mod program_clipboard;
     mod word_selection;
 
     #[cfg(target_os = "macos")]
