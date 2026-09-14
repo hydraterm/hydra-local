@@ -1,11 +1,17 @@
 # Hydra
 
+Hydra is a local-first terminal desktop for macOS and Linux, built for terminal sessions and coding
+agents.
+
+[Download](https://hydraterms.com/#direct-downloads-heading) ·
+[Features](#what-is-in-this-repository) · [Build](#build) ·
+[Privacy](https://hydraterms.com/privacy.html)
+
 ![Synthetic Hydra local desktop showing a neutral project, retained panes and a local test run](docs/assets/hydra-local-demo.gif)
 
 *Synthetic product illustration; no account, terminal transcript, personal path or live desktop was
 recorded.*
 
-Hydra is a local-first terminal desktop for working with terminal sessions and coding agents.
 Projects, windows, panes, terminal history and retained PTY sessions live on your machine.
 
 ## Start here
