@@ -47,6 +47,7 @@ pub mod optional_extension;
 mod output;
 mod picker;
 mod settings;
+pub mod startup_failure;
 /// Non-blocking new-release check against the published downloads manifest.
 pub mod update_check;
 mod window;

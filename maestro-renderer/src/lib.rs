@@ -73,6 +73,7 @@ mod winit_host_services;
 mod linux_host;
 mod render;
 mod scene;
+mod startup_error;
 mod sync;
 mod terminal_links;
 mod terminal_selection;
@@ -138,6 +139,7 @@ fn attach_selection_to_owner(
 /// Re-export the stress-mode enum so the binary can parse `--stress <mode>` without
 /// reaching into a private module.
 pub use scene::StressMode;
+pub use startup_error::show_startup_error_dialog;
 
 /// Re-export the launch-time theme selector so app-shell callers and the bare-renderer binary can
 /// build a [`RendererLaunch`] / parse `--theme <id>` without reaching into a private module.

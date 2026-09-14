@@ -45,6 +45,7 @@
 )]
 
 use std::collections::{BTreeMap, BTreeSet};
+mod startup_probe;
 #[cfg(test)]
 use std::io::Read;
 use std::io::{BufRead, BufReader, Write};

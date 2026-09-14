@@ -158,7 +158,7 @@ impl std::fmt::Display for LinuxHostError {
 ///
 /// Calling this on Wayland is harmless and keeps startup backend-independent. GTK work
 /// remains confined to the owner thread; this only makes the shared Xlib connection safe.
-fn initialize_xlib_threads() -> Result<(), LinuxHostError> {
+pub(super) fn initialize_xlib_threads() -> Result<(), LinuxHostError> {
     static INITIALIZED: OnceLock<bool> = OnceLock::new();
 
     #[link(name = "X11")]

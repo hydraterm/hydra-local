@@ -53,6 +53,7 @@ mod persistent_surface;
 pub mod present_target;
 pub mod recovery;
 pub(crate) mod sidebar_layout;
+pub(crate) mod startup_error;
 pub mod wake;
 pub mod window_host;
 

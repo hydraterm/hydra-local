@@ -12371,7 +12371,20 @@ fn run_launch(launch: LaunchArgs) -> Result<LaunchSuccess, LaunchFailure> {
     //     `spawned` (if any) is killed on drop unless we `keep()` it after a clean launch. When a
     //     `--log-dir` is set, a daemon WE spawn has its stdout/stderr captured to files there.
     let (mut spawned, reused_daemon_protocol, mut retained_daemon_client) =
-        ensure_daemon(&socket_path, &daemon_bin, log_dir.as_deref())?;
+        ensure_daemon(&socket_path, &daemon_bin, log_dir.as_deref()).inspect_err(|failure| {
+            if let Some(dialog) = maestro_app::startup_failure::startup_failure_dialog(
+                launch.product_startup,
+                launch.no_run_renderer,
+                launch.detach_renderer,
+                &failure.error_kind,
+                &failure.message,
+            ) {
+                // Foreground product startup is still on the main thread, before the renderer
+                // owns an event loop. Linux host-init errors keep the original JSON failure;
+                // macOS rfd does not report a distinct unavailable-display error.
+                let _ = maestro_renderer::show_startup_error_dialog(dialog.title, &dialog.message);
+            }
+        })?;
     let retained_attach_only = spawned.is_none() && reused_daemon_protocol.is_attach_only();
     if retained_attach_only && product_startup_target.is_none() {
         // A retained legacy/v2 daemon may still own an exit-latched final Grid even though every
@@ -22472,137 +22485,10 @@ fn record_session_in_window(
     Ok(())
 }
 
-/// Ensure a daemon is connectable at `socket_path`. The first result is `Some(SpawnedDaemon)` only
-/// when THIS call started one. The second preserves the exact reused-daemon classification so a
-/// retained legacy/v2 peer can remain strictly attach-only without weakening reused/fresh v3. The
-/// third retains the exact successfully probed legacy connection for its bounded List/Attach proof.
-fn ensure_daemon(
-    socket_path: &Path,
-    daemon_bin: &Path,
-    log_dir: Option<&Path>,
-) -> Result<
-    (
-        Option<SpawnedDaemon>,
-        ReusedDaemonProtocol,
-        Option<maestro_shell::DaemonClient>,
-    ),
-    LaunchFailure,
-> {
-    if can_connect(socket_path) {
-        let mut client = maestro_shell::DaemonClient::connect(socket_path).map_err(|e| {
-            LaunchFailure::new(
-                "daemon_probe_failed",
-                format!("could not probe retained daemon: {e}"),
-            )
-        })?;
-        let (protocol_version, build_version) = match client.daemon_info() {
-            Ok(info) => info,
-            Err(error) => {
-                // Legacy daemons predate the additive identity request but speak
-                // the existing session/grid protocol. Reuse them so Hydra keeps
-                // its tmux-like promise: an app upgrade must not strand or kill
-                // live PTYs. New-only features become available after the user
-                // naturally drains and restarts that daemon.
-                // Keep the CLI's stdout/stderr JSON contract intact. Reuse is the safe action and
-                // is intentionally silent here; printing a warning before a structured failure
-                // makes machine consumers unable to parse the result.
-                if matches!(error, DaemonClientError::DaemonError { .. }) {
-                    return Ok((None, ReusedDaemonProtocol::Legacy, Some(client)));
-                }
-                return Err(LaunchFailure::new(
-                    "daemon_probe_failed",
-                    format!(
-                        "retained daemon did not return an aligned compatibility identity reply: {error}"
-                    ),
-                ));
-            }
-        };
-        if protocol_version > maestro_protocol::DAEMON_PROTOCOL_VERSION {
-            return Err(LaunchFailure::new(
-                "stale_daemon",
-                format!(
-                    "retained daemon protocol {protocol_version} (build {build_version}) is newer than supported protocol {}; its live sessions were left untouched",
-                    maestro_protocol::DAEMON_PROTOCOL_VERSION
-                ),
-            ));
-        }
-        // Older retained daemons remain attach-compatible so an app upgrade never strands or kills
-        // their PTYs. ShellRuntime separately requires the exact current mutation protocol before
-        // StartSession, making this an attach-only reuse rather than silently applying unsafe old
-        // start/reap semantics.
-        let retained_client =
-            (protocol_version < maestro_protocol::DAEMON_PROTOCOL_VERSION).then_some(client);
-        return Ok((
-            None,
-            ReusedDaemonProtocol::Version(protocol_version),
-            retained_client,
-        ));
-    }
+mod daemon_startup;
+use daemon_startup::ensure_daemon;
 
-    // Isolate the daemon's streams from ours: its tracing logs must never land on the app's
-    // stdout/stderr, which carry only the structured JSON contract. The daemon is a background
-    // server with no console role here, so by default null is the right sink; with `--log-dir` its
-    // stdout/stderr are captured to deterministic files there instead. stdin is always null.
-    let (stdout, stderr) = child_log_stdio(log_dir, ChildLogKind::Daemon)?;
-    let child = ProcCommand::new(daemon_bin)
-        .arg(socket_path)
-        .stdin(Stdio::null())
-        .stdout(stdout)
-        .stderr(stderr)
-        .spawn()
-        .map_err(|e| {
-            LaunchFailure::new(
-                "daemon_spawn_failed",
-                format!("failed to spawn pty-daemon: {e}"),
-            )
-        })?;
-    let mut spawned = SpawnedDaemon {
-        child,
-        socket_path: socket_path.to_path_buf(),
-        conditional_start_peer: None,
-        keep: false,
-    };
-
-    let deadline = Instant::now() + DAEMON_CONNECT_TIMEOUT;
-    while Instant::now() < deadline {
-        // If the daemon process died before binding, fail fast instead of waiting out the timeout.
-        if let Ok(Some(exit)) = spawned.child.try_wait() {
-            return Err(LaunchFailure::new(
-                "daemon_spawn_failed",
-                format!("pty-daemon exited before accepting connections (status {exit})"),
-            ));
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let probe_timeout = remaining.min(Duration::from_millis(250));
-        if let Ok(mut client) =
-            maestro_shell::DaemonClient::connect_with_timeout(socket_path, probe_timeout)
-        {
-            if let Ok(identity) = client.conditional_start_peer_identity() {
-                #[cfg(target_os = "linux")]
-                if identity.server_pid() != Some(spawned.child.id()) {
-                    return Err(LaunchFailure::new(
-                        "daemon_spawn_failed",
-                        "spawned daemon readiness connected to a different kernel peer PID",
-                    ));
-                }
-                spawned.conditional_start_peer = Some(identity);
-                return Ok((Some(spawned), ReusedDaemonProtocol::NotReused, None));
-            }
-        }
-        std::thread::sleep(DAEMON_CONNECT_POLL);
-    }
-
-    Err(LaunchFailure::new(
-        "daemon_unreachable",
-        format!(
-            "pty-daemon did not accept connections at {} within {:?}",
-            socket_path.display(),
-            DAEMON_CONNECT_TIMEOUT
-        ),
-    ))
-}
-
-/// True if a Unix-socket connection to `socket_path` currently succeeds.
+/// Existing owned-daemon cleanup predicate. Startup probes use the bounded client instead.
 fn can_connect(socket_path: &Path) -> bool {
     UnixStream::connect(socket_path).is_ok()
 }
