@@ -57,6 +57,46 @@ fn release(app: &mut App) {
 }
 
 #[test]
+fn explicit_copy_uses_same_owner_live_or_history_row_metadata() {
+    use maestro_protocol::row_copy::RowCopy;
+    for historical in [false, true] {
+        let (mut app, shared) = app_with_primary_grid();
+        let writes = record_copies(&mut app);
+        let mut selected_grid = grid("primary-gen", 20, 6, "ABCDEFGHIJKLMNOPQRS ");
+        selected_grid.rows_cells[1][0] = cell("界");
+        selected_grid.rows_cells[1][0].width = 2;
+        selected_grid.rows_cells[1][1] = cell("");
+        selected_grid.rows_cells[1][1].width = 0;
+        selected_grid.rows_cells[1][2] = cell("x");
+        let mut rows = vec![
+            RowCopy {
+                starts_line: None,
+                soft_wrap: false,
+                excluded_columns: vec![]
+            };
+            6
+        ];
+        rows[0].soft_wrap = true;
+        rows[0].excluded_columns = vec![19];
+        rows[1].starts_line = Some(false);
+        selected_grid.row_copy = Some(rows);
+        if historical {
+            let mut scrollback = shared.scrollback.lock().unwrap();
+            scrollback.view_offset = 1;
+            scrollback.history_len = Some(1);
+            scrollback.historical_generation = Some(selected_grid.generation.clone());
+            scrollback.historical = Some(Arc::new(selected_grid));
+        } else {
+            *shared.grid.lock().unwrap() = Some(Arc::new(selected_grid));
+        }
+        drag(&mut app, CellPos { col: 2, row: 1 });
+        app.copy_selection();
+        assert_eq!(&*writes.borrow(), &["ABCDEFGHIJKLMNOPQRS界x"]);
+        assert!(shared.drain_test_requests().is_empty());
+    }
+}
+
+#[test]
 fn copy_on_select_typed_command_preserves_both_choices() {
     for enabled in [false, true] {
         assert!(matches!(

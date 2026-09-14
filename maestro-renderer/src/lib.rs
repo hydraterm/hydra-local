@@ -108,7 +108,7 @@ use winit::window::WindowId;
 use client::encode_paste;
 use client::{
     command_palette_escape_dismisses, command_palette_nav, compute_dims_with_chrome_rows,
-    encode_focus, encode_key, encode_mouse, extract_selection, pixel_to_cell_with_top_offset,
+    encode_focus, encode_key, encode_mouse, extract_grid_selection, pixel_to_cell_with_top_offset,
     scroll_key_action_for, wheel_input_action_for, CellPos, CommandPaletteNavKey,
     DesiredPaneBinding, DesiredViewportBinding, MouseButton as MouseBtn, MouseEvent as MouseEv,
     PreparedScrollAction, ResizeCoalescer, ScrollAction, ScrollKey, ScrollRequestIntent, Shared,
@@ -20055,7 +20055,7 @@ impl App {
             // A non-primary owner without a live layout is stale and must never fall back to primary.
             return None;
         };
-        let text = extract_selection(&grid.rows_cells, a, b);
+        let text = extract_grid_selection(&grid, a, b);
         if text.is_empty() {
             return None;
         }

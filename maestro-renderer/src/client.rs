@@ -7082,15 +7082,37 @@ pub fn pixel_to_cell_with_top_offset(
 
 /// Extract the text covered by the selection `[anchor, focus]` (inclusive, order
 /// independent) from the painted grid, row by row. Rows are joined with `'\n'`.
-/// Per line, trailing blank cells are trimmed. Wide-spacer cells (`width == 0`)
-/// are skipped — the lead cell already carries the glyph. Wide/combining glyphs
-/// are preserved as-is (`Cell::text` holds the full grapheme).
+/// Full right-edge ASCII padding is trimmed; explicitly partial final selections
+/// retain spaces. Intersected wide/combining graphemes are copied whole and once.
+/// A selection containing only ASCII spaces remains empty, avoiding clipboard overwrite.
 ///
 /// The selection is row-major and contiguous: the first row starts at the
 /// anchor column and runs to the row end; intermediate rows are full width; the
 /// last row runs from the start to the focus column. A single-row selection runs
 /// from the lower to the higher column on that row.
 pub fn extract_selection(rows_cells: &[Vec<Cell>], anchor: CellPos, focus: CellPos) -> String {
+    extract_selection_rows(rows_cells, None, anchor, focus)
+}
+
+/// Copy from the exact painted snapshot; malformed or missing metadata falls back
+/// to physical row boundaries, never a previous view's copy semantics.
+pub fn extract_grid_selection(grid: &GridSnapshot, anchor: CellPos, focus: CellPos) -> String {
+    let Some(metadata) = grid.row_copy.as_deref().filter(|metadata| {
+        grid.rows == grid.rows_cells.len()
+            && grid.rows_cells.iter().all(|row| row.len() == grid.cols)
+            && crate::wire::row_copy_cells_valid(&grid.rows_cells, Some(metadata))
+    }) else {
+        return extract_selection(&grid.rows_cells, anchor, focus);
+    };
+    extract_selection_rows(&grid.rows_cells, Some(metadata), anchor, focus)
+}
+
+fn extract_selection_rows(
+    rows_cells: &[Vec<Cell>],
+    metadata: Option<&[maestro_protocol::row_copy::RowCopy]>,
+    anchor: CellPos,
+    focus: CellPos,
+) -> String {
     if rows_cells.is_empty() {
         return String::new();
     }
@@ -7103,28 +7125,56 @@ pub fn extract_selection(rows_cells: &[Vec<Cell>], anchor: CellPos, focus: CellP
     let r0 = start.row.min(last_row);
     let r1 = end.row.min(last_row);
 
-    let mut lines: Vec<String> = Vec::with_capacity(r1 - r0 + 1);
+    let wraps = |row: usize| {
+        metadata.is_some_and(|metadata| {
+            metadata
+                .get(row)
+                .zip(metadata.get(row + 1))
+                .is_some_and(|(current, next)| current.soft_wrap && next.starts_line == Some(false))
+        })
+    };
+    let mut out = String::new();
     for (r, row) in rows_cells.iter().enumerate().take(r1 + 1).skip(r0) {
+        if r > r0 && !wraps(r - 1) {
+            out.push('\n');
+        }
         let ncols = row.len();
         if ncols == 0 {
-            lines.push(String::new());
             continue;
         }
         let col_start = if r == r0 { start.col } else { 0 };
         let col_end = if r == r1 { end.col } else { ncols - 1 };
-        let col_start = col_start.min(ncols - 1);
+        let mut col_start = col_start.min(ncols - 1);
         let col_end = col_end.min(ncols - 1);
+        // An inclusive selection of the continuation intersects its preceding glyph.
+        if col_start > 0 && row[col_start].width == 0 && row[col_start - 1].width == 2 {
+            col_start -= 1;
+        }
 
         let mut line = String::new();
-        for cell in row.iter().take(col_end + 1).skip(col_start) {
-            if cell.width == 0 {
+        for (col, cell) in row.iter().enumerate().take(col_end + 1).skip(col_start) {
+            if cell.width == 0
+                || metadata.is_some_and(|metadata| {
+                    metadata[r]
+                        .excluded_columns
+                        .binary_search_by_key(&col, |col| usize::from(*col))
+                        .is_ok()
+                })
+            {
                 continue;
             }
             line.push_str(&cell.text);
         }
-        lines.push(line.trim_end().to_string());
+        if col_end == ncols - 1 && !wraps(r) {
+            out.push_str(line.trim_end_matches(' '));
+        } else {
+            out.push_str(&line);
+        }
     }
-    lines.join("\n")
+    if out.bytes().all(|byte| byte == b' ') {
+        out.clear();
+    }
+    out
 }
 
 /// Latest-wins resize throttle (#7). A burst of distinct geometries during a drag
@@ -8372,6 +8422,134 @@ mod input_tests {
         assert_eq!(
             pixel_to_cell_with_top_offset(29.9, 5.0, 30.0, 0.0, 10.0, 20.0, 8, 4),
             None
+        );
+    }
+
+    #[test]
+    fn extract_row_copy_soft_hard_unknown_and_invalid_metadata() {
+        use maestro_protocol::row_copy::RowCopy;
+        let rows = vec![sel_row("ab  ", 4), sel_row("x", 4)];
+        let mut grid = scrollback_snapshot(
+            SessionGeneration("copy-fixture".into()),
+            Revision(1),
+            (rows, None),
+        );
+        let start = CellPos { row: 0, col: 0 };
+        let end = CellPos { row: 1, col: 0 };
+        assert_eq!(extract_grid_selection(&grid, start, end), "ab\nx");
+        grid.row_copy = Some(vec![
+            RowCopy {
+                starts_line: None,
+                soft_wrap: true,
+                excluded_columns: vec![],
+            },
+            RowCopy {
+                starts_line: Some(false),
+                soft_wrap: false,
+                excluded_columns: vec![],
+            },
+        ]);
+        assert_eq!(extract_grid_selection(&grid, start, end), "ab  x");
+        assert_eq!(extract_grid_selection(&grid, end, start), "ab  x");
+        assert_eq!(
+            extract_grid_selection(&grid, start, CellPos { row: 0, col: 3 }),
+            "ab  "
+        );
+        grid.row_copy.as_mut().unwrap()[1].starts_line = None;
+        assert_eq!(extract_grid_selection(&grid, start, end), "ab\nx");
+        grid.row_copy.as_mut().unwrap()[1].starts_line = Some(true);
+        assert_eq!(extract_grid_selection(&grid, start, end), "ab\nx");
+        grid.row_copy.as_mut().unwrap()[1].starts_line = Some(false);
+        grid.row_copy.as_mut().unwrap()[0].excluded_columns = vec![0];
+        assert_eq!(extract_grid_selection(&grid, start, end), "ab\nx");
+        grid.row_copy.as_mut().unwrap()[0].excluded_columns = vec![2, 3];
+        assert_eq!(extract_grid_selection(&grid, start, end), "abx");
+        grid.cols = 5;
+        assert_eq!(extract_grid_selection(&grid, start, end), "ab\nx");
+    }
+
+    #[test]
+    fn extract_row_copy_preserves_partial_spaces_unicode_and_intersected_graphemes() {
+        assert_eq!(
+            extract_selection(
+                &[sel_row("", 4)],
+                CellPos { row: 0, col: 0 },
+                CellPos { row: 0, col: 2 }
+            ),
+            ""
+        );
+        assert_eq!(
+            extract_selection(
+                &[sel_row("", 4), sel_row("", 4)],
+                CellPos { row: 0, col: 0 },
+                CellPos { row: 1, col: 3 }
+            ),
+            "\n"
+        );
+        assert_eq!(
+            extract_selection(
+                &[vec![sel_cell("\u{a0}", 1)]],
+                CellPos { row: 0, col: 0 },
+                CellPos { row: 0, col: 0 }
+            ),
+            "\u{a0}"
+        );
+        let rows = vec![sel_row("ab  ", 4)];
+        assert_eq!(
+            extract_selection(
+                &rows,
+                CellPos { row: 0, col: 1 },
+                CellPos { row: 0, col: 2 }
+            ),
+            "b "
+        );
+        assert_eq!(
+            extract_selection(
+                &rows,
+                CellPos { row: 0, col: 0 },
+                CellPos { row: 0, col: 3 }
+            ),
+            "ab"
+        );
+        let rows = vec![vec![
+            sel_cell("e\u{301}", 1),
+            sel_cell("👩‍💻", 2),
+            sel_cell("", 0),
+            sel_cell("\u{a0}", 1),
+        ]];
+        assert_eq!(
+            extract_selection(
+                &rows,
+                CellPos { row: 0, col: 2 },
+                CellPos { row: 0, col: 2 }
+            ),
+            "👩‍💻"
+        );
+        assert_eq!(
+            extract_selection(
+                &rows,
+                CellPos { row: 0, col: 2 },
+                CellPos { row: 0, col: 1 }
+            ),
+            "👩‍💻"
+        );
+        assert_eq!(
+            extract_selection(
+                &rows,
+                CellPos { row: 0, col: 0 },
+                CellPos { row: 0, col: 3 }
+            ),
+            "e\u{301}👩‍💻\u{a0}"
+        );
+        let mut hidden = sel_cell("unchanged", 1);
+        hidden.hidden = true;
+        assert_eq!(
+            extract_selection(
+                &[vec![hidden]],
+                CellPos { row: 0, col: 0 },
+                CellPos { row: 0, col: 0 }
+            ),
+            "unchanged"
         );
     }
 
