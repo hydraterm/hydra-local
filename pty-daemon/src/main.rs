@@ -13,6 +13,20 @@ mod protocol;
 mod revision;
 mod session;
 mod socket;
+#[cfg(windows)]
+mod windows_command;
+#[cfg(windows)]
+mod windows_conpty;
+#[cfg(windows)]
+mod windows_job;
+#[cfg(windows)]
+mod windows_overlapped_io;
+#[cfg(windows)]
+mod windows_pipe_security;
+#[cfg(windows)]
+mod windows_private_pipe;
+#[cfg(windows)]
+mod windows_process_encoding;
 
 use crate::daemon::{ConditionalSessionTake, Daemon, SessionAttachmentAcquireError, SharedDaemon};
 use crate::ids::SessionId;
@@ -501,6 +515,8 @@ async fn handle_request(
                     generation_conditional_start: true,
                     start_operation_ledger: true,
                     generation_conditional_attach: true,
+                    #[cfg(windows)]
+                    windows_start_operation_retirement_barrier: false,
                 })
                 .await;
         }

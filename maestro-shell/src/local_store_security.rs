@@ -7,10 +7,22 @@
 //! opened relative to that descriptor with `O_NOFOLLOW`, then owner/type/link/mode are checked on
 //! the returned descriptor.  This narrows path races to the explicitly trusted same-UID boundary.
 
-use std::ffi::{CString, OsStr};
-use std::fs::{self, File};
+#[cfg(unix)]
+use std::ffi::CString;
+use std::ffi::OsStr;
+#[cfg(unix)]
+use std::fs;
+use std::fs::File;
 use std::io;
-use std::path::{Component, Path};
+#[cfg(unix)]
+use std::path::Component;
+use std::path::Path;
+
+#[cfg(windows)]
+#[path = "local_store_security_windows.rs"]
+mod windows;
+#[cfg(windows)]
+use windows::{open_owner_file_at, secure_app_support};
 
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -19,13 +31,18 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+#[cfg(unix)]
 pub(crate) const OWNER_DIR_MODE: u32 = 0o700;
+#[cfg(unix)]
 pub(crate) const OWNER_FILE_MODE: u32 = 0o600;
 
 /// A verified descriptor for the current user's real app-support base.
 #[derive(Debug)]
 pub(crate) struct SecureAppSupport {
     dir: File,
+    // Keep every verified Windows ancestor pinned without delete sharing during use.
+    #[cfg(windows)]
+    _ancestors: Vec<File>,
 }
 
 impl SecureAppSupport {
@@ -107,7 +124,7 @@ fn secure_app_support(base: &Path) -> io::Result<SecureAppSupport> {
     Ok(SecureAppSupport { dir: current })
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn secure_app_support(_base: &Path) -> io::Result<SecureAppSupport> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -305,7 +322,7 @@ fn open_file_at_raw(base: &File, name: &CString, flags: libc::c_int) -> io::Resu
     file_from_fd(fd)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn open_owner_file_at(
     _base: &File,
     _name: &OsStr,
@@ -599,7 +616,7 @@ fn file_from_fd(fd: libc::c_int) -> io::Result<File> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use tempfile::TempDir;

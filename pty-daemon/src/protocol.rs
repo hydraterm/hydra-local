@@ -434,6 +434,9 @@ pub enum DaemonEvent {
         start_operation_ledger: bool,
         #[serde(default)]
         generation_conditional_attach: bool,
+        #[cfg(windows)]
+        #[serde(default)]
+        windows_start_operation_retirement_barrier: bool,
     },
     SessionAttachRefused {
         id: SessionId,
@@ -598,10 +601,18 @@ mod damage_tests {
             generation_conditional_start: true,
             start_operation_ledger: true,
             generation_conditional_attach: true,
+            #[cfg(windows)]
+            windows_start_operation_retirement_barrier: false,
         };
+        #[cfg(not(windows))]
         assert_eq!(
             serde_json::to_string(&event).unwrap(),
             r#"{"ev":"daemon_info","protocol_version":3,"build_version":"0.1.0","daemon_instance_id":"22222222222242228222222222222222","output_generation_echo":true,"child_environment":true,"generation_conditional_mutations":true,"attachment_aware_conditional_kill":true,"generation_conditional_start":true,"start_operation_ledger":true,"generation_conditional_attach":true}"#
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            r#"{"ev":"daemon_info","protocol_version":3,"build_version":"0.1.0","daemon_instance_id":"22222222222242228222222222222222","output_generation_echo":true,"child_environment":true,"generation_conditional_mutations":true,"attachment_aware_conditional_kill":true,"generation_conditional_start":true,"start_operation_ledger":true,"generation_conditional_attach":true,"windows_start_operation_retirement_barrier":false}"#
         );
     }
 

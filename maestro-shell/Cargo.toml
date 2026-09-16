@@ -31,6 +31,18 @@ libc = { workspace = true }
 # libsqlite3 dependency and the build is reproducible — the user never installs anything.
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 # Test-only: unique temp dirs so tests never touch the real app-support path.
 # `tempfile` is dev-only, so it never enters the shipped crate's dep graph.

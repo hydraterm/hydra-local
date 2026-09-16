@@ -10,11 +10,17 @@ use crate::ids::{ChannelId, SessionId};
 use crate::revision::{Revision, SessionGeneration};
 use anyhow::{anyhow, Result};
 use maestro_protocol::request::{AttachmentHandoff, AttachmentHandoffToken};
-use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
+#[cfg(not(windows))]
+use portable_pty::{native_pty_system, CommandBuilder};
+use portable_pty::{Child, ChildKiller, MasterPty, PtySize};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::{Arc, Condvar, Mutex};
 use tokio::sync::broadcast;
+
+#[cfg(all(windows, test))]
+#[path = "windows_session_tests.rs"]
+mod windows_session_tests;
 
 /// Max bytes of scrollback retained per session for replay-on-reattach. Bounded
 /// so a long-running agent can't grow memory without limit. ~1 MiB is plenty
@@ -168,9 +174,9 @@ impl GridHandle {
 ///
 /// Ordering is preserved per session: every write for a given session takes the
 /// same `writer` mutex, so concurrent writes serialize in lock-acquisition order
-/// exactly as they did when serialized by the daemon lock. The `writer`/`master`
-/// mutexes are leaf locks held only across the syscall — never across the daemon
-/// lock or any `.await` — so they cannot reintroduce cross-session coupling.
+/// exactly as they did when serialized by the daemon lock. The `writer` lock
+/// covers the syscall; `master` also covers the matching grid publication. Neither
+/// is held across the daemon lock or any `.await`.
 #[derive(Clone)]
 pub struct PtyHandle {
     /// The PTY master write end. `write_all` + `flush` can block on a full PTY
@@ -178,7 +184,7 @@ pub struct PtyHandle {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     /// The PTY master, for resize ioctls. Wrapped in a `Mutex` because
     /// `MasterPty` is `Send` but not `Sync`, so it can't be shared via `Arc`
-    /// alone; the lock is held only across the resize ioctl.
+    /// alone; one guard serializes the resize ioctl and its matching grid update.
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     /// The authoritative grid, kept in lockstep with the PTY size on resize.
     grid: Arc<Mutex<TermGrid>>,
@@ -209,21 +215,106 @@ impl PtyHandle {
     /// daemon lock; the resize ioctl can block, and we don't want it to stall
     /// unrelated sessions.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        self.resize_and_publish(cols, rows, || {})
+    }
+
+    fn resize_and_publish(
+        &self,
+        cols: u16,
+        rows: u16,
+        after_pty_resize: impl FnOnce(),
+    ) -> Result<()> {
         // Normalize once, then clamp to the snapshot cell budget so the
         // resulting grid is always wire-shippable as one line (`MAX_LINE_BYTES`).
         // Resize CLAMPS (preserving aspect ratio) rather than rejecting, so a
         // window drag never errors. The SAME clamped pair sizes the PTY and the
-        // grid, so they can never disagree about geometry.
+        // grid; serialize both updates so concurrent clients cannot commit them
+        // in different orders. Acquire the grid only AFTER the blocking ioctl.
         let (cols, rows) = normalize_dims(cols, rows);
         let (cols, rows) = clamp_to_snapshot_budget(cols, rows);
-        self.master.lock().unwrap().resize(PtySize {
+        let master = self.master.lock().unwrap();
+        master.resize(PtySize {
             rows,
             cols,
             pixel_width: 0,
             pixel_height: 0,
         })?;
+        after_pty_resize();
         self.grid.lock().unwrap().resize(cols, rows);
+        drop(master);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod resize_publication_tests {
+    use super::*;
+    use std::sync::TryLockError;
+
+    struct RecordingMaster(Arc<Mutex<PtySize>>);
+
+    impl MasterPty for RecordingMaster {
+        fn resize(&self, size: PtySize) -> Result<()> {
+            *self.0.lock().unwrap() = size;
+            Ok(())
+        }
+
+        fn get_size(&self) -> Result<PtySize> {
+            Ok(*self.0.lock().unwrap())
+        }
+
+        fn try_clone_reader(&self) -> Result<Box<dyn Read + Send>> {
+            Ok(Box::new(std::io::empty()))
+        }
+
+        fn take_writer(&self) -> Result<Box<dyn Write + Send>> {
+            Ok(Box::new(std::io::sink()))
+        }
+
+        #[cfg(unix)]
+        fn process_group_leader(&self) -> Option<libc::pid_t> {
+            None
+        }
+
+        #[cfg(unix)]
+        fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+            None
+        }
+    }
+
+    #[test]
+    fn resize_keeps_master_owned_until_matching_grid_is_published() {
+        let size = Arc::new(Mutex::new(PtySize::default()));
+        let handle = PtyHandle {
+            writer: Arc::new(Mutex::new(Box::new(std::io::sink()))),
+            master: Arc::new(Mutex::new(Box::new(RecordingMaster(size.clone())))),
+            grid: Arc::new(Mutex::new(TermGrid::new(80, 24))),
+        };
+        let cloned = handle.clone();
+        for (current, cols, rows) in [(&handle, 100, 30), (&cloned, u16::MAX, 0)] {
+            let before = current.grid.lock().unwrap().snapshot();
+            let expected = normalize_dims(cols, rows);
+            let expected = clamp_to_snapshot_budget(expected.0, expected.1);
+            current
+                .resize_and_publish(cols, rows, || {
+                    let actual = *size.lock().unwrap();
+                    assert_eq!((actual.cols, actual.rows), expected);
+                    let pending = current.grid.lock().unwrap().snapshot();
+                    assert_eq!((pending.cols, pending.rows), (before.cols, before.rows));
+                    assert!(
+                        matches!(cloned.master.try_lock(), Err(TryLockError::WouldBlock)),
+                        "another handle can resize the PTY before this grid is published"
+                    );
+                })
+                .unwrap();
+            let published = current.grid.lock().unwrap().snapshot();
+            let actual = current.master.lock().unwrap().get_size().unwrap();
+            assert_eq!(
+                (published.cols, published.rows),
+                (usize::from(expected.0), usize::from(expected.1))
+            );
+            assert_eq!((actual.cols, actual.rows), expected);
+        }
     }
 }
 
@@ -267,6 +358,8 @@ pub struct Session {
     /// can live in the daemon map for a long time; without this seam a late Kill/Shutdown could
     /// signal a recycled pid in the tiny window after waitpid reaped it but before the latch set.
     killer: Arc<Mutex<ChildKillerState>>,
+    #[cfg(windows)]
+    native_lifetime: crate::windows_conpty::SessionLifetime,
     /// Session-object-local attachment ownership. The Arc is held by non-cloneable guards, so a
     /// guard can retire itself after the daemon map lock and even the Session mapping are gone; it
     /// can never affect a same-id replacement's fresh fence.
@@ -336,7 +429,7 @@ const DEFAULT_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/
 
 /// A sane default `PATH` for a spawned shell when the daemon inherited none.
 /// Standard FHS locations, matching what a systemd user session would provide.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
 /// Build the environment overrides for a child attached to Hydra's xterm-compatible
@@ -344,6 +437,7 @@ const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sb
 /// happened to launch the daemon, so inherited values such as `dumb`, `Apple_Terminal`,
 /// or `screen` are not truthful here and must not leak into the child. PATH remains a
 /// fallback only; a user's real non-empty PATH is preserved.
+#[cfg(not(windows))]
 fn terminal_env_overrides<G>(get: G) -> Vec<(&'static str, &'static str)>
 where
     G: Fn(&str) -> Option<String>,
@@ -355,6 +449,16 @@ where
     }
     adds.push(("COLORTERM", "truecolor"));
     adds
+}
+
+#[cfg(windows)]
+fn terminal_env_overrides<G>(_get: G) -> Vec<(&'static str, &'static str)>
+where
+    G: Fn(&str) -> Option<String>,
+{
+    // Do not inject a Unix PATH into a Windows child. Native command preparation retains the
+    // exact captured PATH and its system-directory lookup fallback does not mutate the environment.
+    vec![("TERM", "xterm-256color"), ("COLORTERM", "truecolor")]
 }
 
 /// Variables which explicitly disable color must not leak from the process that
@@ -428,7 +532,9 @@ impl Session {
         // the two authorities drifted.
         let (cols, rows) = normalize_dims(cols, rows);
 
+        #[cfg(not(windows))]
         let pty_system = native_pty_system();
+        #[cfg(not(windows))]
         let pair = pty_system.openpty(PtySize {
             rows,
             cols,
@@ -436,7 +542,20 @@ impl Session {
             pixel_height: 0,
         })?;
 
+        #[cfg(windows)]
+        let pair = crate::windows_conpty::openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        #[cfg(windows)]
+        let native_lifetime = pair.slave.session_lifetime();
+
+        #[cfg(not(windows))]
         let mut cmd = CommandBuilder::new(command);
+        #[cfg(windows)]
+        let mut cmd = crate::windows_command::Command::new(command)?;
         cmd.args(args);
         cmd.cwd(cwd);
         if let Some(environment) = child_environment {
@@ -485,6 +604,8 @@ impl Session {
             let exit_tx = exit_tx.clone();
             let exited = exited.clone();
             let worker_start = worker_start.clone();
+            #[cfg(windows)]
+            let native_lifetime = native_lifetime.clone();
             let _pump_thread = std::thread::Builder::new()
                 .name("pty-session-pump".into())
                 .spawn(move || {
@@ -505,10 +626,16 @@ impl Session {
                     }
                 };
                 let mut buf = [0u8; 8192];
+                #[cfg(windows)]
+                let mut read_failure = (false, ChildReapBackoff::new());
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
+                            #[cfg(windows)]
+                            {
+                                read_failure = (false, ChildReapBackoff::new());
+                            }
                             let chunk = &buf[..n];
                             // Make replay scrollback visible before the corresponding live frame.
                             // A client that reacts to Output by requesting scrollback must never
@@ -550,7 +677,16 @@ impl Session {
                                 let _ = w.flush();
                             }
                         }
+                        #[cfg(not(windows))]
                         Err(_) => break,
+                        #[cfg(windows)]
+                        Err(error) => {
+                            if !read_failure.0 {
+                                eprintln!("pty-daemon: Windows terminal output error; retaining Session until EOF: {error}");
+                                read_failure.0 = true;
+                            }
+                            std::thread::sleep(read_failure.1.next_delay());
+                        }
                     }
                 }
                 // PTY closed → the child has exited (or is about to). Reap it for
@@ -563,7 +699,9 @@ impl Session {
                 // concurrent explicit Kill can still acquire it between polls while the child is
                 // alive. Once try_wait reaps the child, the latch is set before the lock is
                 // released, so no later caller can signal a recycled numeric pid.
+                #[cfg(not(windows))]
                 let mut reap_backoff = ChildReapBackoff::new();
+                #[cfg(not(windows))]
                 let code = loop {
                     let mut fallback_error = None;
                     let reaped = {
@@ -604,6 +742,15 @@ impl Session {
                     }
                     std::thread::sleep(reap_backoff.next_delay());
                 };
+                #[cfg(windows)]
+                let code = {
+                    let code = wait_native_retirement(&mut *child, &native_lifetime);
+                    let mut killer_guard = killer.lock().unwrap();
+                    *exited.lock().unwrap() = Some(code);
+                    // This is after root observation AND exact Job retirement, not Unix PID reuse.
+                    killer_guard.signal_safe = false;
+                    code
+                };
                 let _ = exit_tx.send(code);
                 })?;
         }
@@ -611,7 +758,11 @@ impl Session {
         // The child must not be killed when its PTY handle drops; the daemon owns lifetime
         // explicitly via Kill. The pump thread receives the child for reaping, while Session keeps
         // a cloned killer for explicit lifecycle mutation.
-        let child = match pair.slave.spawn_command(cmd) {
+        #[cfg(not(windows))]
+        let child_result = pair.slave.spawn_command(cmd);
+        #[cfg(windows)]
+        let child_result = pair.slave.spawn_native(cmd);
+        let child = match child_result {
             Ok(child) => child,
             Err(error) => {
                 let (start_lock, start_ready) = &*worker_start;
@@ -650,6 +801,8 @@ impl Session {
             exit_tx,
             exited,
             killer,
+            #[cfg(windows)]
+            native_lifetime,
             attachment_fence: Arc::new(Mutex::new(AttachmentFence::default())),
         })
     }
@@ -862,7 +1015,15 @@ impl Session {
     /// Used by the daemon shutdown path to terminate owned children
     /// deterministically rather than orphaning them when the daemon exits.
     pub fn kill_and_wait(&self, timeout: std::time::Duration) -> bool {
+        #[cfg(not(windows))]
         self.kill_child();
+        #[cfg(windows)]
+        if let Err(error) = self.native_lifetime.terminate() {
+            eprintln!(
+                "pty-daemon: exact Windows Job termination failed; retaining Session: {error}"
+            );
+            return false;
+        }
         let deadline = std::time::Instant::now() + timeout;
         loop {
             if self.exit_state().is_some() {
@@ -884,6 +1045,41 @@ impl Session {
             master: self.master.clone(),
             grid: self.grid.clone(),
         }
+    }
+}
+
+#[cfg(windows)]
+fn wait_native_retirement(
+    child: &mut dyn Child,
+    lifetime: &crate::windows_conpty::SessionLifetime,
+) -> Option<i32> {
+    let mut backoff = ChildReapBackoff::new();
+    let mut root_code = None;
+    let mut logged_error = false;
+    loop {
+        let observed = (|| -> std::io::Result<Option<i32>> {
+            if root_code.is_none() {
+                root_code = child.try_wait()?.map(|status| status.exit_code() as i32);
+            }
+            match root_code {
+                Some(code) if lifetime.is_retired()? => Ok(Some(code)),
+                _ => Ok(None),
+            }
+        })();
+        match observed {
+            Ok(Some(code)) => return Some(code),
+            Ok(None) => logged_error = false,
+            Err(error) => {
+                if !logged_error {
+                    eprintln!(
+                        "pty-daemon: Windows root/Job status unknown; retaining Session: {error}"
+                    );
+                }
+                logged_error = true;
+            }
+        }
+        // Observation does not kill redirected descendants or impose a job-duration ceiling.
+        std::thread::sleep(backoff.next_delay());
     }
 }
 
@@ -973,7 +1169,7 @@ mod child_killer_lifecycle_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 mod env_baseline_tests {
     use super::{terminal_env_overrides, DEFAULT_PATH, TERMINAL_ENV_REMOVALS};
     use std::collections::HashMap;

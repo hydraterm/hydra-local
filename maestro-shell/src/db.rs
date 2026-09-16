@@ -12,6 +12,7 @@
 use rusqlite::{Connection, OpenFlags};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
+#[cfg(not(windows))]
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -40,7 +41,12 @@ static CONNS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<Connection>>>>> = OnceLo
 
 /// The file descriptors that own the process-lifetime shared schema leases for [`CONNS`]. Kept in
 /// a parallel map so the public connection type and its many callers remain unchanged.
-static SCHEMA_LEASES: OnceLock<Mutex<HashMap<PathBuf, File>>> = OnceLock::new();
+static SCHEMA_LEASES: OnceLock<Mutex<HashMap<PathBuf, SchemaLease>>> = OnceLock::new();
+
+#[cfg(not(windows))]
+type SchemaLease = File;
+#[cfg(windows)]
+type SchemaLease = crate::windows_file_lock::WindowsFileLock;
 
 /// Bases whose legacy JSON authority has been resolved successfully in this process. Raw
 /// connections opened by the migrator are deliberately not enough to set this bit: a failed import
@@ -214,7 +220,7 @@ fn authority_ready(base: &Path) -> bool {
 
 /// Open a connection to `<base>/maestro.db`, set the safety PRAGMAs, ensure the schema exists, and enforce the
 /// future-version guard. This is the ONE opener both binaries (app + agent) go through.
-fn open_conn(base: &Path) -> Result<(Connection, File), DbError> {
+fn open_conn(base: &Path) -> Result<(Connection, SchemaLease), DbError> {
     let (secured_base, database_exists) = secure_database_boundary(base)?;
     let path = db_path(base);
 
@@ -293,10 +299,14 @@ fn open_conn(base: &Path) -> Result<(Connection, File), DbError> {
 
 fn open_schema_lease(
     secured_base: &crate::local_store_security::SecureAppSupport,
-) -> Result<File, DbError> {
-    secured_base
+) -> Result<SchemaLease, DbError> {
+    let file = secured_base
         .open_owner_file(OsStr::new(SCHEMA_LEASE_FILENAME), false)
-        .map_err(|error| DbError::Io(io_context("open schema lease", error)))
+        .map_err(|error| DbError::Io(io_context("open schema lease", error)))?;
+    #[cfg(windows)]
+    let file = SchemaLease::from_owner_file(file)
+        .map_err(|error| DbError::Io(io_context("pin Windows schema lease", error)))?;
+    Ok(file)
 }
 
 fn inspect_database_for_write(path: &Path) -> Result<bool, DbError> {
@@ -381,8 +391,8 @@ fn try_lock_schema_exclusive(file: &File) -> std::io::Result<()> {
     flock(file, libc::LOCK_EX | libc::LOCK_NB)
 }
 
-#[cfg(unix)]
-fn acquire_schema_exclusive_after_upgrade(file: &File) -> std::io::Result<()> {
+#[cfg(any(unix, windows))]
+fn acquire_schema_exclusive_after_upgrade(file: &SchemaLease) -> std::io::Result<()> {
     // Two fresh processes can both observe an empty DB while holding shared leases, then both drop
     // them to upgrade. Give that short handoff enough attempts for one contender to win. If a
     // long-lived older process is the blocker, the bounded loop ends and the caller re-enters shared
@@ -408,7 +418,22 @@ fn unlock_schema(file: &File) -> Result<(), DbError> {
     flock(file, libc::LOCK_UN).map_err(DbError::Io)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn lock_schema_shared(lease: &SchemaLease) -> Result<(), DbError> {
+    lease.lock_shared().map_err(DbError::Io)
+}
+
+#[cfg(windows)]
+fn try_lock_schema_exclusive(lease: &SchemaLease) -> std::io::Result<()> {
+    lease.try_lock_exclusive()
+}
+
+#[cfg(windows)]
+fn unlock_schema(lease: &SchemaLease) -> Result<(), DbError> {
+    lease.unlock().map_err(DbError::Io)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn lock_schema_shared(_file: &File) -> Result<(), DbError> {
     Err(DbError::Io(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -416,7 +441,7 @@ fn lock_schema_shared(_file: &File) -> Result<(), DbError> {
     )))
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn try_lock_schema_exclusive(_file: &File) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -424,12 +449,12 @@ fn try_lock_schema_exclusive(_file: &File) -> std::io::Result<()> {
     ))
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn acquire_schema_exclusive_after_upgrade(file: &File) -> std::io::Result<()> {
     try_lock_schema_exclusive(file)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn unlock_schema(_file: &File) -> Result<(), DbError> {
     Ok(())
 }

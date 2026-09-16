@@ -8,8 +8,9 @@
 //! Resolution precedence (first match wins):
 //! 1. an EXPLICIT caller-supplied socket path (e.g. a CLI flag) — always wins;
 //! 2. otherwise a stored, valid [`DaemonEndpoint`] record at `<app-support>/daemon/endpoint.json`;
-//! 3. otherwise the shared fresh-install default: the first non-empty `XDG_RUNTIME_DIR` or
-//!    `TMPDIR`, then `/tmp`, joined with the per-user daemon socket filename.
+//! 3. otherwise the shared fresh-install default: on Unix, the first non-empty `XDG_RUNTIME_DIR`
+//!    or `TMPDIR`, then `/tmp`, joined with the per-user daemon socket filename; on Windows,
+//!    the preserved server's current-user SID-derived named pipe. SID lookup errors propagate.
 //!
 //! The endpoint record is persisted through the SAME envelope/store path as every other record
 //! (atomic write, `0700` dir / `0600` file, corrupt-quarantine, future-version-left-in-place), via
@@ -60,7 +61,7 @@ impl DaemonEndpoint {
 /// An environment lookup, injectable so default-path resolution is testable WITHOUT mutating the
 /// real process environment globally. Returns the value of `key`, or `None` if unset.
 ///
-/// An EMPTY value is treated by [`default_socket_path`] as "absent" (the next source is tried), so
+/// An EMPTY value is treated by Unix `default_socket_path` as "absent" (the next source is tried), so
 /// a caller that wires this to `std::env::var_os` does not need to special-case empty strings.
 pub trait EnvLookup {
     fn get(&self, key: &str) -> Option<String>;
@@ -92,12 +93,13 @@ where
 /// An env var that is unset OR empty is skipped (treated as absent), so a stray empty
 /// `XDG_RUNTIME_DIR`/`TMPDIR` falls through to the next source rather than producing a socket at
 /// the filesystem root.
+#[cfg(unix)]
 pub fn default_socket_path(env: &impl EnvLookup) -> PathBuf {
     // SAFETY: geteuid has no preconditions and does not dereference memory.
     default_socket_path_for_uid(env, unsafe { libc::geteuid() })
 }
 
-/// Testable form of [`default_socket_path`] with an injected effective uid.
+/// Testable form of Unix `default_socket_path` with an injected effective uid.
 pub fn default_socket_path_for_uid(env: &impl EnvLookup, effective_uid: u32) -> PathBuf {
     let base =
         first_non_empty(env, &["XDG_RUNTIME_DIR", "TMPDIR"]).unwrap_or_else(|| "/tmp".into());
@@ -149,7 +151,7 @@ pub fn store_endpoint(
 /// Resolve the socket path to hand to `DaemonClient`, WITHOUT opening it.
 ///
 /// Precedence: an `explicit` path wins; else a stored, valid endpoint record; else the daemon
-/// default ([`default_socket_path`]). This performs no socket IO, no probing, and creates no
+/// platform default. This performs no socket IO, no probing, and creates no
 /// directories — a missing endpoint record simply falls through to the default. A genuine
 /// IO/id error reading the record surfaces as `Err`.
 pub fn resolve_socket_path(
@@ -163,7 +165,16 @@ pub fn resolve_socket_path(
     if let Some(ep) = load_endpoint(paths)? {
         return Ok(PathBuf::from(ep.socket_path));
     }
-    Ok(default_socket_path(env))
+    #[cfg(unix)]
+    {
+        Ok(default_socket_path(env))
+    }
+    #[cfg(windows)]
+    {
+        // Environment values do not choose the Windows server's user-derived namespace.
+        let _ = env;
+        crate::windows_pipe_endpoint::default_pipe_name().map_err(StoreError::Io)
+    }
 }
 
 #[cfg(test)]
@@ -259,6 +270,20 @@ mod tests {
     }
 
     #[test]
+    fn explicit_endpoint_does_not_read_default_environment_or_create_a_profile() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+        let env =
+            |_: &str| -> Option<String> { panic!("explicit endpoint must not read defaults") };
+        let explicit = PathBuf::from("retained-explicit-endpoint");
+        assert_eq!(
+            resolve_socket_path(&paths, Some(explicit.clone()), &env).unwrap(),
+            explicit
+        );
+        assert!(!paths.base().exists());
+    }
+
+    #[test]
     fn arbitrary_stored_endpoint_survives_default_rename_and_beats_fresh_default() {
         let tmp = TempDir::new().unwrap();
         let paths = paths_in(&tmp);
@@ -284,12 +309,18 @@ mod tests {
         let env = MapEnv::new(&[("XDG_RUNTIME_DIR", "/run/user/1000")]);
 
         let resolved = resolve_socket_path(&paths, None, &env).unwrap();
+        #[cfg(unix)]
         assert_eq!(
             resolved,
             PathBuf::from("/run/user/1000").join(maestro_protocol::daemon_socket_filename(
                 // SAFETY: geteuid has no preconditions and does not dereference memory.
                 unsafe { libc::geteuid() },
             ))
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            resolved,
+            crate::windows_pipe_endpoint::default_pipe_name().unwrap()
         );
     }
 

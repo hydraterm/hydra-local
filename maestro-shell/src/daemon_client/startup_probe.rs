@@ -21,12 +21,8 @@ impl DaemonClient {
                 during: "connecting for daemon startup probe",
             })?;
         let path = socket_path.as_ref();
-        let stream = connect_unix_with_timeout(path, remaining).map_err(|source| {
-            DaemonClientError::DaemonUnavailable {
-                path: path.display().to_string(),
-                source,
-            }
-        })?;
+        let stream = connect_platform_with_timeout(path, remaining)
+            .map_err(|source| map_connect_error(path, source))?;
         if Instant::now() >= deadline {
             return Err(DaemonClientError::Timeout {
                 during: "connecting for daemon startup probe",
@@ -53,6 +49,14 @@ impl DaemonClient {
         deadline: Instant,
     ) -> Result<ConditionalStartPeerIdentity, DaemonClientError> {
         let identity = self.startup_identity_before(deadline)?;
+        #[cfg(windows)]
+        if identity.start_peer.is_some() && !self.windows_start_operation_retirement_barrier {
+            return Err(
+                DaemonClientError::WindowsStartRetirementBarrierUnsupported {
+                    observed: identity.protocol_version,
+                },
+            );
+        }
         identity
             .start_peer
             .ok_or(DaemonClientError::MutationProtocolUnsupported {
@@ -90,7 +94,14 @@ impl DaemonClient {
                         generation_conditional_start,
                         start_operation_ledger,
                         generation_conditional_attach,
+                        #[cfg(windows)]
+                        windows_start_operation_retirement_barrier,
                     }) => {
+                        #[cfg(windows)]
+                        {
+                            self.windows_start_operation_retirement_barrier =
+                                windows_start_operation_retirement_barrier;
+                        }
                         let instance = self.bind_daemon_instance_id(daemon_instance_id)?;
                         let start_peer = instance
                             .filter(|_| {
@@ -141,5 +152,5 @@ impl DaemonClient {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;

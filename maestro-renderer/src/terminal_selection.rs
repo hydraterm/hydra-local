@@ -1,7 +1,63 @@
-//! Word selection uses the same authoritative cells as terminal painting and copying.
+//! Selection units use the same authoritative snapshot as terminal painting and copying.
 
 use crate::client::CellPos;
-use crate::wire::Cell;
+use crate::wire::{Cell, GridSnapshot};
+
+#[derive(Clone, Copy)]
+pub(crate) enum SelectionUnit {
+    Word,
+    LogicalLine,
+}
+
+/// Select a complete logical line only when both boundaries exist in this exact painted snapshot.
+/// Unknown, malformed, or off-screen boundaries fall back to the clicked visual row; no history
+/// fetch or reconstruction from another revision is permitted here. Endpoints are inclusive.
+pub(crate) fn logical_line_range(grid: &GridSnapshot, pos: CellPos) -> Option<(CellPos, CellPos)> {
+    let row = grid.rows_cells.get(pos.row)?;
+    row.get(pos.col)?;
+    let visual = (
+        CellPos {
+            col: 0,
+            row: pos.row,
+        },
+        CellPos {
+            col: row.len() - 1,
+            row: pos.row,
+        },
+    );
+    let Some(metadata) = grid.row_copy.as_deref().filter(|metadata| {
+        grid.rows == grid.rows_cells.len()
+            && grid.rows_cells.iter().all(|row| row.len() == grid.cols)
+            && crate::wire::row_copy_cells_valid(&grid.rows_cells, Some(metadata))
+    }) else {
+        return Some(visual);
+    };
+    let mut start = pos.row;
+    loop {
+        match metadata[start].starts_line {
+            Some(true) => break,
+            Some(false) if start > 0 && metadata[start - 1].soft_wrap => start -= 1,
+            _ => return Some(visual),
+        }
+    }
+    let mut end = pos.row;
+    while metadata[end].soft_wrap {
+        if metadata
+            .get(end + 1)
+            .is_none_or(|next| next.starts_line != Some(false))
+        {
+            return Some(visual);
+        }
+        end += 1;
+    }
+    Some((
+        CellPos { col: 0, row: start },
+        CellPos {
+            col: grid.cols - 1,
+            row: end,
+        },
+    ))
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WordClass {

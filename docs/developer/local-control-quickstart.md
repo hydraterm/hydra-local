@@ -5,9 +5,10 @@ Hydra's existing Unix-socket protocol and developer CLI. It is **not an installa
 plugin**, a remote API, or a new server to configure.
 
 Supported scope: macOS and Linux, Python 3.10+, daemon control protocol 3. The real disposable-daemon
-acceptance was run on macOS; Linux uses the same wire/client but this starter has not yet had a
-native Linux run. Windows is not qualified. No Hydra subscription, cloud token, or login is needed
-for these local operations.
+demo passed on macOS and Ubuntu 24.04 x86_64; the Linux run used the unchanged published client with
+the matching installed Hydra 0.2.15 app/daemon pair. This proves local process/protocol behavior,
+not graphical-interface qualification. Windows is not qualified. No Hydra subscription, cloud token,
+or login is needed for these local operations.
 
 ## What works
 

@@ -3159,11 +3159,10 @@ fn product_startup_retained_v2_empty_store_creates_no_terminal_or_recovery_topol
     let daemon = write_fake_daemon_wrapper(ws.dir.path());
     let listener = UnixListener::bind(&ws.socket).expect("bind retained-v2 empty-store stub");
     let server = std::thread::spawn(move || {
-        // `can_connect` proves the retained socket first and sends no request.
-        let (probe_only, _) = listener.accept().unwrap();
-        drop(probe_only);
-
         let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut request = String::new();
         reader.read_line(&mut request).unwrap();
@@ -3179,9 +3178,15 @@ fn product_startup_retained_v2_empty_store_creates_no_terminal_or_recovery_topol
         )
         .unwrap();
         stream.flush().unwrap();
-        drop(stream);
 
-        std::thread::sleep(Duration::from_millis(100));
+        let mut tail = String::new();
+        reader
+            .read_to_string(&mut tail)
+            .expect("empty retained client closes after identity proof");
+        assert!(
+            tail.is_empty(),
+            "empty retained-v2 startup must not send List/Attach/Start: {tail}"
+        );
         listener.set_nonblocking(true).unwrap();
         assert!(
             listener.accept().is_err(),
@@ -3255,10 +3260,6 @@ fn product_startup_retained_v2_exited_target_keeps_probe_list_and_attach_on_one_
     let listener = UnixListener::bind(&ws.socket).expect("bind retained-v2 continuity stub");
     let replacement_path = ws.socket.clone();
     let server = std::thread::spawn(move || {
-        // `can_connect` is a request-free reachability check.
-        let (probe_only, _) = listener.accept().unwrap();
-        drop(probe_only);
-
         let (mut stream, _) = listener
             .accept()
             .expect("accept reviewed retained-v2 client");

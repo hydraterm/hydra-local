@@ -1,38 +1,29 @@
 //! One provider lookup policy shared by preflight and retained-session launch fallbacks.
 
+#[cfg(unix)]
 use std::io::Read;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::{Command, Stdio};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
-use crate::launch_environment::{is_executable_file, LaunchEnvLookup, LOGIN_SHELL_COMMAND_FLAGS};
+#[cfg(unix)]
+use crate::launch_environment::{is_executable_file, LOGIN_SHELL_COMMAND_FLAGS};
+use crate::provider_launch_selection::LaunchEnvLookup;
+#[cfg(unix)]
+use crate::provider_launch_selection::ProviderExecutable;
 
-/// An executable selected for this launch attempt, not a durable provider/conversation recipe.
-#[derive(Clone, PartialEq, Eq)]
-pub struct ProviderExecutable {
-    provider: String,
-    path: PathBuf,
-}
-
-impl std::fmt::Debug for ProviderExecutable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ProviderExecutable")
-            .field("provider", &self.provider)
-            .finish_non_exhaustive()
-    }
-}
-
+#[cfg(unix)]
 impl ProviderExecutable {
-    pub fn path_for(&self, provider: &str) -> Option<&Path> {
-        (self.provider == provider).then_some(self.path.as_path())
-    }
-
     pub fn remains_executable_for(&self, provider: &str) -> bool {
         self.path_for(provider).is_some_and(is_executable_file)
     }
 }
 
+#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProviderResolution {
     Executable(ProviderExecutable),
@@ -40,33 +31,11 @@ pub enum ProviderResolution {
     ShellCommand,
 }
 
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderLookupError {
     Unavailable,
     TimedOut,
-}
-
-/// Preserve user environment while binding an already-selected executable to one provider only.
-pub struct SelectedProviderLaunchEnv<'a, E> {
-    pub env: &'a E,
-    pub selected: Option<&'a ProviderExecutable>,
-}
-
-impl<E: LaunchEnvLookup> LaunchEnvLookup for SelectedProviderLaunchEnv<'_, E> {
-    fn shell_utf8(&self) -> Option<String> {
-        self.env.shell_utf8()
-    }
-    fn home_os(&self) -> Option<std::ffi::OsString> {
-        self.env.home_os()
-    }
-    fn path_os(&self) -> Option<std::ffi::OsString> {
-        self.env.path_os()
-    }
-    fn selected_provider_path(&self, provider: &str) -> Option<PathBuf> {
-        self.selected
-            .and_then(|selected| selected.path_for(provider).map(Path::to_path_buf))
-            .or_else(|| self.env.selected_provider_path(provider))
-    }
 }
 
 /// Conventional installation roots, not version directories or guessed wrapper executable names.
@@ -94,6 +63,7 @@ pub(crate) fn provider_fallback(
         .find(|path| path.to_str().is_some() && executable(path))
 }
 
+#[cfg(unix)]
 pub fn resolve_provider_executable(
     provider: &str,
     cwd: &Path,
@@ -109,12 +79,8 @@ pub fn resolve_provider_executable(
             .map_err(|_| ProviderLookupError::Unavailable)?
             .join(cwd)
     };
-    let selected = |path| {
-        ProviderResolution::Executable(ProviderExecutable {
-            provider: provider.to_owned(),
-            path,
-        })
-    };
+    let selected =
+        |path| ProviderResolution::Executable(ProviderExecutable::new(provider.to_owned(), path));
     let fallback = provider_fallback(provider, env, is_executable_file);
     // Keep OpenCode's existing preferred native installation, without preferring conventional
     // fallback roots over another provider's user-selected login-shell PATH.
@@ -219,6 +185,7 @@ pub fn resolve_provider_executable(
     }))
 }
 
+#[cfg(unix)]
 fn drain_available(
     output: &mut impl Read,
     bytes: &mut Vec<u8>,
@@ -244,9 +211,10 @@ fn drain_available(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::SelectedProviderLaunchEnv;
     use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
 

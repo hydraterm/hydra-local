@@ -57,6 +57,14 @@ pub mod shell_runtime;
 pub mod store;
 pub mod store_sqlite;
 pub mod window_layout;
+#[cfg(windows)]
+mod windows_file_lock;
+#[cfg(windows)]
+mod windows_identity;
+#[cfg(windows)]
+mod windows_pipe_client;
+#[cfg(any(windows, test))]
+mod windows_pipe_endpoint;
 pub mod workspace_consent;
 pub mod workspace_exec;
 pub mod write_trace;
@@ -91,9 +99,11 @@ pub use daemon_client::{
     Direction, GenerationMutationSnapshot, KillSessionPublicationError, KilledSession,
     DEFAULT_TIMEOUT,
 };
+#[cfg(unix)]
+pub use daemon_endpoint::default_socket_path;
 pub use daemon_endpoint::{
-    default_socket_path, default_socket_path_for_uid, load_endpoint, resolve_socket_path,
-    store_endpoint, DaemonEndpoint, EnvLookup, ProcessEnv, ENDPOINT_ID,
+    default_socket_path_for_uid, load_endpoint, resolve_socket_path, store_endpoint,
+    DaemonEndpoint, EnvLookup, ProcessEnv, ENDPOINT_ID,
 };
 pub use dashboard_snapshot::{
     DashboardSnapshot, DashboardSnapshotService, DashboardTab, DashboardWindow, ProjectSnapshot,
@@ -111,6 +121,7 @@ pub use launch_environment::{
     LOGIN_SHELL_COMMAND_FLAGS,
 };
 mod provider_executable;
+mod provider_launch_selection;
 pub use layout_preset::{
     plan_preset_restore, LayoutPresetError, LayoutPresetService, PresetRestoreAction,
     PresetRestoreSlot,
@@ -122,10 +133,11 @@ pub use project::{
     ConditionalCreatedProjectDelete, CreatedProject, NewProject, ProjectCreationReceipt,
     ProjectDeletionPlan, ProjectDeletionResult, ProjectService, ProjectServiceError, ProjectUpdate,
 };
+#[cfg(unix)]
 pub use provider_executable::{
-    resolve_provider_executable, ProviderExecutable, ProviderLookupError, ProviderResolution,
-    SelectedProviderLaunchEnv,
+    resolve_provider_executable, ProviderLookupError, ProviderResolution,
 };
+pub use provider_launch_selection::{ProviderExecutable, SelectedProviderLaunchEnv};
 pub use records::{
     AgentTask, AgentTaskState, Attention, AttentionSource, AttentionState, LaunchSpec,
     LayoutPreset, LayoutPresetTab, PaneRect, Project, ProjectDirectory, ProjectLaunchDefaults,

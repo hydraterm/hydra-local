@@ -19,18 +19,7 @@ const LOGIN_SHELL_PROVIDERS: &[&str] = &[
     "gemini", "opencode",
 ];
 
-/// Launch-specific environment access preserves the old platform semantics: SHELL must be valid
-/// UTF-8 or it is ignored, while HOME stays lossless until an absolute argv string is required.
-pub trait LaunchEnvLookup {
-    fn shell_utf8(&self) -> Option<String>;
-    fn home_os(&self) -> Option<OsString>;
-    fn path_os(&self) -> Option<OsString> {
-        None
-    }
-    fn selected_provider_path(&self, _provider: &str) -> Option<PathBuf> {
-        None
-    }
-}
+pub use crate::provider_launch_selection::LaunchEnvLookup;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProcessLaunchEnv;

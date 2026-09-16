@@ -151,11 +151,18 @@ struct ArchivedIndependentFile {
     bytes: Vec<u8>,
 }
 
-/// Process-shared serialization for every supported local-store writer. Hydra's desktop targets are
-/// Unix (macOS and Linux), where `flock` releases automatically on process death.
+#[cfg(windows)]
+type MigrationLease = crate::windows_file_lock::WindowsFileLock;
+
+/// Process-shared serialization for supported local-store writers. Unix retains flock; Windows uses an
+/// owned synchronous byte-range lease on the same lock file. Handle/process teardown releases the
+/// lock. Windows storage durability and archive identity remain separate qualification gates.
 #[derive(Debug)]
 struct MigrationLock {
+    #[cfg(not(windows))]
     file: File,
+    #[cfg(windows)]
+    _lease: MigrationLease,
     _base: crate::local_store_security::SecureAppSupport,
 }
 
@@ -172,6 +179,9 @@ impl MigrationLock {
         let file = secured_base
             .open_owner_file(std::ffi::OsStr::new(MIGRATION_LOCK), false)
             .map_err(|e| format!("open migration lock {}: {e}", path.display()))?;
+        #[cfg(windows)]
+        let file = MigrationLease::from_owner_file(file)
+            .map_err(|error| format!("pin Windows migration lock {}: {error}", path.display()))?;
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
@@ -187,12 +197,18 @@ impl MigrationLock {
                 }
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        file.lock_exclusive()
+            .map_err(|error| format!("lock legacy migration {}: {error}", path.display()))?;
+        #[cfg(not(any(unix, windows)))]
         {
             return Err("legacy migration locking is unsupported on this platform".to_string());
         }
         Ok(Self {
+            #[cfg(not(windows))]
             file,
+            #[cfg(windows)]
+            _lease: file,
             _base: secured_base,
         })
     }

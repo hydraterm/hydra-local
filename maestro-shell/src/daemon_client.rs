@@ -50,8 +50,11 @@ mod startup_probe;
 use std::io::Read;
 use std::io::{BufRead, BufReader, Write};
 use std::net::Shutdown;
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -59,6 +62,9 @@ use std::sync::{
     Arc,
 };
 use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+use crate::windows_pipe_client::WindowsPipeStream as UnixStream;
 
 use maestro_protocol::{
     AttachmentHandoff, AttachmentHandoffToken, ChildEnvironment, ClientRequest,
@@ -114,6 +120,12 @@ pub enum DaemonClientError {
         observed_uid: Option<u32>,
         detail: String,
     },
+    /// The named-pipe peer's exact live process/token authority was not proven before protocol IO.
+    #[cfg(windows)]
+    UntrustedWindowsDaemon { path: String, detail: String },
+    /// A Windows peer has not proven that delayed starts cannot reuse retired operation tokens.
+    #[cfg(windows)]
+    WindowsStartRetirementBarrierUnsupported { observed: u32 },
     /// The caller-supplied cwd is not an existing directory. Returned BEFORE any request is written,
     /// so a bad cwd never reaches the daemon as a half-issued `StartSession`. This matches the
     /// daemon's own `Path::is_dir()` boundary: a missing path OR an existing non-directory (e.g. a
@@ -679,6 +691,15 @@ impl std::fmt::Display for DaemonClientError {
                     "untrusted daemon at {path}: kernel peer identity was unavailable for client uid {expected_uid} ({detail})"
                 ),
             },
+            #[cfg(windows)]
+            DaemonClientError::UntrustedWindowsDaemon { path, detail } => {
+                write!(f, "untrusted Windows daemon at {path}: {detail}")
+            }
+            #[cfg(windows)]
+            DaemonClientError::WindowsStartRetirementBarrierUnsupported { observed } => write!(
+                f,
+                "Windows daemon protocol {observed} is attach-only because it lacks the durable start-retirement barrier"
+            ),
             DaemonClientError::InvalidCwd { .. } => {
                 f.write_str("cwd is not an existing directory")
             }
@@ -781,7 +802,7 @@ fn validate_expected_attach_generation(generation: &str) -> Result<(), DaemonCli
 }
 
 /// Ask the kernel which effective UID owns the process at the connected server end.
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn connected_server_uid(stream: &UnixStream) -> std::io::Result<u32> {
     let mut uid: libc::uid_t = 0;
     let mut gid: libc::gid_t = 0;
@@ -831,6 +852,7 @@ fn connected_server_credentials(stream: &UnixStream) -> std::io::Result<libc::uc
     Ok(credentials)
 }
 
+#[cfg(unix)]
 fn effective_uid() -> u32 {
     // SAFETY: `geteuid` has no preconditions and cannot fail.
     unsafe { libc::geteuid() as u32 }
@@ -839,6 +861,7 @@ fn effective_uid() -> u32 {
 /// Connect an AF_UNIX stream without allowing the kernel's connect/backlog wait to escape the
 /// caller's absolute deadline. `UnixStream::connect` is otherwise a blocking operation to which
 /// read/write socket timeouts do not apply.
+#[cfg(unix)]
 fn connect_unix_with_timeout(path: &Path, timeout: Duration) -> std::io::Result<UnixStream> {
     if timeout.is_zero() {
         return Err(std::io::Error::new(
@@ -1006,6 +1029,7 @@ fn connect_unix_with_timeout(path: &Path, timeout: Duration) -> std::io::Result<
     Ok(UnixStream::from(owned))
 }
 
+#[cfg(unix)]
 fn verify_connected_server_identity(
     path: &Path,
     expected_uid: u32,
@@ -1025,6 +1049,33 @@ fn verify_connected_server_identity(
             observed_uid: None,
             detail: error.to_string(),
         }),
+    }
+}
+
+#[cfg(unix)]
+fn connect_platform_with_timeout(path: &Path, timeout: Duration) -> std::io::Result<UnixStream> {
+    connect_unix_with_timeout(path, timeout)
+}
+
+#[cfg(windows)]
+fn connect_platform_with_timeout(path: &Path, timeout: Duration) -> std::io::Result<UnixStream> {
+    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "connect deadline overflow")
+    })?;
+    crate::windows_pipe_client::WindowsPipeStream::connect_until(path, deadline)
+}
+
+fn map_connect_error(path: &Path, source: std::io::Error) -> DaemonClientError {
+    #[cfg(windows)]
+    if source.kind() == std::io::ErrorKind::PermissionDenied {
+        return DaemonClientError::UntrustedWindowsDaemon {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        };
+    }
+    DaemonClientError::DaemonUnavailable {
+        path: path.display().to_string(),
+        source,
     }
 }
 
@@ -1637,11 +1688,13 @@ pub struct DaemonClient {
     /// All phases under `operation_deadline` share one unsolicited-event allowance. Re-entering a
     /// socket timeout scope must not mint another allowance for the same mutation.
     operation_unrelated_events_remaining: Option<Arc<AtomicUsize>>,
-    /// Kernel-authenticated server PID on Linux. Other supported Unix platforms expose only UID.
+    /// Kernel-authenticated server PID on Linux/Windows. Other supported Unix exposes only UID.
     server_pid: Option<u32>,
     /// Exact daemon-process identity learned from a typed DaemonInfo reply on this socket. It is
     /// sticky: a conflicting later reply is a protocol failure, never a silent authority rebind.
     daemon_instance_id: Option<DaemonInstanceId>,
+    #[cfg(windows)]
+    windows_start_operation_retirement_barrier: bool,
     /// Checked connection-local Attach route ids. Never reused; exhaustion fails before wire.
     next_output_generation: u64,
 }
@@ -1673,12 +1726,8 @@ impl DaemonClient {
         timeout: Duration,
     ) -> Result<Self, DaemonClientError> {
         let path = socket_path.as_ref();
-        let stream = connect_unix_with_timeout(path, timeout).map_err(|source| {
-            DaemonClientError::DaemonUnavailable {
-                path: path.display().to_string(),
-                source,
-            }
-        })?;
+        let stream = connect_platform_with_timeout(path, timeout)
+            .map_err(|source| map_connect_error(path, source))?;
         Self::from_connected_stream(path, stream, timeout, None)
     }
 
@@ -1707,12 +1756,8 @@ impl DaemonClient {
                 during: "connecting for generation mutation",
             })?;
         let connect_timeout = timeout.min(remaining);
-        let stream = connect_unix_with_timeout(path, connect_timeout).map_err(|source| {
-            DaemonClientError::DaemonUnavailable {
-                path: path.display().to_string(),
-                source,
-            }
-        })?;
+        let stream = connect_platform_with_timeout(path, connect_timeout)
+            .map_err(|source| map_connect_error(path, source))?;
         if Instant::now() >= deadline {
             return Err(DaemonClientError::Timeout {
                 during: "connecting for generation mutation",
@@ -1727,6 +1772,7 @@ impl DaemonClient {
         timeout: Duration,
         operation_deadline: Option<Instant>,
     ) -> Result<Self, DaemonClientError> {
+        #[cfg(unix)]
         verify_connected_server_identity(path, effective_uid(), connected_server_uid(&stream))?;
         #[cfg(target_os = "linux")]
         let server_pid = Some(
@@ -1739,8 +1785,10 @@ impl DaemonClient {
                 })?
                 .pid as u32,
         );
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(all(unix, not(target_os = "linux")))]
         let server_pid = None;
+        #[cfg(windows)]
+        let server_pid = Some(stream.server_pid());
         // A silent daemon must not hang us: bound every read and write by the deadline.
         stream
             .set_read_timeout(Some(timeout))
@@ -1761,6 +1809,8 @@ impl DaemonClient {
                 .map(|_| Arc::new(AtomicUsize::new(GENERATION_KILL_MAX_UNRELATED_EVENTS))),
             server_pid,
             daemon_instance_id: None,
+            #[cfg(windows)]
+            windows_start_operation_retirement_barrier: false,
             next_output_generation: 0,
         })
     }
@@ -1854,7 +1904,7 @@ impl DaemonClient {
                 detail: "fresh-daemon conditional Start peer identity changed".into(),
             });
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         if self.server_pid != expected.server_pid || self.server_pid.is_none() {
             return Err(DaemonClientError::Protocol {
                 detail: "fresh-daemon conditional Start kernel peer PID changed".into(),
@@ -1987,7 +2037,7 @@ impl DaemonClient {
 
     /// Open a fresh reviewed connection to the same daemon instance within the caller's existing
     /// absolute/event budget. Cross-platform identity is the daemon's 128-bit process nonce;
-    /// Linux additionally requires the kernel-authenticated server PID to remain exact.
+    /// Linux and Windows additionally require the kernel-authenticated server PID to remain exact.
     fn reconnect_same_daemon_before(
         &self,
         expected_instance: &DaemonInstanceId,
@@ -1995,12 +2045,8 @@ impl DaemonClient {
     ) -> Result<DaemonClient, DaemonClientError> {
         let remaining = budget.remaining("reconnecting for conditional start recovery")?;
         let timeout = self.connect_timeout.min(remaining);
-        let stream = connect_unix_with_timeout(&self.socket_path, timeout).map_err(|source| {
-            DaemonClientError::DaemonUnavailable {
-                path: self.socket_path.display().to_string(),
-                source,
-            }
-        })?;
+        let stream = connect_platform_with_timeout(&self.socket_path, timeout)
+            .map_err(|source| map_connect_error(&self.socket_path, source))?;
         budget.remaining("reconnecting for conditional start recovery")?;
         let mut replacement = DaemonClient::from_connected_stream(
             &self.socket_path,
@@ -2010,7 +2056,7 @@ impl DaemonClient {
         )?;
         replacement.operation_unrelated_events_remaining =
             Some(Arc::clone(&budget.unrelated_events_remaining));
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         if replacement.server_pid != self.server_pid {
             return Err(DaemonClientError::Protocol {
                 detail: "conditional start recovery connected to a different daemon PID".into(),
@@ -2343,7 +2389,14 @@ impl DaemonClient {
                     generation_conditional_start,
                     start_operation_ledger,
                     generation_conditional_attach,
+                    #[cfg(windows)]
+                    windows_start_operation_retirement_barrier,
                 }) => {
+                    #[cfg(windows)]
+                    {
+                        self.windows_start_operation_retirement_barrier =
+                            windows_start_operation_retirement_barrier;
+                    }
                     let daemon_instance_id = self.bind_daemon_instance_id(daemon_instance_id)?;
                     return Ok((
                         protocol_version,
@@ -2407,7 +2460,14 @@ impl DaemonClient {
                     generation_conditional_start,
                     start_operation_ledger,
                     generation_conditional_attach,
+                    #[cfg(windows)]
+                    windows_start_operation_retirement_barrier,
                 }) => {
+                    #[cfg(windows)]
+                    {
+                        self.windows_start_operation_retirement_barrier =
+                            windows_start_operation_retirement_barrier;
+                    }
                     let daemon_instance_id = self.bind_daemon_instance_id(daemon_instance_id)?;
                     return Ok((
                         protocol_version,
@@ -2461,7 +2521,15 @@ impl DaemonClient {
                 true,
                 true,
                 Some(instance),
-            )) if observed == required => Ok((instance, child_environment)),
+            )) if observed == required => {
+                #[cfg(windows)]
+                if !self.windows_start_operation_retirement_barrier {
+                    return Err(
+                        DaemonClientError::WindowsStartRetirementBarrierUnsupported { observed },
+                    );
+                }
+                Ok((instance, child_environment))
+            }
             Ok((observed, _, _, _, _, _, _, _, _, _)) => {
                 Err(DaemonClientError::MutationProtocolUnsupported {
                     required,
@@ -2500,7 +2568,15 @@ impl DaemonClient {
                 true,
                 true,
                 Some(instance),
-            ) if observed == required => Ok((instance, child_environment)),
+            ) if observed == required => {
+                #[cfg(windows)]
+                if !self.windows_start_operation_retirement_barrier {
+                    return Err(
+                        DaemonClientError::WindowsStartRetirementBarrierUnsupported { observed },
+                    );
+                }
+                Ok((instance, child_environment))
+            }
             (observed, _, _, _, _, _, _, _, _, _) => {
                 Err(DaemonClientError::MutationProtocolUnsupported {
                     required,
@@ -4904,7 +4980,7 @@ impl DaemonClient {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};

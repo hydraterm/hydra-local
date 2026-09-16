@@ -4,7 +4,7 @@ Hydra Local's first-party code is MIT licensed. It depends on third-party softwa
 listed below. This inventory is generated from the exact locked Rust and dashboard
 dependency graphs; it does not change or replace any upstream licence.
 
-- `Cargo.lock` SHA-256: `c93e103136f24c8987191887f79f2ba54be7ed6dbfdec874754105f2a70abeed`
+- `Cargo.lock` SHA-256: `3ece808f8a21bbc71fa9ebec096f5b64ff433629b308bf7cc3b7be4c8e548e16`
 - `dashboard-ui/package-lock.json` SHA-256: `1b24584cf696a0a1993ec68a943b0a361116b7e765e9c2cd464a19e4da140401`
 - Rust dependency versions: 543
 - npm dependency versions: 188

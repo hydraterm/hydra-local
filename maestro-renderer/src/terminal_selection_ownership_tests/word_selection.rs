@@ -8,6 +8,8 @@ fn release(app: &mut App) {
 }
 
 fn double_click(app: &mut App, pos: CellPos) {
+    // This helper represents an independent two-click gesture, not a prior click's continuation.
+    app.last_selection_click = None;
     let now = Instant::now();
     app.begin_local_selection_gesture(Some(pos), now);
     release(app);

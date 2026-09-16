@@ -166,6 +166,10 @@ pub enum ShellEvent {
         /// Whether Attach atomically enforces `expected_session_generation` before guard/Grid.
         #[serde(default)]
         generation_conditional_attach: bool,
+        /// Whether retired Windows start tokens remain a barrier against delayed Start frames.
+        #[cfg(windows)]
+        #[serde(default)]
+        windows_start_operation_retirement_barrier: bool,
     },
     SessionAttachRefused {
         id: SessionId,
@@ -276,8 +280,25 @@ mod tests {
                 generation_conditional_start: false,
                 start_operation_ledger: false,
                 generation_conditional_attach: false,
+                #[cfg(windows)]
+                windows_start_operation_retirement_barrier: false,
             }
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn decodes_explicit_windows_start_retirement_barrier() {
+        for expected in [false, true] {
+            let line = format!(
+                r#"{{"ev":"daemon_info","protocol_version":3,"build_version":"0.1.0","windows_start_operation_retirement_barrier":{expected}}}"#
+            );
+            assert!(matches!(
+                ShellEvent::from_line(&line).unwrap(),
+                ShellEvent::DaemonInfo { windows_start_operation_retirement_barrier, .. }
+                    if windows_start_operation_retirement_barrier == expected
+            ));
+        }
     }
 
     #[test]
