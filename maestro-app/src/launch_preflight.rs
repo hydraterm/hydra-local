@@ -1058,7 +1058,9 @@ mod tests {
         let fake_shell = root.path().join("fake-shell");
         std::fs::write(
             &fake_shell,
-            format!("#!/bin/sh\n[ \"$1\" = '{LOGIN_SHELL_COMMAND_FLAGS}' ] || exit 97\nexit 0\n"),
+            // Execute the real lookup with a fixture shell function. An empty successful exit
+            // no longer proves provider discovery: the resolver requires its framed response.
+            format!("#!/bin/sh\n[ \"$1\" = '{LOGIN_SHELL_COMMAND_FLAGS}' ] || exit 97\ncodex() {{ :; }}\neval \"$2\"\n"),
         )
         .unwrap();
         std::fs::set_permissions(&fake_shell, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1071,6 +1073,10 @@ mod tests {
         assert!(probe
             .login_shell_has(SupportedAgentExecutable::Codex, root.path())
             .unwrap());
+        assert!(
+            probe.selected.borrow().is_none(),
+            "fixture is a shell function, not a selected executable"
+        );
     }
 
     #[test]

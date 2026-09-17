@@ -1346,6 +1346,12 @@ impl LinuxDashboardHost {
                     }
                 }
                 Event::RedrawRequested(_) => {
+                    if std::env::var("HYDRA_LINUX_PRESENT_TRACE").as_deref() == Ok("1") {
+                        eprintln!(
+                            "linux-host present-redraw source=tao_top_level host_monotonic_us={}",
+                            glib::monotonic_time()
+                        );
+                    }
                     if app.handle_host_event(HostEvent::RedrawRequested) == crate::HostControl::Exit
                     {
                         *control_flow = ControlFlow::Exit;

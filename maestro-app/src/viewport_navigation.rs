@@ -6,6 +6,7 @@ pub(super) struct Destination {
     project_id: String,
     window_id: String,
     pane: Option<(String, String)>,
+    dialog_focus_ticket: Option<u64>,
 }
 
 #[derive(Default)]
@@ -20,7 +21,11 @@ pub(super) enum Frontier {
 }
 
 impl PendingNavigation {
-    pub(super) fn retain(&mut self, intent: &ReactChromeIntent) -> bool {
+    pub(super) fn retain(
+        &mut self,
+        intent: &ReactChromeIntent,
+        dialog_focus_ticket: Option<u64>,
+    ) -> bool {
         self.0 = Some(match intent {
             ReactChromeIntent::FocusWindow {
                 project_id,
@@ -29,6 +34,7 @@ impl PendingNavigation {
                 project_id: project_id.clone(),
                 window_id: window_id.clone(),
                 pane: None,
+                dialog_focus_ticket,
             },
             ReactChromeIntent::FocusSessionOrPane {
                 project_id,
@@ -39,6 +45,7 @@ impl PendingNavigation {
                 project_id: project_id.clone(),
                 window_id: window_id.clone(),
                 pane: Some((tab_id.clone(), session_id.clone())),
+                dialog_focus_ticket,
             },
             _ => return false,
         });
@@ -48,6 +55,7 @@ impl PendingNavigation {
     pub(super) fn retain_pending_json(
         &mut self,
         json: &str,
+        dialog_focus_ticket: Option<u64>,
         bound: bool,
         current_window_id: &str,
         stopping: bool,
@@ -60,7 +68,7 @@ impl PendingNavigation {
             if (bound || !react_chrome_intent_requires_window_context(&intent))
                 && !product_recovery_blocks_react_intent(&intent, current_window_id)
             {
-                return self.retain(&intent);
+                return self.retain(&intent, dialog_focus_ticket);
             }
         }
         false
@@ -94,7 +102,13 @@ impl PendingNavigation {
                     json,
                     dialog_focus_ticket,
                 }) => {
-                    if !self.retain_pending_json(&json, bound, current_window_id, false) {
+                    if !self.retain_pending_json(
+                        &json,
+                        dialog_focus_ticket,
+                        bound,
+                        current_window_id,
+                        false,
+                    ) {
                         return Frontier::Event(
                             maestro_renderer::RendererEvent::ReactChromeIntent {
                                 json,
@@ -289,7 +303,12 @@ impl Destination {
                 return Err(error);
             }
         };
-        request_prepared_renderer_viewport(tab_runtime, projection, attachment)
+        request_prepared_renderer_viewport_with_focus(
+            tab_runtime,
+            projection,
+            attachment,
+            self.dialog_focus_ticket,
+        )
     }
 }
 

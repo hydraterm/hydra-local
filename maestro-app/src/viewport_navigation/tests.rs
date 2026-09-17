@@ -12,7 +12,7 @@ fn pane_intent(project: &str, window: &str, tab: &str, session: &str) -> ReactCh
 
 fn pane_destination() -> Destination {
     let mut queue = PendingNavigation::default();
-    queue.retain(&pane_intent("p-b", "w-b", "tab-b-2", "session-b-2"));
+    queue.retain(&pane_intent("p-b", "w-b", "tab-b-2", "session-b-2"), None);
     queue.take_ready(false, true, false).unwrap()
 }
 
@@ -108,10 +108,13 @@ fn changes(paths: &AppPaths) -> u64 {
 #[test]
 fn rapid_a_b_c_retains_only_latest_typed_navigation_until_settlement() {
     let mut queue = PendingNavigation::default();
-    queue.retain(&ReactChromeIntent::FocusWindow {
-        project_id: "p-a".into(),
-        window_id: "w-a".into(),
-    });
+    queue.retain(
+        &ReactChromeIntent::FocusWindow {
+            project_id: "p-a".into(),
+            window_id: "w-a".into(),
+        },
+        None,
+    );
     let a = queue.take_ready(false, true, false).unwrap();
     assert_eq!(a.window_id, "w-a");
     for (window, tab, session) in [("w-b", "b-2", "s-b"), ("w-c", "c-2", "s-c")] {
@@ -119,12 +122,13 @@ fn rapid_a_b_c_retains_only_latest_typed_navigation_until_settlement() {
             "type": "focusSessionOrPane", "project_id": "p-c", "window_id": window,
             "tab_id": tab, "session_id": session,
         });
-        queue.retain_pending_json(&json.to_string(), true, "w-a", false);
+        queue.retain_pending_json(&json.to_string(), None, true, "w-a", false);
         assert!(queue.take_ready(true, false, false).is_none());
     }
-    queue.retain_pending_json(r#"{"type":"focusTerminal"}"#, true, "w-a", false);
+    queue.retain_pending_json(r#"{"type":"focusTerminal"}"#, None, true, "w-a", false);
     queue.retain_pending_json(
         r#"{"type":"focusWindow","project_id":"p"}"#,
+        None,
         true,
         "w-a",
         false,
@@ -139,14 +143,115 @@ fn rapid_a_b_c_retains_only_latest_typed_navigation_until_settlement() {
 fn shutdown_unbound_and_neutral_settlements_never_release_queued_navigation() {
     let json = r#"{"type":"focusWindow","project_id":"p-b","window_id":"w-b"}"#;
     let mut queue = PendingNavigation::default();
-    queue.retain_pending_json(json, false, "w-a", false);
+    queue.retain_pending_json(json, None, false, "w-a", false);
     assert!(queue.take_ready(false, true, false).is_none());
-    queue.retain_pending_json(json, true, "w-a", false);
+    queue.retain_pending_json(json, None, true, "w-a", false);
     assert!(queue.take_ready(true, false, true).is_none());
     assert!(queue.take_ready(false, true, false).is_none());
-    queue.retain_pending_json(json, true, "w-a", false);
+    queue.retain_pending_json(json, None, true, "w-a", false);
     assert!(queue.take_ready(false, false, false).is_none());
     assert!(queue.take_ready(false, true, false).is_none());
+}
+
+#[test]
+fn persistent_navigation_keeps_latest_destination_and_ticket_together() {
+    let (tx, rx) = mpsc::channel();
+    let stop = AtomicBool::new(false);
+    let mut queue = PendingNavigation::default();
+    queue.retain(
+        &pane_intent("p-b", "w-b", "tab-b-2", "session-b-2"),
+        Some(4),
+    );
+    assert_eq!(queue.0.as_ref().unwrap().dialog_focus_ticket, Some(4));
+    for ticket in [Some(9), None] {
+        queue.retain(
+            &pane_intent("p-b", "w-b", "tab-b-2", "session-b-2"),
+            Some(4),
+        );
+        tx.send(maestro_renderer::RendererEvent::ReactChromeIntent {
+            json: r#"{"type":"focusWindow","project_id":"p-a","window_id":"w-a"}"#.into(),
+            dialog_focus_ticket: ticket,
+        })
+        .unwrap();
+        let Frontier::Ready(destination) =
+            queue.drain_frontier(&rx, &stop, false, true, true, "w-b")
+        else {
+            panic!("latest navigation should leave the real event frontier");
+        };
+        assert_eq!(destination.window_id, "w-a");
+        assert_eq!(
+            destination.dialog_focus_ticket, ticket,
+            "None must not inherit an older ticket"
+        );
+    }
+    let json = r#"{"type":"focusSessionOrPane","project_id":"p-b","window_id":"w-b","tab_id":"tab-b-2","session_id":"session-b-2"}"#;
+    assert!(queue.retain_pending_json(json, Some(11), true, "w-a", false));
+    assert!(queue.take_ready(true, false, false).is_none());
+    let destination = queue.take_ready(false, true, false).unwrap();
+    assert_eq!(destination.dialog_focus_ticket, Some(11));
+    let (_tmp, paths) = fixture();
+    let (layout, tab) = destination.prepare(&paths, 42).unwrap();
+    assert_eq!(
+        destination
+            .bind_primary(&layout, &tab)
+            .unwrap()
+            .dialog_focus_ticket,
+        Some(11)
+    );
+}
+
+#[test]
+fn persistent_navigation_prepared_request_carries_only_explicit_focus() {
+    let (_tmp, paths) = fixture();
+    let projection = pane_destination().projection(&paths, "tab-b-2").unwrap();
+    for ticket in [None, Some(17)] {
+        let (mut runtime, commands) = RendererTabRuntime::new();
+        let (events, _received) = mpsc::channel();
+        runtime.bind_renderer_events(events);
+        assert!(request_prepared_renderer_viewport_with_focus(
+            &mut runtime,
+            projection.clone(),
+            None,
+            ticket,
+        )
+        .unwrap()
+        .is_none());
+        let maestro_renderer::RendererCommand::AttachExactViewport { request } =
+            commands.try_recv().unwrap()
+        else {
+            panic!("navigation must request exact publication, not blind terminal focus");
+        };
+        assert_eq!(request.dialog_focus_ticket(), ticket);
+        let Some(maestro_app::PendingRendererViewport::Ordinary { target, .. }) =
+            runtime.pending_viewport()
+        else {
+            panic!("exact navigation must retain its pending projection");
+        };
+        assert_eq!(target.target(), projection.target());
+        assert!(
+            runtime.active_viewport().is_none(),
+            "delivery is not publication"
+        );
+        assert!(
+            commands.try_recv().is_err(),
+            "persistent navigation never hides an overlay"
+        );
+    }
+    let (mut runtime, commands) = RendererTabRuntime::new();
+    let (events, _received) = mpsc::channel();
+    runtime.bind_renderer_events(events);
+    drop(commands);
+    assert!(request_prepared_renderer_viewport_with_focus(
+        &mut runtime,
+        projection,
+        None,
+        Some(17),
+    )
+    .is_err());
+    assert!(
+        !runtime.handoff_is_pending(),
+        "failed send grants no pending authority"
+    );
 }
 
 #[test]
@@ -188,7 +293,7 @@ fn cross_project_nonfirst_pane_preserves_exact_identity_siblings_and_recency() {
 fn pane_stashed_while_pending_is_declined_without_fallback_or_writes() {
     let (_tmp, paths) = fixture();
     let mut queue = PendingNavigation::default();
-    queue.retain(&pane_intent("p-b", "w-b", "tab-b-2", "session-b-2"));
+    queue.retain(&pane_intent("p-b", "w-b", "tab-b-2", "session-b-2"), None);
     assert!(queue.take_ready(true, false, false).is_none());
     WindowLayoutService::new(&paths)
         .set_tab_stashed("w-b", "tab-b-2", true, 2)

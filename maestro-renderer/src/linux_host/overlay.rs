@@ -3346,6 +3346,7 @@ impl LinuxOverlayHost {
         self.suppress_native_underlay_inputs();
         self.park_webview(webview.as_deref(), false);
         self.present_target.set_overlay_occluded(false);
+        self.top_level.queue_draw();
         self.begin_persistent_document_suppression(true);
     }
 
@@ -3370,6 +3371,7 @@ impl LinuxOverlayHost {
         self.suppress_native_underlay_inputs();
         self.park_webview(webview.as_deref(), false);
         self.present_target.set_overlay_occluded(false);
+        self.top_level.queue_draw();
     }
 
     fn hide_and_restore_focus(&self) {
@@ -3477,6 +3479,7 @@ impl LinuxOverlayHost {
         log_overlay_presentation_step(token, "stage-begin", started);
         self.suppress_underlay_inputs();
         self.present_target.set_overlay_occluded(false);
+        self.top_level.queue_draw();
         let target = OverlayGeometry::target(&self.composition);
         let began = self.presentation_barrier.borrow_mut().begin(token, target);
         if !began {

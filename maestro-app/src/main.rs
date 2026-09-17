@@ -3954,28 +3954,41 @@ fn create_project_with_default_window_graph(
     }
 }
 
-/// A complete fresh Project/Window graph whose first daemon start authority and exclusively
-/// created ScratchCwd are still owned by the caller. Neither value is cloneable: the graph may be
-/// started once, and the directory may be removed only while that start is definitely unpublished.
+/// A complete fresh Project/Window graph whose first daemon start authority is owned by the
+/// caller. The selected working directory belongs to the user, never to graph compensation.
 struct PreparedReactFreshWindowGraph {
     created: maestro_shell::CreatedPreparedFreshWindowGraph,
-    scratch: maestro_shell::FreshScratchCwdReceipt,
 }
 
-fn cleanup_unpublished_react_scratch(
+/// Creating a project/window in the dialog's selected Working directory is the user's request
+/// to run there. Record that choice only on the new workspace; do not rewrite existing policies
+/// or grant worktree creation. RepoWrite preparation validates the directory without modifying it.
+fn prepare_react_selected_directory(
     paths: &AppPaths,
-    scratch: maestro_shell::FreshScratchCwdReceipt,
-    context: &str,
-) {
-    match maestro_shell::cleanup_fresh_scratch_cwd(paths, scratch) {
-        Ok(maestro_shell::FreshScratchCwdCleanupOutcome::Removed) => {}
-        Ok(outcome) => eprintln!(
-            "attach-tab: {context} retained fresh ScratchCwd after unpublished graph refusal: {outcome:?}"
-        ),
-        Err(error) => eprintln!(
-            "attach-tab: {context} could not consume fresh ScratchCwd cleanup receipt; directory retained safely: {error}"
-        ),
-    }
+    project_id: &str,
+    workspace_id: String,
+    session_id: &str,
+    root: &str,
+    now_ms: u64,
+) -> Result<(Workspace, maestro_shell::PreparedWorkspace), maestro_shell::WorkspaceExecError> {
+    let workspace = Workspace {
+        workspace_id,
+        project_id: project_id.to_string(),
+        root: root.to_string(),
+        policy: maestro_shell::WorkspacePolicy::RepoWrite,
+        consent: WorkspaceConsent {
+            repo_write: true,
+            granted_at_ms: Some(now_ms),
+            ..WorkspaceConsent::default()
+        },
+    };
+    let prepared = maestro_shell::prepare_workspace_with_consent(
+        paths,
+        workspace.policy,
+        &workspace,
+        session_id,
+    )?;
+    Ok((workspace, prepared))
 }
 
 enum PreparedReactFreshLaunch {
@@ -4244,25 +4257,20 @@ fn prepare_react_project_with_default_window_graph(
             "fresh Project session {session_id:?} is already owned by the daemon"
         ));
     }
-    let (prepared, scratch) =
-        maestro_shell::prepare_fresh_scratch_cwd(paths, &workspace_id, &session_id, root)
-            .map_err(|error| format!("prepare exclusive fresh Project ScratchCwd: {error}"))?
-            .into_parts();
-    let session = match launch.seal_at_prepared_cwd(&prepared, now_ms) {
-        Ok(session) => session,
-        Err(error) => {
-            cleanup_unpublished_react_scratch(paths, scratch, "createProject launch sealing");
-            return Err(format!("seal fresh Project launch: {error}"));
-        }
-    };
+    let (workspace, prepared) = prepare_react_selected_directory(
+        paths,
+        project_id,
+        workspace_id,
+        &session_id,
+        root,
+        now_ms,
+    )
+    .map_err(|error| format!("prepare selected Project working directory: {error}"))?;
+    let session = launch
+        .seal_at_prepared_cwd(&prepared, now_ms)
+        .map_err(|error| format!("seal fresh Project launch: {error}"))?;
     let spec = maestro_shell::PreparedFreshWindowGraphSpec {
-        workspace: Workspace {
-            workspace_id,
-            project_id: project_id.to_string(),
-            root: root.to_string(),
-            policy: maestro_shell::WorkspacePolicy::ScratchCwd,
-            consent: WorkspaceConsent::default(),
-        },
+        workspace,
         session,
         window_id,
         window_name: "Window 1".into(),
@@ -4276,20 +4284,14 @@ fn prepare_react_project_with_default_window_graph(
         .create_prepared_fresh_project_window_graph(project_id, name, root, opts, spec)
     {
         Ok(maestro_shell::PreparedFreshWindowGraphCreateOutcome::Created(created)) => {
-            Ok(PreparedReactFreshWindowGraph { created, scratch })
+            Ok(PreparedReactFreshWindowGraph { created })
         }
-        Ok(outcome) => {
-            cleanup_unpublished_react_scratch(paths, scratch, "createProject graph refusal");
-            Err(format!(
-                "prepared fresh Project window graph refused project={project_id:?}: {outcome:?}"
-            ))
-        }
-        Err(error) => {
-            cleanup_unpublished_react_scratch(paths, scratch, "createProject graph error");
-            Err(format!(
-                "create prepared complete Project window graph: {error}"
-            ))
-        }
+        Ok(outcome) => Err(format!(
+            "prepared fresh Project window graph refused project={project_id:?}: {outcome:?}"
+        )),
+        Err(error) => Err(format!(
+            "create prepared complete Project window graph: {error}"
+        )),
     }
 }
 
@@ -5585,9 +5587,19 @@ fn request_prepared_renderer_viewport(
     projection: maestro_app::RendererViewportProjection,
     attachment_handoff: Option<maestro_shell::AttachmentHandoffAuthority>,
 ) -> Result<Option<maestro_app::RendererViewportProjection>, String> {
+    request_prepared_renderer_viewport_with_focus(tab_runtime, projection, attachment_handoff, None)
+}
+
+fn request_prepared_renderer_viewport_with_focus(
+    tab_runtime: &mut RendererTabRuntime,
+    projection: maestro_app::RendererViewportProjection,
+    attachment_handoff: Option<maestro_shell::AttachmentHandoffAuthority>,
+    dialog_focus_ticket: Option<u64>,
+) -> Result<Option<maestro_app::RendererViewportProjection>, String> {
     if let Some(authority) = attachment_handoff {
         let retry_authority = authority.clone();
-        let handoff = maestro_renderer::RendererAttachmentHandoff::new(authority);
+        let handoff = maestro_renderer::RendererAttachmentHandoff::new(authority)
+            .with_dialog_focus(dialog_focus_ticket);
         if let Err(error) = tab_runtime.switch_to_with_handoff(projection, handoff) {
             cancel_or_retain_attachment_handoff(retry_authority);
             return Err(format!("request exact renderer handoff: {error}"));
@@ -5596,7 +5608,7 @@ fn request_prepared_renderer_viewport(
     } else {
         let compatible_projection = projection.clone();
         match tab_runtime
-            .switch_to_exact(projection)
+            .switch_to_exact_with_dialog_focus(projection, dialog_focus_ticket)
             .map_err(|error| format!("request exact renderer viewport: {error}"))?
         {
             Some(_) => Ok(None),
@@ -6645,33 +6657,20 @@ fn prepare_fresh_react_window_graph(
         if !candidate_allowed(&session_id) {
             continue;
         }
-        let preparation =
-            match maestro_shell::prepare_fresh_scratch_cwd(paths, &workspace_id, &session_id, root)
-            {
-                Ok(preparation) => preparation,
-                Err(maestro_shell::WorkspaceExecError::FreshScratchCwdAlreadyExists { .. }) => {
-                    continue;
-                }
-                Err(error) => {
-                    return Err(ReactWindowGraphCreateError::Preparation(error.to_string()));
-                }
-            };
-        let (prepared, scratch) = preparation.into_parts();
-        let session = match launch.seal_at_prepared_cwd(&prepared, written_at_ms) {
-            Ok(session) => session,
-            Err(error) => {
-                cleanup_unpublished_react_scratch(paths, scratch, "createWindow launch sealing");
-                return Err(ReactWindowGraphCreateError::Preparation(error.to_string()));
-            }
-        };
+        let (workspace, prepared) = prepare_react_selected_directory(
+            paths,
+            project_id,
+            workspace_id,
+            &session_id,
+            root,
+            written_at_ms,
+        )
+        .map_err(|error| ReactWindowGraphCreateError::Preparation(error.to_string()))?;
+        let session = launch
+            .seal_at_prepared_cwd(&prepared, written_at_ms)
+            .map_err(ReactWindowGraphCreateError::Preparation)?;
         let spec = maestro_shell::PreparedFreshWindowGraphSpec {
-            workspace: Workspace {
-                workspace_id,
-                project_id: project_id.to_string(),
-                root: root.to_string(),
-                policy: maestro_shell::WorkspacePolicy::ScratchCwd,
-                consent: WorkspaceConsent::default(),
-            },
+            workspace,
             session,
             window_id,
             window_name: window_name.to_string(),
@@ -6685,31 +6684,18 @@ fn prepare_fresh_react_window_graph(
             .create_prepared_fresh_window_graph(expected_project, spec)
         {
             Err(error) => {
-                cleanup_unpublished_react_scratch(
-                    paths,
-                    scratch,
-                    "createWindow prepared graph error",
-                );
                 return Err(ReactWindowGraphCreateError::Store(error));
             }
             Ok(maestro_shell::PreparedFreshWindowGraphCreateOutcome::Created(created)) => {
-                return Ok(PreparedReactFreshWindowGraph { created, scratch });
+                return Ok(PreparedReactFreshWindowGraph { created });
             }
             Ok(maestro_shell::PreparedFreshWindowGraphCreateOutcome::ProjectMissing { .. }) => {
-                cleanup_unpublished_react_scratch(paths, scratch, "createWindow missing Project");
                 return Err(ReactWindowGraphCreateError::ProjectMissing);
             }
             Ok(maestro_shell::PreparedFreshWindowGraphCreateOutcome::ProjectChanged { .. }) => {
-                cleanup_unpublished_react_scratch(paths, scratch, "createWindow changed Project");
                 return Err(ReactWindowGraphCreateError::ProjectChanged);
             }
-            Ok(maestro_shell::PreparedFreshWindowGraphCreateOutcome::Conflict(_)) => {
-                cleanup_unpublished_react_scratch(
-                    paths,
-                    scratch,
-                    "createWindow candidate conflict",
-                );
-            }
+            Ok(maestro_shell::PreparedFreshWindowGraphCreateOutcome::Conflict(_)) => {}
         }
     }
     Err(ReactWindowGraphCreateError::Exhausted)
@@ -14192,7 +14178,6 @@ fn cancel_unpublished_react_fresh_graph(
     paths: &AppPaths,
     socket_path: &Path,
     start: maestro_shell::PreparedNewSessionStart,
-    scratch: maestro_shell::FreshScratchCwdReceipt,
     now_ms: u64,
     context: &'static str,
 ) {
@@ -14212,18 +14197,15 @@ fn cancel_unpublished_react_fresh_graph(
                     context,
                 );
             }
-            cleanup_unpublished_react_scratch(paths, scratch, context);
         }
         Ok(outcome) => {
-            drop(scratch);
             eprintln!(
-                "attach-tab: {context} unpublished fresh-graph cancellation did not prove exact deletion; ScratchCwd retained: {outcome:?}"
+                "attach-tab: {context} unpublished fresh-graph cancellation did not prove exact deletion; graph retained: {outcome:?}"
             );
         }
         Err(error) => {
-            drop(scratch);
             eprintln!(
-                "attach-tab: {context} unpublished fresh-graph cancellation failed; graph and ScratchCwd retained: {error}"
+                "attach-tab: {context} unpublished fresh-graph cancellation failed; graph retained: {error}"
             );
         }
     }
@@ -14270,16 +14252,13 @@ fn start_headless_react_fresh_graph(
     now_ms: u64,
     context: &'static str,
 ) -> Result<SessionRecord, String> {
-    let PreparedReactFreshWindowGraph { created, scratch } = allocation;
+    let PreparedReactFreshWindowGraph { created } = allocation;
     match ShellRuntime::new(paths).start_prepared_new_session(
         Some(socket_path.to_path_buf()),
         &ProcessEnv,
         created.start,
     ) {
         Ok(started) => {
-            // The first daemon frame has crossed the publication boundary. The exclusive
-            // directory receipt is now permanently burned even if later durable checks fail.
-            drop(scratch);
             let (_socket, record, compensation, attachment_handoff) = started.into_parts();
             if let Some(authority) = attachment_handoff {
                 compensate_fresh_graph_after_exact_handoff_cancel(
@@ -14317,14 +14296,7 @@ fn start_headless_react_fresh_graph(
             start,
         }) => {
             let detail = settle_shell_runtime_error(error);
-            cancel_unpublished_react_fresh_graph(
-                paths,
-                socket_path,
-                start,
-                scratch,
-                now_ms,
-                context,
-            );
+            cancel_unpublished_react_fresh_graph(paths, socket_path, start, now_ms, context);
             Err(format!(
                 "{context} Prepared start was unpublished: {detail}"
             ))
@@ -14333,7 +14305,6 @@ fn start_headless_react_fresh_graph(
             error,
             compensation,
         }) => {
-            drop(scratch);
             let detail = settle_shell_runtime_error(error);
             let _ = compensate_react_fresh_graph(
                 paths,
@@ -14346,7 +14317,6 @@ fn start_headless_react_fresh_graph(
             Err(format!("{context} Prepared start was refused: {detail}"))
         }
         Err(maestro_shell::PreparedNewSessionRuntimeError::PossiblyApplied { error }) => {
-            drop(scratch);
             let detail = settle_shell_runtime_error(error);
             Err(format!(
                 "{context} Prepared start may have been applied; graph retained: {detail}"
@@ -14365,7 +14335,7 @@ fn start_bound_react_fresh_graph(
     dialog_focus_ticket: Option<u64>,
 ) -> Result<PendingListenerFreshGraphHandoff, String> {
     let context = action.context();
-    let PreparedReactFreshWindowGraph { created, scratch } = allocation;
+    let PreparedReactFreshWindowGraph { created } = allocation;
     let window_id = created.window.layout.window_id.clone();
     let tab_id = created
         .window
@@ -14376,7 +14346,7 @@ fn start_bound_react_fresh_graph(
         .map(|tab| tab.tab_id.clone());
     let start = created.start;
     let Some(tab_id) = tab_id else {
-        cancel_unpublished_react_fresh_graph(paths, socket_path, start, scratch, now_ms, context);
+        cancel_unpublished_react_fresh_graph(paths, socket_path, start, now_ms, context);
         return Err(format!(
             "{context} prepared fresh graph has no visible primary tab"
         ));
@@ -14392,14 +14362,7 @@ fn start_bound_react_fresh_graph(
             start,
         }) => {
             let detail = settle_shell_runtime_error(error);
-            cancel_unpublished_react_fresh_graph(
-                paths,
-                socket_path,
-                start,
-                scratch,
-                now_ms,
-                context,
-            );
+            cancel_unpublished_react_fresh_graph(paths, socket_path, start, now_ms, context);
             return Err(format!(
                 "{context} Prepared start was unpublished: {detail}"
             ));
@@ -14408,7 +14371,6 @@ fn start_bound_react_fresh_graph(
             error,
             compensation,
         }) => {
-            drop(scratch);
             let detail = settle_shell_runtime_error(error);
             let _ = compensate_react_fresh_graph(
                 paths,
@@ -14421,14 +14383,12 @@ fn start_bound_react_fresh_graph(
             return Err(format!("{context} Prepared start was refused: {detail}"));
         }
         Err(maestro_shell::PreparedNewSessionRuntimeError::PossiblyApplied { error }) => {
-            drop(scratch);
             let detail = settle_shell_runtime_error(error);
             return Err(format!(
                 "{context} Prepared start may have been applied; graph retained: {detail}"
             ));
         }
     };
-    drop(scratch);
     let (_socket, record, compensation, attachment_handoff) = started.into_parts();
     let session_id = record.session_id.clone();
     let Some(expected_generation) = record.last_known_generation.clone() else {
@@ -15026,7 +14986,10 @@ fn spawn_window_event_listener(
                     maestro_renderer::RendererEvent::AttachmentHandoffDisposition(disposition) => {
                         disposition
                     }
-                    maestro_renderer::RendererEvent::ReactChromeIntent { json, .. } => {
+                    maestro_renderer::RendererEvent::ReactChromeIntent {
+                        json,
+                        dialog_focus_ticket,
+                    } => {
                         launch_mutation::reject_inactive_json(
                             &mut tab_runtime,
                             &json,
@@ -15039,6 +15002,7 @@ fn spawn_window_event_listener(
                         );
                         pending_navigation.retain_pending_json(
                             &json,
+                            dialog_focus_ticket,
                             listener_window_context.is_bound(),
                             &listener_window_id,
                             stopping,
@@ -17599,7 +17563,7 @@ fn spawn_window_event_listener(
                         }
                         intent @ (ReactChromeIntent::FocusWindow { .. }
                         | ReactChromeIntent::FocusSessionOrPane { .. }) => {
-                            pending_navigation.retain(&intent);
+                            pending_navigation.retain(&intent, dialog_focus_ticket);
                         }
                         ReactChromeIntent::SaveLayoutPreset {
                             project_id,
@@ -23616,7 +23580,7 @@ mod react_session_insert_only_tests {
     }
 
     fn cancel_prepared_react_graph(paths: &AppPaths, allocation: PreparedReactFreshWindowGraph) {
-        let PreparedReactFreshWindowGraph { created, scratch } = allocation;
+        let PreparedReactFreshWindowGraph { created } = allocation;
         let outcome = WindowLayoutService::new(paths)
             .cancel_prepared_new_session(created.start, 99)
             .expect("cancel unpublished Prepared graph");
@@ -23626,11 +23590,6 @@ mod react_session_insert_only_tests {
                 maestro_shell::ConditionalFreshWindowGraphDelete::Deleted { .. }
             )
         ));
-        assert_eq!(
-            maestro_shell::cleanup_fresh_scratch_cwd(paths, scratch)
-                .expect("consume exact fresh Scratch receipt"),
-            maestro_shell::FreshScratchCwdCleanupOutcome::Removed
-        );
     }
 
     fn prepared_test_shell_launch() -> PreparedReactFreshLaunch {
@@ -23649,6 +23608,8 @@ mod react_session_insert_only_tests {
         let root = tmp.path().join("repo");
         std::fs::create_dir_all(&root).unwrap();
         let project_id = "prepared-react-project";
+        let sentinel = root.join("user-file");
+        std::fs::write(&sentinel, b"keep user work").unwrap();
         let session_id = default_project_pane_session_id(project_id);
         let launch = prepared_test_shell_launch();
         let allocation = prepare_react_project_with_default_window_graph(
@@ -23673,13 +23634,26 @@ mod react_session_insert_only_tests {
         assert!(stored.last_known_generation.is_none());
         assert_eq!(
             stored.cwd_resolved,
-            paths.scratch_base().join(&session_id).to_string_lossy()
+            root.to_string_lossy(),
+            "the new-project Working directory choice is the actual first-session cwd"
         );
         assert_eq!(
             allocation.created.window.layout.tabs[0].session_id,
             session_id
         );
+        let Some(LoadOutcome::Loaded(workspace)) =
+            load_one::<Workspace>(&paths, RecordKind::Workspace, &stored.workspace_id).unwrap()
+        else {
+            panic!("new workspace must exist")
+        };
+        assert_eq!(workspace.policy, maestro_shell::WorkspacePolicy::RepoWrite);
+        assert!(workspace.consent.repo_write);
+        assert!(!workspace.consent.worktree_create);
+        assert_eq!(workspace.consent.granted_at_ms, Some(7));
+        assert!(!paths.scratch_base().join(&session_id).exists());
         cancel_prepared_react_graph(&paths, allocation);
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep user work");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
         assert!(maestro_shell::ProjectService::new(&paths)
             .load(project_id)
             .unwrap()
@@ -23687,7 +23661,7 @@ mod react_session_insert_only_tests {
     }
 
     #[test]
-    fn prepared_react_project_refusal_never_adopts_or_deletes_preexisting_scratch() {
+    fn prepared_react_project_never_adopts_or_deletes_preexisting_scratch() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = AppPaths::with_base(tmp.path().join("Maestro"));
         let root = tmp.path().join("repo");
@@ -23700,7 +23674,7 @@ mod react_session_insert_only_tests {
         std::fs::write(&sentinel, b"keep").unwrap();
 
         let launch = prepared_test_shell_launch();
-        assert!(prepare_react_project_with_default_window_graph(
+        let allocation = prepare_react_project_with_default_window_graph(
             &paths,
             project_id,
             "Prepared React",
@@ -23710,8 +23684,10 @@ mod react_session_insert_only_tests {
             &std::collections::HashSet::new(),
             8,
         )
-        .is_err());
-        assert!(sentinel.exists());
+        .expect("unrelated old scratch does not change the selected directory");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
+        cancel_prepared_react_graph(&paths, allocation);
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
         assert!(maestro_shell::ProjectService::new(&paths)
             .load(project_id)
             .unwrap()
@@ -23724,12 +23700,14 @@ mod react_session_insert_only_tests {
     }
 
     #[test]
-    fn prepared_react_project_graph_conflict_cleans_only_its_owned_empty_scratch() {
+    fn prepared_react_project_graph_conflict_preserves_selected_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = AppPaths::with_base(tmp.path().join("Maestro"));
         let root = tmp.path().join("repo");
         std::fs::create_dir_all(&root).unwrap();
         let project_id = "prepared-react-conflict";
+        let sentinel = root.join("user-file");
+        std::fs::write(&sentinel, b"keep").unwrap();
         maestro_shell::ProjectService::new(&paths)
             .create(
                 project_id,
@@ -23753,6 +23731,7 @@ mod react_session_insert_only_tests {
         )
         .is_err());
         assert!(!paths.scratch_base().join(session_id).exists());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
         assert_eq!(
             maestro_shell::ProjectService::new(&paths)
                 .load(project_id)
@@ -23761,6 +23740,130 @@ mod react_session_insert_only_tests {
                 .name,
             "Winner"
         );
+    }
+
+    #[test]
+    fn prepared_react_selected_directory_rejects_missing_or_file_without_creating_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::with_base(tmp.path().join("Maestro"));
+        let missing = tmp.path().join("missing");
+        let file = tmp.path().join("file");
+        std::fs::write(&file, b"keep").unwrap();
+        for root in [&missing, &file] {
+            assert!(prepare_react_project_with_default_window_graph(
+                &paths,
+                "invalid-cwd",
+                "Invalid",
+                &root.to_string_lossy(),
+                maestro_shell::NewProject::default(),
+                &prepared_test_shell_launch(),
+                &std::collections::HashSet::new(),
+                1,
+            )
+            .is_err());
+        }
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read(file).unwrap(), b"keep");
+        assert!(!paths.scratch_base().exists());
+        assert!(maestro_shell::ProjectService::new(&paths)
+            .load("invalid-cwd")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn prepared_react_selected_directory_preserves_known_daemon_session_before_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::with_base(tmp.path().join("Maestro"));
+        let project_id = "daemon-owned-project";
+        let known = std::collections::HashSet::from([default_project_pane_session_id(project_id)]);
+        assert!(prepare_react_project_with_default_window_graph(
+            &paths,
+            project_id,
+            "Existing daemon owner",
+            &tmp.path().to_string_lossy(),
+            maestro_shell::NewProject::default(),
+            &prepared_test_shell_launch(),
+            &known,
+            1,
+        )
+        .err()
+        .expect("known daemon identity must refuse")
+        .contains("already owned by the daemon"));
+        assert!(!paths.scratch_base().exists());
+        assert!(maestro_shell::ProjectService::new(&paths)
+            .load(project_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn prepared_react_window_honors_selected_directory_after_graph_collision() {
+        let (_tmp, paths, existing, _template, layout) = fixture();
+        let root = _tmp.path().join("selected window folder");
+        std::fs::create_dir(&root).unwrap();
+        let sentinel = root.join("user-file");
+        std::fs::write(&sentinel, b"keep").unwrap();
+        let Some(LoadOutcome::Loaded(before_workspace)) =
+            load_one::<Workspace>(&paths, RecordKind::Workspace, &existing.workspace_id).unwrap()
+        else {
+            panic!("original workspace")
+        };
+        let expected = WindowLayoutService::new(&paths)
+            .load_project_window_graph_snapshot("react-insert-project")
+            .unwrap()
+            .unwrap();
+        let allocation = prepare_fresh_react_window_graph(
+            &paths,
+            &expected,
+            &root.to_string_lossy(),
+            "Selected folder",
+            "Pane 1",
+            &prepared_test_shell_launch(),
+            12,
+            |attempt| {
+                (
+                    format!("selected-workspace-{attempt}"),
+                    format!("selected-window-{attempt}"),
+                    if attempt == 0 {
+                        existing.session_id.clone()
+                    } else {
+                        "selected-session".into()
+                    },
+                )
+            },
+            |_| true,
+        )
+        .expect("retry durable collision without modifying the winner");
+        assert_eq!(allocation.created.start.session_id(), "selected-session");
+        let Some(LoadOutcome::Loaded(stored)) =
+            load_one::<SessionRecord>(&paths, RecordKind::Session, "selected-session").unwrap()
+        else {
+            panic!("new session")
+        };
+        assert_eq!(stored.cwd_resolved, root.to_string_lossy());
+        let Some(LoadOutcome::Loaded(original_session)) =
+            load_one::<SessionRecord>(&paths, RecordKind::Session, &existing.session_id).unwrap()
+        else {
+            panic!("original session")
+        };
+        assert_eq!(original_session, existing);
+        let Some(LoadOutcome::Loaded(original_workspace)) =
+            load_one::<Workspace>(&paths, RecordKind::Workspace, &existing.workspace_id).unwrap()
+        else {
+            panic!("original workspace retained")
+        };
+        assert_eq!(original_workspace, before_workspace);
+        assert_eq!(
+            WindowLayoutService::new(&paths)
+                .load(&layout.window_id)
+                .unwrap(),
+            Some(layout)
+        );
+        assert!(!paths.scratch_base().join("selected-session").exists());
+        cancel_prepared_react_graph(&paths, allocation);
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
     }
 
     #[test]
@@ -33589,8 +33692,11 @@ mod product_startup_target_tests {
     }
 
     #[test]
-    fn sidebar_revival_focus_is_forwarded_by_the_typed_retained_listener() {
-        for ticket in [None, Some(41)] {
+    fn persistent_navigation_and_sidebar_revival_focus_reach_the_typed_listener() {
+        for (kind, ticket) in ["reviveSession", "focusSessionOrPane", "focusWindow"]
+            .into_iter()
+            .flat_map(|kind| [None, Some(41)].map(|ticket| (kind, ticket)))
+        {
             let tmp = tempfile::tempdir().unwrap();
             let paths = AppPaths::with_base(tmp.path().join("base"));
             let mut target = seed_user_target(&paths, tmp.path());
@@ -33604,7 +33710,12 @@ mod product_startup_target_tests {
             )
             .unwrap();
             WindowLayoutService::new(&paths)
-                .set_tab_stashed(&target.layout.window_id, &target.tab_id, true, 20)
+                .set_tab_stashed(
+                    &target.layout.window_id,
+                    &target.tab_id,
+                    kind == "reviveSession",
+                    20,
+                )
                 .unwrap();
             let socket = tmp.path().join("revive-focus.sock");
             let daemon = UnixListener::bind(&socket).unwrap();
@@ -33672,11 +33783,21 @@ mod product_startup_target_tests {
                 RecordedPaneOpenPolicy::Product,
                 ListenerWindowContext::PublishedForTest,
             );
-            events.send(maestro_renderer::RendererEvent::ReactChromeIntent {
-                dialog_focus_ticket: ticket,
-                json: serde_json::json!({"type": "reviveSession", "window_id": target.layout.window_id,
-                    "tab_id": target.tab_id, "session_id": target.session.session_id}).to_string(),
-            }).unwrap();
+            let mut intent =
+                serde_json::json!({"type": kind, "window_id": target.layout.window_id});
+            if kind != "reviveSession" {
+                intent["project_id"] = target.workspace.project_id.clone().into();
+            }
+            if kind != "focusWindow" {
+                intent["tab_id"] = target.tab_id.clone().into();
+                intent["session_id"] = target.session.session_id.clone().into();
+            }
+            events
+                .send(maestro_renderer::RendererEvent::ReactChromeIntent {
+                    dialog_focus_ticket: ticket,
+                    json: intent.to_string(),
+                })
+                .unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             let request = loop {
                 if let maestro_renderer::RendererCommand::AttachExactViewport { request } = commands
@@ -33689,7 +33810,7 @@ mod product_startup_target_tests {
             assert_eq!(
                 request.dialog_focus_ticket(),
                 ticket,
-                "native metadata survives actual typed ReviveSession dispatch"
+                "native metadata survives actual typed {kind} dispatch"
             );
             let layout = WindowLayoutService::new(&paths)
                 .load(&target.layout.window_id)

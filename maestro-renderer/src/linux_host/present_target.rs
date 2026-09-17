@@ -598,10 +598,13 @@ impl TerminalPresentTarget {
         }
     }
 
-    /// Reject a renderer frame before it reaches WGPU while the Wayland child is occluded or its
-    /// reveal is waiting for the parent commit. X11 always returns true.
+    /// Reject hidden frames before they reach WGPU on the GTK owner thread. Wayland additionally
+    /// waits for its parent-commit reveal acknowledgement; X11 resumes immediately on reveal.
     pub(crate) fn try_begin_frame(&self) -> bool {
-        self.presentation_gate.try_begin_frame()
+        match &self.backend {
+            Backend::X11(_) => !self.overlay_occlusion.occluded.get(),
+            Backend::Wayland(_) => self.presentation_gate.try_begin_frame(),
+        }
     }
 
     /// Retain only the newest surface allocation while hidden. PTY/session geometry remains owned
@@ -901,14 +904,29 @@ mod tests {
             presentation_gate: TerminalPresentationGate::new(false),
         };
 
+        assert!(target.try_begin_frame());
         target.set_overlay_occluded(true);
         assert!(target.overlay_occlusion.occluded.get());
+        assert!(!target.try_begin_frame());
+        // Allocation/PTY geometry is not deferred by the X11 frame-only policy. It does not
+        // enter Wayland's parent-paint acknowledgement state or require a later reveal event.
+        assert!(target.try_begin_surface_resize(800, 600));
+        assert_eq!(target.parent_paint_observed(), None);
+        assert_eq!(target.complete_reveal(1), None);
         target.set_overlay_occluded(true);
         assert!(target.overlay_occlusion.occluded.get());
+        assert!(!target.try_begin_frame());
         target.set_overlay_occluded(false);
         assert!(!target.overlay_occlusion.occluded.get());
         assert!(target.try_begin_frame());
         assert!(target.try_begin_surface_resize(800, 600));
+        target.set_overlay_occluded(false);
+        assert!(target.try_begin_frame());
+        // A later modal/recovery fallback independently closes the frame boundary again.
+        target.set_overlay_occluded(true);
+        assert!(!target.try_begin_frame());
+        target.set_overlay_occluded(false);
+        assert!(target.try_begin_frame());
     }
 
     #[test]

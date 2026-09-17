@@ -202,15 +202,22 @@ impl DialogFocusEpoch {
         (dialog_owns_focus && self.0.get() != u64::MAX).then(|| self.0.get())
     }
 
-    pub(crate) fn capture_sidebar_revival(&self, json: &str, owns_focus: bool) -> Option<u64> {
+    pub(crate) fn capture_persistent_action(
+        &self,
+        json: &str,
+        owns_focus: bool,
+        is_sidebar: bool,
+    ) -> Option<u64> {
         #[derive(serde::Deserialize)]
         struct IntentKind {
             #[serde(rename = "type")]
             kind: String,
         }
-        let explicit_revival = serde_json::from_str::<IntentKind>(json)
-            .is_ok_and(|intent| intent.kind == "reviveSession");
-        self.capture(owns_focus && explicit_revival)
+        let explicit_action = serde_json::from_str::<IntentKind>(json).is_ok_and(|intent| {
+            matches!(intent.kind.as_str(), "focusWindow" | "focusSessionOrPane")
+                || (is_sidebar && intent.kind == "reviveSession")
+        });
+        self.capture(owns_focus && explicit_action)
     }
 
     pub(crate) fn can_finish(&self, ticket: u64, window_active: bool, modal_visible: bool) -> bool {
@@ -406,8 +413,9 @@ mod dialog_restore_tests {
     fn sidebar_revival_focus_requires_explicit_intent_and_current_native_owner() {
         let epoch = super::DialogFocusEpoch::default();
         let json = r#"{"type":"reviveSession","session_id":"fixture"}"#;
-        let ticket = epoch.capture_sidebar_revival(json, true).unwrap();
-        assert!(epoch.capture_sidebar_revival(json, false).is_none());
+        let ticket = epoch.capture_persistent_action(json, true, true).unwrap();
+        assert!(epoch.capture_persistent_action(json, false, true).is_none());
+        assert!(epoch.capture_persistent_action(json, true, false).is_none());
         assert!(epoch.can_finish(ticket, true, false));
         epoch.changed();
         assert!(!epoch.can_finish(ticket, true, false));
@@ -419,7 +427,32 @@ mod dialog_restore_tests {
             r#"{"type":"createProject"}"#,
             r#"{"type":"__hydraPersistentFocusReady","token":"1"}"#,
         ] {
-            assert!(epoch.capture_sidebar_revival(json, true).is_none());
+            assert!(epoch.capture_persistent_action(json, true, true).is_none());
+        }
+    }
+
+    #[test]
+    fn persistent_navigation_requires_owned_surface_and_current_publication_epoch() {
+        for sidebar in [false, true] {
+            for kind in ["focusWindow", "focusSessionOrPane"] {
+                let epoch = super::DialogFocusEpoch::default();
+                let json = format!(r#"{{"type":"{kind}"}}"#);
+                let ticket = epoch
+                    .capture_persistent_action(&json, true, sidebar)
+                    .unwrap();
+                assert!(epoch
+                    .capture_persistent_action(&json, false, sidebar)
+                    .is_none());
+                assert!(!epoch.can_finish(ticket, false, false), "inactive window");
+                assert!(!epoch.can_finish(ticket, true, true), "new modal");
+                assert!(epoch.can_finish(ticket, true, false));
+                epoch.changed();
+                assert!(!epoch.can_finish(ticket, true, false), "new native input");
+                assert_eq!(
+                    epoch.capture_persistent_action(&json, true, sidebar),
+                    Some(ticket + 1)
+                );
+            }
         }
     }
 

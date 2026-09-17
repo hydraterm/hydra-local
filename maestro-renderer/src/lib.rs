@@ -16681,6 +16681,78 @@ enum HostControl {
     Exit,
 }
 
+// Opt-in, content-free measurement on the GTK owner thread. These spans observe the existing
+// frame path; they never change scheduling, modal visibility, input delivery, or surface policy.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum LinuxPresentStage {
+    DrawFrame,
+    RenderFrame,
+    RenderNeutral,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_present_timing_line(stage: LinuxPresentStage, start_us: i64, end_us: i64) -> String {
+    let stage = match stage {
+        LinuxPresentStage::DrawFrame => "draw_frame",
+        LinuxPresentStage::RenderFrame => "render_frame",
+        LinuxPresentStage::RenderNeutral => "render_neutral",
+    };
+    let elapsed_us = end_us.saturating_sub(start_us).max(0);
+    format!(
+        "linux-host present-timing stage={stage} start_us={start_us} end_us={end_us} elapsed_us={elapsed_us}"
+    )
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxPresentTiming {
+    stage: LinuxPresentStage,
+    start_us: i64,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxPresentTiming {
+    fn start(stage: LinuxPresentStage) -> Option<Self> {
+        (std::env::var("HYDRA_LINUX_PRESENT_TRACE").as_deref() == Ok("1")).then(|| Self {
+            stage,
+            start_us: glib::monotonic_time(),
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LinuxPresentTiming {
+    fn drop(&mut self) {
+        eprintln!(
+            "{}",
+            linux_present_timing_line(self.stage, self.start_us, glib::monotonic_time())
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_present_timing_tests {
+    use super::*;
+
+    #[test]
+    fn trace_contains_only_closed_stage_and_numeric_timings() {
+        for (stage, label) in [
+            (LinuxPresentStage::DrawFrame, "draw_frame"),
+            (LinuxPresentStage::RenderFrame, "render_frame"),
+            (LinuxPresentStage::RenderNeutral, "render_neutral"),
+        ] {
+            assert_eq!(
+                linux_present_timing_line(stage, 123, 456),
+                format!("linux-host present-timing stage={label} start_us=123 end_us=456 elapsed_us=333")
+            );
+        }
+        assert_eq!(
+            linux_present_timing_line(LinuxPresentStage::DrawFrame, 456, 123),
+            "linux-host present-timing stage=draw_frame start_us=456 end_us=123 elapsed_us=0"
+        );
+    }
+}
+
 impl ApplicationHandler<UserEvent> for App {
     // macOS/winit path — UNCHANGED. On Linux the window/event loop are owned by the Tao/GTK DashboardHost
     // (`linux_host`), so this winit `resumed` is never driven there; it is cfg'd out to an empty body so the
@@ -20214,7 +20286,11 @@ impl App {
         renderer.set_focus_indicator(None);
         renderer.set_inactive_dims(Vec::new());
         renderer.set_drop_highlight(None);
-        let outcome = renderer.render(None, None, None);
+        let outcome = {
+            #[cfg(target_os = "linux")]
+            let _present_timing = LinuxPresentTiming::start(LinuxPresentStage::RenderNeutral);
+            renderer.render(None, None, None)
+        };
         match self.frame_recovery.observe(outcome) {
             FrameRecoveryAction::None => HostControl::Continue,
             FrameRecoveryAction::RequestRedraw => {
@@ -20230,6 +20306,8 @@ impl App {
     /// to commit a correctly sized WGPU buffer immediately, while the existing ResizeCoalescer and
     /// settled refit remain the sole bounded path for daemon winsize changes during resize bursts.
     fn draw_frame(&mut self, sync_session_geometry: bool) -> HostControl {
+        #[cfg(target_os = "linux")]
+        let _present_timing = LinuxPresentTiming::start(LinuxPresentStage::DrawFrame);
         // Reader/writer fail-close publishes the atomic transport latch and wakes the owner before
         // physical cache teardown, which may still be waiting for an in-flight authority reader.
         // Honor that latch before ANY retry path: retry_pending_recoveries can otherwise discover a
@@ -20695,7 +20773,11 @@ impl App {
             // The divider is carried in `extra_dividers`. With no split, `grid` is the single pane.
             let grid_for_render = if split_active { None } else { grid };
             let legacy_bottom_overlay = LEGACY_BOTTOM_OVERLAY_VISIBLE.then_some(overlay.as_str());
-            frame_outcome = Some(r.render(grid_for_render, legacy_bottom_overlay, selection));
+            frame_outcome = Some({
+                #[cfg(target_os = "linux")]
+                let _present_timing = LinuxPresentTiming::start(LinuxPresentStage::RenderFrame);
+                r.render(grid_for_render, legacy_bottom_overlay, selection)
+            });
         }
 
         let Some(frame_outcome) = frame_outcome else {

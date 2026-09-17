@@ -434,17 +434,17 @@ fn mount_webview(
                     json.len()
                 );
                 if let Some(events) = ipc_events.as_ref() {
-                    // Revive is an explicit sidebar action, not a background activation. Capture
-                    // its current native input epoch before app/daemon work; the same epoch used
-                    // by dialog launches is invalidated by newer keys, presses, modals or activation.
-                    let owns_focus = surface == WebKitSurface::Sidebar && ipc_view.upgrade().is_some_and(|view| {
+                    // Explicit navigation in either persistent surface may return focus only
+                    // after exact publication. Revive remains sidebar-only; refresh and other
+                    // chrome actions carry no ticket. New input/modal/activation cancels it.
+                    let owns_focus = ipc_view.upgrade().is_some_and(|view| {
                         view.has_focus() && view.toplevel().and_downcast::<gtk::Window>().is_some_and(|window| {
                             window.is_active() && window.has_toplevel_focus()
                                 && window.focused_widget().as_ref() == Some(view.upcast_ref::<gtk::Widget>())
                         })
                     });
                     let dialog_focus_ticket = trusted_input_gate.focus_epoch
-                        .capture_sidebar_revival(&json, owns_focus);
+                        .capture_persistent_action(&json, owns_focus, surface == WebKitSurface::Sidebar);
                     if events
                         .send(RendererEvent::ReactChromeIntent { json, dialog_focus_ticket })
                         .is_err()
