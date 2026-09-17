@@ -3991,6 +3991,8 @@ pub struct NewTabForegroundRequest<'a> {
     /// project id). A later window reassignment is a refusal, never authority to adopt the new
     /// owner by window id alone.
     pub expected_project_id: Option<&'a str>,
+    /// Only an explicit dialog launch may transfer native focus at exact publication.
+    pub dialog_focus_ticket: Option<u64>,
 }
 
 /// Names the source tab and axis for a split-tab record on [`NewTabForegroundRequest`]. The new tab
@@ -4473,7 +4475,8 @@ where
         });
     };
     let renderer_handoff =
-        maestro_renderer::RendererAttachmentHandoff::new(attachment_handoff.clone());
+        maestro_renderer::RendererAttachmentHandoff::new(attachment_handoff.clone())
+            .with_dialog_focus(request.dialog_focus_ticket);
     let exact_snapshot = match maestro_shell::WindowLayoutService::new(request.paths)
         .load_viewport_snapshot(request.window_id)
     {
@@ -6592,6 +6595,7 @@ mod tests {
                 split_from: None,
                 split_source_session: None,
                 expected_project_id: None,
+                dialog_focus_ticket: None,
             },
             &granted,
             &env,
@@ -6732,6 +6736,7 @@ mod tests {
                 split_from: None,
                 split_source_session: None,
                 expected_project_id: None,
+                dialog_focus_ticket: None,
             },
             &granted,
             &env,
@@ -6956,6 +6961,7 @@ mod tests {
                 split_from: None,
                 split_source_session: None,
                 expected_project_id: None,
+                dialog_focus_ticket: None,
             },
             &env,
             &mut rt,
@@ -7054,6 +7060,7 @@ mod tests {
                 }),
                 split_source_session: Some(&source_session),
                 expected_project_id: Some("maestro-app-dev-project"),
+                dialog_focus_ticket: None,
             },
             &env,
             &mut rt,
@@ -7192,6 +7199,7 @@ mod tests {
             }),
             split_source_session: Some(&source_session),
             expected_project_id: Some("maestro-app-dev-project"),
+            dialog_focus_ticket: None,
         };
         let out = run_new_tab_foreground_pipeline_from_prepared_with_reprobe(
             request,
@@ -7339,6 +7347,7 @@ mod tests {
             }),
             split_source_session: Some(&source_session),
             expected_project_id: Some("maestro-app-dev-project"),
+            dialog_focus_ticket: None,
         };
         let out = run_new_tab_foreground_pipeline_from_prepared_with_reprobe(
             request,
@@ -7450,6 +7459,7 @@ mod tests {
                 split_from: None,
                 split_source_session: None,
                 expected_project_id: None,
+                dialog_focus_ticket: None,
             },
             &fresh,
             &env,
@@ -7550,6 +7560,7 @@ mod tests {
                 split_from: None,
                 split_source_session: None,
                 expected_project_id: None,
+                dialog_focus_ticket: None,
             },
             &fresh,
             &env,
@@ -9876,6 +9887,7 @@ mod tests {
                 split_from: None,
                 split_source_session: None,
                 expected_project_id: None,
+                dialog_focus_ticket: None,
             },
             &env,
             &mut rt,
@@ -9940,6 +9952,7 @@ mod tests {
                 split_from: None,
                 split_source_session: None,
                 expected_project_id: None,
+                dialog_focus_ticket: None,
             },
             &env,
             &mut rt,
@@ -11626,6 +11639,7 @@ mod tests {
                 split_from: None,
                 split_source_session: None,
                 expected_project_id: None,
+                dialog_focus_ticket: None,
             },
             &env,
             &mut rt,
@@ -11698,6 +11712,7 @@ mod tests {
                 split_from: None,
                 split_source_session: None,
                 expected_project_id: None,
+                dialog_focus_ticket: None,
             },
             &env,
             &mut runtime,
@@ -11781,6 +11796,7 @@ mod tests {
                 split_from: None,
                 split_source_session: None,
                 expected_project_id: None,
+                dialog_focus_ticket: None,
             };
             let result = if consent_route {
                 let workspace = match maestro_shell::load_one::<maestro_shell::Workspace>(
@@ -11841,6 +11857,7 @@ mod tests {
                 split_from: None,
                 split_source_session: None,
                 expected_project_id: None,
+                dialog_focus_ticket: None,
             },
             &env,
             &mut runtime,

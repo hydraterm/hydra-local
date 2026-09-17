@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FocusEvent, type KeyboardEvent } from 'react'
+import { useEffect, useRef, useState, type DragEvent, type FocusEvent, type KeyboardEvent } from 'react'
 import type {
   AgentKind,
   DashboardModel,
@@ -235,16 +235,20 @@ export function Topbar({
             owner.project_id === project.project_id && w.window_id === focusedWindowId
           const agents = windowAgents(w.tabs)
           const canClose = globalVisibleWindowCount > 1
+          // WebKit can enter successive tab children without an intervening dragover.
+          // Both events must accept the same locally owned drag destination.
+          const acceptLocalDrag = (event: DragEvent<HTMLSpanElement>) => {
+            if (!dragWindow || orderPending.current) return
+            event.preventDefault()
+            const rect = event.currentTarget.getBoundingClientRect()
+            setDropTarget({ id: w.window_id, edge: event.clientX < rect.left + rect.width / 2 ? 'before' : 'after' })
+          }
           return (
             <span
               key={`${owner.project_id}:${w.window_id}`}
               className={`window-tab-group ${isActive ? 'is-active' : ''} ${isRenaming ? 'is-renaming' : ''} ${dropTarget?.id === w.window_id ? `drop-${dropTarget.edge}` : ''}`}
-              onDragOver={(event) => {
-                if (!dragWindow || orderPending.current) return
-                event.preventDefault()
-                const rect = event.currentTarget.getBoundingClientRect()
-                setDropTarget({ id: w.window_id, edge: event.clientX < rect.left + rect.width / 2 ? 'before' : 'after' })
-              }}
+              onDragEnter={acceptLocalDrag}
+              onDragOver={acceptLocalDrag}
               onDragLeave={() => setDropTarget(null)}
               onDrop={(event) => {
                 event.preventDefault()

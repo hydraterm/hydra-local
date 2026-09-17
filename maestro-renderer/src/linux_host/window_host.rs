@@ -31,6 +31,7 @@ use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop};
 use tao::platform::unix::WindowExtUnix;
 use tao::window::WindowBuilder;
+use wry::WebViewExtUnix as _;
 
 use super::clipboard::GtkTerminalClipboardHost;
 use super::event_bridge::{
@@ -642,6 +643,19 @@ impl LinuxDashboardHost {
         let topbar_webview = topbar_surface
             .as_ref()
             .and_then(PersistentChromeSurface::webview);
+
+        if let (Some(topbar), Some(sidebar)) = (topbar_webview.as_ref(), sidebar_webview.as_ref()) {
+            // A native drag icon can expose the sibling sidebar's GTK fallback ground without
+            // invalidating its WebKit backing surface. Redraw the actual chrome owners when the
+            // source drag finishes; never paint the terminal or change focus/layout here.
+            let sidebar = sidebar.webview().downgrade();
+            topbar.webview().connect_drag_end(move |topbar, _| {
+                topbar.queue_draw();
+                if let Some(sidebar) = sidebar.upgrade() {
+                    sidebar.queue_draw();
+                }
+            });
+        }
 
         // The terminal IM context routes composition/commit for the terminal slot.
         let im_context = gtk::IMMulticontext::new();
@@ -1300,6 +1314,11 @@ impl LinuxDashboardHost {
                 Event::UserEvent(LinuxLoopEvent::PersistentSuppression(result)) => {
                     if let Some(overlay) = self.overlay_host.as_ref() {
                         overlay.handle_persistent_suppression_result(result);
+                    }
+                }
+                Event::UserEvent(LinuxLoopEvent::PersistentFocusReady(ready)) => {
+                    if let Some(overlay) = self.overlay_host.as_ref() {
+                        overlay.handle_persistent_focus_ready(ready);
                     }
                 }
                 Event::UserEvent(LinuxLoopEvent::OverlayNativeAllocationReady(result)) => {

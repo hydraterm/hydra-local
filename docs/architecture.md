@@ -1,7 +1,7 @@
-# Local desktop architecture
+# Local desktop and Remote library architecture
 
-This page describes the open local desktop in this repository. It does not describe the private
-Hydra Remote implementation.
+This page describes the open local desktop and reusable Remote libraries in this repository. It
+does not describe the private desktop agent or hosted service composition.
 
 ## Process and ownership map
 
@@ -49,6 +49,23 @@ processes. Closing or crashing the UI can disconnect a client without terminatin
 | `maestro-app` | Composes the domain, daemon client, renderer and typed dashboard intents |
 | `dashboard-ui` | Supplies React presentation chrome; it owns no PTY or generic shell execution |
 | `maestro-extension-api` | Defines the bounded, version-negotiated request seam for an optional sibling extension |
+
+## Reusable Remote libraries
+
+These separately built library objects sit outside the desktop process/ownership map above:
+
+- `web-client` provides the browser `WebrtcBridge`, connection lifecycle and typed signaling interfaces.
+- `hydra-cloud` provides the Node `SignalingBroker` and typed storage interfaces for bounded opaque
+  offer/answer/ICE metadata.
+
+They neither own PTYs nor acquire daemon authority. The browser transport validates pinned desktop
+answer proof and connection ownership; the broker checks device/account membership, revocation and
+session expiry. A deployment still supplies identity, enrollment, authorization, persistence and
+network composition. A connected DataChannel is not an authenticated terminal session, and the
+private desktop agent remains the final authority for Hydra terminal operations.
+
+See the [Remote library quickstart](developer/remote-core-quickstart.md) and
+[public/private boundary](public-private-boundary.md). These libraries are not a complete Remote app.
 
 ## Native terminal and dashboard composition
 
@@ -110,6 +127,8 @@ filesystem or extension boundary.
 - provider discovery and local launch defaults: `maestro-local-services`
 - dashboard presentation: `dashboard-ui`
 - typed intent orchestration and platform composition: `maestro-app`
+- reusable browser transport and signaling interfaces: `web-client`
+- reusable signaling broker and storage interfaces: `hydra-cloud`
 
 Protocol, durable-record, renderer-host and extension-boundary changes are architectural. Open an
 issue and obtain agreement before implementation, then update every affected mirror and test.

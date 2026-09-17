@@ -296,6 +296,7 @@ fn window_and_pane_focus_reject_primary_session_rebinding_during_preflight() {
 
 fn focus_event(window: &str) -> maestro_renderer::RendererEvent {
     maestro_renderer::RendererEvent::ReactChromeIntent {
+        dialog_focus_ticket: None,
         json: serde_json::json!({
             "type": "focusWindow", "project_id": "p-b", "window_id": window,
         })
@@ -325,8 +326,11 @@ fn settled_receiver_coalesces_c_before_b_and_preserves_other_events_once_in_orde
     .unwrap();
     tx.send(focus_event("w-c")).unwrap();
     let other = r#"{"type":"openWorkspace","project_id":"p-a"}"#;
-    tx.send(maestro_renderer::RendererEvent::ReactChromeIntent { json: other.into() })
-        .unwrap();
+    tx.send(maestro_renderer::RendererEvent::ReactChromeIntent {
+        json: other.into(),
+        dialog_focus_ticket: Some(42),
+    })
+    .unwrap();
     assert!(matches!(
         queue.drain_frontier(&rx, &stop, false, true, true, "w-a"),
         Frontier::Event(maestro_renderer::RendererEvent::SessionExited { code: Some(1), .. })
@@ -336,12 +340,19 @@ fn settled_receiver_coalesces_c_before_b_and_preserves_other_events_once_in_orde
         "w-b",
         "must not scan past lifecycle"
     );
-    let Frontier::Event(maestro_renderer::RendererEvent::ReactChromeIntent { json }) =
-        queue.drain_frontier(&rx, &stop, false, true, true, "w-a")
+    let Frontier::Event(maestro_renderer::RendererEvent::ReactChromeIntent {
+        json,
+        dialog_focus_ticket,
+    }) = queue.drain_frontier(&rx, &stop, false, true, true, "w-a")
     else {
         panic!("non-navigation intent must return to normal dispatch");
     };
     assert_eq!(json, other);
+    assert_eq!(
+        dialog_focus_ticket,
+        Some(42),
+        "frontier preserves native launch ownership"
+    );
     let Frontier::Ready(c) = queue.drain_frontier(&rx, &stop, false, true, true, "w-a") else {
         panic!("latest navigation remains available after normal event dispatch");
     };

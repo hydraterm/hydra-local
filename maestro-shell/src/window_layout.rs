@@ -8745,10 +8745,10 @@ impl<'a> WindowLayoutService<'a> {
     /// KEPT (its `session_id` is preserved so the live daemon session keeps running and can be
     /// relaunched from the dashboard) but `stashed` is set so the joined window-view strip hides it
     /// from the live layout while the dashboard surfaces it as a revive candidate. Like
-    /// [`close_pane`], it RE-PARENTS the stashed pane's children onto the stashed pane's own parent
-    /// (or detaches them to roots when the stashed pane was a root) so no survivor dangles at a hidden
-    /// parent, and the canonical replay re-snaps survivors into the smaller layout. Refuses to stash
-    /// the window's only NON-stashed pane (`CannotStashLastPane`) so a window is never left with an
+    /// [`close_pane`], it recomputes survivor geometry through the canonical reduction rule (or its
+    /// reconstruction fallback), so no live split points through the hidden pane. The prior split
+    /// is retained as historical `stashed_from` provenance, not as a future placement rule. Refuses
+    /// to stash the window's only NON-stashed pane (`CannotStashLastPane`) so a window is never left with an
     /// empty live layout. An unknown window/tab is a typed error.
     pub fn stash_pane(
         &self,
@@ -8780,9 +8780,9 @@ impl<'a> WindowLayoutService<'a> {
             if let Some(tab) = layout.tabs.iter_mut().find(|t| t.tab_id == tab_id) {
                 tab.stashed = true;
                 tab.stashed_from = inherited_parent;
-                // A stashed pane is no longer part of the live split chain; drop its own provenance and live
-                // geometry so live rendering never points through a hidden pane. The original provenance is
-                // preserved in `stashed_from` for `revive_pane`.
+                // Clear the hidden pane's live split link and geometry, keeping only historical
+                // provenance in `stashed_from`. Click revive uses the surviving live layout for
+                // placement and clears the saved provenance rather than restoring this old parent.
                 tab.split_from = None;
                 tab.pane_rect = None;
             }
@@ -8792,12 +8792,12 @@ impl<'a> WindowLayoutService<'a> {
 
     /// REVIVE a stashed pane into the live layout while preserving its session identity.
     ///
-    /// This is the layout-aware counterpart to [`set_tab_stashed(false)`]. It first restores the
-    /// pane's saved `stashed_from` parent when that parent is still live. If the old parent was closed
-    /// or is itself stashed, it falls back to a deterministic four-pane growth rule: the second pane
-    /// docks right of the sole survivor, the third docks below the first survivor, and the fourth
-    /// docks below a stable right-side/second survivor when available. The transition never revives
-    /// beyond four active panes.
+    /// This is the layout-aware counterpart to [`set_tab_stashed(false)`]. Placement follows the
+    /// canonical click-revive table for the current live geometry, irrespective of the saved
+    /// `stashed_from` parent: one survivor gains a right column; two columns gain a pane below the
+    /// left column; two rows gain a pane right of the top row. Other shapes follow the same table,
+    /// with a flat-chain fallback when live geometry cannot be reconstructed. Revive clears the
+    /// saved provenance and never exceeds four active panes.
     pub fn revive_pane(
         &self,
         window_id: &str,

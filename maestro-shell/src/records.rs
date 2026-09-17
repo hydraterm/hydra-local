@@ -361,9 +361,9 @@ pub struct TabRecord {
     /// `split_from` chain). When present, the renderer paints this rect directly — no layout guessing.
     #[serde(default)]
     pub pane_rect: Option<PaneRect>,
-    /// The split provenance this pane had when it was stashed. `split_from` is cleared while the pane
-    /// is hidden so the live renderer never points at a stashed parent, but revive can use this to
-    /// place the pane back into a sensible location instead of reviving every stashed pane as a root.
+    /// Historical split provenance from when this pane was stashed. `split_from` is cleared while
+    /// the pane is hidden so the live renderer never points through a stashed parent. Click revive
+    /// derives placement from the current live geometry, not this saved parent, and clears this field.
     #[serde(default)]
     pub stashed_from: Option<SplitFrom>,
     /// Whether this tab is STASHED: kept in the layout as a dormant/revivable row instead of being

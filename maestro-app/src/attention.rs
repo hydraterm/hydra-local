@@ -1,5 +1,9 @@
 //! The extracted attention projection / wire-string / clear-refresh / live-refresh cluster.
 
+#[cfg(test)]
+#[path = "waiting_attention_tests.rs"]
+mod waiting_attention_tests;
+
 use serde::Serialize;
 
 use crate::{
@@ -61,9 +65,9 @@ pub fn attention_needs_attention(attention: &AttentionJson) -> bool {
 }
 
 /// A tab's state-aware attention indicator: the persisted attention `kind` plus the single
-/// deterministic ASCII `marker` a tab strip draws for it. Pure serde DTO derived ONLY from
-/// [`AttentionJson`] by [`tab_attention_indicator`]; it carries no daemon/renderer/task signal and is
-/// the app-side projection mirrored by the renderer's own indicator type. `kind` is the persisted
+/// deterministic ASCII `marker` a tab strip draws for it. Pure serde DTO normally derived from
+/// [`AttentionJson`]; the joined view can override stale done/activity for a declared live wait.
+/// This app-side projection is mirrored by the renderer's own indicator type. `kind` is an existing
 /// attention string (`activity`/`needs_input`/`error`/`done`); `marker` is its fixed glyph.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct TabAttentionIndicator {

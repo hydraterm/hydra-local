@@ -1,13 +1,17 @@
 # Third-party notices
 
-Hydra Local's first-party code is MIT licensed. It depends on third-party software under the terms
-listed below. This inventory is generated from the exact locked Rust and dashboard
-dependency graphs; it does not change or replace any upstream licence.
+Hydra's first-party public source is MIT licensed. It uses third-party software under the terms
+listed below. This inventory covers the locked Rust and dashboard graphs plus the separate
+Remote library development-tool locks; it does not change or replace any upstream licence.
 
-- `Cargo.lock` SHA-256: `3ece808f8a21bbc71fa9ebec096f5b64ff433629b308bf7cc3b7be4c8e548e16`
+- `Cargo.lock` SHA-256: `26d6dd5cfd23c9af278ebe66eeb3dd882aef87a20572ccbc9351fbf8f7c7fce1`
 - `dashboard-ui/package-lock.json` SHA-256: `1b24584cf696a0a1993ec68a943b0a361116b7e765e9c2cd464a19e4da140401`
 - Rust dependency versions: 543
 - npm dependency versions: 188
+- `web-client/package-lock.json` SHA-256: `ef9c130a7481c2c23f7a02197beccc12a6925c99bc1ab281d347ba9a952c88e3`
+- Browser-core development dependency versions: 105
+- `hydra-cloud/package-lock.json` SHA-256: `325f475dd0ab2f374d3086d4ed895da61fa0fb59a7c3affc9b1fb9115996d3c8`
+- Broker-core development dependency versions: 104
 
 The source repository does not vendor these dependencies. Package managers retrieve each
 dependency from its named upstream, where the complete corresponding licence and copyright
@@ -774,8 +778,238 @@ obligation that applies to the exact dependency set they ship.
 | `xmlchars` | `2.2.0` | `MIT` | [source](https://www.npmjs.com/package/xmlchars) |
 | `yallist` | `3.1.1` | `ISC` | [source](https://www.npmjs.com/package/yallist) |
 
+## Remote library development tools
+
+The following locks are build/test tools for the separately consumable Remote libraries,
+not additions to the desktop binary dependency policy. The reviewed library artifacts contain
+only Hydra code, declarations and their MIT licence; their runtime module graphs contain no
+third-party package code. Recheck that boundary after source or build changes.
+
+These tables include locked optional platform tools, not a claim that every platform archive
+was installed or its complete licence material reviewed. Declared metadata can be less detailed
+than bundled tool notices. Tool redistributors must review the actual material they ship.
+
+### Locked browser-core development dependencies
+
+| Package | Version | Declared licence | Upstream |
+|---|---:|---|---|
+| `@esbuild/aix-ppc64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/aix-ppc64) |
+| `@esbuild/android-arm` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/android-arm) |
+| `@esbuild/android-arm64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/android-arm64) |
+| `@esbuild/android-x64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/android-x64) |
+| `@esbuild/darwin-arm64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/darwin-arm64) |
+| `@esbuild/darwin-x64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/darwin-x64) |
+| `@esbuild/freebsd-arm64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/freebsd-arm64) |
+| `@esbuild/freebsd-x64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/freebsd-x64) |
+| `@esbuild/linux-arm` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/linux-arm) |
+| `@esbuild/linux-arm64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/linux-arm64) |
+| `@esbuild/linux-ia32` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/linux-ia32) |
+| `@esbuild/linux-loong64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/linux-loong64) |
+| `@esbuild/linux-mips64el` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/linux-mips64el) |
+| `@esbuild/linux-ppc64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/linux-ppc64) |
+| `@esbuild/linux-riscv64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/linux-riscv64) |
+| `@esbuild/linux-s390x` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/linux-s390x) |
+| `@esbuild/linux-x64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/linux-x64) |
+| `@esbuild/netbsd-arm64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/netbsd-arm64) |
+| `@esbuild/netbsd-x64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/netbsd-x64) |
+| `@esbuild/openbsd-arm64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/openbsd-arm64) |
+| `@esbuild/openbsd-x64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/openbsd-x64) |
+| `@esbuild/openharmony-arm64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/openharmony-arm64) |
+| `@esbuild/sunos-x64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/sunos-x64) |
+| `@esbuild/win32-arm64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/win32-arm64) |
+| `@esbuild/win32-ia32` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/win32-ia32) |
+| `@esbuild/win32-x64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/win32-x64) |
+| `@jridgewell/sourcemap-codec` | `1.5.5` | `MIT` | [source](https://www.npmjs.com/package/@jridgewell/sourcemap-codec) |
+| `@rollup/rollup-android-arm-eabi` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-android-arm-eabi) |
+| `@rollup/rollup-android-arm64` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-android-arm64) |
+| `@rollup/rollup-darwin-arm64` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-darwin-arm64) |
+| `@rollup/rollup-darwin-x64` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-darwin-x64) |
+| `@rollup/rollup-freebsd-arm64` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-freebsd-arm64) |
+| `@rollup/rollup-freebsd-x64` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-freebsd-x64) |
+| `@rollup/rollup-linux-arm-gnueabihf` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-linux-arm-gnueabihf) |
+| `@rollup/rollup-linux-arm-musleabihf` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-linux-arm-musleabihf) |
+| `@rollup/rollup-linux-arm64-gnu` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-linux-arm64-gnu) |
+| `@rollup/rollup-linux-arm64-musl` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-linux-arm64-musl) |
+| `@rollup/rollup-linux-loong64-gnu` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-linux-loong64-gnu) |
+| `@rollup/rollup-linux-loong64-musl` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-linux-loong64-musl) |
+| `@rollup/rollup-linux-ppc64-gnu` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-linux-ppc64-gnu) |
+| `@rollup/rollup-linux-ppc64-musl` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-linux-ppc64-musl) |
+| `@rollup/rollup-linux-riscv64-gnu` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-linux-riscv64-gnu) |
+| `@rollup/rollup-linux-riscv64-musl` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-linux-riscv64-musl) |
+| `@rollup/rollup-linux-s390x-gnu` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-linux-s390x-gnu) |
+| `@rollup/rollup-linux-x64-gnu` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-linux-x64-gnu) |
+| `@rollup/rollup-linux-x64-musl` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-linux-x64-musl) |
+| `@rollup/rollup-openbsd-x64` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-openbsd-x64) |
+| `@rollup/rollup-openharmony-arm64` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-openharmony-arm64) |
+| `@rollup/rollup-win32-arm64-msvc` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-win32-arm64-msvc) |
+| `@rollup/rollup-win32-ia32-msvc` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-win32-ia32-msvc) |
+| `@rollup/rollup-win32-x64-gnu` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-win32-x64-gnu) |
+| `@rollup/rollup-win32-x64-msvc` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-win32-x64-msvc) |
+| `@types/chai` | `5.2.3` | `MIT` | [source](https://www.npmjs.com/package/@types/chai) |
+| `@types/deep-eql` | `4.0.2` | `MIT` | [source](https://www.npmjs.com/package/@types/deep-eql) |
+| `@types/estree` | `1.0.9` | `MIT` | [source](https://www.npmjs.com/package/@types/estree) |
+| `@types/node` | `26.0.1` | `MIT` | [source](https://www.npmjs.com/package/@types/node) |
+| `@vitest/expect` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/expect) |
+| `@vitest/mocker` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/mocker) |
+| `@vitest/pretty-format` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/pretty-format) |
+| `@vitest/pretty-format` | `3.2.7` | `MIT` | [source](https://www.npmjs.com/package/@vitest/pretty-format) |
+| `@vitest/runner` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/runner) |
+| `@vitest/snapshot` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/snapshot) |
+| `@vitest/spy` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/spy) |
+| `@vitest/utils` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/utils) |
+| `assertion-error` | `2.0.1` | `MIT` | [source](https://www.npmjs.com/package/assertion-error) |
+| `cac` | `6.7.14` | `MIT` | [source](https://www.npmjs.com/package/cac) |
+| `chai` | `5.3.3` | `MIT` | [source](https://www.npmjs.com/package/chai) |
+| `check-error` | `2.1.3` | `MIT` | [source](https://www.npmjs.com/package/check-error) |
+| `debug` | `4.4.3` | `MIT` | [source](https://www.npmjs.com/package/debug) |
+| `deep-eql` | `5.0.2` | `MIT` | [source](https://www.npmjs.com/package/deep-eql) |
+| `es-module-lexer` | `1.7.0` | `MIT` | [source](https://www.npmjs.com/package/es-module-lexer) |
+| `esbuild` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/esbuild) |
+| `estree-walker` | `3.0.3` | `MIT` | [source](https://www.npmjs.com/package/estree-walker) |
+| `expect-type` | `1.3.0` | `Apache-2.0` | [source](https://www.npmjs.com/package/expect-type) |
+| `fdir` | `6.5.0` | `MIT` | [source](https://www.npmjs.com/package/fdir) |
+| `fsevents` | `2.3.3` | `MIT` | [source](https://www.npmjs.com/package/fsevents) |
+| `js-tokens` | `9.0.1` | `MIT` | [source](https://www.npmjs.com/package/js-tokens) |
+| `loupe` | `3.2.1` | `MIT` | [source](https://www.npmjs.com/package/loupe) |
+| `magic-string` | `0.30.21` | `MIT` | [source](https://www.npmjs.com/package/magic-string) |
+| `ms` | `2.1.3` | `MIT` | [source](https://www.npmjs.com/package/ms) |
+| `nanoid` | `3.3.15` | `MIT` | [source](https://www.npmjs.com/package/nanoid) |
+| `pathe` | `2.0.3` | `MIT` | [source](https://www.npmjs.com/package/pathe) |
+| `pathval` | `2.0.1` | `MIT` | [source](https://www.npmjs.com/package/pathval) |
+| `picocolors` | `1.1.1` | `ISC` | [source](https://www.npmjs.com/package/picocolors) |
+| `picomatch` | `4.0.4` | `MIT` | [source](https://www.npmjs.com/package/picomatch) |
+| `picomatch` | `4.0.5` | `MIT` | [source](https://www.npmjs.com/package/picomatch) |
+| `postcss` | `8.5.15` | `MIT` | [source](https://www.npmjs.com/package/postcss) |
+| `rollup` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/rollup) |
+| `siginfo` | `2.0.0` | `ISC` | [source](https://www.npmjs.com/package/siginfo) |
+| `source-map-js` | `1.2.1` | `BSD-3-Clause` | [source](https://www.npmjs.com/package/source-map-js) |
+| `stackback` | `0.0.2` | `MIT` | [source](https://www.npmjs.com/package/stackback) |
+| `std-env` | `3.10.0` | `MIT` | [source](https://www.npmjs.com/package/std-env) |
+| `strip-literal` | `3.1.0` | `MIT` | [source](https://www.npmjs.com/package/strip-literal) |
+| `tinybench` | `2.9.0` | `MIT` | [source](https://www.npmjs.com/package/tinybench) |
+| `tinyexec` | `0.3.2` | `MIT` | [source](https://www.npmjs.com/package/tinyexec) |
+| `tinyglobby` | `0.2.17` | `MIT` | [source](https://www.npmjs.com/package/tinyglobby) |
+| `tinypool` | `1.1.1` | `MIT` | [source](https://www.npmjs.com/package/tinypool) |
+| `tinyrainbow` | `2.0.0` | `MIT` | [source](https://www.npmjs.com/package/tinyrainbow) |
+| `tinyspy` | `4.0.4` | `MIT` | [source](https://www.npmjs.com/package/tinyspy) |
+| `typescript` | `5.9.3` | `Apache-2.0` | [source](https://www.npmjs.com/package/typescript) |
+| `undici-types` | `8.3.0` | `MIT` | [source](https://www.npmjs.com/package/undici-types) |
+| `vite` | `6.4.3` | `MIT` | [source](https://www.npmjs.com/package/vite) |
+| `vite-node` | `3.2.4` | `MIT` | [source](https://www.npmjs.com/package/vite-node) |
+| `vitest` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/vitest) |
+| `why-is-node-running` | `2.3.0` | `MIT` | [source](https://www.npmjs.com/package/why-is-node-running) |
+
+### Locked broker-core development dependencies
+
+| Package | Version | Declared licence | Upstream |
+|---|---:|---|---|
+| `@esbuild/aix-ppc64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/aix-ppc64) |
+| `@esbuild/android-arm` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/android-arm) |
+| `@esbuild/android-arm64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/android-arm64) |
+| `@esbuild/android-x64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/android-x64) |
+| `@esbuild/darwin-arm64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/darwin-arm64) |
+| `@esbuild/darwin-x64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/darwin-x64) |
+| `@esbuild/freebsd-arm64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/freebsd-arm64) |
+| `@esbuild/freebsd-x64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/freebsd-x64) |
+| `@esbuild/linux-arm` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/linux-arm) |
+| `@esbuild/linux-arm64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/linux-arm64) |
+| `@esbuild/linux-ia32` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/linux-ia32) |
+| `@esbuild/linux-loong64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/linux-loong64) |
+| `@esbuild/linux-mips64el` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/linux-mips64el) |
+| `@esbuild/linux-ppc64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/linux-ppc64) |
+| `@esbuild/linux-riscv64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/linux-riscv64) |
+| `@esbuild/linux-s390x` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/linux-s390x) |
+| `@esbuild/linux-x64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/linux-x64) |
+| `@esbuild/netbsd-arm64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/netbsd-arm64) |
+| `@esbuild/netbsd-x64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/netbsd-x64) |
+| `@esbuild/openbsd-arm64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/openbsd-arm64) |
+| `@esbuild/openbsd-x64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/openbsd-x64) |
+| `@esbuild/openharmony-arm64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/openharmony-arm64) |
+| `@esbuild/sunos-x64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/sunos-x64) |
+| `@esbuild/win32-arm64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/win32-arm64) |
+| `@esbuild/win32-ia32` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/win32-ia32) |
+| `@esbuild/win32-x64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/win32-x64) |
+| `@jridgewell/sourcemap-codec` | `1.5.5` | `MIT` | [source](https://www.npmjs.com/package/@jridgewell/sourcemap-codec) |
+| `@rollup/rollup-android-arm-eabi` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-android-arm-eabi) |
+| `@rollup/rollup-android-arm64` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-android-arm64) |
+| `@rollup/rollup-darwin-arm64` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-darwin-arm64) |
+| `@rollup/rollup-darwin-x64` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-darwin-x64) |
+| `@rollup/rollup-freebsd-arm64` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-freebsd-arm64) |
+| `@rollup/rollup-freebsd-x64` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-freebsd-x64) |
+| `@rollup/rollup-linux-arm-gnueabihf` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-linux-arm-gnueabihf) |
+| `@rollup/rollup-linux-arm-musleabihf` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-linux-arm-musleabihf) |
+| `@rollup/rollup-linux-arm64-gnu` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-linux-arm64-gnu) |
+| `@rollup/rollup-linux-arm64-musl` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-linux-arm64-musl) |
+| `@rollup/rollup-linux-loong64-gnu` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-linux-loong64-gnu) |
+| `@rollup/rollup-linux-loong64-musl` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-linux-loong64-musl) |
+| `@rollup/rollup-linux-ppc64-gnu` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-linux-ppc64-gnu) |
+| `@rollup/rollup-linux-ppc64-musl` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-linux-ppc64-musl) |
+| `@rollup/rollup-linux-riscv64-gnu` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-linux-riscv64-gnu) |
+| `@rollup/rollup-linux-riscv64-musl` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-linux-riscv64-musl) |
+| `@rollup/rollup-linux-s390x-gnu` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-linux-s390x-gnu) |
+| `@rollup/rollup-linux-x64-gnu` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-linux-x64-gnu) |
+| `@rollup/rollup-linux-x64-musl` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-linux-x64-musl) |
+| `@rollup/rollup-openbsd-x64` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-openbsd-x64) |
+| `@rollup/rollup-openharmony-arm64` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-openharmony-arm64) |
+| `@rollup/rollup-win32-arm64-msvc` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-win32-arm64-msvc) |
+| `@rollup/rollup-win32-ia32-msvc` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-win32-ia32-msvc) |
+| `@rollup/rollup-win32-x64-gnu` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-win32-x64-gnu) |
+| `@rollup/rollup-win32-x64-msvc` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-win32-x64-msvc) |
+| `@types/chai` | `5.2.3` | `MIT` | [source](https://www.npmjs.com/package/@types/chai) |
+| `@types/deep-eql` | `4.0.2` | `MIT` | [source](https://www.npmjs.com/package/@types/deep-eql) |
+| `@types/estree` | `1.0.9` | `MIT` | [source](https://www.npmjs.com/package/@types/estree) |
+| `@types/node` | `22.20.0` | `MIT` | [source](https://www.npmjs.com/package/@types/node) |
+| `@vitest/expect` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/expect) |
+| `@vitest/mocker` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/mocker) |
+| `@vitest/pretty-format` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/pretty-format) |
+| `@vitest/pretty-format` | `3.2.7` | `MIT` | [source](https://www.npmjs.com/package/@vitest/pretty-format) |
+| `@vitest/runner` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/runner) |
+| `@vitest/snapshot` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/snapshot) |
+| `@vitest/spy` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/spy) |
+| `@vitest/utils` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/utils) |
+| `assertion-error` | `2.0.1` | `MIT` | [source](https://www.npmjs.com/package/assertion-error) |
+| `cac` | `6.7.14` | `MIT` | [source](https://www.npmjs.com/package/cac) |
+| `chai` | `5.3.3` | `MIT` | [source](https://www.npmjs.com/package/chai) |
+| `check-error` | `2.1.3` | `MIT` | [source](https://www.npmjs.com/package/check-error) |
+| `debug` | `4.4.3` | `MIT` | [source](https://www.npmjs.com/package/debug) |
+| `deep-eql` | `5.0.2` | `MIT` | [source](https://www.npmjs.com/package/deep-eql) |
+| `es-module-lexer` | `1.7.0` | `MIT` | [source](https://www.npmjs.com/package/es-module-lexer) |
+| `esbuild` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/esbuild) |
+| `estree-walker` | `3.0.3` | `MIT` | [source](https://www.npmjs.com/package/estree-walker) |
+| `expect-type` | `1.3.0` | `Apache-2.0` | [source](https://www.npmjs.com/package/expect-type) |
+| `fdir` | `6.5.0` | `MIT` | [source](https://www.npmjs.com/package/fdir) |
+| `fsevents` | `2.3.3` | `MIT` | [source](https://www.npmjs.com/package/fsevents) |
+| `js-tokens` | `9.0.1` | `MIT` | [source](https://www.npmjs.com/package/js-tokens) |
+| `loupe` | `3.2.1` | `MIT` | [source](https://www.npmjs.com/package/loupe) |
+| `magic-string` | `0.30.21` | `MIT` | [source](https://www.npmjs.com/package/magic-string) |
+| `ms` | `2.1.3` | `MIT` | [source](https://www.npmjs.com/package/ms) |
+| `nanoid` | `3.3.16` | `MIT` | [source](https://www.npmjs.com/package/nanoid) |
+| `pathe` | `2.0.3` | `MIT` | [source](https://www.npmjs.com/package/pathe) |
+| `pathval` | `2.0.1` | `MIT` | [source](https://www.npmjs.com/package/pathval) |
+| `picocolors` | `1.1.1` | `ISC` | [source](https://www.npmjs.com/package/picocolors) |
+| `picomatch` | `4.0.5` | `MIT` | [source](https://www.npmjs.com/package/picomatch) |
+| `postcss` | `8.5.21` | `MIT` | [source](https://www.npmjs.com/package/postcss) |
+| `rollup` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/rollup) |
+| `siginfo` | `2.0.0` | `ISC` | [source](https://www.npmjs.com/package/siginfo) |
+| `source-map-js` | `1.2.1` | `BSD-3-Clause` | [source](https://www.npmjs.com/package/source-map-js) |
+| `stackback` | `0.0.2` | `MIT` | [source](https://www.npmjs.com/package/stackback) |
+| `std-env` | `3.10.0` | `MIT` | [source](https://www.npmjs.com/package/std-env) |
+| `strip-literal` | `3.1.0` | `MIT` | [source](https://www.npmjs.com/package/strip-literal) |
+| `tinybench` | `2.9.0` | `MIT` | [source](https://www.npmjs.com/package/tinybench) |
+| `tinyexec` | `0.3.2` | `MIT` | [source](https://www.npmjs.com/package/tinyexec) |
+| `tinyglobby` | `0.2.17` | `MIT` | [source](https://www.npmjs.com/package/tinyglobby) |
+| `tinypool` | `1.1.1` | `MIT` | [source](https://www.npmjs.com/package/tinypool) |
+| `tinyrainbow` | `2.0.0` | `MIT` | [source](https://www.npmjs.com/package/tinyrainbow) |
+| `tinyspy` | `4.0.4` | `MIT` | [source](https://www.npmjs.com/package/tinyspy) |
+| `typescript` | `5.9.3` | `Apache-2.0` | [source](https://www.npmjs.com/package/typescript) |
+| `undici-types` | `6.21.0` | `MIT` | [source](https://www.npmjs.com/package/undici-types) |
+| `vite` | `6.4.3` | `MIT` | [source](https://www.npmjs.com/package/vite) |
+| `vite-node` | `3.2.4` | `MIT` | [source](https://www.npmjs.com/package/vite-node) |
+| `vitest` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/vitest) |
+| `why-is-node-running` | `2.3.0` | `MIT` | [source](https://www.npmjs.com/package/why-is-node-running) |
+
 ## Updating this file
 
-Run `python3 scripts/generate-third-party-notices.py` after either lockfile changes, then
+Run `python3 scripts/generate-third-party-notices.py` after any of the four lockfiles changes, then
 review every changed licence expression and upstream source before accepting the result.
 The generator failing on missing licence metadata is intentional.

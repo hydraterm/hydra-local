@@ -18,8 +18,11 @@ fn scrolled_app() -> (App, Arc<Shared>) {
     let mut scrollback = shared.scrollback.lock().unwrap();
     assert_eq!(scrollback.view_offset, 3);
     scrollback.history_len = Some(40);
-    scrollback.historical = Some(Arc::new(grid("primary-gen", 20, 6, "older transcript")));
-    scrollback.historical_generation = Some(SessionGeneration("primary-gen".into()));
+    scrollback.historical = Some(crate::client::HistoricalView::new(
+        Arc::new(grid("primary-gen", 20, 6, "older transcript")),
+        3,
+        40,
+    ));
     drop(scrollback);
     (app, shared)
 }
@@ -54,7 +57,8 @@ fn periodic_remote_status_keeps_scrolled_transcript_and_sends_no_resize() {
         flush_scheduled_refit(&mut app);
         let paint = shared.pane_paint("primary", "primary");
         assert_eq!(
-            paint.scrolled_offset, 3,
+            paint.scrolled_offset(),
+            3,
             "status refresh must not return to live"
         );
         assert!(Arc::ptr_eq(&paint.paint_grid().unwrap(), &historical));
@@ -71,7 +75,7 @@ fn legacy_display_only_owner_summary_cannot_resize_or_reset_scrollback() {
     for remote in [false, true, true, false] {
         app.handle_user_event(UserEvent::SetWinsizeOwner { remote });
         flush_scheduled_refit(&mut app);
-        assert_eq!(shared.pane_paint("primary", "primary").scrolled_offset, 3);
+        assert_eq!(shared.pane_paint("primary", "primary").scrolled_offset(), 3);
         assert!(shared.drain_test_requests().is_empty());
     }
 }
@@ -87,7 +91,7 @@ fn equal_normalized_ownership_keeps_history_but_real_reclaim_still_refits() {
         remote_owned_sessions: vec!["other-pane".into(), "primary".into(), "primary".into()],
     });
     assert!(app.pending_resize_refit_at.is_none());
-    assert_eq!(shared.pane_paint("primary", "primary").scrolled_offset, 3);
+    assert_eq!(shared.pane_paint("primary", "primary").scrolled_offset(), 3);
     assert!(shared.drain_test_requests().is_empty());
 
     // A negotiated ownership release, unlike its display-only summary, must still
@@ -100,7 +104,7 @@ fn equal_normalized_ownership_keeps_history_but_real_reclaim_still_refits() {
     });
     assert!(app.pending_resize_refit_at.is_some());
     flush_scheduled_refit(&mut app);
-    assert_eq!(shared.pane_paint("primary", "primary").scrolled_offset, 0);
+    assert_eq!(shared.pane_paint("primary", "primary").scrolled_offset(), 0);
     let requests = shared.drain_test_requests();
     let resized: Vec<_> = requests
         .iter()

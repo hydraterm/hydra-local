@@ -16,6 +16,9 @@ Projects, windows, panes, terminal history and retained PTY sessions live on you
 
 ## Start here
 
+- [Remote library quickstart](docs/developer/remote-core-quickstart.md) — build the reusable browser
+  transport and signaling broker, and implement your own adapters.
+
 - [Frequently asked questions](FAQ.md) — tmux, Electron, retention, Remote, security and Herdr.
 - [Architecture](docs/architecture.md) — PTY ownership, native rendering, dashboard composition and
   the macOS/Linux host split.
@@ -49,8 +52,10 @@ to the hosted service.
 - local projects, windows, panes and layouts;
 - local provider and previous-session discovery;
 - the desktop dashboard;
-- local macOS and Linux platform support; and
-- the bounded API used to request optional desktop extensions.
+- local macOS and Linux platform support;
+- the bounded API used to request optional desktop extensions;
+- the reusable browser WebRTC transport in `web-client`; and
+- the content-blind signaling broker in `hydra-cloud`.
 
 ### Provider interoperability
 
@@ -62,17 +67,20 @@ be launched and resumed through their CLIs, but Hydra does not read their histor
 
 ## Open source and Hydra Remote
 
-This repository contains Hydra's local desktop. You can inspect it, build it, fork it and propose
-changes under the [MIT License](LICENSE).
+Hydra's local desktop and the Remote transport/signaling libraries in this repository are open
+source under the [MIT License](LICENSE). You can build, fork, extend and contribute to them.
 
-Hydra Remote is a separate hosted product. Its desktop agent, browser client, coordination service,
-relays, identity, entitlement and billing systems are not in this repository and are not open
-source. The private agent, not this application, decides whether a remote peer is authenticated and
-authorized.
+The Remote libraries provide a browser WebRTC transport and a content-blind signaling broker with
+typed integration interfaces. They do not require Clerk or Stripe. They are reusable components,
+not a complete self-hosted Remote application or a replacement for Hydra's desktop remote agent.
 
-We publish the local desktop so that the code which owns terminal sessions and runs on your machine
-can be reviewed. See [the public/private boundary](docs/public-private-boundary.md) for the exact
-scope and threat model.
+The hosted account website, Clerk and Stripe integrations, account/billing operations, enrollment
+and authorization-service composition, deployment configuration, relay operation and desktop agent
+remain outside this source release. The local desktop works independently of those services.
+Installing the libraries does not enable Remote controls in a source-built desktop or grant access
+to HydraTerms' hosted service. The private agent remains the final authority for remote terminal
+operations. See [the public/private boundary](docs/public-private-boundary.md) for the exact scope
+and threat model.
 
 ## Build
 
@@ -128,7 +136,7 @@ Do not report vulnerabilities in a public issue. Follow [SECURITY.md](SECURITY.m
 
 ## Licence and marks
 
-Hydra's first-party local desktop code is licensed under the [MIT License](LICENSE). That licence
+First-party code in this repository is licensed under the [MIT License](LICENSE). That licence
 does not include the private Hydra Remote implementation or hosted service, and it grants no rights
 to HydraTerms names or logos. See [TRADEMARKS.md](TRADEMARKS.md).
 

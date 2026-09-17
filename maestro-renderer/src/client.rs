@@ -854,14 +854,14 @@ impl OutboundQueue {
 
 /// Renderer-owned scrollback VIEW state. The daemon is stateless about
 /// the viewport — it pins its live grid at the bottom and only answers read-only
-/// `Scrollback` queries. This struct is the renderer's entire notion of "where the
-/// user has scrolled to". Touched by BOTH threads: the UI thread writes `view_offset`
-/// on wheel/key and reads `historical` in `draw`; the reader thread writes
-/// `historical`/`history_len` when a `ScrollbackRows` reply arrives. Hence the Mutex.
+/// `Scrollback` queries. Desired intent is distinct from the last accepted historical
+/// pixels: another request can be pending while those pixels remain on screen. The UI
+/// writes `view_offset`; the reader installs `historical` and updates the planning
+/// `history_len` when a reply arrives. Both threads access this state under its Mutex.
 #[derive(Default)]
 pub struct ScrollbackState {
-    /// How far the viewport is scrolled UP from the live bottom, in rows. `0` means
-    /// "live" (paint `Shared.grid` exactly as before). `> 0` means paint `historical`.
+    /// Desired offset UP from the live bottom, in rows. `0` means "live"; `> 0` paints
+    /// accepted `historical` while waiting for this intent's response, or live if none yet.
     /// Normally clamped to the last-known `history_len`. An explicit upward gesture at
     /// that cached ceiling may move provisionally by at most one page so the daemon can
     /// report a newer depth after live output grows history.
@@ -875,10 +875,7 @@ pub struct ScrollbackState {
     /// The synthetic snapshot built from the latest `ScrollbackRows` window, ready to
     /// paint through the SAME render path as a live grid. `None` until a reply arrives
     /// (or after returning to live, where it is cleared).
-    pub historical: Option<Arc<GridSnapshot>>,
-    /// The live grid generation the `historical` rows belong to. A `ScrollbackRows`
-    /// for a different (older/newer) generation than the live grid is stale and ignored.
-    pub historical_generation: Option<SessionGeneration>,
+    pub historical: Option<HistoricalView>,
     /// Monotonic owner-local view intent. Replies are untagged by the daemon, so this epoch plus the
     /// single exactly-correlated admitted query prevents an older clamped reply from overwriting a
     /// newer scroll or return-to-live intent.
@@ -891,8 +888,27 @@ pub struct ScrollbackState {
     pub(crate) discard_admitted_reply_metadata: bool,
 }
 
+/// One accepted reply's pixels and served coordinates. Offset/depth describe this snapshot's
+/// revision, not an absolute history origin or its position after later output/eviction.
+#[derive(Clone)]
+pub struct HistoricalView {
+    pub(crate) grid: Arc<GridSnapshot>,
+    served_offset: u32,
+    history_len: u32,
+}
+
+impl HistoricalView {
+    pub(crate) fn new(grid: Arc<GridSnapshot>, served_offset: u32, history_len: u32) -> Self {
+        Self {
+            grid,
+            served_offset,
+            history_len,
+        }
+    }
+}
+
 impl ScrollbackState {
-    /// Are we currently showing history (vs. the live bottom)?
+    /// Is history requested? Keep routing local while a scroll reply is still pending.
     pub fn is_scrolled(&self) -> bool {
         self.view_offset > 0
     }
@@ -902,7 +918,6 @@ impl ScrollbackState {
         let _ = self.advance_intent();
         self.view_offset = 0;
         self.historical = None;
-        self.historical_generation = None;
     }
 
     pub(crate) fn advance_intent(&mut self) -> Option<u64> {
@@ -927,7 +942,6 @@ impl ScrollbackState {
         self.view_offset = 0;
         self.history_len = None;
         self.historical = None;
-        self.historical_generation = None;
     }
 }
 
@@ -1393,8 +1407,7 @@ fn apply_scrollback_payload(
             return false;
         }
         sb.view_offset = served;
-        sb.historical = Some(snap);
-        sb.historical_generation = Some(generation);
+        sb.historical = Some(HistoricalView::new(snap, served, history_len));
     }
     true
 }
@@ -1643,7 +1656,7 @@ pub type PaneSnapshot = (Option<Arc<GridSnapshot>>, Option<Option<i32>>);
 /// `live` is the pane's latest accepted live grid (`None` until its first frame). `exited` is
 /// `Some(code)` once its process exited. The remaining fields are the pane's OWN scrollback view
 /// (`PaneStore::scrollback` for a non-primary pane; the primary's dedicated [`Shared::scrollback`]
-/// for the primary), so paint reads the scrollback of the pane being drawn: `scrolled_offset > 0`
+/// for the primary), so paint reads the scrollback of the pane being drawn: `desired_offset > 0`
 /// means paint `historical` (a cut window already fetched for THIS pane) and show the scroll label;
 /// `0` means paint `live`.
 #[derive(Clone, Default)]
@@ -1652,37 +1665,46 @@ pub struct PanePaint {
     pub live: Option<Arc<GridSnapshot>>,
     /// `Some(code)` once this pane's process exited; `None` while live.
     pub exited: Option<Option<i32>>,
-    /// The pane's scrollback offset from the live bottom (0 = live). Drives the paint-source choice.
-    pub scrolled_offset: u32,
-    /// Known history length for this pane (for the scroll-indicator fraction), if a reply has landed.
-    pub history_len: Option<u32>,
-    /// The pane's cached historical window to paint while `scrolled_offset > 0`, or `None`.
-    pub historical: Option<Arc<GridSnapshot>>,
+    /// Desired intent (0 = live), not necessarily the position of the pixels being painted.
+    pub desired_offset: u32,
+    /// The pane's cached historical reply, including its own served offset/depth.
+    pub historical: Option<HistoricalView>,
 }
 
 impl PanePaint {
+    fn painted_history(&self) -> Option<&HistoricalView> {
+        self.historical.as_ref().filter(|historical| {
+            self.desired_offset > 0
+                && self
+                    .live
+                    .as_ref()
+                    .is_some_and(|live| historical.grid.generation == live.generation)
+        })
+    }
+
+    /// Offset of the actually painted snapshot, never the pending desired position.
+    pub fn scrolled_offset(&self) -> u32 {
+        self.painted_history()
+            .map_or(0, |history| history.served_offset)
+    }
+
+    /// Response-time depth belonging to the same painted history, not a newer planning hint.
+    pub fn history_len(&self) -> Option<u32> {
+        self.painted_history().map(|history| history.history_len)
+    }
+
     /// The grid to actually paint for this pane: the historical window while scrolled up (and a cut
     /// has arrived), else the live grid. The same choice is applied uniformly per pane.
     pub fn paint_grid(&self) -> Option<Arc<GridSnapshot>> {
-        if self.scrolled_offset > 0 {
-            self.historical
-                .as_ref()
-                .filter(|historical| {
-                    self.live
-                        .as_ref()
-                        .is_some_and(|live| historical.generation == live.generation)
-                })
-                .cloned()
-                .or_else(|| self.live.clone())
-        } else {
-            self.live.clone()
-        }
+        self.painted_history()
+            .map(|history| history.grid.clone())
+            .or_else(|| self.live.clone())
     }
 
     /// The scroll-indicator label for this pane, or `None` at the live bottom. Pure projection of the
     /// owned offset/length so the caller needs no scrollback lock.
     pub fn scroll_label(&self) -> Option<String> {
-        scroll_indicator_label(self.scrolled_offset, self.history_len)
+        scroll_indicator_label(self.scrolled_offset(), self.history_len())
     }
 }
 
@@ -3726,15 +3748,14 @@ impl Shared {
             // before the next so we never hold two at once and never hold any past return.
             let live = self.grid.lock().unwrap().clone();
             let exited = *self.exited.lock().unwrap();
-            let (scrolled_offset, history_len, historical) = {
+            let (desired_offset, historical) = {
                 let sb = self.scrollback.lock().unwrap();
-                (sb.view_offset, sb.history_len, sb.historical.clone())
+                (sb.view_offset, sb.historical.clone())
             };
             let paint = PanePaint {
                 live,
                 exited,
-                scrolled_offset,
-                history_len,
+                desired_offset,
                 historical,
             };
             return if self.connection_is_closed() {
@@ -3750,8 +3771,7 @@ impl Shared {
             Some(entry) => PanePaint {
                 live: entry.grid.clone(),
                 exited: entry.exited,
-                scrolled_offset: entry.scrollback.view_offset,
-                history_len: entry.scrollback.history_len,
+                desired_offset: entry.scrollback.view_offset,
                 historical: entry.scrollback.historical.clone(),
             },
             None => PanePaint::default(),
@@ -9361,12 +9381,15 @@ mod scrollback_view_tests {
         let mut sb = ScrollbackState {
             view_offset: 7,
             history_len: Some(100),
-            historical: Some(Arc::new(scrollback_snapshot(
-                SessionGeneration("g".into()),
-                Revision(1),
-                (hist_rows(40, 6), None),
-            ))),
-            historical_generation: Some(SessionGeneration("g".into())),
+            historical: Some(HistoricalView::new(
+                Arc::new(scrollback_snapshot(
+                    SessionGeneration("g".into()),
+                    Revision(1),
+                    (hist_rows(40, 6), None),
+                )),
+                7,
+                100,
+            )),
             ..ScrollbackState::default()
         };
         assert!(sb.is_scrolled());
@@ -9384,15 +9407,18 @@ mod scrollback_view_tests {
         fn seed(sb: &mut ScrollbackState, offset: u32, generation: &str) {
             sb.view_offset = offset;
             sb.history_len = Some(100);
-            sb.historical = Some(Arc::new(live_grid(generation, 40, 6, false)));
-            sb.historical_generation = Some(SessionGeneration(generation.to_string()));
+            sb.historical = Some(HistoricalView::new(
+                Arc::new(live_grid(generation, 40, 6, false)),
+                offset,
+                100,
+            ));
         }
 
         fn assert_reset(sb: &ScrollbackState) {
             assert_eq!(sb.view_offset, 0);
             assert!(sb.history_len.is_none());
             assert!(sb.historical.is_none());
-            assert!(sb.historical_generation.is_none());
+            assert!(sb.historical.as_ref().map(|h| &h.grid.generation).is_none());
         }
 
         let (shared, _queue) = Shared::with_test_queue();
@@ -9479,18 +9505,21 @@ mod scrollback_view_tests {
         let mut sb = ScrollbackState {
             view_offset: 12,
             history_len: Some(100),
-            historical: Some(Arc::new(scrollback_snapshot(
-                SessionGeneration("g".into()),
-                Revision(1),
-                (hist_rows(40, 6), None),
-            ))),
-            historical_generation: None,
+            historical: Some(HistoricalView::new(
+                Arc::new(scrollback_snapshot(
+                    SessionGeneration("g".into()),
+                    Revision(1),
+                    (hist_rows(40, 6), None),
+                )),
+                12,
+                100,
+            )),
             ..ScrollbackState::default()
         };
         sb.reset_to_live();
         assert_eq!(sb.view_offset, 0);
         assert!(sb.historical.is_none());
-        assert!(sb.historical_generation.is_none());
+        assert!(sb.historical.as_ref().map(|h| &h.grid.generation).is_none());
     }
 
     // --- 7: ScrollbackRows for wrong session / generation ignored -----------
@@ -9518,7 +9547,7 @@ mod scrollback_view_tests {
                 1,
                 (vec![vec![cell("h"), cell(" ")]], row_copy.clone())
             ));
-            let snap = sb.historical.as_ref().unwrap();
+            let snap = &sb.historical.as_ref().unwrap().grid;
             assert_eq!(
                 (snap.cols, snap.rows, snap.revision),
                 (2, 1, Revision(revision))
@@ -9540,8 +9569,8 @@ mod scrollback_view_tests {
             (vec![vec![cell("h")]], Some(bad))
         ));
         assert!(Arc::ptr_eq(
-            sb.historical.as_ref().unwrap(),
-            old.as_ref().unwrap()
+            &sb.historical.as_ref().unwrap().grid,
+            &old.as_ref().unwrap().grid
         ));
         assert_eq!(sb.history_len, Some(100));
     }
@@ -9671,9 +9700,9 @@ mod scrollback_view_tests {
         assert_eq!(scrollback.view_offset, 9);
         assert_eq!(
             scrollback
-                .historical_generation
+                .historical
                 .as_ref()
-                .map(|generation| generation.0.as_str()),
+                .map(|history| history.grid.generation.0.as_str()),
             Some("gen-current")
         );
     }
@@ -9699,7 +9728,11 @@ mod scrollback_view_tests {
         let sb = shared.scrollback.lock().unwrap();
         assert_eq!(sb.history_len, Some(100));
         assert_eq!(sb.view_offset, 10, "echoes the served offset");
-        let snap = sb.historical.as_ref().expect("historical window adopted");
+        let snap = &sb
+            .historical
+            .as_ref()
+            .expect("historical window adopted")
+            .grid;
         assert_eq!(snap.rows, 6);
         assert_eq!(snap.cols, 40);
         assert_eq!(
@@ -9843,7 +9876,7 @@ mod scrollback_view_tests {
         let sb = shared.scrollback.lock().unwrap();
         assert_eq!(sb.view_offset, 10, "live update does not move the viewport");
         assert!(
-            Arc::ptr_eq(sb.historical.as_ref().unwrap(), &painted_before),
+            Arc::ptr_eq(&sb.historical.as_ref().unwrap().grid, &painted_before.grid),
             "the historical window the UI paints is the same Arc, untouched by live damage"
         );
     }
@@ -9857,12 +9890,15 @@ mod scrollback_view_tests {
         {
             let mut sb = shared.scrollback.lock().unwrap();
             sb.view_offset = 8;
-            sb.historical = Some(Arc::new(scrollback_snapshot(
-                SessionGeneration("gen-a".into()),
-                Revision(1),
-                (hist_rows(40, 6), None),
-            )));
-            sb.historical_generation = Some(SessionGeneration("gen-a".into()));
+            sb.historical = Some(HistoricalView::new(
+                Arc::new(scrollback_snapshot(
+                    SessionGeneration("gen-a".into()),
+                    Revision(1),
+                    (hist_rows(40, 6), None),
+                )),
+                8,
+                100,
+            ));
         }
         // Returning to the bottom: offset reaches 0, reset_to_live drops the window so
         // draw() falls through to the live grid.
@@ -12448,7 +12484,8 @@ mod rebind_tests {
             let mut scrollback = shared.scrollback.lock().unwrap();
             scrollback.view_offset = 3;
             scrollback.history_len = Some(42);
-            scrollback.historical_generation = Some(SessionGeneration("old-session".into()));
+            scrollback.historical =
+                Some(HistoricalView::new(Arc::new(grid("old-session", 1)), 3, 42));
         }
 
         reset_session_state(&shared);
@@ -12463,7 +12500,11 @@ mod rebind_tests {
             "a new session must not inherit the old PTY's cached history ceiling"
         );
         assert!(scrollback.historical.is_none());
-        assert!(scrollback.historical_generation.is_none());
+        assert!(scrollback
+            .historical
+            .as_ref()
+            .map(|h| &h.grid.generation)
+            .is_none());
     }
 
     // Reader-switch race: the reader rebases at the TOP of the loop, then
@@ -13058,7 +13099,7 @@ mod rebind_tests {
             vec![vec![cell(), cell()]],
         ));
         let paint = shared.pane_paint("s-sib", "s-active");
-        assert_eq!(paint.scrolled_offset, 3);
+        assert_eq!(paint.scrolled_offset(), 3);
         assert!(paint.historical.is_some());
     }
 
@@ -13087,9 +13128,9 @@ mod rebind_tests {
         ));
         let pane_b = shared.pane_paint("pane-b", "s-active");
         let pane_c = shared.pane_paint("pane-c", "s-active");
-        assert_eq!(pane_b.scrolled_offset, 4);
+        assert_eq!(pane_b.scrolled_offset(), 4);
         assert!(pane_b.historical.is_some());
-        assert_eq!(pane_c.scrolled_offset, 0);
+        assert_eq!(pane_c.scrolled_offset(), 0);
         assert!(pane_c.historical.is_none());
     }
 
@@ -13162,18 +13203,135 @@ mod rebind_tests {
     // --- Phase B: uniform per-pane paint resolution --------------------------
 
     #[test]
+    fn painted_history_metadata_tracks_the_served_arc_not_pending_intent() {
+        for id in ["primary", "sibling", "extra"] {
+            let shared = Shared::with_test_outbound();
+            let active = shared.init_active_session("primary").unwrap();
+            assert!(shared.commit_active_grid(&active, Revision(1), Arc::new(grid("gen-a", 1))));
+            let sibling = shared.set_sibling_session("sibling").unwrap();
+            assert!(shared.apply_sibling_grid("sibling", sibling, Arc::new(grid("gen-a", 1))));
+            shared.set_pane_sessions(&["extra"]);
+            let extra = shared.pane_epoch("extra").unwrap();
+            assert!(shared.apply_pane_grid("extra", extra, Arc::new(grid("gen-a", 1))));
+            shared.with_pane_scrollback(id, "primary", |sb| sb.history_len = Some(20));
+            let reply = |revision, depth, offset| {
+                let generation = SessionGeneration("gen-a".into());
+                let rows = vec![vec![cell(), cell()]];
+                match id {
+                    "primary" => shared.commit_active_scrollback(
+                        &active,
+                        generation,
+                        Revision(revision),
+                        depth,
+                        offset,
+                        (rows, None),
+                    ),
+                    "sibling" => shared.apply_sibling_scrollback(
+                        id,
+                        sibling,
+                        generation,
+                        Revision(revision),
+                        depth,
+                        offset,
+                        rows,
+                    ),
+                    _ => shared.apply_pane_scrollback(
+                        id,
+                        extra,
+                        generation,
+                        Revision(revision),
+                        depth,
+                        offset,
+                        rows,
+                    ),
+                }
+            };
+
+            admit_scrollback_query(&shared, id, "primary", ScrollAction::Lines(4), 4);
+            let first_pending = shared.pane_paint(id, "primary");
+            assert_eq!(first_pending.desired_offset, 4);
+            assert_eq!(first_pending.paint_grid().unwrap().revision, Revision(1));
+            assert_eq!(
+                first_pending.scroll_label(),
+                None,
+                "live pixels are not yet history"
+            );
+            assert!(reply(7, 20, 4));
+            let first = shared.pane_paint(id, "primary").paint_grid().unwrap();
+            assert_eq!(first.revision, Revision(7));
+            admit_scrollback_query(&shared, id, "primary", ScrollAction::Lines(4), 8);
+            let pending = shared.pane_paint(id, "primary");
+            assert!(Arc::ptr_eq(&first, &pending.paint_grid().unwrap()));
+            assert_eq!(pending.scroll_label().as_deref(), Some("[scroll 4/20 20%]"));
+
+            // New live output must not require historical and live revisions to match.
+            let newer = Arc::new(grid("gen-a", 9));
+            assert!(match id {
+                "primary" => shared.commit_active_grid(&active, Revision(9), newer),
+                "sibling" => shared.apply_sibling_grid(id, sibling, newer),
+                _ => shared.apply_pane_grid(id, extra, newer),
+            });
+            assert!(Arc::ptr_eq(
+                &first,
+                &shared.pane_paint(id, "primary").paint_grid().unwrap()
+            ));
+            assert!(reply(10, 5, 5)); // Matching requested offset 8 is clamped by the daemon.
+            let served = shared.pane_paint(id, "primary");
+            let second = served.paint_grid().unwrap();
+            assert!(!Arc::ptr_eq(&first, &second));
+            assert_eq!(
+                (second.revision, second.cols, second.rows),
+                (Revision(10), 2, 1)
+            );
+            assert_eq!(served.scroll_label().as_deref(), Some("[scroll 5/5 100%]"));
+
+            admit_scrollback_query(&shared, id, "primary", ScrollAction::Lines(1), 6);
+            assert!(matches!(
+                shared.prepare_scroll_action(id, "primary", ScrollAction::Lines(1)),
+                PreparedScrollAction::Moved {
+                    request: ScrollRequestIntent {
+                        requested_offset: 7,
+                        ..
+                    },
+                    ..
+                }
+            ));
+            assert!(reply(11, 12, 6)); // Superseded reply refreshes planning depth, not pixels.
+            shared.with_pane_scrollback(id, "primary", |sb| {
+                assert_eq!((sb.view_offset, sb.history_len), (7, Some(12)));
+                assert!(sb.admitted_request.is_none());
+            });
+            let still_served = shared.pane_paint(id, "primary");
+            assert!(Arc::ptr_eq(&second, &still_served.paint_grid().unwrap()));
+            assert_eq!(
+                still_served.scroll_label().as_deref(),
+                Some("[scroll 5/5 100%]")
+            );
+            assert!(matches!(
+                shared.prepare_scroll_action(id, "primary", ScrollAction::End),
+                PreparedScrollAction::ToLive
+            ));
+            assert_eq!(shared.pane_paint(id, "primary").scroll_label(), None);
+        }
+    }
+
+    #[test]
     fn pane_paint_rejects_historical_pixels_from_another_live_generation() {
         let paint = PanePaint {
             live: Some(Arc::new(grid("gen-b", 9))),
-            scrolled_offset: 4,
-            history_len: Some(20),
-            historical: Some(Arc::new(grid("gen-a", 5))),
+            desired_offset: 4,
+            historical: Some(HistoricalView::new(Arc::new(grid("gen-a", 5)), 4, 20)),
             ..PanePaint::default()
         };
 
         let painted = paint.paint_grid().expect("live grid remains paintable");
         assert_eq!(painted.generation.0, "gen-b");
         assert_eq!(painted.revision, Revision(9));
+        assert_eq!(
+            paint.scroll_label(),
+            None,
+            "rejected pixels cannot supply a history label"
+        );
     }
 
     #[test]
@@ -13186,8 +13344,7 @@ mod rebind_tests {
             let old_intent = scrollback.advance_intent().unwrap();
             scrollback.view_offset = 4;
             scrollback.history_len = Some(20);
-            scrollback.historical = Some(Arc::new(grid("gen-a", 5)));
-            scrollback.historical_generation = Some(SessionGeneration("gen-a".into()));
+            scrollback.historical = Some(HistoricalView::new(Arc::new(grid("gen-a", 5)), 4, 20));
             scrollback.admitted_request = Some((old_intent, 4, SessionGeneration("gen-a".into())));
         }
         assert_eq!(
@@ -13205,7 +13362,11 @@ mod rebind_tests {
             assert_eq!(scrollback.view_offset, 0);
             assert!(scrollback.history_len.is_none());
             assert!(scrollback.historical.is_none());
-            assert!(scrollback.historical_generation.is_none());
+            assert!(scrollback
+                .historical
+                .as_ref()
+                .map(|h| &h.grid.generation)
+                .is_none());
             assert!(
                 scrollback.admitted_request.is_some(),
                 "the old ordered reply must still be able to release its admission slot"
@@ -13271,8 +13432,7 @@ mod rebind_tests {
             let old_intent = scrollback.advance_intent().unwrap();
             scrollback.view_offset = 4;
             scrollback.history_len = Some(20);
-            scrollback.historical = Some(Arc::new(grid("gen-a", 5)));
-            scrollback.historical_generation = Some(SessionGeneration("gen-a".into()));
+            scrollback.historical = Some(HistoricalView::new(Arc::new(grid("gen-a", 5)), 4, 20));
             scrollback.admitted_request = Some((old_intent, 4, SessionGeneration("gen-a".into())));
         });
 
@@ -13281,7 +13441,11 @@ mod rebind_tests {
             assert_eq!(scrollback.view_offset, 0);
             assert!(scrollback.history_len.is_none());
             assert!(scrollback.historical.is_none());
-            assert!(scrollback.historical_generation.is_none());
+            assert!(scrollback
+                .historical
+                .as_ref()
+                .map(|h| &h.grid.generation)
+                .is_none());
             assert!(scrollback.admitted_request.is_some());
         });
         let painted = shared.pane_paint("pane-x", "primary").paint_grid().unwrap();
@@ -13326,14 +13490,14 @@ mod rebind_tests {
             let mut sb = shared.scrollback.lock().unwrap();
             sb.view_offset = 4;
             sb.history_len = Some(20);
-            sb.historical = Some(Arc::new(grid("gen-p", 5)));
+            sb.historical = Some(HistoricalView::new(Arc::new(grid("gen-p", 5)), 4, 20));
         }
 
         let pp = shared.pane_paint("primary", "primary");
         assert_eq!(pp.live.as_ref().unwrap().revision.0, 7, "primary live grid");
         assert_eq!(pp.exited, Some(Some(3)), "primary exit");
-        assert_eq!(pp.scrolled_offset, 4, "primary's own scrollback offset");
-        assert_eq!(pp.history_len, Some(20));
+        assert_eq!(pp.scrolled_offset(), 4, "primary's own scrollback offset");
+        assert_eq!(pp.history_len(), Some(20));
         // Scrolled up with a cut present -> paints the historical window, not live.
         assert_eq!(pp.paint_grid().unwrap().revision.0, 5);
         assert!(pp.scroll_label().is_some());
@@ -13350,12 +13514,12 @@ mod rebind_tests {
         shared.with_pane_scrollback("pane-x", "primary", |sb| {
             sb.view_offset = 2;
             sb.history_len = Some(9);
-            sb.historical = Some(Arc::new(grid("gen-x", 8)));
+            sb.historical = Some(HistoricalView::new(Arc::new(grid("gen-x", 8)), 2, 9));
         });
 
         let pp = shared.pane_paint("pane-x", "primary");
         assert_eq!(pp.live.as_ref().unwrap().revision.0, 11, "pane's live grid");
-        assert_eq!(pp.scrolled_offset, 2, "pane's OWN scrollback offset");
+        assert_eq!(pp.scrolled_offset(), 2, "pane's OWN scrollback offset");
         assert_eq!(
             pp.paint_grid().unwrap().revision.0,
             8,
@@ -13876,7 +14040,7 @@ mod user_event_sender_tests {
             scrollback
                 .historical
                 .as_ref()
-                .map(|grid| grid.generation.0.as_str()),
+                .map(|history| history.grid.generation.0.as_str()),
             Some("gen-b")
         );
     }
@@ -13973,7 +14137,7 @@ mod user_event_sender_tests {
                 .unwrap()
                 .historical
                 .as_ref()
-                .map(|grid| grid.generation.0.as_str()),
+                .map(|history| history.grid.generation.0.as_str()),
             Some("gen-a")
         );
     }

@@ -176,10 +176,399 @@ pub trait ChromeHostServices {
     fn set_sidebar_width(&self, width_logical_px: u32);
     /// Return keyboard/IME focus from dashboard chrome to the native terminal widget.
     fn focus_terminal(&self);
+    /// Consume a captured ownership ticket after exact viewport publication. A newer user
+    /// interaction, modal or window activation must make the ticket ineffective.
+    fn finish_dialog_focus(&self, _ticket: u64) {}
     /// Show/hide the host-owned full-window dashboard overlay. On Linux this owns GTK/WebKit stacking
     /// and focus restoration; the terminal present target remains renderer-owned and PTYs are untouched.
     fn set_overlay_visible(&self, visible: bool);
     /// Open a native folder picker (GTK FileChooserNative / portal) and relay the chosen path (or cancel) back
     /// into the dashboard via `evaluate_dashboard_script`, keyed by `request_id`. Content-blind: a path only.
     fn pick_folder(&self, request_id: &str);
+}
+
+/// Window-local input ownership, not a timer or a launch-success signal.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Default)]
+pub(crate) struct DialogFocusEpoch(std::cell::Cell<u64>);
+
+#[cfg(any(target_os = "linux", test))]
+impl DialogFocusEpoch {
+    pub(crate) fn changed(&self) {
+        self.0.set(self.0.get().saturating_add(1));
+    }
+
+    pub(crate) fn capture(&self, dialog_owns_focus: bool) -> Option<u64> {
+        (dialog_owns_focus && self.0.get() != u64::MAX).then(|| self.0.get())
+    }
+
+    pub(crate) fn capture_sidebar_revival(&self, json: &str, owns_focus: bool) -> Option<u64> {
+        #[derive(serde::Deserialize)]
+        struct IntentKind {
+            #[serde(rename = "type")]
+            kind: String,
+        }
+        let explicit_revival = serde_json::from_str::<IntentKind>(json)
+            .is_ok_and(|intent| intent.kind == "reviveSession");
+        self.capture(owns_focus && explicit_revival)
+    }
+
+    pub(crate) fn can_finish(&self, ticket: u64, window_active: bool, modal_visible: bool) -> bool {
+        window_active && !modal_visible && self.capture(true) == Some(ticket)
+    }
+}
+
+/// Finish a native modal close without letting document restoration precede native focus.
+/// Dropping an overlay restores its interactivity but must not request opener focus.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn restore_dialog_underlay(
+    restore_opener: bool,
+    restore_native: impl FnOnce(),
+    focus_opener: impl FnOnce(),
+    restore_documents: impl FnOnce(bool),
+) {
+    restore_native();
+    if restore_opener {
+        focus_opener();
+    }
+    restore_documents(restore_opener);
+}
+
+/// One close owns one opener restoration; accepting it must not consume the launch focus epoch.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod dialog_opener {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Pending {
+        pub token: u64,
+        pub input_epoch: u64,
+        pub target: usize,
+        pub generation: u64,
+        pub dispatched: bool,
+    }
+
+    impl Pending {
+        pub fn accept(
+            &mut self,
+            token: u64,
+            target: usize,
+            generation: u64,
+            epoch: Option<u64>,
+            owns_focus: bool,
+        ) -> bool {
+            if self.dispatched
+                || self.token != token
+                || self.target != target
+                || self.generation != generation
+                || epoch != Some(self.input_epoch)
+                || !owns_focus
+            {
+                return false;
+            }
+            self.dispatched = true;
+            true
+        }
+    }
+
+    /// None means ordinary dashboard IPC; malformed reserved messages must never reach App.
+    pub fn parse_ready(json: &str) -> Option<Result<u64, ()>> {
+        let value: serde_json::Value = serde_json::from_str(json).ok()?;
+        if value.get("type").and_then(serde_json::Value::as_str)
+            != Some("__hydraPersistentFocusReady")
+        {
+            return None;
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Ready {
+            #[serde(rename = "type")]
+            _kind: String,
+            token: String,
+        }
+        Some((|| {
+            if json.len() > 192 {
+                return Err(());
+            }
+            let ready: Ready = serde_json::from_value(value).map_err(|_| ())?;
+            if ready.token.is_empty()
+                || ready.token.starts_with('0')
+                || ready.token.len() > 20
+                || !ready.token.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err(());
+            }
+            ready.token.parse().map_err(|_| ())
+        })())
+    }
+}
+
+/// Opt-in focus diagnostics contain only closed categories and boolean state, never page content.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod dialog_focus_trace {
+    pub const SNAPSHOT_FUNCTION: &str = r#"function(requested, attempted, root, saved, prior, current, focused) {
+      function tag(node) {
+        if (!node) return "none";
+        switch (node.tagName) {
+          case "BODY": return "body";
+          case "BUTTON": return "button";
+          case "INPUT": return "input";
+          default: return "other";
+        }
+      }
+      return {
+        root_present: Boolean(root), saved_present: Boolean(saved),
+        firewall_present: Boolean(window.__HYDRA_NATIVE_MODAL_UNDERLAY_FIREWALL__),
+        firewall_active: Boolean(window.__HYDRA_NATIVE_MODAL_UNDERLAY_FIREWALL__ && window.__HYDRA_NATIVE_MODAL_UNDERLAY_FIREWALL__.active),
+        prior_present: Boolean(prior), prior_tag: tag(prior), current_tag: tag(current),
+        document_focused: Boolean(focused), current_is_prior: Boolean(prior && current === prior),
+        current_unchanged: !current || current === document.body || current === root || current === prior,
+        inert: Boolean(root && root.inert), prior_connected: Boolean(prior && prior.isConnected),
+        prior_focusable: Boolean(prior && typeof prior.focus === "function"),
+        restore_requested: Boolean(requested), attempted_focus: Boolean(attempted),
+        active_is_prior_after: Boolean(prior && document.activeElement === prior)
+      };
+    }"#;
+
+    pub fn saved_snapshot_script() -> String {
+        format!(
+            "(function () {{ var saved = window.__HYDRA_NATIVE_MODAL_UNDERLAY_STATE__; \
+             return ({SNAPSHOT_FUNCTION})(false, false, document.documentElement, saved, \
+             saved && saved.activeElement, document.activeElement, document.hasFocus()); }})();"
+        )
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum Tag {
+        None,
+        Body,
+        Button,
+        Input,
+        Other,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Snapshot {
+        root_present: bool,
+        saved_present: bool,
+        firewall_present: bool,
+        firewall_active: bool,
+        prior_present: bool,
+        prior_tag: Tag,
+        current_tag: Tag,
+        document_focused: bool,
+        current_is_prior: bool,
+        current_unchanged: bool,
+        inert: bool,
+        prior_connected: bool,
+        prior_focusable: bool,
+        restore_requested: bool,
+        attempted_focus: bool,
+        active_is_prior_after: bool,
+    }
+
+    /// Explicit field formatting ensures no raw callback payload or arbitrary string reaches logs.
+    pub fn summary(json: &str) -> Option<String> {
+        if json.len() > 2048 {
+            return None;
+        }
+        let s: Snapshot = serde_json::from_str(json).ok()?;
+        Some(format!(
+            "root={} saved={} firewall={} firewall_active={} prior={} prior_tag={:?} current_tag={:?} \
+             document_focused={} current_is_prior={} unchanged={} inert={} connected={} \
+             focusable={} requested={} attempted={} active_is_prior_after={}",
+            s.root_present,
+            s.saved_present,
+            s.firewall_present,
+            s.firewall_active,
+            s.prior_present,
+            s.prior_tag,
+            s.current_tag,
+            s.document_focused,
+            s.current_is_prior,
+            s.current_unchanged,
+            s.inert,
+            s.prior_connected,
+            s.prior_focusable,
+            s.restore_requested,
+            s.attempted_focus,
+            s.active_is_prior_after,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod dialog_restore_tests {
+    use super::restore_dialog_underlay;
+    use std::cell::Cell;
+
+    #[test]
+    fn sidebar_revival_focus_requires_explicit_intent_and_current_native_owner() {
+        let epoch = super::DialogFocusEpoch::default();
+        let json = r#"{"type":"reviveSession","session_id":"fixture"}"#;
+        let ticket = epoch.capture_sidebar_revival(json, true).unwrap();
+        assert!(epoch.capture_sidebar_revival(json, false).is_none());
+        assert!(epoch.can_finish(ticket, true, false));
+        epoch.changed();
+        assert!(!epoch.can_finish(ticket, true, false));
+        for json in [
+            "{}",
+            "not json",
+            r#"{"type":"focusPane"}"#,
+            r#"{"type":"reviveWindow"}"#,
+            r#"{"type":"createProject"}"#,
+            r#"{"type":"__hydraPersistentFocusReady","token":"1"}"#,
+        ] {
+            assert!(epoch.capture_sidebar_revival(json, true).is_none());
+        }
+    }
+
+    #[test]
+    fn dialog_opener_ready_requires_exact_owned_identity_and_only_dispatches_once() {
+        use super::{dialog_opener::Pending, DialogFocusEpoch};
+        let epoch = DialogFocusEpoch::default();
+        let ticket = epoch.capture(true).unwrap();
+        let mut pending = Pending {
+            token: 4,
+            input_epoch: ticket,
+            target: 0,
+            generation: 2,
+            dispatched: false,
+        };
+        for (token, target, generation, owner) in [
+            (3, 0, 2, true),
+            (4, 1, 2, true),
+            (4, 0, 1, true),
+            (4, 0, 2, false),
+        ] {
+            assert!(!pending.accept(token, target, generation, epoch.capture(true), owner));
+            assert!(
+                !pending.dispatched,
+                "a stale ACK must not consume the current opener"
+            );
+        }
+        assert!(pending.accept(4, 0, 2, epoch.capture(true), true));
+        assert!(
+            epoch.can_finish(ticket, true, false),
+            "opener restore must preserve a pending Create/Split launch ticket"
+        );
+        assert!(!pending.accept(4, 0, 2, epoch.capture(true), true));
+    }
+
+    #[test]
+    fn dialog_opener_newer_input_or_terminal_publication_revokes_old_epoch() {
+        use super::{dialog_opener::Pending, DialogFocusEpoch};
+        let epoch = DialogFocusEpoch::default();
+        let mut pending = Pending {
+            token: 4,
+            input_epoch: epoch.capture(true).unwrap(),
+            target: 0,
+            generation: 2,
+            dispatched: false,
+        };
+        // Native key/press, deactivation and successful terminal publication advance this epoch.
+        epoch.changed();
+        assert!(!pending.accept(4, 0, 2, epoch.capture(true), true));
+    }
+
+    #[test]
+    fn dialog_opener_private_ack_is_closed_bounded_and_has_no_caller_selected_origin() {
+        use super::dialog_opener::parse_ready;
+        assert_eq!(
+            parse_ready(r#"{"type":"__hydraPersistentFocusReady","token":"4"}"#),
+            Some(Ok(4))
+        );
+        for json in [
+            r#"{"type":"__hydraPersistentFocusReady","token":4}"#,
+            r#"{"type":"__hydraPersistentFocusReady","token":"04"}"#,
+            r#"{"type":"__hydraPersistentFocusReady","token":"0"}"#,
+            r#"{"type":"__hydraPersistentFocusReady","token":"18446744073709551616"}"#,
+            r#"{"type":"__hydraPersistentFocusReady","token":"4","surface":"sidebar"}"#,
+            r#"{"type":"__hydraPersistentFocusReady","token":"4","generation":0}"#,
+        ] {
+            assert_eq!(parse_ready(json), Some(Err(())));
+        }
+        let oversized = format!(
+            r#"{{"type":"__hydraPersistentFocusReady","token":"{}"}}"#,
+            "1".repeat(193)
+        );
+        assert_eq!(parse_ready(&oversized), Some(Err(())));
+        assert_eq!(parse_ready(r#"{"type":"openProjectDialog"}"#), None);
+    }
+
+    #[test]
+    fn dialog_restore_native_focus_precedes_guarded_document_restore() {
+        let interactive = Cell::new(false);
+        let focused = Cell::new(false);
+        let restored_opener = Cell::new(false);
+        restore_dialog_underlay(
+            true,
+            || interactive.set(true),
+            || {
+                assert!(
+                    interactive.get(),
+                    "parent bands must reopen before native focus"
+                );
+                focused.set(true);
+            },
+            |restore_focus| {
+                // The real document guard declines while document.hasFocus() is false and
+                // discards its saved opener. A later native focus cannot repair that loss.
+                restored_opener.set(restore_focus && focused.get());
+            },
+        );
+        assert!(
+            restored_opener.get(),
+            "Cancel must not lose its DOM opener before GTK focus"
+        );
+    }
+
+    #[test]
+    fn dialog_restore_teardown_restores_state_without_requesting_focus() {
+        let interactive = Cell::new(false);
+        let restored_document = Cell::new(false);
+        restore_dialog_underlay(
+            false,
+            || interactive.set(true),
+            || panic!("teardown must not focus the old opener"),
+            |restore_focus| {
+                assert!(interactive.get());
+                assert!(!restore_focus);
+                restored_document.set(true);
+            },
+        );
+        assert!(restored_document.get());
+    }
+
+    #[test]
+    fn dialog_focus_trace_accepts_only_bounded_closed_metadata() {
+        use super::dialog_focus_trace::summary;
+        assert!(super::dialog_focus_trace::saved_snapshot_script().contains("saved.activeElement"));
+        let valid = serde_json::json!({
+            "root_present": true, "saved_present": true, "firewall_present": true,
+            "firewall_active": false,
+            "prior_present": true, "prior_tag": "button", "current_tag": "body",
+            "document_focused": true, "current_is_prior": false, "current_unchanged": true,
+            "inert": false, "prior_connected": true, "prior_focusable": true,
+            "restore_requested": true, "attempted_focus": true, "active_is_prior_after": true
+        });
+        assert!(summary(&valid.to_string())
+            .unwrap()
+            .contains("prior_tag=Button"));
+        assert!(summary(&valid.to_string())
+            .unwrap()
+            .contains("firewall_active=false"));
+        for invalid in ["", "null", "[]", "{", &" ".repeat(2049)] {
+            assert!(summary(invalid).is_none());
+        }
+        let mut unknown = valid.clone();
+        unknown["value"] = serde_json::json!("must-not-be-logged");
+        assert!(summary(&unknown.to_string()).is_none());
+        let mut arbitrary_tag = valid.clone();
+        arbitrary_tag["prior_tag"] = serde_json::json!("must-not-be-logged");
+        assert!(summary(&arbitrary_tag.to_string()).is_none());
+        let mut wrong_type = valid;
+        wrong_type["document_focused"] = serde_json::json!("true");
+        assert!(summary(&wrong_type.to_string()).is_none());
+    }
 }

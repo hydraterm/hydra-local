@@ -61,6 +61,7 @@ allowed_root_entries = {
     "CODE_OF_CONDUCT.md", "CONTRIBUTING.md", "Cargo.lock", "Cargo.toml",
     "DCO.md", "DEVELOPMENT.md", "FAQ.md", "LICENSE", "README.md", "SECURITY.md",
     "THIRD_PARTY_NOTICES.md", "TRADEMARKS.md", "TROUBLESHOOTING.md", "dashboard-ui", "docs",
+    "hydra-cloud", "web-client",
     "hydra-launcher", "maestro-app",
     "maestro-extension-api", "maestro-local-services", "maestro-protocol",
     "maestro-renderer", "maestro-shell", "packaging", "pty-daemon", "rust-toolchain.toml",
@@ -76,6 +77,7 @@ allowed_docs = {
     "public-private-boundary.md",
     "third-party-licensing.md",
     "developer/local-control-quickstart.md",
+    "developer/remote-core-quickstart.md",
 }
 unexpected_docs = sorted(
     str(path.relative_to(root / "docs"))
@@ -155,6 +157,92 @@ for path in sorted(candidate for candidate in source_paths if candidate.is_file(
                 "public-boundary: ERROR: globally routable IP address requires private review at "
                 f"{path.relative_to(root)}:{line}"
             )
+
+# Only the reviewed reusable library leaves belong here; hosted composition stays private.
+# Source eligibility and exact runtime/test bytes are bound by the separate sync manifest.
+remote_core_files = {
+    "hydra-cloud/package-lock.json",
+    "hydra-cloud/package.json",
+    "hydra-cloud/src/domain/clock.ts",
+    "hydra-cloud/src/domain/content-blind.ts",
+    "hydra-cloud/src/domain/offer-wake.ts",
+    "hydra-cloud/src/domain/signaling-ports.ts",
+    "hydra-cloud/src/domain/signaling.ts",
+    "hydra-cloud/src/domain/types.ts",
+    "hydra-cloud/test/signaling-port.test.ts",
+    "hydra-cloud/tsconfig.core-build.json",
+    "hydra-cloud/tsconfig.json",
+    "web-client/package-lock.json",
+    "web-client/package.json",
+    "web-client/src/bridge/connect-deadline.test.ts",
+    "web-client/src/bridge/connect-deadline.ts",
+    "web-client/src/bridge/datachannel-send-queue.test.ts",
+    "web-client/src/bridge/datachannel-send-queue.ts",
+    "web-client/src/bridge/ice-candidate-security.test.ts",
+    "web-client/src/bridge/ice-candidate-security.ts",
+    "web-client/src/bridge/ice-path-classifier.test.ts",
+    "web-client/src/bridge/ice-path-classifier.ts",
+    "web-client/src/bridge/relay-fallback.test.ts",
+    "web-client/src/bridge/relay-fallback.ts",
+    "web-client/src/bridge/remote-transport.ts",
+    "web-client/src/bridge/sdp-security.test.ts",
+    "web-client/src/bridge/sdp-security.ts",
+    "web-client/src/bridge/setup-refusal-contract.ts",
+    "web-client/src/bridge/signaling-contract.test.ts",
+    "web-client/src/bridge/signaling-contract.ts",
+    "web-client/src/bridge/webrtc-attempt-ownership.test.ts",
+    "web-client/src/bridge/webrtc-bridge.ts",
+    "web-client/src/bridge/webrtc-security.test.ts",
+    "web-client/src/protocol/bounded-control-json.test.ts",
+    "web-client/src/protocol/bounded-control-json.ts",
+    "web-client/tsconfig.core-build.json",
+    "web-client/tsconfig.json",
+    "web-client/vite.config.ts",
+}
+remote_core_dirs = {
+    parent.as_posix()
+    for name in remote_core_files
+    for parent in pathlib.PurePosixPath(name).parents
+    if parent.as_posix() != "."
+}
+actual_remote_files = set()
+for package in ("hydra-cloud", "web-client"):
+    package_root = root / package
+    if not package_root.is_dir():
+        raise SystemExit(f"public-boundary: ERROR: missing Remote core package: {package}")
+    for path in package_root.rglob("*"):
+        name = path.relative_to(root).as_posix()
+        if path.is_dir():
+            if name not in remote_core_dirs:
+                raise SystemExit(f"public-boundary: ERROR: unexpected Remote core directory: {name}")
+        elif path.is_file():
+            actual_remote_files.add(name)
+        else:
+            raise SystemExit(f"public-boundary: ERROR: non-regular Remote core path: {name}")
+if actual_remote_files != remote_core_files:
+    raise SystemExit(
+        "public-boundary: ERROR: Remote core leaf inventory drifted: "
+        f"missing={sorted(remote_core_files - actual_remote_files)} "
+        f"extra={sorted(actual_remote_files - remote_core_files)}"
+    )
+
+# Exact bytes close exports, runtime dependencies, tooling, locks and build callers together.
+# Build outputs and package LICENSE copies are generated, not additional source leaves.
+remote_core_metadata = {
+    "LICENSE": "763a6e17187e1e6998d6d1af0d323c276e89fd54eff401bea96f20ba55d7828b",
+    "hydra-cloud/package-lock.json": "325f475dd0ab2f374d3086d4ed895da61fa0fb59a7c3affc9b1fb9115996d3c8",
+    "hydra-cloud/package.json": "e7a03ce33c58941da71b7a281001c0a251a5e0d17da7ae421ee14c173de66809",
+    "hydra-cloud/tsconfig.core-build.json": "14dac3664fc66ea4bfd2459158c2f9e0f7569975ff8b2cdb91253b07793b9ac4",
+    "hydra-cloud/tsconfig.json": "55686b33aaa6786496c8a8a3c0b49d1f095a7e4a03a4190170b118a2361da4a4",
+    "web-client/package-lock.json": "ef9c130a7481c2c23f7a02197beccc12a6925c99bc1ab281d347ba9a952c88e3",
+    "web-client/package.json": "f908a8a1db1c62e635dddb6624bc83939c798c130898d6931d9f32f0826ce8f9",
+    "web-client/tsconfig.core-build.json": "d5d492691452dd3ac69cc2657d6dbda0379d0b1cb90cf986e43572d35c145c1d",
+    "web-client/tsconfig.json": "60c13f7d2d8b39dad5f29e8bb39598f26126c41021a129d7f43cf6c3f8edcbef",
+    "web-client/vite.config.ts": "9e3df78c1e438fe868435ed21c7c4549d43a6b7351fe0cba90f0a45713cc5fa5",
+}
+for name, expected_digest in remote_core_metadata.items():
+    if hashlib.sha256((root / name).read_bytes()).hexdigest() != expected_digest:
+        raise SystemExit(f"public-boundary: ERROR: Remote core metadata digest drifted: {name}")
 
 metadata = json.loads(subprocess.check_output(
     ["cargo", "metadata", "--locked", "--format-version", "1", "--no-deps"],

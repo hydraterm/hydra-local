@@ -84,8 +84,11 @@ fn explicit_copy_uses_same_owner_live_or_history_row_metadata() {
             let mut scrollback = shared.scrollback.lock().unwrap();
             scrollback.view_offset = 1;
             scrollback.history_len = Some(1);
-            scrollback.historical_generation = Some(selected_grid.generation.clone());
-            scrollback.historical = Some(Arc::new(selected_grid));
+            scrollback.historical = Some(crate::client::HistoricalView::new(
+                Arc::new(selected_grid),
+                1,
+                1,
+            ));
         } else {
             *shared.grid.lock().unwrap() = Some(Arc::new(selected_grid));
         }
@@ -143,8 +146,11 @@ fn copy_on_select_matches_explicit_copy_for_live_and_historical_cells() {
             let mut scrollback = shared.scrollback.lock().unwrap();
             scrollback.view_offset = 1;
             scrollback.history_len = Some(1);
-            scrollback.historical_generation = Some(selected_grid.generation.clone());
-            scrollback.historical = Some(Arc::new(selected_grid));
+            scrollback.historical = Some(crate::client::HistoricalView::new(
+                Arc::new(selected_grid),
+                1,
+                1,
+            ));
         } else {
             *shared.grid.lock().unwrap() = Some(Arc::new(selected_grid));
         }

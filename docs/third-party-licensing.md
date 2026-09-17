@@ -1,4 +1,4 @@
-# Third-party licensing for binary packages
+# Third-party licensing for source and binary packages
 
 Hydra Local keeps two deliberately different records:
 
@@ -47,9 +47,30 @@ checks live on the private composition side so the public verifier does not publ
 needles it is meant to detect. A boundary match fails packaging rather than publishing a diagnostic
 string from the builder's machine.
 
-## Updating the reviewed policy
+## Separate Remote library source and development tools
 
-After either lockfile changes:
+The browser transport and signaling-broker libraries are separately built source packages, not
+new dependencies of the desktop binary. Their `web-client/package-lock.json` and
+`hydra-cloud/package-lock.json` contain pinned build/test tools, with no runtime package
+dependencies. `scripts/generate-third-party-notices.py` lists each tool graph separately and
+binds all four source lock hashes. This inventory includes optional platform records; it is not
+proof that every platform archive or all bundled-tool attribution was reviewed.
+
+The library build scripts copy the public root MIT licence into each local tarball. The package
+gate must prove the actual exports, declarations, MIT payload and emitted runtime module closure.
+Current reviewed artifacts contain only Hydra code/types and no bundled third-party runtime
+modules; this does not waive a future dependency's licence or notice obligations. Do not copy
+development `node_modules` into those artifacts or mistake their licence labels for a full legal review.
+
+After either Remote tool lock changes, regenerate the source notices and review every changed
+version, licence, upstream and applicable material, then rerun the library build/package/consumer
+gates. Preserve compatible pinned versions rather than upgrading opportunistically. Changes to
+these separate development locks do not change the desktop four-target policy below; a real
+desktop graph change still requires that independent policy review.
+
+## Updating the reviewed desktop binary policy
+
+After `Cargo.lock` or `dashboard-ui/package-lock.json` changes:
 
 1. Regenerate `THIRD_PARTY_NOTICES.md` and review every changed package, licence expression and
    upstream source.

@@ -6,8 +6,9 @@ Hydra is a local-first terminal desktop for running terminal sessions and coding
 retained PTY service owns the live terminal processes, while the desktop supplies projects, panes,
 layouts, provider-session discovery and a native terminal view.
 
-This repository is the complete local desktop. Official packages may also include the separate,
-proprietary Hydra Remote component described in the
+This repository contains the complete local desktop and reusable Remote transport/signaling
+libraries. Official packages may also include the separate proprietary agent and hosted-service
+composition described in the
 [public/private boundary](docs/public-private-boundary.md).
 
 ## Why not use tmux or Zellij?
@@ -45,11 +46,17 @@ repository's local desktop.
 The current provider coverage and its limits are listed in the
 [README](README.md#provider-interoperability).
 
-## Why is Hydra Remote not open source?
+## Which parts of Hydra Remote are open source?
 
-Hydra Remote is a separate hosted product. Its desktop agent, browser client, cloud coordination,
-identity, entitlement, billing, signaling and relay systems are maintained privately. The public
-desktop remains fully usable without it.
+The reusable browser WebRTC transport and content-blind signaling broker are MIT-licensed here.
+They expose typed interfaces for independent adapters and do not require Clerk or Stripe. See the
+[Remote library quickstart](docs/developer/remote-core-quickstart.md).
+
+These libraries are not a complete self-hosted Remote application or desktop agent. The hosted
+account website, identity/billing integrations, enrollment and authorization-service composition,
+deployment configuration, relay operation and desktop agent remain outside this source release.
+The local desktop remains usable independently, and installing the libraries does not grant hosted
+service access or enable Remote controls in a source-built desktop.
 
 This is a product and source boundary, not a claim that secrecy provides security. The private
 agent must authenticate and authorize remote operations; a modified public app cannot grant itself
@@ -63,8 +70,9 @@ PTY daemon uses a private local socket and operating-system peer credentials to 
 but it is not a sandbox against another process already running as the same user.
 
 The local store refuses unsafe symlinks, foreign ownership, ambiguous ancestry and unsafe file
-types or link counts. Source builds do not contain Hydra Remote and do not fetch HydraTerms update
-or model-catalog metadata automatically. Report suspected vulnerabilities privately as described
+types or link counts. Source-built desktop packages do not include the desktop remote agent or
+hosted service and do not fetch HydraTerms update or model-catalog metadata automatically. The
+Remote libraries have a separate source build. Report suspected vulnerabilities privately as described
 in [SECURITY.md](SECURITY.md).
 
 ## How is Hydra different from Herdr?

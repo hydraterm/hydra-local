@@ -108,8 +108,11 @@ fn double_click_uses_split_owner_and_historical_grid() {
         let mut history = shared.scrollback.lock().unwrap();
         history.view_offset = 1;
         history.history_len = Some(1);
-        history.historical_generation = Some(SessionGeneration("primary-gen".into()));
-        history.historical = Some(Arc::new(grid("primary-gen", 20, 6, "historical")));
+        history.historical = Some(crate::client::HistoricalView::new(
+            Arc::new(grid("primary-gen", 20, 6, "historical")),
+            1,
+            1,
+        ));
     }
     double_click(&mut app, CellPos { col: 2, row: 0 });
     assert_eq!(app.selected_text().as_deref(), Some("historical"));

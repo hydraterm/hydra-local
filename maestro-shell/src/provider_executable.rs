@@ -156,17 +156,22 @@ pub fn resolve_provider_executable(
     if !status.success() {
         return Ok(fallback.map(selected));
     }
+    // A shell startup file can exit successfully without running our lookup. Only a complete,
+    // nonempty command-v response proves discovery; process exit status alone does not.
     let Some(marker) = bytes.windows(MARKER.len()).rposition(|part| part == MARKER) else {
-        return Ok(Some(ProviderResolution::ShellCommand));
+        return Err(ProviderLookupError::Unavailable);
     };
     let result = &bytes[marker + MARKER.len()..];
     let Some(end) = result.windows(END.len()).position(|part| part == END) else {
-        return Ok(Some(ProviderResolution::ShellCommand));
+        return Err(ProviderLookupError::Unavailable);
     };
     let Ok(value) = std::str::from_utf8(&result[..end]) else {
         return Ok(Some(ProviderResolution::ShellCommand));
     };
     let value = value.strip_suffix('\n').unwrap_or(value);
+    if value.is_empty() {
+        return Err(ProviderLookupError::Unavailable);
+    }
     // A bare name can be a shell function even when an unrelated same-name file exists in cwd.
     // Do not reinterpret that ambiguous shell result as a filesystem selection.
     if !value.contains('/') {
@@ -277,6 +282,53 @@ mod tests {
             assert!(output.status.success());
             String::from_utf8(output.stdout).unwrap()
         }
+    }
+
+    #[test]
+    fn successful_shell_exit_without_probe_envelope_is_not_provider_resolution() {
+        for script in [
+            "#!/bin/sh\nexit 0\n",
+            "#!/bin/sh\nprintf 'startup banner\\n'\nexit 0\n",
+            "#!/bin/sh\nprintf '\\036HYDRA_PROVIDER\\037claude\\n'\nexit 0\n",
+            "#!/bin/sh\nprintf 'claude\\n\\036HYDRA_PROVIDER_END\\037'\nexit 0\n",
+            "#!/bin/sh\nprintf '\\036HYDRA_PROVIDER\\037\\036HYDRA_PROVIDER_END\\037'\nexit 0\n",
+        ] {
+            let fixture = Fixture::new();
+            Fixture::write(&fixture.shell, script);
+            assert_eq!(
+                resolve_provider_executable("claude", fixture.root.path(), &fixture),
+                Err(ProviderLookupError::Unavailable),
+                "shell exit status alone cannot prove command discovery"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_shell_alias_still_resolves() {
+        let fixture = Fixture::new();
+        Fixture::write(
+            &fixture.shell,
+            "#!/bin/sh\nexec /bin/sh -c 'alias claude=\"printf alias\"; eval \"$1\"' sh \"$2\"\n",
+        );
+        assert_eq!(
+            fixture.resolve("claude"),
+            Some(ProviderResolution::ShellCommand)
+        );
+    }
+
+    #[test]
+    fn complete_probe_preserves_non_utf8_shell_command_fallback() {
+        let fixture = Fixture::new();
+        // A framed non-UTF8 command path is not a missing lookup result. Keep its existing shell
+        // fallback; this payload fixture does not claim a native non-UTF8 filesystem launch.
+        Fixture::write(
+            &fixture.shell,
+            "#!/bin/sh\nprintf '\\036HYDRA_PROVIDER\\037/qa/\\377/claude\\n\\036HYDRA_PROVIDER_END\\037'\n",
+        );
+        assert_eq!(
+            fixture.resolve("claude"),
+            Some(ProviderResolution::ShellCommand)
+        );
     }
 
     #[test]

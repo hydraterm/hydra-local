@@ -309,6 +309,7 @@ struct RendererExactViewportRequestCore {
     exact_viewport: RendererExactViewport,
     tab_strip: RendererTabStrip,
     dispositions: std::sync::mpsc::Sender<RendererEvent>,
+    dialog_focus_ticket: Option<u64>,
     state: AtomicU8,
 }
 
@@ -323,6 +324,18 @@ impl RendererExactViewportRequest {
         tab_strip: RendererTabStrip,
         dispositions: std::sync::mpsc::Sender<RendererEvent>,
     ) -> Result<Self, RendererExactViewportError> {
+        Self::new_with_dialog_focus(session_id, exact_viewport, tab_strip, dispositions, None)
+    }
+
+    /// The existing native focus epoch also covers explicit sidebar revival. It is captured by
+    /// the host, never supplied by JSON, and remains immutable across clones and delivery.
+    pub fn new_with_dialog_focus(
+        session_id: String,
+        exact_viewport: RendererExactViewport,
+        tab_strip: RendererTabStrip,
+        dispositions: std::sync::mpsc::Sender<RendererEvent>,
+        dialog_focus_ticket: Option<u64>,
+    ) -> Result<Self, RendererExactViewportError> {
         if exact_viewport.primary().session_id() != session_id
             || !exact_viewport.matches_projection(&tab_strip)
         {
@@ -335,6 +348,7 @@ impl RendererExactViewportRequest {
                 exact_viewport,
                 tab_strip,
                 dispositions,
+                dialog_focus_ticket,
                 state: AtomicU8::new(EXACT_VIEWPORT_REQUEST_FRESH),
             }),
         })
@@ -342,6 +356,10 @@ impl RendererExactViewportRequest {
 
     pub fn request_id(&self) -> RendererExactViewportRequestId {
         self.core.request_id
+    }
+
+    pub fn dialog_focus_ticket(&self) -> Option<u64> {
+        self.core.dialog_focus_ticket
     }
 
     fn session_id(&self) -> &str {
@@ -470,6 +488,7 @@ impl std::fmt::Debug for RendererAttachmentHandoffRequestId {
 pub struct RendererAttachmentHandoff {
     request_id: RendererAttachmentHandoffRequestId,
     core: Arc<RendererAttachmentHandoffCore>,
+    dialog_focus_ticket: Option<u64>,
 }
 
 struct RendererAttachmentHandoffCore {
@@ -483,6 +502,7 @@ struct RendererAttachmentHandoffAttemptFacts {
     session_id: String,
     tab_strip: Option<RendererTabStrip>,
     exact_viewport: Option<RendererExactViewport>,
+    dialog_focus_ticket: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -501,7 +521,15 @@ impl RendererAttachmentHandoff {
                 settled: std::sync::atomic::AtomicBool::new(false),
                 attempt_facts: Mutex::new(None),
             }),
+            dialog_focus_ticket: None,
         }
+    }
+
+    /// An explicit Create Project/Window/Split may transfer its still-owned dialog focus
+    /// only after the complete viewport publishes. Background and recovery requests omit it.
+    pub fn with_dialog_focus(mut self, ticket: Option<u64>) -> Self {
+        self.dialog_focus_ticket = ticket;
+        self
     }
 
     pub fn request_id(&self) -> RendererAttachmentHandoffRequestId {
@@ -526,6 +554,7 @@ impl RendererAttachmentHandoff {
             session_id: session_id.to_string(),
             tab_strip: tab_strip.cloned(),
             exact_viewport: exact_viewport.cloned(),
+            dialog_focus_ticket: self.dialog_focus_ticket,
         };
         let mut facts = self
             .core
@@ -1333,7 +1362,10 @@ fn forward_mac_dashboard_ipc(
         return false;
     };
     if events
-        .send(RendererEvent::ReactChromeIntent { json })
+        .send(RendererEvent::ReactChromeIntent {
+            json,
+            dialog_focus_ticket: None,
+        })
         .is_err()
     {
         eprintln!("hydra-dashboard {surface} intent dropped: app event receiver closed");
@@ -1568,12 +1600,14 @@ mod mac_dashboard_transport_tests {
         assert_eq!(
             received.recv().unwrap(),
             RendererEvent::ReactChromeIntent {
+                dialog_focus_ticket: None,
                 json: normal.to_string()
             }
         );
         assert_eq!(
             received.recv().unwrap(),
             RendererEvent::ReactChromeIntent {
+                dialog_focus_ticket: None,
                 json: bundle_loaded.to_string()
             }
         );
@@ -10341,7 +10375,11 @@ pub enum RendererEvent {
     /// A JSON intent emitted by the embedded React chrome WebView. INTENT ONLY: the renderer does not
     /// parse, authorize, or execute it. The app-shell listener is the sole authority for validating the
     /// JSON shape and mapping supported actions onto existing tab/dashboard/split paths.
-    ReactChromeIntent { json: String },
+    ReactChromeIntent {
+        json: String,
+        /// Native Linux dialog ownership captured at receipt, never supplied by JavaScript.
+        dialog_focus_ticket: Option<u64>,
+    },
 }
 
 /// Durable lifecycle/disposition observations remain deliverable while the terminal viewport is
@@ -10536,6 +10574,7 @@ mod viewport_event_gate_tests {
         assert!(!gate.is_published());
         gated
             .send(RendererEvent::ReactChromeIntent {
+                dialog_focus_ticket: None,
                 json: "{\"type\":\"newTab\"}".to_string(),
             })
             .unwrap();
@@ -10555,6 +10594,7 @@ mod viewport_event_gate_tests {
         assert!(gate.publish(neutral_epoch));
         gated
             .send(RendererEvent::ReactChromeIntent {
+                dialog_focus_ticket: None,
                 json: "{\"type\":\"newTab\"}".to_string(),
             })
             .unwrap();
@@ -10566,6 +10606,7 @@ mod viewport_event_gate_tests {
         let next_epoch = gate.neutralize();
         gated
             .send(RendererEvent::ReactChromeIntent {
+                dialog_focus_ticket: None,
                 json: "{\"type\":\"mustNeverResurrect\"}".to_string(),
             })
             .unwrap();
@@ -10600,6 +10641,7 @@ mod viewport_event_gate_tests {
             close_observed.recv().unwrap();
             gated
                 .send(RendererEvent::ReactChromeIntent {
+                    dialog_focus_ticket: None,
                     json: "{\"type\":\"afterCloseReturned\"}".to_string(),
                 })
                 .unwrap();
@@ -11636,6 +11678,7 @@ struct PendingActiveAttach {
     /// Publication epoch captured after the prior viewport was synchronously neutralized. Only
     /// this exact epoch may reopen native/WebView intent delivery after aggregate proof.
     event_gate_epoch: u64,
+    dialog_focus_ticket: Option<u64>,
     window_dims: Option<(u16, u16)>,
     /// Distinguishes an Attach waiting for its projection from a delivered `SetTabStrip(None)`,
     /// which is a legitimate primary-only topology.
@@ -11899,7 +11942,7 @@ struct App {
     // Linux: the dashboard WebView + GTK sidebar live in the DashboardHost, not in App, so App delegates its
     // outbound chrome operations (evaluate script / set model / sidebar width / folder picker) here instead of
     // no-op'ing. macOS keeps its own `react_webview` path below (this stays None there).
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(not(target_os = "macos"), test))]
     chrome_host: Option<std::rc::Rc<dyn crate::host_services::ChromeHostServices>>,
     #[cfg(target_os = "macos")]
     react_webview: Option<wry::WebView>,
@@ -12183,7 +12226,7 @@ impl App {
             react_chrome,
             last_expanded_react_chrome_width_logical_px,
             latest_react_chrome_model_json: None,
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(any(not(target_os = "macos"), test))]
             chrome_host: None,
             #[cfg(target_os = "macos")]
             react_webview: None,
@@ -15211,6 +15254,7 @@ impl App {
             viewport_request: None,
             exact_viewport: Some(exact_viewport),
             event_gate_epoch: self.viewport_event_gate.epoch(),
+            dialog_focus_ticket: None,
             window_dims: self.split_frame_dims(),
             projection_received: true,
             tab_strip_line: self.tab_strip_line.clone(),
@@ -16270,6 +16314,7 @@ impl App {
         primary_session_id: String,
     ) -> bool {
         let event_gate_epoch = pending.event_gate_epoch;
+        let dialog_focus_ticket = pending.dialog_focus_ticket;
         self.session_id = primary_session_id;
         self.exact_viewport = pending.exact_viewport;
         self.tab_strip_line = pending.tab_strip_line;
@@ -16302,6 +16347,14 @@ impl App {
             self.connection_alive = false;
             self.clear_viewport_projections();
             return false;
+        }
+        if let Some(ticket) = dialog_focus_ticket {
+            #[cfg(any(not(target_os = "macos"), test))]
+            if let Some(host) = self.chrome_host.as_ref() {
+                host.finish_dialog_focus(ticket);
+            }
+            #[cfg(all(target_os = "macos", not(test)))]
+            let _ = ticket;
         }
         self.request_redraw();
         true
@@ -16380,7 +16433,7 @@ impl App {
         // after its Rust model is cleared. Hide it at the same local revoke point: macOS owns the
         // child WebView directly, while Linux delegates native stacking to ChromeHostServices.
         self.resize_react_chrome_webview();
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(any(not(target_os = "macos"), test))]
         if let Some(chrome_host) = self.chrome_host.as_ref() {
             chrome_host.set_overlay_visible(false);
         }
@@ -16464,6 +16517,9 @@ impl App {
             self.retain_or_cancel_attachment_handoff(guard);
             return;
         };
+        // Ownership was captured at the original native dialog IPC receipt, before launch
+        // preparation. Never recapture a newer dialog/input epoch here.
+        let dialog_focus_ticket = guard.handoff.dialog_focus_ticket;
         // App has already entered Pending B when this command is delivered. Revoke A immediately,
         // before validating any B fact, so malformed/refused B cannot leave A paint/input/OSC live.
         self.clear_viewport();
@@ -16490,6 +16546,7 @@ impl App {
             viewport_request: None,
             exact_viewport: Some(exact_viewport),
             event_gate_epoch,
+            dialog_focus_ticket,
             window_dims,
             projection_received: true,
             tab_strip_line: line,
@@ -16510,6 +16567,7 @@ impl App {
         let new_id = request.session_id().to_string();
         let exact_viewport = request.exact_viewport().clone();
         let tab_strip = request.tab_strip().clone();
+        let dialog_focus_ticket = request.dialog_focus_ticket();
         if self.pending_active_attach.is_some()
             || self.pending_viewport_binding.is_some()
             || self.runtime_attachment_handoff.is_some()
@@ -16549,6 +16607,7 @@ impl App {
             viewport_request: Some(request),
             exact_viewport: Some(exact_viewport),
             event_gate_epoch,
+            dialog_focus_ticket,
             window_dims: self.window_dims(),
             projection_received: true,
             tab_strip_line: apply_set_tab_strip(Some(&tab_strip)),
@@ -18139,9 +18198,19 @@ impl App {
                                 );
                             }
                             if self.focused_pane_session != next {
+                                // None (or a vanished explicit target) already routes to the
+                                // primary. Naming that same owner must not discard its history
+                                // before this press can start selecting the painted text.
+                                let owner_changed = focused_session_write_target(
+                                    self.focused_pane_session.as_deref(),
+                                    &self.session_id,
+                                    Some(layout),
+                                ) != pane.session_id;
                                 self.focused_pane_session = next;
                                 self.emit_focused_pane_event();
-                                self.force_live_view();
+                                if owner_changed {
+                                    self.force_live_view();
+                                }
                             } else {
                                 // React topbar controls live outside the terminal grid; re-emit even
                                 // on a same-pane click so the app's focused-tab cache cannot stay
@@ -19428,10 +19497,12 @@ impl App {
     /// Split focus, dividers, and pane drag/drop operate in window coordinates; terminal mouse
     /// reporting still uses the painted-grid path and translates to pane-local coordinates as needed.
     fn hit_test_window_grid(&self, (x, y): (f32, f32)) -> Option<CellPos> {
-        let r = self.renderer.as_ref()?;
+        let cell_size = self.renderer.as_ref().map(Renderer::cell_size_logical);
+        #[cfg(test)]
+        let cell_size = cell_size.or(self.test_cell_size_logical);
+        let (cw, ch) = cell_size?;
         let w = self.host.as_ref()?;
         let scale = w.scale_factor() as f32;
-        let (cw, ch) = r.cell_size_logical();
         let (cols, rows) = self.split_frame_dims()?;
         pixel_to_cell_with_top_offset(
             x,
@@ -19759,7 +19830,13 @@ impl App {
             // during resize. Detect only in the visible slice so neither hit geometry
             // nor the underline can cross a divider into the adjacent pane.
             let visible_cols = usize::from(content.cols).min(row.len());
-            let span = terminal_links::link_at_cell(&row[..visible_cols], local_col)?;
+            let span = terminal_links::link_at_grid_cell(
+                &grid,
+                local_row,
+                local_col,
+                visible_cols,
+                usize::from(content.rows),
+            )?;
             return Some(HoveredTerminalLink {
                 url: span.url,
                 highlight: TerminalLinkHighlight {
@@ -19772,8 +19849,8 @@ impl App {
 
         let cell = self.hit_test(self.cursor_px)?;
         let grid = self.focused_pane_grid(&self.session_id)?;
-        let row = grid.rows_cells.get(cell.row)?;
-        let span = terminal_links::link_at_cell(row, cell.col)?;
+        let span =
+            terminal_links::link_at_grid_cell(&grid, cell.row, cell.col, grid.cols, grid.rows)?;
         Some(HoveredTerminalLink {
             url: span.url,
             highlight: TerminalLinkHighlight {
@@ -20209,7 +20286,7 @@ impl App {
 
         // Choose the primary pane's paint source from its OWN resolved scrollback view: the historical
         // window while scrolled up (and only once a window has arrived), else the live grid. The offset
-        // and cached snapshot were read together under one lock in `pane_paint`, so they cannot disagree.
+        // is taken from that snapshot's served metadata, not a newer pending scroll intent.
         let (paint, scroll_label) = if live.as_ref().map(|g| g.alt_screen).unwrap_or(false) {
             (live.clone(), None)
         } else {
@@ -23324,6 +23401,272 @@ mod split_frame_tests {
         (app, owner_rx, events_rx)
     }
 
+    struct DialogFocusHost {
+        focus_calls: std::cell::Cell<usize>,
+        epoch: crate::host_services::DialogFocusEpoch,
+        active: std::cell::Cell<bool>,
+        modal: std::cell::Cell<bool>,
+    }
+
+    impl Default for DialogFocusHost {
+        fn default() -> Self {
+            Self {
+                focus_calls: std::cell::Cell::new(0),
+                epoch: Default::default(),
+                active: std::cell::Cell::new(true),
+                modal: std::cell::Cell::new(true),
+            }
+        }
+    }
+
+    impl crate::host_services::ChromeHostServices for DialogFocusHost {
+        fn evaluate_dashboard_script(&self, _: &str, _: super::ReactChromeScriptKind) {}
+        fn set_sidebar_width(&self, _: u32) {}
+        fn focus_terminal(&self) {
+            self.focus_calls.set(self.focus_calls.get() + 1);
+        }
+        fn finish_dialog_focus(&self, ticket: u64) {
+            if self
+                .epoch
+                .can_finish(ticket, self.active.get(), self.modal.get())
+            {
+                self.epoch.changed();
+                self.focus_terminal();
+            }
+        }
+        fn set_overlay_visible(&self, visible: bool) {
+            self.modal.set(visible);
+        }
+        fn pick_folder(&self, _: &str) {}
+    }
+
+    #[test]
+    fn dialog_launch_focus_waits_for_exact_viewport_publication() {
+        let fixture = owned_handoff_fixture("22222222222242228222222222222222");
+        let authority = fixture.authority();
+        let shared = Shared::with_test_handoff_peer(&authority);
+        shared.set_active_session("sid-A").unwrap();
+        let (mut app, _owner_rx, events_rx) = role_transition_handoff_app(shared.clone(), "sid-A");
+        let host = std::rc::Rc::new(DialogFocusHost::default());
+        app.chrome_host = Some(host.clone());
+        app.react_overlay_visible = true;
+        let handoff =
+            RendererAttachmentHandoff::new(authority).with_dialog_focus(host.epoch.capture(true));
+        app.handle_user_event(handoff_event("sid-B", handoff, "sid-B"));
+        assert_eq!(host.focus_calls.get(), 0, "admission is not publication");
+        assert!(shared.prove_test_exact_viewport_grid("sid-B", "gen-C"));
+        install_exact_test_grid(&shared, "sid-B", "gen-C");
+        app.handle_user_event(UserEvent::Redraw);
+        assert!(matches!(
+            events_rx.try_recv().unwrap(),
+            RendererEvent::AttachmentHandoffDisposition(disposition)
+                if disposition.outcome() == RendererAttachmentHandoffOutcome::Claimed
+        ));
+        assert!(app.viewport_is_bound());
+        assert_eq!(
+            host.focus_calls.get(),
+            1,
+            "published dialog launch owns terminal focus"
+        );
+        app.handle_user_event(UserEvent::Redraw);
+        assert_eq!(host.focus_calls.get(), 1, "focus is consumed exactly once");
+    }
+
+    #[test]
+    fn dialog_launch_focus_never_adopts_newer_input_or_background_launches() {
+        for scenario in [
+            "background",
+            "before_preparation",
+            "while_pending",
+            "new_modal",
+            "inactive",
+        ] {
+            let fixture = owned_handoff_fixture("22222222222242228222222222222222");
+            let authority = fixture.authority();
+            let shared = Shared::with_test_handoff_peer(&authority);
+            shared.set_active_session("sid-A").unwrap();
+            let (mut app, _owner_rx, _events_rx) =
+                role_transition_handoff_app(shared.clone(), "sid-A");
+            let host = std::rc::Rc::new(DialogFocusHost::default());
+            app.chrome_host = Some(host.clone());
+            let ticket = host.epoch.capture(scenario != "background");
+            if scenario == "before_preparation" {
+                host.epoch.changed(); // newer interaction between IPC receipt and handoff
+            }
+            app.handle_user_event(handoff_event(
+                "sid-B",
+                RendererAttachmentHandoff::new(authority).with_dialog_focus(ticket),
+                "sid-B",
+            ));
+            match scenario {
+                "while_pending" => host.epoch.changed(),
+                "new_modal" => {
+                    host.epoch.changed();
+                    host.modal.set(true);
+                }
+                "inactive" => host.active.set(false),
+                _ => {}
+            }
+            assert!(shared.prove_test_exact_viewport_grid("sid-B", "gen-C"));
+            install_exact_test_grid(&shared, "sid-B", "gen-C");
+            app.handle_user_event(UserEvent::Redraw);
+            assert!(
+                app.viewport_is_bound(),
+                "{scenario}: valid launch still publishes"
+            );
+            assert_eq!(host.focus_calls.get(), 0, "{scenario}: no focus ownership");
+        }
+    }
+
+    #[test]
+    fn dialog_launch_focus_is_not_consumed_on_failed_or_cancelled_attachment() {
+        for cancelled in [false, true] {
+            let fixture = owned_handoff_fixture("22222222222242228222222222222222");
+            let authority = fixture.authority();
+            let shared = Shared::with_test_handoff_peer(&authority);
+            shared.set_active_session("sid-A").unwrap();
+            let (mut app, owner_rx, events_rx) = role_transition_handoff_app(shared, "sid-A");
+            let host = std::rc::Rc::new(DialogFocusHost::default());
+            app.chrome_host = Some(host.clone());
+            let handoff = RendererAttachmentHandoff::new(authority)
+                .with_dialog_focus(host.epoch.capture(true));
+            app.handle_user_event(handoff_event(
+                "sid-B",
+                handoff,
+                if cancelled { "sid-B" } else { "wrong-session" },
+            ));
+            if cancelled {
+                app.handle_user_event(UserEvent::ClearViewport);
+            }
+            assert_eq!(
+                finish_handoff_worker(&mut app, &owner_rx, &events_rx).outcome(),
+                if cancelled {
+                    RendererAttachmentHandoffOutcome::ClaimPossiblyApplied
+                } else {
+                    RendererAttachmentHandoffOutcome::CancelledBeforeClaimAdmission
+                }
+            );
+            assert!(!app.viewport_is_bound());
+            assert_eq!(host.focus_calls.get(), 0);
+            assert!(!host.modal.get(), "ordinary overlay close still runs");
+        }
+    }
+
+    #[test]
+    fn dialog_launch_focus_ticket_is_an_immutable_handoff_fact() {
+        use super::RendererAttachmentHandoffAttemptRegistration as Registration;
+        let fixture = owned_handoff_fixture("22222222222242228222222222222222");
+        let handoff =
+            RendererAttachmentHandoff::new(fixture.authority()).with_dialog_focus(Some(3));
+        assert_eq!(
+            handoff.register_attempt("sid-B", None, None),
+            Registration::New
+        );
+        assert_eq!(
+            handoff.clone().register_attempt("sid-B", None, None),
+            Registration::Duplicate
+        );
+        assert_eq!(
+            handoff
+                .with_dialog_focus(Some(4))
+                .register_attempt("sid-B", None, None),
+            Registration::Conflict
+        );
+    }
+
+    #[test]
+    fn sidebar_revival_focus_waits_for_ordinary_exact_publication() {
+        for scenario in [
+            "current",
+            "background",
+            "before_preparation",
+            "new_input",
+            "new_modal",
+            "inactive",
+            "clear",
+            "failed",
+        ] {
+            let instance = "33333333333343338333333333333333".parse().unwrap();
+            let shared = Shared::with_test_handoff_peer_facts(Some(instance), None);
+            shared.set_active_session("sid-A").unwrap();
+            let (mut app, _owner_rx, _events_rx) =
+                role_transition_handoff_app(shared.clone(), "sid-A");
+            let host = std::rc::Rc::new(DialogFocusHost::default());
+            host.modal.set(false);
+            app.chrome_host = Some(host.clone());
+            let ticket = host.epoch.capture(scenario != "background");
+            let target_strip = strip(vec![plain_tab("B", true)]);
+            let exact = exact_viewport_for_strip(&target_strip, "gen-C");
+            let (events, received) = mpsc::channel();
+            let request = super::RendererExactViewportRequest::new_with_dialog_focus(
+                "sid-B".into(),
+                exact,
+                target_strip,
+                events,
+                ticket,
+            )
+            .unwrap();
+            let duplicate = request.clone();
+            assert_eq!(duplicate.dialog_focus_ticket(), ticket);
+            if scenario == "before_preparation" {
+                host.epoch.changed();
+            }
+            app.handle_user_event(UserEvent::AttachExactViewport { request });
+            assert_eq!(
+                host.focus_calls.get(),
+                0,
+                "{scenario}: admission is not publication"
+            );
+            assert!(received.try_recv().is_err());
+            match scenario {
+                "new_input" => host.epoch.changed(),
+                "new_modal" => {
+                    host.epoch.changed();
+                    host.modal.set(true);
+                }
+                "inactive" => host.active.set(false),
+                "clear" => app.handle_user_event(UserEvent::ClearViewport),
+                "failed" => {
+                    shared.abort_connection();
+                    app.handle_user_event(UserEvent::ConnectionClosed);
+                }
+                _ => {}
+            }
+            if !matches!(scenario, "clear" | "failed") {
+                assert!(shared.prove_test_exact_viewport_grid("sid-B", "gen-C"));
+                install_exact_test_grid(&shared, "sid-B", "gen-C");
+                app.handle_user_event(UserEvent::Redraw);
+                assert!(
+                    app.viewport_is_bound(),
+                    "{scenario}: exact publication still succeeds"
+                );
+                assert_eq!(
+                    receive_exact_viewport_disposition(&received).outcome(),
+                    RendererExactViewportOutcome::Published
+                );
+            } else {
+                assert!(!app.viewport_is_bound());
+                assert_eq!(
+                    receive_exact_viewport_disposition(&received).outcome(),
+                    RendererExactViewportOutcome::Unavailable
+                );
+                assert!(!shared.prove_test_exact_viewport_grid("sid-B", "gen-C"));
+            }
+            assert_eq!(
+                host.focus_calls.get(),
+                usize::from(scenario == "current"),
+                "{scenario}"
+            );
+            app.handle_user_event(UserEvent::AttachExactViewport { request: duplicate });
+            app.handle_user_event(UserEvent::Redraw);
+            assert!(
+                received.try_recv().is_err(),
+                "duplicate request does not publish again"
+            );
+            assert_eq!(host.focus_calls.get(), usize::from(scenario == "current"));
+        }
+    }
+
     fn handoff_event(
         session_id: &str,
         handoff: RendererAttachmentHandoff,
@@ -23451,6 +23794,7 @@ mod split_frame_tests {
             .as_ref()
             .unwrap()
             .send(RendererEvent::ReactChromeIntent {
+                dialog_focus_ticket: None,
                 json: "{\"type\":\"beforeRebind\"}".to_string(),
             })
             .unwrap();
@@ -23487,6 +23831,7 @@ mod split_frame_tests {
             .as_ref()
             .unwrap()
             .send(RendererEvent::ReactChromeIntent {
+                dialog_focus_ticket: None,
                 json: "{\"type\":\"duringRebind\"}".to_string(),
             })
             .unwrap();
@@ -23522,6 +23867,7 @@ mod split_frame_tests {
             .as_ref()
             .unwrap()
             .send(RendererEvent::ReactChromeIntent {
+                dialog_focus_ticket: None,
                 json: "{\"type\":\"afterPublish\"}".to_string(),
             })
             .unwrap();
@@ -23722,6 +24068,7 @@ mod split_frame_tests {
                 .as_ref()
                 .unwrap()
                 .send(RendererEvent::ReactChromeIntent {
+                    dialog_focus_ticket: None,
                     json: "{\"type\":\"afterUnavailable\"}".to_string(),
                 })
                 .unwrap();
@@ -37916,6 +38263,7 @@ mod shortcut_hint_overlay_tests {
 #[cfg(test)]
 mod terminal_selection_ownership_tests {
     mod copy_on_select;
+    mod link_hit_testing;
     mod logical_line_selection;
     mod program_clipboard;
     mod scroll_projection;

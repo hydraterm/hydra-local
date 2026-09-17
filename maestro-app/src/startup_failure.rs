@@ -37,6 +37,26 @@ pub fn startup_failure_dialog(
     })
 }
 
+/// Only the post-probe attach-only branch with no visible persisted target may use this.
+/// Generic `product_startup_failed` errors do not prove retained-session preservation.
+pub fn retained_target_unavailable_dialog(
+    product_startup: bool,
+    no_run_renderer: bool,
+    detach_renderer: bool,
+    reason: &str,
+) -> Option<StartupFailureDialog> {
+    if !product_startup || no_run_renderer || detach_renderer {
+        return None;
+    }
+    let reason = reason.replace('\0', "\u{fffd}");
+    Some(StartupFailureDialog {
+        title: "Hydra could not open",
+        message: format!(
+            "Hydra could not reopen a saved terminal session.\n\n{reason}\n\nThis launch did not stop or replace the retained terminal service, and no new terminal session was created.\n\nIf another Hydra window is still open, use it to access retained sessions."
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +145,30 @@ mod tests {
         assert!(dialog.message.contains("build\u{fffd}version"));
         assert!(!dialog.message.contains('\0'));
         assert_eq!(reason, "build\0version");
+    }
+
+    #[test]
+    fn retained_target_context_preserves_plain_reason_and_conditional_next_step() {
+        let reason = "no target <saved> & bağlantı\nsecond line\0end";
+        let dialog = retained_target_unavailable_dialog(true, false, false, reason).unwrap();
+        assert_eq!(dialog.title, "Hydra could not open");
+        assert!(dialog
+            .message
+            .contains("<saved> & bağlantı\nsecond line\u{fffd}end"));
+        assert!(!dialog.message.contains('\0'));
+        assert!(dialog
+            .message
+            .contains("did not stop or replace the retained terminal service"));
+        assert!(dialog
+            .message
+            .contains("no new terminal session was created"));
+        assert!(dialog.message.contains(
+            "If another Hydra window is still open, use it to access retained sessions."
+        ));
+        // The new branch context must not turn unrelated product failures into retained errors.
+        assert!(
+            startup_failure_dialog(true, false, false, "product_startup_failed", reason).is_none()
+        );
+        assert_eq!(reason, "no target <saved> & bağlantı\nsecond line\0end");
     }
 }

@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use gtk::prelude::*;
+use javascriptcore::ValueExt as _;
 use serde::Deserialize;
 use webkit2gtk::WebViewExt as _;
 use wry::{NewWindowResponse, WebViewBuilder, WebViewBuilderExtUnix, WebViewExtUnix};
@@ -67,6 +68,8 @@ const CANONICAL_OVERLAY_READY_JSON: &str = r#"{"type":"dashboardOverlayReady"}"#
 const SUPPRESS_PERSISTENT_DOCUMENTS_SCRIPT: &str = r#"
 (function () {
   "use strict";
+  var pending = window.__HYDRA_PENDING_OPENER_FOCUS__;
+  if (pending) pending.cancel();
   var root = document.documentElement;
   var firewall = window.__HYDRA_NATIVE_MODAL_UNDERLAY_FIREWALL__;
   if (!root || !("inert" in root) || !firewall) return;
@@ -89,11 +92,16 @@ const SUPPRESS_PERSISTENT_DOCUMENTS_SCRIPT: &str = r#"
 const RESTORE_PERSISTENT_DOCUMENTS_SCRIPT: &str = r#"
 (function (restoreFocus) {
   "use strict";
+  var old = window.__HYDRA_PENDING_OPENER_FOCUS__;
+  if (old) old.cancel();
+  var trace = __HYDRA_FOCUS_TRACE_FUNCTION__;
   var root = document.documentElement;
   var saved = window.__HYDRA_NATIVE_MODAL_UNDERLAY_STATE__;
   var firewall = window.__HYDRA_NATIVE_MODAL_UNDERLAY_FIREWALL__;
-  if (!root || !saved || !firewall) return;
-  var prior = saved.activeElement;
+  var prior = saved && saved.activeElement;
+  if (!root || !saved || !firewall) {
+    return trace ? trace(restoreFocus, false, root, saved, prior, document.activeElement, document.hasFocus()) : undefined;
+  }
   try {
     root.inert = Boolean(saved.inert);
     if (saved.ariaHidden === null) root.removeAttribute("aria-hidden");
@@ -102,14 +110,66 @@ const RESTORE_PERSISTENT_DOCUMENTS_SCRIPT: &str = r#"
     firewall.active = false;
     delete window.__HYDRA_NATIVE_MODAL_UNDERLAY_STATE__;
   }
-  if (restoreFocus && !root.inert && prior && prior.isConnected && typeof prior.focus === "function") {
-    try {
-      prior.focus({ preventScroll: true });
-    } catch (_) {
-      try { prior.focus(); } catch (_) {}
+  var current = document.activeElement;
+  var unchanged = !current || current === document.body || current === root || current === prior;
+  var focused = restoreFocus || trace ? document.hasFocus() : false;
+  var token = __HYDRA_RESTORE_FOCUS_TOKEN__;
+  if (restoreFocus && token && unchanged && !root.inert && prior && prior.isConnected && typeof prior.focus === "function") {
+    var done = false, sent = false;
+    var pending = { token: token, prior: prior, saved: saved, cancel: cancel };
+    function cancel() {
+      if (done) return;
+      done = true;
+      ["focus", "focusin", "blur", "keydown", "pointerdown", "pagehide"].forEach(function (kind) {
+        window.removeEventListener(kind, observe, true);
+      });
+      if (window.__HYDRA_PENDING_OPENER_FOCUS__ === pending) delete window.__HYDRA_PENDING_OPENER_FOCUS__;
     }
+    function ready() {
+      if (done || sent || !document.hasFocus()) return;
+      var current = document.activeElement;
+      if (root.inert || firewall.active || !prior.isConnected ||
+          (current && current !== document.body && current !== root && current !== prior)) { cancel(); return; }
+      sent = true;
+      window.ipc.postMessage(JSON.stringify({ type: "__hydraPersistentFocusReady", token: token }));
+    }
+    function observe(event) {
+      if (event.type === "focus" && event.target === window) { ready(); return; }
+      if ((event.type === "focus" || event.type === "focusin") &&
+          (event.target === prior || event.target === document.body || event.target === root)) return;
+      cancel();
+    }
+    window.__HYDRA_PENDING_OPENER_FOCUS__ = pending;
+    ["focus", "focusin", "blur", "keydown", "pointerdown", "pagehide"].forEach(function (kind) {
+      window.addEventListener(kind, observe, true);
+    });
+    ready();
   }
+  return trace ? trace(restoreFocus, false, root, saved, prior, current, focused) : undefined;
 })(__HYDRA_RESTORE_DOM_FOCUS__);
+"#;
+const CANCEL_PERSISTENT_FOCUS_SCRIPT: &str = r#"
+(function () {
+  var pending = window.__HYDRA_PENDING_OPENER_FOCUS__;
+  if (pending && pending.token === __HYDRA_RESTORE_FOCUS_TOKEN__) pending.cancel();
+})();
+"#;
+const COMPLETE_PERSISTENT_FOCUS_SCRIPT: &str = r#"
+(function () {
+  var pending = window.__HYDRA_PENDING_OPENER_FOCUS__;
+  if (!pending || pending.token !== __HYDRA_RESTORE_FOCUS_TOKEN__) return;
+  var prior = pending.prior, saved = pending.saved, root = document.documentElement;
+  var firewall = window.__HYDRA_NATIVE_MODAL_UNDERLAY_FIREWALL__;
+  var current = document.activeElement, focused = document.hasFocus(), attempted = false;
+  pending.cancel();
+  if (focused && root && !root.inert && firewall && !firewall.active && prior.isConnected &&
+      (!current || current === document.body || current === root || current === prior)) {
+    attempted = true;
+    try { prior.focus({ preventScroll: true }); } catch (_) { try { prior.focus(); } catch (_) {} }
+  }
+  var trace = __HYDRA_FOCUS_TRACE_FUNCTION__;
+  return trace ? trace(true, attempted, root, saved, prior, current, focused) : undefined;
+})();
 "#;
 const OVERLAY_RECOVERY_GENERATION_PRELOAD: &str = r#"
 (function () {
@@ -850,6 +910,25 @@ struct UnderlayInteractivityState {
     saved: Option<UnderlayInteractivitySnapshot>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PersistentFocusReady {
+    pub surface: WebKitSurface,
+    pub generation: u64,
+    pub token: u64,
+}
+
+type PendingOpener = Rc<RefCell<Option<crate::host_services::dialog_opener::Pending>>>;
+
+fn cancel_pending_opener(pending: &PendingOpener, views: &[Rc<wry::WebView>]) {
+    let Some(retired) = pending.borrow_mut().take() else {
+        return;
+    };
+    if let Some(view) = views.get(retired.target) {
+        let script = focus_token_script(CANCEL_PERSISTENT_FOCUS_SCRIPT, retired.token);
+        let _ = view.evaluate_script(&script);
+    }
+}
+
 impl UnderlayInteractivityState {
     fn capture_once(&mut self, current: UnderlayInteractivitySnapshot) {
         if self.saved.is_none() {
@@ -1127,6 +1206,68 @@ impl OverlayRuntime {
             .then_some(self.deadline_phase)
     }
 
+    /// Cached facts at the current timeout, not live GTK geometry or evidence that an ACK never
+    /// arrived. Masks use sidebar/topbar order and Layer/PageStack/Content/WebView order.
+    fn timeout_snapshot(&self, token: u64, barrier: &OverlayPresentationBarrier) -> Option<String> {
+        let phase = match self.deadline_phase_for_token(token)? {
+            OverlayDeadlinePhase::ColdLoad => "cold_load",
+            OverlayDeadlinePhase::Presentation => "presentation",
+            OverlayDeadlinePhase::Idle => return None,
+        };
+        fn mask(flags: impl Iterator<Item = bool>) -> u8 {
+            flags.take(8).enumerate().fold(0, |mask, (index, set)| {
+                mask | if set { 1 << index } else { 0 }
+            })
+        }
+        let delivery = match self.delivery.modal_delivery {
+            ModalDelivery::Absent => "absent",
+            ModalDelivery::AwaitingReady => "awaiting_ready",
+            ModalDelivery::Evaluating(_) => "evaluating",
+            ModalDelivery::Delivered => "delivered",
+        };
+        let suppression = &self.persistent_suppression;
+        let required = mask(self.persistent_documents.iter().map(|_| true));
+        let completed = if suppression.ready {
+            required
+        } else {
+            suppression
+                .active
+                .as_ref()
+                .map_or(0, |active| mask(active.completed.iter().copied()))
+        };
+        let documents = mask(
+            self.persistent_documents
+                .iter()
+                .map(|document| document.finished),
+        );
+        let active = barrier.active.as_ref();
+        let barrier_phase = active.map_or("absent", |active| match active.phase {
+            OverlayPresentationBarrierPhase::Containers => "containers",
+            OverlayPresentationBarrierPhase::WebView => "webview",
+            OverlayPresentationBarrierPhase::WebViewport => "awaiting_accepted_dom_ack",
+        });
+        let observed = active.map_or(0, |active| {
+            mask(active.observed.iter().map(Option::is_some))
+        });
+        let matched = active.map_or(0, |active| {
+            mask(
+                active
+                    .observed
+                    .iter()
+                    .map(|observed| active.target.is_some() && *observed == active.target),
+            )
+        });
+        Some(format!(
+            "phase={phase} visible={} attached={} react_ready={} modal={} delivery={delivery} presented={} suppression_active={} suppression_ready={} required_mask={required} completed_mask={completed} documents_finished_mask={documents} barrier={barrier_phase} token_matches={} target_present={} observed_mask={observed} target_match_mask={matched} native_event_queued={}",
+            self.visible, self.delivery.webview_attached, self.delivery.react_ready,
+            self.delivery.has_active_modal(), self.presentation_complete,
+            suppression.active.is_some(), suppression.ready,
+            active.is_some_and(|active| active.token == token),
+            active.is_some_and(|active| active.target.is_some()),
+            active.is_some_and(|active| active.native_event_queued),
+        ))
+    }
+
     fn cold_load_pending(&self) -> bool {
         self.deadline_phase == OverlayDeadlinePhase::ColdLoad
     }
@@ -1355,6 +1496,13 @@ enum OverlayNativeAllocationPhase {
     WebView,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OverlayViewportAcceptance {
+    Ignored,
+    RetryNative,
+    Accepted(OverlayGeometry),
+}
+
 #[derive(Default, Debug)]
 struct OverlayPresentationBarrier {
     active: Option<OverlayPresentationAttempt>,
@@ -1483,22 +1631,36 @@ impl OverlayPresentationBarrier {
         event: OverlayViewportReady,
         live_target: Option<OverlayGeometry>,
         live_observed: [Option<OverlayGeometry>; OverlayAllocationSurface::COUNT],
-    ) -> Option<OverlayGeometry> {
-        let active = self.active.as_ref()?;
-        let target = active.target?;
+    ) -> OverlayViewportAcceptance {
+        let Some(active) = self.active.as_mut() else {
+            return OverlayViewportAcceptance::Ignored;
+        };
+        let Some(target) = active.target else {
+            return OverlayViewportAcceptance::Ignored;
+        };
         if active.token != event.token
             || active.phase != OverlayPresentationBarrierPhase::WebViewport
             || event.width != target.width
             || event.height != target.height
-            || live_target != Some(target)
+        {
+            return OverlayViewportAcceptance::Ignored;
+        }
+        if live_target != Some(target)
             || live_observed
                 .iter()
                 .any(|geometry| *geometry != Some(target))
         {
-            return None;
+            // This exact ACK already consumed its one-shot DOM observer. Rejoin native geometry
+            // before installing a fresh observer; neither stale ACKs nor this retry may present
+            // the document or extend the original presentation deadline.
+            active.target = live_target;
+            active.observed = live_observed;
+            active.phase = OverlayPresentationBarrierPhase::Containers;
+            active.native_event_queued = false;
+            return OverlayViewportAcceptance::RetryNative;
         }
         self.active = None;
-        Some(target)
+        OverlayViewportAcceptance::Accepted(target)
     }
 
     fn update_target(active: &mut OverlayPresentationAttempt, target: Option<OverlayGeometry>) {
@@ -1783,6 +1945,12 @@ pub struct LinuxOverlayHost {
     state: Rc<RefCell<OverlayRuntime>>,
     recovery_tracker: Rc<RefCell<RecoverySignalTracker>>,
     previous_focus: Rc<RefCell<Option<gtk::Widget>>>,
+    focus_epoch: Rc<crate::host_services::DialogFocusEpoch>,
+    focus_key_signal: Option<glib::SignalHandlerId>,
+    focus_pointer: gtk::GestureMultiPress,
+    focus_active_signal: Option<glib::SignalHandlerId>,
+    focus_target_signal: Option<glib::SignalHandlerId>,
+    pending_opener: PendingOpener,
 }
 
 impl LinuxOverlayHost {
@@ -1941,6 +2109,67 @@ impl LinuxOverlayHost {
         );
         let input_trace_enabled = linux_overlay_input_trace_enabled();
 
+        let focus_epoch = persistent_input_gate.focus_epoch.clone();
+        let pending_opener: PendingOpener = Rc::new(RefCell::new(None));
+        // GTK sends keys to GtkWindow first. This normal signal handler runs before the
+        // window's default handler propagates to the focused WebKit/terminal child, so a child
+        // consuming the key cannot hide newer input. Observe presses only, never consume them.
+        // Unlike EventControllerKey, this API is available in the pinned GTK feature set.
+        let epoch = focus_epoch.clone();
+        let pending = pending_opener.clone();
+        let views = underlay_webviews.clone();
+        let key_trace = input_trace_enabled.then(|| {
+            (
+                terminal_slot.clone(),
+                underlay_webviews.clone(),
+                Rc::downgrade(&state),
+            )
+        });
+        let focus_key_signal = top_level.connect_key_press_event(move |window, event| {
+            epoch.changed();
+            cancel_pending_opener(&pending, &views);
+            if let Some((terminal, underlays, state)) = key_trace.as_ref() {
+                if matches!(
+                    event.keyval(),
+                    gtk::gdk::keys::constants::Return | gtk::gdk::keys::constants::KP_Enter
+                ) {
+                    trace_return_focus(window, terminal, underlays, state);
+                }
+            }
+            glib::Propagation::Proceed
+        });
+        // Pointer capture remains observational; the initiating click's release does not revoke
+        // its ticket, and the gesture never claims the sequence.
+        let focus_pointer = gtk::GestureMultiPress::new(&top_level);
+        focus_pointer.set_button(0);
+        focus_pointer.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let epoch = focus_epoch.clone();
+        let pending = pending_opener.clone();
+        let views = underlay_webviews.clone();
+        focus_pointer.connect_pressed(move |_, _, _, _| {
+            epoch.changed();
+            cancel_pending_opener(&pending, &views);
+        });
+        let epoch = focus_epoch.clone();
+        let pending = pending_opener.clone();
+        let views = underlay_webviews.clone();
+        let focus_active_signal = top_level.connect_is_active_notify(move |_| {
+            epoch.changed();
+            cancel_pending_opener(&pending, &views);
+        });
+        let pending = pending_opener.clone();
+        let views = underlay_webviews.clone();
+        let focus_target_signal = top_level.connect_set_focus(move |_, target| {
+            let index = pending.borrow().as_ref().map(|pending| pending.target);
+            if index.is_some_and(|index| {
+                views
+                    .get(index)
+                    .is_none_or(|view| target != Some(view.webview().upcast_ref::<gtk::Widget>()))
+            }) {
+                cancel_pending_opener(&pending, &views);
+            }
+        });
+
         Ok(Self {
             composition,
             layer,
@@ -1969,6 +2198,12 @@ impl LinuxOverlayHost {
             state,
             recovery_tracker: Rc::new(RefCell::new(RecoverySignalTracker::default())),
             previous_focus: Rc::new(RefCell::new(None)),
+            focus_epoch,
+            focus_key_signal: Some(focus_key_signal),
+            focus_pointer,
+            focus_active_signal: Some(focus_active_signal),
+            focus_target_signal: Some(focus_target_signal),
+            pending_opener,
         })
     }
 
@@ -1976,6 +2211,10 @@ impl LinuxOverlayHost {
     /// for its lazy first load/recovery. Model and modal scripts are superseding; transient replies are
     /// accepted only while the overlay is active.
     pub fn evaluate_or_remember(&self, script: &str, kind: ReactChromeScriptKind) {
+        if kind == ReactChromeScriptKind::Modal {
+            self.focus_epoch.changed();
+            cancel_pending_opener(&self.pending_opener, &self.underlay_webviews);
+        }
         let evaluate = {
             let mut state = self.state.borrow_mut();
             // A new modal supersedes every request emitted by the previous modal render. The new
@@ -2014,6 +2253,19 @@ impl LinuxOverlayHost {
             });
             accessible.set_name(name);
             accessible.set_description(description);
+        }
+    }
+
+    pub(crate) fn finish_dialog_focus(&self, ticket: u64) {
+        if self.focus_epoch.can_finish(
+            ticket,
+            self.top_level.is_active(),
+            self.state.borrow().visible,
+        ) {
+            self.focus_epoch.changed(); // consume before GTK can deliver reentrant focus signals
+            cancel_pending_opener(&self.pending_opener, &self.underlay_webviews);
+            self.terminal_slot.grab_focus();
+            eprintln!("linux-host published dialog launch returned focus to terminal");
         }
     }
 
@@ -2087,42 +2339,218 @@ impl LinuxOverlayHost {
         self.begin_persistent_document_suppression(false);
     }
 
-    fn restore_underlay_inputs(&self) {
+    fn restore_underlay_inputs(&self, restore_opener: bool) {
         // Cold-load requests deliberately have no native interactivity snapshot. Retire their
         // deadline before the early return as well as the presentation deadline used after
         // suppression begins.
         self.cancel_presentation_timeout();
-        let Some(saved) = self.underlay_interactivity.borrow_mut().take_for_restore() else {
-            return;
-        };
-        debug_assert_eq!(saved.containers.len(), self.underlay_containers.len());
-        debug_assert_eq!(saved.webviews.len(), self.underlay_webviews.len());
-        for (webview, interactivity) in self.underlay_webviews.iter().zip(&saved.webviews) {
-            let widget = webview.webview();
-            widget.set_sensitive(interactivity.sensitive);
-            widget.set_can_focus(interactivity.can_focus);
-        }
-        self.terminal_slot.set_sensitive(saved.terminal.sensitive);
-        self.terminal_slot.set_can_focus(saved.terminal.can_focus);
-        // Restore children while their parent bands are still closed, then reopen the bands in one
-        // owner-loop turn. The JS restore is exact: pre-existing root inert/aria-hidden values were
-        // snapshotted once by the suppression script and are never guessed.
-        self.restore_persistent_documents(saved.restore_focus_webview);
-        self.persistent_input_gate.restore();
-        self.state.borrow_mut().persistent_suppression.clear();
-        for (container, interactivity) in self.underlay_containers.iter().zip(&saved.containers) {
-            container.set_sensitive(interactivity.sensitive);
-            container.set_can_focus(interactivity.can_focus);
-        }
+        let saved = self.underlay_interactivity.borrow_mut().take_for_restore();
+        // Reopen every native band, then restore GTK focus before queueing WebKit work. A
+        // document restore sent earlier can observe hasFocus=false and discard its saved opener.
+        // The script still refuses a newer document/terminal owner; there is no delayed retry.
+        crate::host_services::restore_dialog_underlay(
+            restore_opener,
+            || {
+                let Some(saved) = saved.as_ref() else { return };
+                debug_assert_eq!(saved.containers.len(), self.underlay_containers.len());
+                debug_assert_eq!(saved.webviews.len(), self.underlay_webviews.len());
+                for (webview, interactivity) in self.underlay_webviews.iter().zip(&saved.webviews) {
+                    let widget = webview.webview();
+                    widget.set_sensitive(interactivity.sensitive);
+                    widget.set_can_focus(interactivity.can_focus);
+                }
+                self.terminal_slot.set_sensitive(saved.terminal.sensitive);
+                self.terminal_slot.set_can_focus(saved.terminal.can_focus);
+                self.persistent_input_gate.restore();
+                self.state.borrow_mut().persistent_suppression.clear();
+                for (container, interactivity) in
+                    self.underlay_containers.iter().zip(&saved.containers)
+                {
+                    container.set_sensitive(interactivity.sensitive);
+                    container.set_can_focus(interactivity.can_focus);
+                }
+            },
+            || {
+                let prior = if self.input_trace_enabled {
+                    self.previous_focus.borrow().clone()
+                } else {
+                    None
+                };
+                self.trace_native_focus("before-restore", prior.as_ref());
+                restore_focus(&self.previous_focus, &self.terminal_slot);
+                self.trace_native_focus("after-restore", prior.as_ref());
+            },
+            |restore_focus| {
+                if let Some(saved) = saved.as_ref() {
+                    self.restore_persistent_documents(
+                        saved.restore_focus_webview.filter(|_| restore_focus),
+                    );
+                }
+            },
+        );
     }
 
     fn restore_persistent_documents(&self, restore_focus_webview: Option<usize>) {
+        cancel_pending_opener(&self.pending_opener, &self.underlay_webviews);
+        let token = self.state.borrow().presentation_token;
+        if let (Some(target), Some(input_epoch)) =
+            (restore_focus_webview, self.focus_epoch.capture(true))
+        {
+            if let Some(document) = self
+                .state
+                .borrow()
+                .persistent_documents
+                .get(target)
+                .filter(|document| document.finished)
+            {
+                if let Some(generation) = document.generation {
+                    *self.pending_opener.borrow_mut() =
+                        Some(crate::host_services::dialog_opener::Pending {
+                            token,
+                            input_epoch,
+                            target,
+                            generation,
+                            dispatched: false,
+                        });
+                }
+            }
+        }
         for (index, webview) in self.underlay_webviews.iter().enumerate() {
-            let script = persistent_restore_script(restore_focus_webview == Some(index));
+            let restore = self
+                .pending_opener
+                .borrow()
+                .as_ref()
+                .is_some_and(|pending| pending.target == index);
+            let script = persistent_restore_script(restore, self.input_trace_enabled).replace(
+                "__HYDRA_RESTORE_FOCUS_TOKEN__",
+                &serde_json::to_string(&token.to_string()).expect("focus token serializes"),
+            );
+            if self.input_trace_enabled {
+                self.evaluate_focus_trace(
+                    webview,
+                    &script,
+                    "restore-result",
+                    "presentation",
+                    index,
+                    self.state.borrow().presentation_token,
+                );
+                continue;
+            }
             if let Err(error) = webview.evaluate_script(&script) {
                 eprintln!("linux-host persistent modal accessibility restore failed: {error}");
             }
         }
+    }
+
+    pub(crate) fn handle_persistent_focus_ready(&self, ready: PersistentFocusReady) {
+        let Some(index) = persistent_document_index(ready.surface, self.underlay_webviews.len())
+        else {
+            return;
+        };
+        let Some(view) = self.underlay_webviews.get(index) else {
+            return;
+        };
+        let state = self.state.borrow();
+        let current_document = state
+            .persistent_documents
+            .get(index)
+            .is_some_and(|document| {
+                document.finished && document.generation == Some(ready.generation)
+            });
+        let current = self.top_level.focused_widget();
+        let widget = view.webview();
+        let owns_focus = current_document
+            && state.presentation_token == ready.token
+            && !state.visible
+            && self.top_level.is_active()
+            && self.top_level.has_toplevel_focus()
+            && widget.has_focus()
+            && current.as_ref() == Some(widget.upcast_ref::<gtk::Widget>());
+        drop(state);
+        let accepted = self
+            .pending_opener
+            .borrow_mut()
+            .as_mut()
+            .is_some_and(|pending| {
+                pending.accept(
+                    ready.token,
+                    index,
+                    ready.generation,
+                    self.focus_epoch.capture(true),
+                    owns_focus,
+                )
+            });
+        if !accepted {
+            return;
+        }
+        let script = focus_token_script(COMPLETE_PERSISTENT_FOCUS_SCRIPT, ready.token).replace(
+            "__HYDRA_FOCUS_TRACE_FUNCTION__",
+            if self.input_trace_enabled {
+                crate::host_services::dialog_focus_trace::SNAPSHOT_FUNCTION
+            } else {
+                "null"
+            },
+        );
+        if self.input_trace_enabled {
+            self.evaluate_focus_trace(
+                view,
+                &script,
+                "opener-focus-result",
+                "presentation",
+                index,
+                ready.token,
+            );
+        } else {
+            let _ = view.evaluate_script(&script);
+        }
+    }
+
+    fn evaluate_focus_trace(
+        &self,
+        webview: &wry::WebView,
+        script: &str,
+        stage: &'static str,
+        token_kind: &'static str,
+        index: usize,
+        token: u64,
+    ) {
+        if !self.input_trace_enabled {
+            return;
+        }
+        let native = (stage == "restore-result").then(|| {
+            NativeFocusTrace::new(
+                &self.top_level,
+                &self.terminal_slot,
+                &self.underlay_webviews,
+                &Rc::downgrade(&self.state),
+            )
+        });
+        webview.webview().run_javascript(script, None::<&gtk::gio::Cancellable>, move |result| {
+            if native.as_ref().is_some_and(|native| !native.snapshot_if_current("after-restore-dom-result", token)) {
+                eprintln!("linux-host focus-trace stage={stage} index={index} token_kind={token_kind} token={token} stale_result=true");
+                return;
+            }
+            let json = result.ok().and_then(|result| result.js_value()?.to_json(0));
+            let summary = json.as_deref().and_then(crate::host_services::dialog_focus_trace::summary);
+            match summary {
+                Some(summary) => eprintln!("linux-host focus-trace host_monotonic_us={} stage={stage} index={index} token_kind={token_kind} token={token} {summary}", overlay_trace_monotonic_us()),
+                None => eprintln!("linux-host focus-trace host_monotonic_us={} stage={stage} index={index} token_kind={token_kind} token={token} invalid_result=true", overlay_trace_monotonic_us()),
+            }
+        });
+    }
+
+    fn trace_native_focus(&self, stage: &'static str, prior: Option<&gtk::Widget>) {
+        if !self.input_trace_enabled {
+            return;
+        }
+        trace_native_focus_snapshot(
+            &self.top_level,
+            &self.terminal_slot,
+            &self.underlay_webviews,
+            self.state.borrow().webview.as_deref(),
+            stage,
+            prior,
+        );
     }
 
     /// Start one epoch of persistent-document suppression and require an exact callback from every
@@ -2234,6 +2662,7 @@ impl LinuxOverlayHost {
             self.hide_and_restore_focus();
             return;
         }
+        cancel_pending_opener(&self.pending_opener, &self.underlay_webviews);
         if self.state.borrow().recovery.is_exhausted() {
             eprintln!(
                 "linux-host overlay recovery phase=exhausted bundled=true bytes={} reason=visibility-request attempts={MAX_WEBKIT_RECOVERY_ATTEMPTS}",
@@ -2283,6 +2712,10 @@ impl LinuxOverlayHost {
         };
         if first_transition {
             *self.previous_focus.borrow_mut() = self.top_level.focused_widget();
+            self.trace_native_focus(
+                "capture-before-native-suppression",
+                self.previous_focus.borrow().as_ref(),
+            );
             self.arm_presentation_timeout();
         }
 
@@ -2364,6 +2797,7 @@ impl LinuxOverlayHost {
     /// no longer proof about the replacement DOM, so invalidate the epoch immediately and park the
     /// overlay until the accepted PageFinished path starts a fresh callback-gated suppression.
     pub(crate) fn persistent_document_started(&self, surface: WebKitSurface, generation: u64) {
+        cancel_pending_opener(&self.pending_opener, &self.underlay_webviews);
         let (visible, webview) = {
             let mut state = self.state.borrow_mut();
             if !state.mark_persistent_document_started(surface, generation) {
@@ -2393,10 +2827,9 @@ impl LinuxOverlayHost {
         };
         self.park_webview(webview.as_deref(), false);
         self.present_target.set_overlay_occluded(false);
-        self.restore_underlay_inputs();
+        self.restore_underlay_inputs(was_visible);
         self.top_level.queue_draw();
         if was_visible {
-            restore_focus(&self.previous_focus, &self.terminal_slot);
             eprintln!("linux-host dashboard overlay hidden");
         }
     }
@@ -2412,11 +2845,8 @@ impl LinuxOverlayHost {
         };
         self.park_webview(webview.as_deref(), false);
         self.present_target.set_overlay_occluded(false);
-        self.restore_underlay_inputs();
+        self.restore_underlay_inputs(was_visible);
         self.top_level.queue_draw();
-        if was_visible {
-            restore_focus(&self.previous_focus, &self.terminal_slot);
-        }
     }
 
     fn current_presentation_geometry(
@@ -2672,12 +3102,19 @@ impl LinuxOverlayHost {
             return;
         };
         let (target, observed) = self.current_presentation_geometry(&webview);
-        let Some(target) = self
+        let acceptance = self
             .presentation_barrier
             .borrow_mut()
-            .accept_viewport_ready(event, target, observed)
-        else {
-            return;
+            .accept_viewport_ready(event, target, observed);
+        let target = match acceptance {
+            OverlayViewportAcceptance::Ignored => return,
+            OverlayViewportAcceptance::RetryNative => {
+                // Reseeding dispatches any already-ready native wake. Otherwise the existing GTK
+                // allocation callbacks dispatch it when geometry settles; no new timer is armed.
+                self.observe_current_presentation_geometry(&webview);
+                return;
+            }
+            OverlayViewportAcceptance::Accepted(target) => target,
         };
         if let Err(error) = self.activate_ready_webview(event.token, target, &webview) {
             eprintln!("linux-host overlay gated activation failed: {error}");
@@ -2702,7 +3139,10 @@ impl LinuxOverlayHost {
         };
         for json in intents {
             if events
-                .send(RendererEvent::ReactChromeIntent { json })
+                .send(RendererEvent::ReactChromeIntent {
+                    json,
+                    dialog_focus_ticket: None,
+                })
                 .is_err()
             {
                 eprintln!(
@@ -2817,6 +3257,10 @@ impl LinuxOverlayHost {
             // The exact ready marker is the ownership boundary. Only now capture focus, start the
             // short presentation join, and suppress the native terminal/sidebar/topbar.
             *self.previous_focus.borrow_mut() = self.top_level.focused_widget();
+            self.trace_native_focus(
+                "capture-before-native-suppression",
+                self.previous_focus.borrow().as_ref(),
+            );
             self.arm_overlay_timeout_source(token, MODAL_PRESENTATION_TIMEOUT);
             self.set_fallback_accessibility(FallbackAccessibility::Loading);
             self.suppress_underlay_inputs();
@@ -2859,6 +3303,23 @@ impl LinuxOverlayHost {
             .borrow_mut()
             .persistent_suppression
             .finish(result);
+        if self.input_trace_enabled
+            && matches!(
+                decision,
+                PersistentSuppressionDecision::Pending | PersistentSuppressionDecision::Ready
+            )
+        {
+            if let Some(webview) = self.underlay_webviews.get(result.index) {
+                self.evaluate_focus_trace(
+                    webview,
+                    &crate::host_services::dialog_focus_trace::saved_snapshot_script(),
+                    "post-suppression-callback",
+                    "suppression",
+                    result.index,
+                    result.epoch,
+                );
+            }
+        }
         match decision {
             PersistentSuppressionDecision::Ready => {
                 eprintln!(
@@ -2884,6 +3345,15 @@ impl LinuxOverlayHost {
 
     pub(crate) fn handle_presentation_timeout(&self, token: u64) {
         let phase = self.state.borrow().deadline_phase_for_token(token);
+        if self.input_trace_enabled {
+            if let Some(snapshot) = self
+                .state
+                .borrow()
+                .timeout_snapshot(token, &self.presentation_barrier.borrow())
+            {
+                eprintln!("linux-host overlay timeout-state {snapshot}");
+            }
+        }
         match phase {
             Some(OverlayDeadlinePhase::ColdLoad) => {
                 eprintln!("linux-host overlay cold load timed out token={token}");
@@ -2980,11 +3450,10 @@ impl LinuxOverlayHost {
                         // lazily-created WebView instance.
                         self.recovery_tracker.borrow_mut().shut_down();
                         self.park_webview(webview.as_deref(), false);
-                        self.restore_underlay_inputs();
+                        self.restore_underlay_inputs(was_visible);
                         if was_visible {
                             self.present_target.set_overlay_occluded(false);
                             self.top_level.queue_draw();
-                            restore_focus(&self.previous_focus, &self.terminal_slot);
                         }
                         eprintln!(
                             "linux-host overlay recovery phase=exhausted bundled=true bytes={} reason={reason:?} attempts={MAX_WEBKIT_RECOVERY_ATTEMPTS} visible={was_visible}",
@@ -3110,6 +3579,8 @@ impl LinuxOverlayHost {
         let navigation_tracker = Rc::downgrade(&self.recovery_tracker);
         let navigation_recovery_sender = webkit_recovery_sender(self.wake_proxy.clone());
         let ipc_state = Rc::downgrade(&self.state);
+        let ipc_focus_epoch = self.focus_epoch.clone();
+        let ipc_top_level = self.top_level.clone();
         let page_state = Rc::downgrade(&self.state);
         let overlay_url = self.overlay_url.clone();
         let input_trace_enabled = self.input_trace_enabled;
@@ -3314,8 +3785,24 @@ impl LinuxOverlayHost {
                         return;
                     };
                     if let Some(events) = ipc_events.as_ref() {
+                        // Stamp the originating dialog, before app/daemon preparation. Late input,
+                        // modal replacement or activation changes invalidate this exact epoch.
+                        let explicit_launch = serde_json::from_str::<ProductIntentDiscriminant>(&forwarded_json)
+                            .is_ok_and(|intent| matches!(intent.kind.as_str(), "createProject" | "createWindow" | "splitPane"));
+                        let owns_focus = explicit_launch && ipc_state.upgrade().is_some_and(|state| {
+                            let state = state.borrow();
+                            state.visible && ipc_top_level.is_active()
+                                && ipc_top_level.focused_widget().is_some_and(|focused| {
+                                    state.webview.as_ref().is_some_and(|webview| {
+                                        let widget: gtk::Widget = webview.webview().clone().upcast();
+                                        focused == widget || focused.is_ancestor(&widget)
+                                    })
+                                })
+                        });
+                        let dialog_focus_ticket = ipc_focus_epoch.capture(owns_focus);
                         if events
                             .send(RendererEvent::ReactChromeIntent {
+                                dialog_focus_ticket,
                                 json: forwarded_json,
                             })
                             .is_err()
@@ -3511,13 +3998,180 @@ impl LinuxOverlayHost {
 
 impl Drop for LinuxOverlayHost {
     fn drop(&mut self) {
+        self.focus_epoch.changed();
+        cancel_pending_opener(&self.pending_opener, &self.underlay_webviews);
+        if let Some(signal) = self.focus_key_signal.take() {
+            self.top_level.disconnect(signal);
+        }
+        self.focus_pointer
+            .set_propagation_phase(gtk::PropagationPhase::None);
+        if let Some(signal) = self.focus_active_signal.take() {
+            self.top_level.disconnect(signal);
+        }
+        if let Some(signal) = self.focus_target_signal.take() {
+            self.top_level.disconnect(signal);
+        }
         // Belt-and-braces for construction failures or callers which never enter `run`.
         self.state.borrow_mut().recovery.shut_down();
         self.recovery_tracker.borrow_mut().shut_down();
         self.presentation_barrier.borrow_mut().cancel();
         self.presentation_timeout.borrow_mut().cancel();
-        self.restore_underlay_inputs();
+        self.restore_underlay_inputs(false);
     }
+}
+
+fn trace_native_focus_snapshot(
+    window: &gtk::ApplicationWindow,
+    terminal: &gtk::DrawingArea,
+    underlays: &[Rc<wry::WebView>],
+    overlay: Option<&wry::WebView>,
+    stage: &'static str,
+    prior: Option<&gtk::Widget>,
+) {
+    let current = window.focused_widget();
+    let kind = |candidate: Option<&gtk::Widget>| {
+        let Some(candidate) = candidate else {
+            return "none";
+        };
+        if candidate == terminal.upcast_ref::<gtk::Widget>() {
+            return "terminal";
+        }
+        for (index, webview) in underlays.iter().enumerate() {
+            let widget: gtk::Widget = webview.webview().upcast();
+            if candidate == &widget || candidate.is_ancestor(&widget) {
+                return match index {
+                    0 => "sidebar",
+                    1 => "topbar",
+                    _ => "other",
+                };
+            }
+        }
+        if overlay.is_some_and(|webview| {
+            let widget: gtk::Widget = webview.webview().upcast();
+            candidate == &widget || candidate.is_ancestor(&widget)
+        }) {
+            "overlay"
+        } else {
+            "other"
+        }
+    };
+    let exact_webview = |candidate: Option<&gtk::Widget>| {
+        candidate.is_some_and(|candidate| {
+            underlays
+                .iter()
+                .map(Rc::as_ref)
+                .chain(overlay)
+                .any(|view| candidate == view.webview().upcast_ref::<gtk::Widget>())
+        })
+    };
+    eprintln!("linux-host focus-trace host_monotonic_us={} stage={stage} native=true prior={} current={} active={} same={} prior_mapped={} prior_sensitive={} prior_can_focus={} current_mapped={} current_sensitive={} current_can_focus={} toplevel_focused={} prior_has_focus={} current_has_focus={} prior_exact_webview={} current_exact_webview={}",
+        overlay_trace_monotonic_us(), kind(prior), kind(current.as_ref()), window.is_active(),
+        prior.is_some() && prior == current.as_ref(), prior.is_some_and(|w| w.is_mapped()),
+        prior.is_some_and(|w| w.is_sensitive()), prior.is_some_and(|w| w.can_focus()),
+        current.as_ref().is_some_and(|w| w.is_mapped()), current.as_ref().is_some_and(|w| w.is_sensitive()), current.as_ref().is_some_and(|w| w.can_focus()),
+        window.has_toplevel_focus(), prior.is_some_and(|w| w.has_focus()), current.as_ref().is_some_and(|w| w.has_focus()), exact_webview(prior), exact_webview(current.as_ref()));
+}
+
+/// Keep a diagnostic callback from retaining a closed window or its WebViews. A callback snapshot
+/// is later than the script execution; it is not an atomic GTK/DOM focus observation.
+struct NativeFocusTrace {
+    window: glib::WeakRef<gtk::ApplicationWindow>,
+    terminal: glib::WeakRef<gtk::DrawingArea>,
+    underlays: Vec<std::rc::Weak<wry::WebView>>,
+    state: std::rc::Weak<RefCell<OverlayRuntime>>,
+}
+
+impl NativeFocusTrace {
+    fn new(
+        window: &gtk::ApplicationWindow,
+        terminal: &gtk::DrawingArea,
+        underlays: &[Rc<wry::WebView>],
+        state: &std::rc::Weak<RefCell<OverlayRuntime>>,
+    ) -> Self {
+        Self {
+            window: window.downgrade(),
+            terminal: terminal.downgrade(),
+            underlays: underlays.iter().map(Rc::downgrade).collect(),
+            state: state.clone(),
+        }
+    }
+
+    fn snapshot_if_current(&self, stage: &'static str, presentation_token: u64) -> bool {
+        let (Some(state), Some(window), Some(terminal), Some(underlays)) = (
+            self.state.upgrade(),
+            self.window.upgrade(),
+            self.terminal.upgrade(),
+            self.underlays
+                .iter()
+                .map(std::rc::Weak::upgrade)
+                .collect::<Option<Vec<_>>>(),
+        ) else {
+            return false;
+        };
+        let state = state.borrow();
+        if state.presentation_token != presentation_token {
+            return false;
+        }
+        trace_native_focus_snapshot(
+            &window,
+            &terminal,
+            &underlays,
+            state.webview.as_deref(),
+            stage,
+            None,
+        );
+        true
+    }
+}
+
+/// Trace one real Return observation without consuming it or altering focus. The callback is
+/// GTK-local, like Wry's run_javascript backend, so it can read effective native focus as well.
+fn trace_return_focus(
+    window: &gtk::ApplicationWindow,
+    terminal: &gtk::DrawingArea,
+    underlays: &[Rc<wry::WebView>],
+    state: &std::rc::Weak<RefCell<OverlayRuntime>>,
+) {
+    let Some(runtime) = state.upgrade() else {
+        return;
+    };
+    let runtime = runtime.borrow();
+    trace_native_focus_snapshot(
+        window,
+        terminal,
+        underlays,
+        runtime.webview.as_deref(),
+        "return-observed",
+        None,
+    );
+    let Some(current) = window.focused_widget() else {
+        return;
+    };
+    let Some((index, target)) = underlays.iter().enumerate().find(|(_, view)| {
+        let widget: gtk::Widget = view.webview().upcast();
+        current == widget || current.is_ancestor(&widget)
+    }) else {
+        return;
+    };
+    let token = runtime.presentation_token;
+    drop(runtime);
+    let native = NativeFocusTrace::new(window, terminal, underlays, state);
+    target.webview().run_javascript(
+        &crate::host_services::dialog_focus_trace::saved_snapshot_script(),
+        None::<&gtk::gio::Cancellable>,
+        move |result| {
+            if !native.snapshot_if_current("after-return-dom-result", token) {
+                eprintln!("linux-host focus-trace stage=return-dom-result index={index} token_kind=presentation token={token} stale_result=true");
+                return;
+            }
+            let json = result.ok().and_then(|result| result.js_value()?.to_json(0));
+            let summary = json.as_deref().and_then(crate::host_services::dialog_focus_trace::summary);
+            match summary {
+                Some(summary) => eprintln!("linux-host focus-trace host_monotonic_us={} stage=return-dom-result index={index} token_kind=presentation token={token} {summary}", overlay_trace_monotonic_us()),
+                None => eprintln!("linux-host focus-trace host_monotonic_us={} stage=return-dom-result index={index} token_kind=presentation token={token} invalid_result=true", overlay_trace_monotonic_us()),
+            }
+        },
+    );
 }
 
 fn restore_focus(
@@ -3648,11 +4302,27 @@ fn overlay_viewport_barrier_script(token: u64, target: OverlayGeometry) -> Strin
     )
 }
 
-fn persistent_restore_script(restore_focus: bool) -> String {
-    RESTORE_PERSISTENT_DOCUMENTS_SCRIPT.replace(
-        "__HYDRA_RESTORE_DOM_FOCUS__",
-        if restore_focus { "true" } else { "false" },
+fn focus_token_script(script: &str, token: u64) -> String {
+    script.replace(
+        "__HYDRA_RESTORE_FOCUS_TOKEN__",
+        &serde_json::to_string(&token.to_string()).expect("focus token serializes"),
     )
+}
+
+fn persistent_restore_script(restore_focus: bool, trace: bool) -> String {
+    RESTORE_PERSISTENT_DOCUMENTS_SCRIPT
+        .replace(
+            "__HYDRA_RESTORE_DOM_FOCUS__",
+            if restore_focus { "true" } else { "false" },
+        )
+        .replace(
+            "__HYDRA_FOCUS_TRACE_FUNCTION__",
+            if trace {
+                crate::host_services::dialog_focus_trace::SNAPSHOT_FUNCTION
+            } else {
+                "null"
+            },
+        )
 }
 
 #[cfg(test)]
@@ -3771,7 +4441,7 @@ mod tests {
         assert!(RESTORE_PERSISTENT_DOCUMENTS_SCRIPT.contains("saved.ariaHidden"));
         assert!(RESTORE_PERSISTENT_DOCUMENTS_SCRIPT.contains("removeAttribute"));
         assert!(RESTORE_PERSISTENT_DOCUMENTS_SCRIPT.contains("prior.isConnected"));
-        assert!(RESTORE_PERSISTENT_DOCUMENTS_SCRIPT.contains("preventScroll"));
+        assert!(!RESTORE_PERSISTENT_DOCUMENTS_SCRIPT.contains("prior.focus("));
         assert!(RESTORE_PERSISTENT_DOCUMENTS_SCRIPT.contains("finally"));
         assert!(RESTORE_PERSISTENT_DOCUMENTS_SCRIPT.contains("firewall.active = false"));
         assert!(RESTORE_PERSISTENT_DOCUMENTS_SCRIPT.contains("restoreFocus &&"));
@@ -3779,12 +4449,26 @@ mod tests {
         let clear = RESTORE_PERSISTENT_DOCUMENTS_SCRIPT
             .find("delete window.__HYDRA_NATIVE_MODAL_UNDERLAY_STATE__")
             .unwrap();
-        let focus = RESTORE_PERSISTENT_DOCUMENTS_SCRIPT
+        let arm = RESTORE_PERSISTENT_DOCUMENTS_SCRIPT
+            .find("window.__HYDRA_PENDING_OPENER_FOCUS__ = pending")
+            .unwrap();
+        assert!(
+            clear < arm,
+            "accessibility is released before asynchronous focus readiness"
+        );
+        let consume = COMPLETE_PERSISTENT_FOCUS_SCRIPT
+            .find("pending.cancel();")
+            .unwrap();
+        let focus = COMPLETE_PERSISTENT_FOCUS_SCRIPT
             .find("prior.focus({ preventScroll: true })")
             .unwrap();
-        assert!(clear < focus);
-        let focused_restore = persistent_restore_script(true);
-        let passive_restore = persistent_restore_script(false);
+        assert!(consume < focus);
+        assert!(COMPLETE_PERSISTENT_FOCUS_SCRIPT.contains("pending.token !=="));
+        assert!(COMPLETE_PERSISTENT_FOCUS_SCRIPT.contains("document.hasFocus()"));
+        assert!(COMPLETE_PERSISTENT_FOCUS_SCRIPT.contains("!root.inert"));
+        assert!(COMPLETE_PERSISTENT_FOCUS_SCRIPT.contains("!firewall.active"));
+        let focused_restore = persistent_restore_script(true, false);
+        let passive_restore = persistent_restore_script(false, false);
         assert!(focused_restore.contains("})(true);"));
         assert!(passive_restore.contains("})(false);"));
         assert!(!focused_restore.contains("__HYDRA_RESTORE_DOM_FOCUS__"));
@@ -4197,7 +4881,7 @@ mod tests {
                 Some(target),
                 live,
             ),
-            None
+            OverlayViewportAcceptance::Ignored
         );
         assert_eq!(
             barrier.accept_viewport_ready(
@@ -4209,7 +4893,7 @@ mod tests {
                 Some(target),
                 live,
             ),
-            Some(target)
+            OverlayViewportAcceptance::Accepted(target)
         );
         assert!(barrier.active.is_none());
     }
@@ -4382,6 +5066,209 @@ mod tests {
     }
 
     #[test]
+    fn consumed_viewport_ack_can_retry_after_live_revalidation_rejects_it() {
+        let target = overlay_geometry(1854, 1001);
+        let mismatch = overlay_geometry(1853, 1001);
+        let mut barrier = OverlayPresentationBarrier::default();
+        barrier.begin(22, Some(target));
+        let native = advance_native_barrier_to_viewport(&mut barrier, target);
+        let settled = [Some(target); OverlayAllocationSurface::COUNT];
+        assert!(barrier.accept_native_ready(native, Some(target), settled));
+
+        // A stale or wrong-size ACK did not consume this attempt's one-shot DOM observer.
+        // Neither may reset the current generation's native join.
+        for (token, width) in [(21, target.width), (22, mismatch.width)] {
+            assert_eq!(
+                barrier.accept_viewport_ready(
+                    OverlayViewportReady {
+                        token,
+                        width,
+                        height: target.height,
+                    },
+                    Some(target),
+                    settled,
+                ),
+                OverlayViewportAcceptance::Ignored
+            );
+            assert_eq!(
+                barrier.active.as_ref().unwrap().phase,
+                OverlayPresentationBarrierPhase::WebViewport
+            );
+        }
+
+        // The exact ACK removes its JS observer before dispatch. GTK can differ at this live
+        // revalidation even though its allocation callback has not updated the cached geometry.
+        assert_eq!(
+            barrier.accept_viewport_ready(
+                OverlayViewportReady {
+                    token: 22,
+                    width: target.width,
+                    height: target.height,
+                },
+                Some(target),
+                [Some(target), Some(target), Some(mismatch), Some(target)],
+            ),
+            OverlayViewportAcceptance::RetryNative
+        );
+        assert_eq!(barrier.observe_target(Some(target)), None);
+        assert_eq!(
+            barrier.observe_surface(OverlayAllocationSurface::Content, Some(mismatch)),
+            None,
+            "persistent bad geometry must not release a native wake"
+        );
+        let fresh = barrier
+            .observe_surface(OverlayAllocationSurface::Content, Some(target))
+            .expect("settling after a consumed DOM ACK must enqueue a fresh native join");
+        assert_eq!(fresh.token, 22);
+        assert_eq!(fresh.phase, OverlayNativeAllocationPhase::Containers);
+        assert!(barrier.accept_native_ready(fresh, Some(target), settled));
+        let webview = barrier
+            .observe_surface(OverlayAllocationSurface::WebView, Some(target))
+            .expect("the fresh native join must rearm the DOM observer through its WebView wake");
+        assert!(barrier.accept_native_ready(webview, Some(target), settled));
+        assert_eq!(
+            barrier.accept_viewport_ready(
+                OverlayViewportReady {
+                    token: 22,
+                    width: target.width,
+                    height: target.height,
+                },
+                Some(target),
+                settled,
+            ),
+            OverlayViewportAcceptance::Accepted(target)
+        );
+        assert!(barrier.active.is_none());
+    }
+
+    #[test]
+    fn viewport_ack_in_wrong_native_phase_preserves_the_current_join() {
+        let target = overlay_geometry(1854, 1001);
+        let ack = OverlayViewportReady {
+            token: 23,
+            width: target.width,
+            height: target.height,
+        };
+        let mut barrier = OverlayPresentationBarrier::default();
+        assert_eq!(
+            barrier.accept_viewport_ready(ack, None, [None; OverlayAllocationSurface::COUNT]),
+            OverlayViewportAcceptance::Ignored
+        );
+        for webview_phase in [false, true] {
+            barrier.cancel();
+            barrier.begin(23, Some(target));
+            if webview_phase {
+                advance_native_barrier_to_viewport(&mut barrier, target);
+            }
+            let before = barrier.active.as_ref().unwrap();
+            let saved = (
+                before.target,
+                before.observed,
+                before.phase,
+                before.native_event_queued,
+            );
+            assert_eq!(
+                barrier.accept_viewport_ready(ack, None, [None; OverlayAllocationSurface::COUNT]),
+                OverlayViewportAcceptance::Ignored
+            );
+            let after = barrier.active.as_ref().unwrap();
+            assert_eq!(after.token, 23);
+            assert_eq!(
+                (
+                    after.target,
+                    after.observed,
+                    after.phase,
+                    after.native_event_queued
+                ),
+                saved
+            );
+        }
+    }
+
+    #[test]
+    fn consumed_viewport_ack_waits_for_a_missing_live_target_without_a_new_token() {
+        let target = overlay_geometry(1854, 1001);
+        let mut barrier = OverlayPresentationBarrier::default();
+        barrier.begin(24, Some(target));
+        let native = advance_native_barrier_to_viewport(&mut barrier, target);
+        let settled = [Some(target); OverlayAllocationSurface::COUNT];
+        assert!(barrier.accept_native_ready(native, Some(target), settled));
+        let ack = OverlayViewportReady {
+            token: 24,
+            width: target.width,
+            height: target.height,
+        };
+        assert_eq!(
+            barrier.accept_viewport_ready(ack, None, [None; OverlayAllocationSurface::COUNT]),
+            OverlayViewportAcceptance::RetryNative
+        );
+        assert_eq!(barrier.observe_target(None), None);
+        assert_eq!(
+            barrier.observe_surface(OverlayAllocationSurface::Content, None),
+            None
+        );
+        assert_eq!(barrier.active.as_ref().unwrap().token, 24);
+        assert_eq!(barrier.observe_target(Some(target)), None);
+        let native = advance_native_barrier_to_viewport(&mut barrier, target);
+        assert_eq!(native.token, 24);
+        assert!(barrier.accept_native_ready(native, Some(target), settled));
+        assert_eq!(
+            barrier.accept_viewport_ready(ack, Some(target), settled),
+            OverlayViewportAcceptance::Accepted(target)
+        );
+    }
+
+    #[test]
+    fn consumed_viewport_ack_reseeds_already_settled_new_geometry() {
+        let initial = overlay_geometry(1280, 753);
+        let resized = overlay_geometry(1854, 1001);
+        let mut barrier = OverlayPresentationBarrier::default();
+        barrier.begin(25, Some(initial));
+        let native = advance_native_barrier_to_viewport(&mut barrier, initial);
+        assert!(barrier.accept_native_ready(
+            native,
+            Some(initial),
+            [Some(initial); OverlayAllocationSurface::COUNT],
+        ));
+        let old_ack = OverlayViewportReady {
+            token: 25,
+            width: initial.width,
+            height: initial.height,
+        };
+        let settled = [Some(resized); OverlayAllocationSurface::COUNT];
+        assert_eq!(
+            barrier.accept_viewport_ready(old_ack, Some(resized), settled),
+            OverlayViewportAcceptance::RetryNative
+        );
+        // The actual caller reseeds target first, so this must queue even if no later GTK
+        // allocation callback arrives: all live surfaces already match the changed target.
+        let containers = barrier.observe_target(Some(resized)).unwrap();
+        assert_eq!(containers.token, 25);
+        assert_eq!(containers.phase, OverlayNativeAllocationPhase::Containers);
+        assert!(barrier.accept_native_ready(containers, Some(resized), settled));
+        let webview = barrier
+            .observe_surface(OverlayAllocationSurface::WebView, Some(resized))
+            .unwrap();
+        assert!(barrier.accept_native_ready(webview, Some(resized), settled));
+        assert_eq!(
+            barrier.accept_viewport_ready(old_ack, Some(resized), settled),
+            OverlayViewportAcceptance::Ignored
+        );
+        assert_eq!(
+            barrier.accept_viewport_ready(
+                OverlayViewportReady {
+                    token: 25,
+                    width: resized.width,
+                    height: resized.height
+                },
+                Some(resized),
+                settled,
+            ),
+            OverlayViewportAcceptance::Accepted(resized)
+        );
+    }
+
+    #[test]
     fn scale_only_transition_invalidates_the_old_native_wake() {
         let scale_one = overlay_geometry(1280, 753);
         let scale_two = OverlayGeometry::new(0, 0, 1280, 753, 2).unwrap();
@@ -4428,7 +5315,7 @@ mod tests {
                 Some(resized),
                 [Some(initial); OverlayAllocationSurface::COUNT],
             ),
-            None
+            OverlayViewportAcceptance::Ignored
         );
         let resized_event = advance_native_barrier_to_viewport(&mut barrier, resized);
         assert_eq!(resized_event.token, 21);
@@ -4447,7 +5334,7 @@ mod tests {
                 Some(resized),
                 [Some(resized); OverlayAllocationSurface::COUNT],
             ),
-            Some(resized)
+            OverlayViewportAcceptance::Accepted(resized)
         );
     }
 
@@ -4484,6 +5371,74 @@ mod tests {
         assert!(!script.contains("setTimeout"));
         assert!(!script.contains("textContent"));
         assert!(!script.contains("target.value"));
+    }
+
+    #[test]
+    fn timeout_snapshot_is_current_content_free_and_captures_pending_barrier() {
+        let mut runtime = OverlayRuntime::new(2);
+        runtime
+            .delivery
+            .remember("private modal text", ReactChromeScriptKind::Modal, true);
+        runtime.delivery.attach_webview();
+        let evaluation = runtime.delivery.react_ready().unwrap();
+        let token = runtime.begin_presentation_deadline();
+        runtime.visible = true;
+        runtime.persistent_documents[0].finished = true;
+        let epoch = runtime.persistent_suppression.begin(2);
+        runtime
+            .persistent_suppression
+            .finish(PersistentSuppressionResult {
+                epoch,
+                index: 0,
+                succeeded: true,
+            });
+        let mut barrier = OverlayPresentationBarrier::default();
+        let snapshot = runtime.timeout_snapshot(token, &barrier).unwrap();
+        assert!(snapshot.contains("delivery=evaluating"));
+        assert!(snapshot
+            .contains("required_mask=3 completed_mask=1 documents_finished_mask=1 barrier=absent"));
+        assert!(!snapshot.contains("private"));
+        assert!(runtime.timeout_snapshot(token + 1, &barrier).is_none());
+        runtime
+            .delivery
+            .finish_modal_evaluation(OverlayEvaluationResult {
+                attempt: evaluation.modal_attempt.unwrap(),
+                succeeded: true,
+            });
+        runtime
+            .persistent_suppression
+            .finish(PersistentSuppressionResult {
+                epoch,
+                index: 1,
+                succeeded: true,
+            });
+        let target = overlay_geometry(1854, 1001);
+        barrier.begin(token, Some(target));
+        for (phase, label) in [
+            (OverlayPresentationBarrierPhase::Containers, "containers"),
+            (OverlayPresentationBarrierPhase::WebView, "webview"),
+            (
+                OverlayPresentationBarrierPhase::WebViewport,
+                "awaiting_accepted_dom_ack",
+            ),
+        ] {
+            let active = barrier.active.as_mut().unwrap();
+            active.phase = phase;
+            active.observed = [
+                Some(target),
+                Some(target),
+                None,
+                Some(overlay_geometry(2, 2)),
+            ];
+            let snapshot = runtime.timeout_snapshot(token, &barrier).unwrap();
+            assert!(snapshot.contains("delivery=delivered"));
+            assert!(snapshot.contains(
+                "suppression_active=false suppression_ready=true required_mask=3 completed_mask=3"
+            ));
+            assert!(snapshot.contains(&format!("barrier={label} token_matches=true target_present=true observed_mask=11 target_match_mask=3")));
+        }
+        runtime.end_deadline();
+        assert!(runtime.timeout_snapshot(token, &barrier).is_none());
     }
 
     #[test]

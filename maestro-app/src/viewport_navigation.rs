@@ -90,10 +90,16 @@ impl PendingNavigation {
                 return Frontier::NotReady;
             }
             match receiver.try_recv() {
-                Ok(maestro_renderer::RendererEvent::ReactChromeIntent { json }) => {
+                Ok(maestro_renderer::RendererEvent::ReactChromeIntent {
+                    json,
+                    dialog_focus_ticket,
+                }) => {
                     if !self.retain_pending_json(&json, bound, current_window_id, false) {
                         return Frontier::Event(
-                            maestro_renderer::RendererEvent::ReactChromeIntent { json },
+                            maestro_renderer::RendererEvent::ReactChromeIntent {
+                                json,
+                                dialog_focus_ticket,
+                            },
                         );
                     }
                 }

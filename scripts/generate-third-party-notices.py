@@ -49,16 +49,33 @@ def rust_dependencies() -> list[tuple[str, str, str, str]]:
     return sorted(rows, key=lambda row: (row[0].lower(), row[1], row[2], row[3]))
 
 
-def npm_dependencies() -> list[tuple[str, str, str, str]]:
-    lock = json.loads((ROOT / "dashboard-ui/package-lock.json").read_text(encoding="utf-8"))
+NPM_LOCKS = (
+    "dashboard-ui/package-lock.json",
+    "web-client/package-lock.json",
+    "hydra-cloud/package-lock.json",
+)
+
+
+def npm_dependencies(lock_path: str) -> list[tuple[str, str, str, str]]:
+    if lock_path not in NPM_LOCKS:
+        raise SystemExit("dependency-notices: unreviewed npm lock path")
+    lock = json.loads((ROOT / lock_path).read_text(encoding="utf-8"))
+    packages = lock.get("packages")
+    if not isinstance(packages, dict) or not packages or "" not in packages:
+        raise SystemExit(f"dependency-notices: invalid npm package inventory: {lock_path}")
     rows: set[tuple[str, str, str, str]] = set()
-    for path, package in lock.get("packages", {}).items():
+    for path, package in packages.items():
         if not path or "node_modules/" not in path:
             continue
         name = path.rsplit("node_modules/", 1)[1]
         version = package.get("version")
         license_expression = package.get("license")
-        if not version or not license_expression:
+        if (
+            not isinstance(version, str)
+            or not version.strip()
+            or not isinstance(license_expression, str)
+            or not license_expression.strip()
+        ):
             raise SystemExit(
                 f"dependency-notices: npm package lacks version/license metadata: {path}"
             )
@@ -79,19 +96,25 @@ def table(rows: list[tuple[str, str, str, str]]) -> list[str]:
 
 def main() -> int:
     rust = rust_dependencies()
-    npm = npm_dependencies()
+    npm = npm_dependencies(NPM_LOCKS[0])
+    browser = npm_dependencies(NPM_LOCKS[1])
+    broker = npm_dependencies(NPM_LOCKS[2])
     lines = [
         "# Third-party notices",
         "",
-        "Hydra Local's first-party code is MIT licensed. It depends on third-party software under the terms",
-        "listed below. This inventory is generated from the exact locked Rust and dashboard",
-        "dependency graphs; it does not change or replace any upstream licence.",
+        "Hydra's first-party public source is MIT licensed. It uses third-party software under the terms",
+        "listed below. This inventory covers the locked Rust and dashboard graphs plus the separate",
+        "Remote library development-tool locks; it does not change or replace any upstream licence.",
         "",
         f"- `Cargo.lock` SHA-256: `{sha256(ROOT / 'Cargo.lock')}`",
         "- `dashboard-ui/package-lock.json` SHA-256: "
         f"`{sha256(ROOT / 'dashboard-ui/package-lock.json')}`",
         f"- Rust dependency versions: {len(rust)}",
         f"- npm dependency versions: {len(npm)}",
+        f"- `web-client/package-lock.json` SHA-256: `{sha256(ROOT / NPM_LOCKS[1])}`",
+        f"- Browser-core development dependency versions: {len(browser)}",
+        f"- `hydra-cloud/package-lock.json` SHA-256: `{sha256(ROOT / NPM_LOCKS[2])}`",
+        f"- Broker-core development dependency versions: {len(broker)}",
         "",
         "The source repository does not vendor these dependencies. Package managers retrieve each",
         "dependency from its named upstream, where the complete corresponding licence and copyright",
@@ -125,16 +148,36 @@ def main() -> int:
         "",
         *table(npm),
         "",
+        "## Remote library development tools",
+        "",
+        "The following locks are build/test tools for the separately consumable Remote libraries,",
+        "not additions to the desktop binary dependency policy. The reviewed library artifacts contain",
+        "only Hydra code, declarations and their MIT licence; their runtime module graphs contain no",
+        "third-party package code. Recheck that boundary after source or build changes.",
+        "",
+        "These tables include locked optional platform tools, not a claim that every platform archive",
+        "was installed or its complete licence material reviewed. Declared metadata can be less detailed",
+        "than bundled tool notices. Tool redistributors must review the actual material they ship.",
+        "",
+        "### Locked browser-core development dependencies",
+        "",
+        *table(browser),
+        "",
+        "### Locked broker-core development dependencies",
+        "",
+        *table(broker),
+        "",
         "## Updating this file",
         "",
-        "Run `python3 scripts/generate-third-party-notices.py` after either lockfile changes, then",
+        "Run `python3 scripts/generate-third-party-notices.py` after any of the four lockfiles changes, then",
         "review every changed licence expression and upstream source before accepting the result.",
         "The generator failing on missing licence metadata is intentional.",
         "",
     ]
     OUTPUT.write_text("\n".join(lines), encoding="utf-8")
     print(
-        f"dependency-notices: wrote {OUTPUT} with {len(rust)} Rust and {len(npm)} npm rows"
+        f"dependency-notices: wrote {OUTPUT} with {len(rust)} Rust, {len(npm)} dashboard, "
+        f"{len(browser)} browser-tool and {len(broker)} broker-tool rows"
     )
     return 0
 

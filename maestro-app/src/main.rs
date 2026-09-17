@@ -8455,6 +8455,7 @@ fn project_recorded_pane_revive_to_renderer(
     previous_active: Option<maestro_app::ActiveRendererViewport>,
     previous_strip_tabs: Vec<WindowTabJson>,
     runtime: &mut RendererTabRuntime,
+    dialog_focus_ticket: Option<u64>,
 ) -> Result<RecordedPaneReviveProjection, RecordedPaneReviveError> {
     let RecordedPaneReviveOutcome {
         layout: _layout,
@@ -8482,7 +8483,8 @@ fn project_recorded_pane_revive_to_renderer(
     match attachment_handoff {
         Some(authority) => {
             let retry_authority = authority.clone();
-            let handoff = maestro_renderer::RendererAttachmentHandoff::new(authority);
+            let handoff = maestro_renderer::RendererAttachmentHandoff::new(authority)
+                .with_dialog_focus(dialog_focus_ticket);
             let request_id = handoff.request_id();
             if let Err(error) = runtime.switch_to_with_handoff(projection, handoff) {
                 if retry_authority.cancel().is_err() {
@@ -8508,11 +8510,13 @@ fn project_recorded_pane_revive_to_renderer(
         }
         None => {
             let compatible_projection = projection.clone();
-            match runtime.switch_to_exact(projection).map_err(|error| {
-                RecordedPaneReviveError::Projection(format!(
-                    "request exact revived live pane: {error}"
-                ))
-            })? {
+            match runtime
+                .switch_to_exact_with_dialog_focus(projection, dialog_focus_ticket)
+                .map_err(|error| {
+                    RecordedPaneReviveError::Projection(format!(
+                        "request exact revived live pane: {error}"
+                    ))
+                })? {
                 Some(_) => Ok(RecordedPaneReviveProjection::OrdinaryPending),
                 None => Ok(RecordedPaneReviveProjection::AlreadyPublished(
                     compatible_projection,
@@ -12090,6 +12094,69 @@ fn recover_visible_product_sessions_after_daemon_loss(
     report
 }
 
+/// The exact post-probe refusal where a retained daemon has no visible persisted target.
+/// Keep this context separate from generic product failures, which may follow other side effects.
+fn retained_startup_target_unavailable(
+    launch: &LaunchArgs,
+    present: impl FnOnce(maestro_app::startup_failure::StartupFailureDialog),
+) -> LaunchFailure {
+    let failure = LaunchFailure::new(
+        "product_startup_failed",
+        "retained legacy daemon has no visible persisted session to attach; no recovery topology was created",
+    );
+    if let Some(dialog) = maestro_app::startup_failure::retained_target_unavailable_dialog(
+        launch.product_startup,
+        launch.no_run_renderer,
+        launch.detach_renderer,
+        &failure.message,
+    ) {
+        present(dialog);
+    }
+    failure
+}
+
+#[cfg(test)]
+mod retained_startup_presentation_tests {
+    use super::*;
+
+    #[test]
+    fn exact_retained_refusal_presents_once_only_for_foreground_product_launch() {
+        for product_startup in [false, true] {
+            for no_run_renderer in [false, true] {
+                for detach_renderer in [false, true] {
+                    let launch = LaunchArgs {
+                        product_startup,
+                        no_run_renderer,
+                        detach_renderer,
+                        ..LaunchArgs::default()
+                    };
+                    let mut calls = Vec::new();
+                    let failure =
+                        retained_startup_target_unavailable(&launch, |dialog| calls.push(dialog));
+                    assert_eq!(
+                        serde_json::to_value(&failure).unwrap(),
+                        serde_json::json!({
+                            "ok": false,
+                            "command": "launch",
+                            "error_kind": "product_startup_failed",
+                            "message": "retained legacy daemon has no visible persisted session to attach; no recovery topology was created",
+                        }),
+                        "presentation must preserve the complete structured refusal"
+                    );
+                    assert_eq!(
+                        calls.len(),
+                        usize::from(product_startup && !no_run_renderer && !detach_renderer),
+                        "product={product_startup} headless={no_run_renderer} detached={detach_renderer}"
+                    );
+                    if let Some(dialog) = calls.first() {
+                        assert!(dialog.message.contains(&failure.message));
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn run_launch(launch: LaunchArgs) -> Result<LaunchSuccess, LaunchFailure> {
     let mode = RendererMode::from_flags(launch.no_run_renderer, launch.detach_renderer);
     if mode == RendererMode::Detached {
@@ -12492,10 +12559,9 @@ fn run_launch(launch: LaunchArgs) -> Result<LaunchSuccess, LaunchFailure> {
     let mut created_product_topology_after_daemon_classification = false;
     if launch.product_startup && product_startup_target.is_none() {
         if retained_attach_only {
-            return Err(LaunchFailure::new(
-                "product_startup_failed",
-                "retained legacy daemon has no visible persisted session to attach; no recovery topology was created",
-            ));
+            return Err(retained_startup_target_unavailable(&launch, |dialog| {
+                let _ = maestro_renderer::show_startup_error_dialog(dialog.title, &dialog.message);
+            }));
         }
         product_startup_target = Some(
             if product_startup_requires_recovery {
@@ -13639,6 +13705,20 @@ struct PendingListenerNewTabHandoff {
     claim_action: PendingNewTabClaimAction,
 }
 
+/// Project an already accepted exact Claim into the listener's UI caches. The caller retains
+/// disposition validation and the contradictory-adoption guard; this grants no Claim authority.
+fn adopt_claimed_new_tab_listener_cache(
+    adoption: maestro_app::NewTabForegroundAdoption,
+    focused_tab_id: &mut Option<String>,
+    strip_tabs: &mut Vec<WindowTabJson>,
+    selection: &mut Vec<TabSelection>,
+) -> String {
+    *focused_tab_id = Some(adoption.tab_id.clone());
+    *strip_tabs = adoption.strip_tabs;
+    *selection = adoption.selection;
+    adoption.tab_id
+}
+
 struct PendingListenerReviveHandoff {
     request_id: maestro_renderer::RendererAttachmentHandoffRequestId,
     window_id: String,
@@ -14282,6 +14362,7 @@ fn start_bound_react_fresh_graph(
     runtime: &mut RendererTabRuntime,
     now_ms: u64,
     action: PendingFreshGraphAction,
+    dialog_focus_ticket: Option<u64>,
 ) -> Result<PendingListenerFreshGraphHandoff, String> {
     let context = action.context();
     let PreparedReactFreshWindowGraph { created, scratch } = allocation;
@@ -14399,7 +14480,8 @@ fn start_bound_react_fresh_graph(
         }
     };
     let renderer_handoff =
-        maestro_renderer::RendererAttachmentHandoff::new(attachment_handoff.clone());
+        maestro_renderer::RendererAttachmentHandoff::new(attachment_handoff.clone())
+            .with_dialog_focus(dialog_focus_ticket);
     let request_id = renderer_handoff.request_id();
     if let Err(error) = runtime.switch_to_with_handoff(projection, renderer_handoff) {
         compensate_fresh_graph_after_exact_handoff_cancel(
@@ -14944,7 +15026,7 @@ fn spawn_window_event_listener(
                     maestro_renderer::RendererEvent::AttachmentHandoffDisposition(disposition) => {
                         disposition
                     }
-                    maestro_renderer::RendererEvent::ReactChromeIntent { json } => {
+                    maestro_renderer::RendererEvent::ReactChromeIntent { json, .. } => {
                         launch_mutation::reject_inactive_json(
                             &mut tab_runtime,
                             &json,
@@ -15319,13 +15401,17 @@ fn spawn_window_event_listener(
                                 );
                                 break;
                             }
-                            listener_strip_tabs = adoption.strip_tabs;
-                            listener_selection = adoption.selection;
+                            let adopted_tab_id = adopt_claimed_new_tab_listener_cache(
+                                adoption,
+                                &mut listener_focused_tab_id,
+                                &mut listener_strip_tabs,
+                                &mut listener_selection,
+                            );
                             listener_activated = true;
                             last_sent_strip = build_tab_strip_model(
                                 &listener_window_id,
                                 &listener_strip_tabs,
-                                Some(&adoption.tab_id),
+                                Some(&adopted_tab_id),
                             )
                             .ok();
                             if !stopping {
@@ -15558,7 +15644,7 @@ fn spawn_window_event_listener(
                     Ok(maestro_renderer::RendererEvent::ExactViewportDisposition(disposition)) => {
                         let _ = tab_runtime.settle_exact_viewport_disposition(&disposition);
                     }
-                    Ok(maestro_renderer::RendererEvent::ReactChromeIntent { json }) => {
+                    Ok(maestro_renderer::RendererEvent::ReactChromeIntent { json, .. }) => {
                         launch_mutation::reject_inactive_json(
                             &mut tab_runtime,
                             &json,
@@ -16068,6 +16154,7 @@ fn spawn_window_event_listener(
                             split_from: None,
                             split_source_session: None,
                             expected_project_id: None,
+                            dialog_focus_ticket: None,
                         };
                         // Route preparation by policy: a consent-gated worktree row
                         // (`launch_workspace == Some`) goes through the consent-gated
@@ -16394,6 +16481,7 @@ fn spawn_window_event_listener(
                                 recoverable_previous_active,
                                 previous_strip_tabs,
                                 &mut tab_runtime,
+                                None,
                             )
                         })();
                         match revive_result {
@@ -16514,7 +16602,10 @@ fn spawn_window_event_listener(
                         }
                     }
                 }
-                maestro_renderer::RendererEvent::ReactChromeIntent { json } => {
+                maestro_renderer::RendererEvent::ReactChromeIntent {
+                    json,
+                    dialog_focus_ticket,
+                } => {
                     let intent = match parse_react_chrome_intent(&json) {
                         Ok(intent) => intent,
                         Err(e) => {
@@ -17021,6 +17112,7 @@ fn spawn_window_event_listener(
                                             &mut tab_runtime,
                                             now,
                                             PendingFreshGraphAction::CreateProject,
+                                            dialog_focus_ticket,
                                         ) {
                                             Ok(pending) => {
                                                 eprintln!(
@@ -17486,6 +17578,7 @@ fn spawn_window_event_listener(
                                 &mut tab_runtime,
                                 now,
                                 PendingFreshGraphAction::CreateWindow,
+                                dialog_focus_ticket,
                             ) {
                                 Ok(pending) => {
                                     eprintln!(
@@ -18591,6 +18684,7 @@ fn spawn_window_event_listener(
                                     recoverable_previous_active,
                                     previous_strip_tabs,
                                     &mut tab_runtime,
+                                    None,
                                 )
                             })();
                             match revive_result {
@@ -18699,6 +18793,7 @@ fn spawn_window_event_listener(
                                     recoverable_previous_active,
                                     previous_strip_tabs,
                                     &mut tab_runtime,
+                                    dialog_focus_ticket,
                                 )
                             })();
                             match revive_result {
@@ -19182,6 +19277,7 @@ fn spawn_window_event_listener(
                                     }),
                                     split_source_session: Some(&source_session),
                                     expected_project_id: Some(project_id.as_str()),
+                                    dialog_focus_ticket,
                                 };
                                 match run_new_tab_foreground_pipeline_with_consent(
                                     request,
@@ -19739,6 +19835,7 @@ fn spawn_window_event_listener(
                                     split_from: None,
                                     split_source_session: None,
                                     expected_project_id: None,
+                                    dialog_focus_ticket: None,
                                 },
                                 &ProcessEnv,
                                 &mut tab_runtime,
@@ -19883,6 +19980,7 @@ fn spawn_window_event_listener(
                                     split_from: Some(split_from),
                                     split_source_session: None,
                                     expected_project_id: None,
+                                    dialog_focus_ticket: None,
                                 },
                                 &ProcessEnv,
                                 &mut tab_runtime,
@@ -25365,6 +25463,163 @@ mod external_active_pane_projection_tests {
         collected
     }
 
+    #[test]
+    fn claimed_new_tab_cache_targets_next_split_dialog_at_new_right_pane() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        let paths = AppPaths::with_base(&base);
+        seed_exact_viewport_session(&paths, "session-left", "generation-left");
+        seed_exact_viewport_session(&paths, "session-right", "generation-right");
+        let windows = WindowLayoutService::new(&paths);
+        windows.create_empty("window", 1).unwrap();
+        let left = windows
+            .open_tab(
+                "window",
+                "left",
+                "session-left",
+                "Left",
+                false,
+                Default::default(),
+                1,
+            )
+            .unwrap();
+        let right = windows
+            .split_tab(
+                "window",
+                "left",
+                "right",
+                "session-right",
+                "Right",
+                SplitAxis::Right,
+                2,
+            )
+            .unwrap();
+        store::set_window_project(&paths, "window", "external-projection-fixture-project").unwrap();
+        let mut focused = Some("left".to_string());
+        let mut tabs = maestro_app::live_tab_records_json(&left.tabs);
+        let mut selection = maestro_app::selection_from_strip_tabs(&tabs);
+        let right_tabs = maestro_app::live_tab_records_json(&right.tabs);
+        let right_selection = maestro_app::selection_from_strip_tabs(&right_tabs);
+        let active = super::adopt_claimed_new_tab_listener_cache(
+            maestro_app::NewTabForegroundAdoption {
+                tab_id: "right".into(),
+                session_id: "session-right".into(),
+                strip_tabs: right_tabs.clone(),
+                selection: right_selection.clone(),
+            },
+            &mut focused,
+            &mut tabs,
+            &mut selection,
+        );
+        assert_eq!(active, "right");
+        assert_eq!(
+            focused.as_deref(),
+            Some("right"),
+            "the old left cache must retire with Claim"
+        );
+        assert_eq!(tabs, right_tabs);
+        assert_eq!(selection, right_selection);
+
+        // This is cache projection + the real dialog consumer, not proof validation. Feed the
+        // already-accepted cache result into the existing published-listener fixture through its
+        // normal focus event; no forgeable renderer Claim constructor or test hook is added.
+        let (mut runtime, commands) = RendererTabRuntime::new();
+        runtime.seed_active_tab("window", &active, "session-right");
+        let strip = maestro_app::build_tab_strip_model("window", &tabs, Some(&active)).unwrap();
+        let (events, receiver) = mpsc::channel();
+        let listener = spawn_window_event_listener(
+            runtime,
+            receiver,
+            maestro_app::update_check::spawn_update_check(),
+            "window".into(),
+            selection,
+            tabs,
+            paths,
+            base,
+            temp.path().join("unused-daemon.sock"),
+            None,
+            strip,
+            "test".into(),
+            None,
+            None,
+            false,
+            RecordedPaneOpenPolicy::Ordinary,
+            ListenerWindowContext::PublishedForTest,
+        );
+        events
+            .send(maestro_renderer::RendererEvent::PaneFocused {
+                window_id: "window".into(),
+                tab_id: focused.unwrap(),
+            })
+            .unwrap();
+        events
+            .send(maestro_renderer::RendererEvent::ReactChromeIntent {
+                dialog_focus_ticket: None,
+                json: serde_json::json!({
+                    "type": "openSplitDialog", "project_id": "external-projection-fixture-project",
+                    "window_id": "window", "tab_id": "left", "dir": "v",
+                })
+                .to_string(),
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let script = loop {
+            if let maestro_renderer::RendererCommand::EvaluateReactChromeScript {
+                script,
+                kind: maestro_renderer::ReactChromeScriptKind::Modal,
+            } = commands
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap()
+            {
+                break script;
+            }
+        };
+        drop(events);
+        assert_eq!(
+            listener.shutdown_and_join_with_timeout(Duration::from_secs(2)),
+            WindowEventListenerShutdown::Completed
+        );
+        let expected = super::react_chrome_overlay_modal_script(&serde_json::json!({
+            "kind": "split", "project_id": "external-projection-fixture-project",
+            "window_id": "window", "tab_id": "right", "dir": "v",
+        }));
+        assert_eq!(
+            script, expected,
+            "next dialog uses the published right pane, not the previous left pane"
+        );
+    }
+
+    #[test]
+    fn claimed_new_tab_cache_projection_stays_after_exact_adoption_guard() {
+        let source = include_str!("main.rs");
+        let branch = source
+            .split("match pending.success.resolve_handoff(disposition) {")
+            .nth(1)
+            .unwrap()
+            .split("if let Some(pending) = pending_revive_handoff.take()")
+            .next()
+            .unwrap();
+        let claimed = branch
+            .find("Ok(maestro_app::NewTabForegroundHandoffResolution::Claimed(adoption))")
+            .unwrap();
+        let refusal = branch.find("if !adopted {").unwrap();
+        let stop = branch[refusal..].find("break;").unwrap() + refusal;
+        let cache = branch
+            .find("let adopted_tab_id = adopt_claimed_new_tab_listener_cache(")
+            .unwrap();
+        let recover = branch
+            .find("Ok(maestro_app::NewTabForegroundHandoffResolution::Recover(mut error))")
+            .unwrap();
+        assert!(claimed < refusal && stop < cache && cache < recover);
+        assert_eq!(
+            branch
+                .matches("adopt_claimed_new_tab_listener_cache(")
+                .count(),
+            1,
+            "stale, recovery and contradiction branches must not project an accepted focus cache"
+        );
+    }
+
     fn recv_until_viewport_clear(
         commands: &mpsc::Receiver<maestro_renderer::RendererCommand>,
         deadline: Instant,
@@ -25568,6 +25823,7 @@ mod external_active_pane_projection_tests {
         );
         events_tx
             .send(maestro_renderer::RendererEvent::ReactChromeIntent {
+                dialog_focus_ticket: None,
                 json: format!(
                     r#"{{"type":"removeWindow","project_id":"{project_id}","window_id":"{window_id}"}}"#
                 ),
@@ -25577,6 +25833,7 @@ mod external_active_pane_projection_tests {
         // returned without attempting a stale fallback Attach or daemon Kill.
         events_tx
             .send(maestro_renderer::RendererEvent::ReactChromeIntent {
+                dialog_focus_ticket: None,
                 json: r#"{"type":"focusTerminal"}"#.into(),
             })
             .expect("queue post-remove acknowledgement");
@@ -25982,6 +26239,7 @@ mod external_active_pane_projection_tests {
         );
         events_tx
             .send(maestro_renderer::RendererEvent::ReactChromeIntent {
+                dialog_focus_ticket: None,
                 json: format!(
                     r#"{{"type":"stashWindow","project_id":"{project_id}","window_id":"{window_id}"}}"#
                 ),
@@ -25992,6 +26250,7 @@ mod external_active_pane_projection_tests {
         // to reproject after a new successful read).
         events_tx
             .send(maestro_renderer::RendererEvent::ReactChromeIntent {
+                dialog_focus_ticket: None,
                 json: r#"{"type":"focusTerminal"}"#.into(),
             })
             .expect("queue post-stash acknowledgement");
@@ -26155,6 +26414,7 @@ mod external_active_pane_projection_tests {
             .expect("dispatch production close event");
         events_tx
             .send(maestro_renderer::RendererEvent::ReactChromeIntent {
+                dialog_focus_ticket: None,
                 json: r#"{"type":"focusTerminal"}"#.into(),
             })
             .expect("queue post-close acknowledgement");
@@ -26322,6 +26582,7 @@ mod external_active_pane_projection_tests {
 
         events_tx
             .send(maestro_renderer::RendererEvent::ReactChromeIntent {
+                dialog_focus_ticket: None,
                 json: r#"{"type":"removeWindow","project_id":"clear-order-project","window_id":"clear-order-current"}"#.into(),
             })
             .expect("dispatch production removeWindow intent");
@@ -26440,6 +26701,7 @@ mod external_active_pane_projection_tests {
             .expect("dispatch production close event");
         events_tx
             .send(maestro_renderer::RendererEvent::ReactChromeIntent {
+                dialog_focus_ticket: None,
                 json: r#"{"type":"focusTerminal"}"#.into(),
             })
             .expect("queue post-refusal acknowledgement");
@@ -33324,6 +33586,130 @@ mod product_startup_target_tests {
             Some(&policy),
             "recovery-to-real transition is reversible for a listener launched Bound"
         );
+    }
+
+    #[test]
+    fn sidebar_revival_focus_is_forwarded_by_the_typed_retained_listener() {
+        for ticket in [None, Some(41)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let paths = AppPaths::with_base(tmp.path().join("base"));
+            let mut target = seed_user_target(&paths, tmp.path());
+            target.session.last_known_generation = Some("retained".into());
+            store::write_record(
+                &paths,
+                RecordKind::Session,
+                &target.session.session_id,
+                19,
+                &target.session,
+            )
+            .unwrap();
+            WindowLayoutService::new(&paths)
+                .set_tab_stashed(&target.layout.window_id, &target.tab_id, true, 20)
+                .unwrap();
+            let socket = tmp.path().join("revive-focus.sock");
+            let daemon = UnixListener::bind(&socket).unwrap();
+            let session_id = target.session.session_id.clone();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = daemon.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line.trim(), r#"{"op":"daemon_info"}"#);
+                writeln!(stream, "{}", serde_json::json!({
+                    "ev": "daemon_info", "protocol_version": maestro_protocol::DAEMON_PROTOCOL_VERSION,
+                    "build_version": "test", "daemon_instance_id": "7777777777774777a777777777777777",
+                    "output_generation_echo": true, "generation_conditional_mutations": true,
+                    "attachment_aware_conditional_kill": true, "generation_conditional_start": true,
+                    "generation_conditional_attach": true, "start_operation_ledger": true,
+                })).unwrap();
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                let attach: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(attach["op"], "attach");
+                assert_eq!(attach["id"], session_id);
+                assert_eq!(attach["expected_session_generation"], "retained");
+                writeln!(stream, "{}", serde_json::json!({
+                    "ev": "grid", "id": session_id, "output_generation": attach["output_generation"],
+                    "grid": {"generation": "retained", "revision": 1},
+                })).unwrap();
+                let mut remainder = String::new();
+                reader.read_to_string(&mut remainder).unwrap();
+                assert!(
+                    !remainder.contains("start_session"),
+                    "revival must not recreate the retained session"
+                );
+            });
+            let tabs = maestro_app::live_tab_records_json(&target.layout.tabs);
+            let selection = maestro_app::selection_from_strip_tabs(&tabs);
+            let strip = maestro_app::build_tab_strip_model(
+                &target.layout.window_id,
+                &tabs,
+                Some(&target.tab_id),
+            )
+            .unwrap();
+            let (mut runtime, commands) = super::RendererTabRuntime::new();
+            let (events, received) = std::sync::mpsc::channel();
+            runtime.bind_renderer_events(events.clone());
+            let listener = super::spawn_window_event_listener(
+                runtime,
+                received,
+                maestro_app::update_check::spawn_update_check(),
+                target.layout.window_id.clone(),
+                selection,
+                tabs,
+                paths.clone(),
+                paths.base().to_path_buf(),
+                socket,
+                None,
+                strip,
+                "test".into(),
+                None,
+                None,
+                false,
+                RecordedPaneOpenPolicy::Product,
+                ListenerWindowContext::PublishedForTest,
+            );
+            events.send(maestro_renderer::RendererEvent::ReactChromeIntent {
+                dialog_focus_ticket: ticket,
+                json: serde_json::json!({"type": "reviveSession", "window_id": target.layout.window_id,
+                    "tab_id": target.tab_id, "session_id": target.session.session_id}).to_string(),
+            }).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            let request = loop {
+                if let maestro_renderer::RendererCommand::AttachExactViewport { request } = commands
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .unwrap()
+                {
+                    break request;
+                }
+            };
+            assert_eq!(
+                request.dialog_focus_ticket(),
+                ticket,
+                "native metadata survives actual typed ReviveSession dispatch"
+            );
+            let layout = WindowLayoutService::new(&paths)
+                .load(&target.layout.window_id)
+                .unwrap()
+                .unwrap();
+            let revived = layout
+                .tabs
+                .iter()
+                .find(|tab| tab.tab_id == target.tab_id)
+                .unwrap();
+            assert!(!revived.stashed);
+            assert_eq!(revived.session_id, target.session.session_id);
+            server.join().unwrap();
+            drop(request); // settle the pending request without fabricating renderer publication
+            drop(events);
+            assert_eq!(
+                listener.shutdown_and_join(),
+                super::WindowEventListenerShutdown::Completed
+            );
+        }
     }
 
     #[test]

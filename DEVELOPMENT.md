@@ -1,7 +1,7 @@
 # Development
 
-This repository builds the local Hydra desktop. It does not require the private Hydra Remote
-repository or agent.
+This repository builds the local Hydra desktop and, separately, reusable Remote libraries. Neither
+build requires the private hosted repository or desktop remote agent.
 
 ## Toolchains
 
@@ -98,6 +98,18 @@ Remote or the private agent. Extract the resulting archive to a disposable direc
 If the optional private extension is absent or incompatible, the local desktop must remain usable
 and Remote controls must remain unavailable. A source build must not need a sibling private
 repository to compile or run.
+
+## Remote library build
+
+The browser transport and signaling broker have separate package manifests, tests and ESM builds.
+Follow the [Remote library quickstart](docs/developer/remote-core-quickstart.md) for pinned commands,
+local tarballs and adapter examples. They are reusable components, not a complete self-hosted
+application or desktop remote agent.
+
+The unsigned desktop packaging scripts do not bundle these libraries or a private agent. The
+optional extension's absence/incompatibility behavior above is unchanged. Library integration must
+supply identity, authorization, persistence and network composition; transport connectivity alone
+does not authorize terminal operations.
 
 ## Test
 

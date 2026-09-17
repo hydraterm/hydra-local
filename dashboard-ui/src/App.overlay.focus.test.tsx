@@ -2,7 +2,7 @@
 
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { App } from './App'
 import { mockDashboardModel } from './data/mock'
 import { bridge } from './ipc/bridge'
@@ -193,5 +193,181 @@ describe('nested overlay DOM focus ownership', () => {
 
     expect(document.activeElement).toBe(firstControl)
     expect(document.activeElement).not.toBe(secondStaleOpener)
+  })
+})
+
+// Execute the actual Linux host script; the fake realm controls cross-process delivery order.
+// This proves script/state behavior, not GTK timing or an atomic native/DOM focus transaction.
+let linuxHostSource = ''
+beforeAll(async () => {
+  const fs = await vi.importActual<{
+    readFileSync(path: string, encoding: 'utf8'): string
+  }>('node:fs')
+  linuxHostSource = fs.readFileSync('../maestro-renderer/src/linux_host/overlay.rs', 'utf8')
+})
+
+function linuxFocusRealm() {
+  const listeners = new Map<string, Set<(event: { type: string; target: unknown }) => void>>()
+  const messages: Array<{ type: string; token: string }> = []
+  let focused = false
+  let focusCalls = 0
+  const body = { tagName: 'BODY' }
+  const attributes = new Map<string, string>()
+  const html = {
+    inert: true,
+    getAttribute(name: string) { return attributes.get(name) ?? null },
+    removeAttribute(name: string) { attributes.delete(name) },
+    setAttribute(name: string, value: string) { attributes.set(name, value) },
+  }
+  const document = {
+    body,
+    documentElement: html,
+    activeElement: body as unknown,
+    hasFocus: () => focused,
+  }
+  const prior = {
+    tagName: 'BUTTON',
+    isConnected: true,
+    focus() {
+      focusCalls++
+      document.activeElement = prior
+    },
+  }
+  const window = {
+    __HYDRA_NATIVE_MODAL_UNDERLAY_STATE__: { inert: false, ariaHidden: null, activeElement: prior },
+    __HYDRA_NATIVE_MODAL_UNDERLAY_FIREWALL__: { active: true },
+    ipc: {
+      postMessage(json: string) { messages.push(JSON.parse(json)) },
+    },
+    addEventListener(kind: string, listener: (event: { type: string; target: unknown }) => void) {
+      if (!listeners.has(kind)) listeners.set(kind, new Set())
+      listeners.get(kind)!.add(listener)
+    },
+    removeEventListener(kind: string, listener: (event: { type: string; target: unknown }) => void) {
+      listeners.get(kind)?.delete(listener)
+    },
+  }
+  function run(name: string, token = '4', restore = true) {
+    const script = linuxHostSource.match(
+      new RegExp(`const ${name}: &str = r#"([\\s\\S]*?)"#;`),
+    )?.[1]
+    expect(script).toBeDefined()
+    return new Function(
+      'window', 'document',
+      script!
+        .replaceAll('__HYDRA_FOCUS_TRACE_FUNCTION__', 'null')
+        .replaceAll('__HYDRA_RESTORE_DOM_FOCUS__', String(restore))
+        .replaceAll('__HYDRA_RESTORE_FOCUS_TOKEN__', JSON.stringify(token)),
+    )(window, document)
+  }
+  return {
+    run,
+    messages,
+    document,
+    prior,
+    window,
+    focusCalls: () => focusCalls,
+    listenerCount: () => [...listeners.values()].reduce((n, entries) => n + entries.size, 0),
+    setFocused(value: boolean) { focused = value },
+    emit(kind: string, target: unknown = window) {
+      for (const listener of [...(listeners.get(kind) ?? [])]) listener({ type: kind, target })
+    },
+  }
+}
+
+describe('Linux delayed document opener restoration', () => {
+  it('keeps the opener through late window focus and requires native acceptance', () => {
+    const realm = linuxFocusRealm()
+    realm.run('RESTORE_PERSISTENT_DOCUMENTS_SCRIPT')
+    expect(realm.document.documentElement.inert).toBe(false)
+    expect(realm.window.__HYDRA_NATIVE_MODAL_UNDERLAY_FIREWALL__.active).toBe(false)
+    expect(realm.focusCalls()).toBe(0)
+    realm.setFocused(true)
+    realm.emit('focus')
+    expect(realm.messages).toEqual([{ type: '__hydraPersistentFocusReady', token: '4' }])
+    expect(realm.focusCalls()).toBe(0)
+    realm.run('COMPLETE_PERSISTENT_FOCUS_SCRIPT')
+    expect(realm.focusCalls()).toBe(1)
+    expect(realm.document.activeElement).toBe(realm.prior)
+    expect(realm.listenerCount()).toBe(0)
+  })
+
+  it('handles already-focused documents once without readiness granting focus', () => {
+    const realm = linuxFocusRealm()
+    realm.setFocused(true)
+    realm.run('RESTORE_PERSISTENT_DOCUMENTS_SCRIPT')
+    realm.emit('focus')
+    expect(realm.messages).toHaveLength(1)
+    expect(realm.focusCalls()).toBe(0)
+    realm.run('COMPLETE_PERSISTENT_FOCUS_SCRIPT')
+    realm.run('COMPLETE_PERSISTENT_FOCUS_SCRIPT')
+    expect(realm.focusCalls()).toBe(1)
+    expect(realm.listenerCount()).toBe(0)
+  })
+
+  it.each(['keydown', 'pointerdown', 'blur', 'pagehide', 'focusin'])('retires on newer local %s before acceptance', (kind) => {
+    const realm = linuxFocusRealm()
+    realm.run('RESTORE_PERSISTENT_DOCUMENTS_SCRIPT')
+    realm.emit(kind, { tagName: 'INPUT' })
+    realm.setFocused(true)
+    realm.emit('focus')
+    realm.run('COMPLETE_PERSISTENT_FOCUS_SCRIPT')
+    expect(realm.focusCalls()).toBe(0)
+    expect(realm.messages).toHaveLength(0)
+    expect(realm.listenerCount()).toBe(0)
+  })
+
+  it('cannot resurrect a canceled native token or let a stale cancellation retire a newer opener', () => {
+    const realm = linuxFocusRealm()
+    realm.run('RESTORE_PERSISTENT_DOCUMENTS_SCRIPT')
+    realm.run('CANCEL_PERSISTENT_FOCUS_SCRIPT', '3')
+    expect(realm.listenerCount()).toBeGreaterThan(0)
+    realm.run('CANCEL_PERSISTENT_FOCUS_SCRIPT')
+    realm.setFocused(true)
+    realm.emit('focus')
+    realm.run('COMPLETE_PERSISTENT_FOCUS_SCRIPT')
+    expect(realm.focusCalls()).toBe(0)
+    expect(realm.listenerCount()).toBe(0)
+  })
+
+  it('cancellation delivered before final JS prevents focus; the opposite order cannot undo completed focus', () => {
+    for (const cancelFirst of [true, false]) {
+      const realm = linuxFocusRealm()
+      realm.setFocused(true)
+      realm.run('RESTORE_PERSISTENT_DOCUMENTS_SCRIPT')
+      const tasks = ['CANCEL_PERSISTENT_FOCUS_SCRIPT', 'COMPLETE_PERSISTENT_FOCUS_SCRIPT']
+      if (!cancelFirst) tasks.reverse()
+      for (const task of tasks) realm.run(task)
+      expect(realm.focusCalls()).toBe(cancelFirst ? 0 : 1)
+      expect(realm.listenerCount()).toBe(0)
+    }
+  })
+
+  it.each(['document', 'target', 'inert', 'firewall', 'removed'])('final JS rechecks %s after native acceptance', (changed) => {
+    const realm = linuxFocusRealm()
+    realm.setFocused(true)
+    realm.run('RESTORE_PERSISTENT_DOCUMENTS_SCRIPT')
+    if (changed === 'document') realm.setFocused(false)
+    if (changed === 'target') realm.document.activeElement = { tagName: 'INPUT' }
+    if (changed === 'inert') realm.document.documentElement.inert = true
+    if (changed === 'firewall') realm.window.__HYDRA_NATIVE_MODAL_UNDERLAY_FIREWALL__.active = true
+    if (changed === 'removed') realm.prior.isConnected = false
+    realm.run('COMPLETE_PERSISTENT_FOCUS_SCRIPT')
+    expect(realm.focusCalls()).toBe(0)
+    expect(realm.listenerCount()).toBe(0)
+  })
+
+  it('new modal suppression and passive Drop release old listeners without autofocus', () => {
+    const realm = linuxFocusRealm()
+    realm.run('RESTORE_PERSISTENT_DOCUMENTS_SCRIPT')
+    realm.run('SUPPRESS_PERSISTENT_DOCUMENTS_SCRIPT')
+    realm.run('RESTORE_PERSISTENT_DOCUMENTS_SCRIPT', '5', false)
+    realm.setFocused(true)
+    realm.emit('focus')
+    realm.run('COMPLETE_PERSISTENT_FOCUS_SCRIPT')
+    expect(realm.document.documentElement.inert).toBe(false)
+    expect(realm.window.__HYDRA_NATIVE_MODAL_UNDERLAY_FIREWALL__.active).toBe(false)
+    expect(realm.focusCalls()).toBe(0)
+    expect(realm.listenerCount()).toBe(0)
   })
 })

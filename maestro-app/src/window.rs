@@ -664,13 +664,24 @@ impl<S: RendererCommandSink> TabSwitchController<S> {
         projection: RendererViewportProjection,
         events: std::sync::mpsc::Sender<maestro_renderer::RendererEvent>,
     ) -> Result<Option<maestro_renderer::RendererExactViewportRequestId>, TabSwitchError> {
+        self.switch_to_exact_with_dialog_focus(projection, events, None)
+    }
+
+    fn switch_to_exact_with_dialog_focus(
+        &mut self,
+        projection: RendererViewportProjection,
+        events: std::sync::mpsc::Sender<maestro_renderer::RendererEvent>,
+        dialog_focus_ticket: Option<u64>,
+    ) -> Result<Option<maestro_renderer::RendererExactViewportRequestId>, TabSwitchError> {
         if self.pending_viewport.is_some() {
             return Err(TabSwitchError::HandoffPending);
         }
-        if self.active_viewport.as_ref().is_some_and(|active| {
-            active.projection.exact_viewport == projection.exact_viewport
-                && active.projection.target == projection.target
-        }) {
+        if dialog_focus_ticket.is_none()
+            && self.active_viewport.as_ref().is_some_and(|active| {
+                active.projection.exact_viewport == projection.exact_viewport
+                    && active.projection.target == projection.target
+            })
+        {
             let strip_changed = self
                 .active_viewport
                 .as_ref()
@@ -691,11 +702,14 @@ impl<S: RendererCommandSink> TabSwitchController<S> {
             }
             return Ok(None);
         }
-        let request = maestro_renderer::RendererExactViewportRequest::new(
+        // An explicit revival with native focus ownership also re-proves an already displayed
+        // target. Focus is granted at exact publication, never merely from this App-side cache.
+        let request = maestro_renderer::RendererExactViewportRequest::new_with_dialog_focus(
             projection.target.session_id.clone(),
             projection.exact_viewport.clone(),
             projection.tab_strip.clone(),
             events,
+            dialog_focus_ticket,
         )
         .map_err(|error| {
             TabSwitchError::ViewportProjection(RendererViewportProjectionError::Exact(error))
@@ -1376,12 +1390,21 @@ impl RendererTabRuntime {
         &mut self,
         projection: RendererViewportProjection,
     ) -> Result<Option<maestro_renderer::RendererExactViewportRequestId>, TabSwitchError> {
+        self.switch_to_exact_with_dialog_focus(projection, None)
+    }
+
+    pub fn switch_to_exact_with_dialog_focus(
+        &mut self,
+        projection: RendererViewportProjection,
+        dialog_focus_ticket: Option<u64>,
+    ) -> Result<Option<maestro_renderer::RendererExactViewportRequestId>, TabSwitchError> {
         let events = self
             .renderer_events
             .as_ref()
             .cloned()
             .ok_or(TabSwitchError::RendererEventChannelUnavailable)?;
-        self.controller.switch_to_exact(projection, events)
+        self.controller
+            .switch_to_exact_with_dialog_focus(projection, events, dialog_focus_ticket)
     }
 
     pub fn adopt_claimed_handoff_disposition(
@@ -2503,7 +2526,7 @@ pub struct TabStripItem {
     pub active: bool,
     pub attention: AttentionJson,
     pub needs_attention: bool,
-    /// State-aware attention indicator derived from `attention` ([`tab_attention_indicator`]).
+    /// State-aware indicator, with the joined live waiting-task override described below.
     /// `None` when the tab shows no marker (seen, `none`, or unknown state). Additive to
     /// `needs_attention`, which keeps its original boolean meaning. Serializes as JSON `null` absent.
     pub attention_indicator: Option<TabAttentionIndicator>,
@@ -2615,8 +2638,8 @@ pub fn build_tab_strip_model(
 /// semantics as [`build_tab_strip_model`]; the only difference is the attention source:
 ///
 /// - the persisted nested `attention` object is copied verbatim;
-/// - `attention_indicator` is the persisted-only [`tab_attention_indicator`] — task-derived attention
-///   never invents a state-aware marker, so persisted state-aware markers keep strict priority;
+/// - a linked, present, live `WaitingOnUser` task with derived attention replaces an unseen
+///   persisted `done`/`activity` marker with `needs_input`; all other persisted markers keep priority;
 /// - `needs_attention` is `attention_needs_attention(&view.attention) || view.needs_attention`, so a
 ///   task/session-derived signal lights the legacy `!` fallback (renderer draws `!` when
 ///   `needs_attention == true` and `attention_indicator == None`) without changing the persisted path.
@@ -2663,7 +2686,7 @@ pub fn build_tab_strip_model_from_window_view(
                 active,
                 attention: t.attention.clone(),
                 needs_attention: attention_needs_attention(&t.attention) || t.needs_attention,
-                attention_indicator: tab_attention_indicator(&t.attention),
+                attention_indicator: joined_tab_attention_indicator(t),
                 split_from: t.split_from.clone(),
                 pane_rect: t.pane_rect.clone(),
             }
@@ -2675,6 +2698,27 @@ pub fn build_tab_strip_model_from_window_view(
         active_tab_id: resolved_active,
         tabs: items,
     })
+}
+
+// Display-only precedence for an explicitly declared wait, never provider-output detection.
+fn joined_tab_attention_indicator(tab: &WindowViewTabJson) -> Option<TabAttentionIndicator> {
+    let persisted = tab_attention_indicator(&tab.attention);
+    if tab.needs_attention
+        && tab.agent_task_id.is_some()
+        && tab.agent_task_state.as_deref() == Some("waiting_on_user")
+        && tab.session_status.as_deref() == Some("live")
+        && !tab.session_record_missing
+        && matches!(
+            persisted.as_ref().map(|indicator| indicator.kind.as_str()),
+            Some("done" | "activity")
+        )
+    {
+        return Some(TabAttentionIndicator {
+            kind: "needs_input".into(),
+            marker: "?".into(),
+        });
+    }
+    persisted
 }
 
 /// Pure change detection for the live tab-strip refresh: returns `true` when `next` differs from the
@@ -3185,6 +3229,43 @@ mod tests {
         let projection = renderer_viewport_projection_from_snapshot(&snapshot, tab_id)
             .expect("project exact active viewport");
         runtime.seed_exact_active_for_test(projection, test_daemon_instance());
+    }
+
+    #[test]
+    fn sidebar_revival_focus_reproves_cached_target_and_keeps_refresh_focusless() {
+        let (_tmp, _paths, projection, _) = exact_viewport_fixture();
+        let (mut runtime, commands) = RendererTabRuntime::new();
+        let (events, _received) = std::sync::mpsc::channel();
+        runtime.bind_renderer_events(events);
+        runtime.seed_exact_active_for_test(projection.clone(), test_daemon_instance());
+        assert!(runtime
+            .switch_to_exact(projection.clone())
+            .unwrap()
+            .is_none());
+        assert!(
+            commands.try_recv().is_err(),
+            "background refresh does not focus/rebind"
+        );
+        let id = runtime
+            .switch_to_exact_with_dialog_focus(projection.clone(), Some(7))
+            .unwrap()
+            .unwrap();
+        let maestro_renderer::RendererCommand::AttachExactViewport { request } =
+            commands.try_recv().unwrap()
+        else {
+            panic!("explicit revival needs exact publication");
+        };
+        assert_eq!(request.request_id(), id);
+        assert_eq!(request.dialog_focus_ticket(), Some(7));
+        assert!(runtime.active_viewport().is_none());
+        assert!(matches!(
+            runtime.switch_to_exact_with_dialog_focus(projection, Some(8)),
+            Err(TabSwitchError::HandoffPending)
+        ));
+        assert!(
+            commands.try_recv().is_err(),
+            "newer request cannot replace a pending exact bind"
+        );
     }
 
     #[test]

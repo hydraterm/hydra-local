@@ -42,7 +42,7 @@
 use super::event_bridge::HostEvent;
 use super::overlay::{
     OverlayEvaluationResult, OverlayNativeAllocationReady, OverlayViewportReady,
-    PersistentSuppressionResult,
+    PersistentFocusReady, PersistentSuppressionResult,
 };
 use super::recovery::WebKitRecoveryEvent;
 use crate::{UserEvent, UserEventSender};
@@ -66,6 +66,8 @@ pub enum LinuxLoopEvent {
     /// Completion of one persistent sidebar/topbar `inert` task. The owner loop joins all targets
     /// with modal delivery before exposing the overlay document.
     PersistentSuppression(PersistentSuppressionResult),
+    /// A trusted persistent document observed focus for an exact pending opener token.
+    PersistentFocusReady(PersistentFocusReady),
     /// Exact native GTK/WebKit geometry was observed for one presentation token. The owner loop
     /// revalidates it before requesting the content-blind DOM viewport acknowledgement.
     OverlayNativeAllocationReady(OverlayNativeAllocationReady),
@@ -161,6 +163,9 @@ where
             unreachable!("renderer event transport only submits LinuxLoopEvent::Renderer")
         }
         LinuxLoopEvent::PersistentSuppression(_) => {
+            unreachable!("renderer event transport only submits LinuxLoopEvent::Renderer")
+        }
+        LinuxLoopEvent::PersistentFocusReady(_) => {
             unreachable!("renderer event transport only submits LinuxLoopEvent::Renderer")
         }
         LinuxLoopEvent::OverlayNativeAllocationReady(_) => {
@@ -408,6 +413,9 @@ mod tests {
                 }
                 LinuxLoopEvent::PersistentSuppression(_) => {
                     panic!("GTK delivery must never submit PersistentSuppression")
+                }
+                LinuxLoopEvent::PersistentFocusReady(_) => {
+                    panic!("GTK delivery must never submit PersistentFocusReady")
                 }
                 LinuxLoopEvent::OverlayNativeAllocationReady(_) => {
                     panic!("GTK delivery must never submit OverlayNativeAllocationReady")

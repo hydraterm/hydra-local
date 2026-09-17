@@ -1,11 +1,12 @@
-# Public local / private remote boundary
+# Public source and hosted Remote boundary
 
-Hydra has an open local desktop and a closed remote service. This is a product and source boundary,
+Hydra has an open local desktop and reusable Remote transport/signaling libraries. The desktop
+remote agent and hosted service composition remain private. This is a product and source boundary,
 not a claim that obscurity protects the remote service.
 
 ## What is public
 
-This repository contains the mechanisms that run locally:
+This repository contains the local desktop components and two separately built Remote libraries:
 
 | Component | Responsibility |
 |---|---|
@@ -18,19 +19,28 @@ This repository contains the mechanisms that run locally:
 | `maestro-app` | Local application composition and typed dashboard intents |
 | `dashboard-ui` | React presentation chrome for the native desktop |
 | `hydra-launcher` | Local packaged-application launcher |
+| `web-client` | Reusable browser WebRTC transport, lifecycle and signaling interfaces |
+| `hydra-cloud` | Reusable content-blind signaling broker and storage interfaces |
 
-These modules contain local safety checks and resource bounds, but none decides whether a remote
-user is authenticated or entitled to control a desktop.
+The desktop modules contain local safety checks and resource bounds; they do not grant remote
+authority. The public transport validates pinned desktop answer proof and connection ownership.
+The public broker checks device/account membership, revocation and session expiry against supplied
+records. Those checks do not replace the deployment's identity/enrollment services or the desktop
+agent's final authorization of terminal operations.
+
+The libraries have no Clerk or Stripe dependency and support independently developed adapters. They
+are not a complete self-hosted Remote application or desktop agent, and installing them does not
+enable source-desktop Remote controls or grant hosted-service access. See the
+[Remote library quickstart](developer/remote-core-quickstart.md).
 
 ## What remains private
 
 The private product contains:
 
-- the desktop remote agent and browser bridge;
-- cloud authentication, enrollment, token issuance and revocation;
-- browser, session, device, account and origin binding;
-- entitlement and billing;
-- signaling, relay operation and the remote browser client; and
+- the desktop remote agent and complete browser application;
+- hosted account identity, enrollment, token issuance and revocation-service composition;
+- Clerk and Stripe integrations, entitlement and billing workflows;
+- hosted HTTP/API composition, deployment configuration and relay operation; and
 - the reviewed environment descriptors and token-verification trust roots.
 
 The private agent is the final authority before a remote operation can reach any public local
@@ -77,9 +87,10 @@ state, never proof of remote authority.
 ## What source visibility proves
 
 The public repository lets anyone inspect how Hydra owns PTYs, renders terminal output, stores local
-records and performs local discovery. It does not prove the implementation of remote authentication,
-encryption, key exchange, relay opacity, cloud content handling or billing. Claims about those closed
-components need their own evidence.
+records and performs local discovery, plus the published transport proof/lifecycle and signaling
+broker checks. Source visibility does not qualify an end-to-end deployment, identity/enrollment
+service, desktop agent, real ICE/TURN path, relay operation or hosted billing. Claims about those
+private or deployed components still need their own evidence.
 
 The boundary is tested in the private composition: a rebuilt public app cannot select another cloud,
 verification key or browser origin, mint a valid token, bypass entitlement or make an unauthenticated

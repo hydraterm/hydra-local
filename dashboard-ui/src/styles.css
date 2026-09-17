@@ -245,17 +245,29 @@ body.is-resizing-sidebar .sidebar-resizer::before {
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.38);
 }
 .sidebar__brand-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: #f4f4f6;
   font-weight: 700;
   letter-spacing: 0.08em;
   font-size: 12px;
   text-transform: uppercase;
 }
+.sidebar__brand .pill {
+  /* Keep the glyph, three gaps and collapse target outside the badge's paint. */
+  flex: 0 0 auto;
+  max-width: calc(100% - 101px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .sidebar--collapsed .sidebar__brand-name,
 .sidebar--collapsed .sidebar__brand .pill {
   display: none;
 }
 .sidebar__collapse {
+  flex-shrink: 0;
   margin-left: auto;
   width: 27px;
   height: 27px;
@@ -1714,6 +1726,8 @@ body.is-resizing-sidebar .sidebar-resizer::before {
   font-size: 12px;
 }
 .window-tab-group {
+  position: relative;
+  isolation: isolate;
   display: inline-flex;
   align-items: center;
   flex: 1 1 0;
@@ -1731,11 +1745,23 @@ body.is-resizing-sidebar .sidebar-resizer::before {
   min-width: 72px;
   max-width: 250px;
 }
-.window-tab-group.drop-before {
-  box-shadow: inset 3px 0 #7eafff;
+.window-tab-group.drop-before::after,
+.window-tab-group.drop-after::after {
+  content: '';
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  width: 3px;
+  background: #7eafff;
+  /* Paint above active/focus-visible children, clipped inside this group. */
+  z-index: 4;
+  pointer-events: none;
 }
-.window-tab-group.drop-after {
-  box-shadow: inset -3px 0 #7eafff;
+.window-tab-group.drop-before::after {
+  left: 0;
+}
+.window-tab-group.drop-after::after {
+  right: 0;
 }
 .sidebar__order-status {
   padding: 6px 8px;

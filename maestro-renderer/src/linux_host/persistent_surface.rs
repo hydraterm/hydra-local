@@ -99,6 +99,7 @@ fn persistent_firewall_release_allowed(
 #[derive(Default)]
 pub(super) struct PersistentInputGate {
     modal_active: Cell<bool>,
+    pub(super) focus_epoch: Rc<crate::host_services::DialogFocusEpoch>,
 }
 
 impl PersistentInputGate {
@@ -303,6 +304,7 @@ fn mount_webview(
     let initialization_script = persistent_initialization_script(&initialization_script);
     let serve_url = serving.url.clone();
     let ipc_events = events.clone();
+    let focus_ready_proxy = wake_proxy.clone();
     let page_recovery_sender = webkit_recovery_sender(wake_proxy.clone());
     let navigation_recovery_sender = webkit_recovery_sender(wake_proxy.clone());
     let bundled_url = serve_url.clone();
@@ -312,6 +314,8 @@ fn mount_webview(
     let trusted_ipc_tracker = tracker.clone();
     let trusted_navigation_url = serve_url.clone();
     let trusted_input_gate = input_gate;
+    let mounted_view = Rc::new(glib::WeakRef::<webkit2gtk::WebView>::new());
+    let ipc_view = mounted_view.clone();
 
     let result = {
         let mut context = web_context.borrow_mut();
@@ -416,14 +420,33 @@ fn mount_webview(
                     );
                     return;
                 };
+                if let Some(ready) = crate::host_services::dialog_opener::parse_ready(&json) {
+                    if let (Ok(token), Some(generation)) = (ready, owned_generation) {
+                        let _ = focus_ready_proxy.send_event(LinuxLoopEvent::PersistentFocusReady(
+                            super::overlay::PersistentFocusReady { surface, generation, token },
+                        ));
+                    }
+                    return;
+                }
                 eprintln!(
                     "linux-host {} ipc intent bytes={}",
                     surface_name(surface),
                     json.len()
                 );
                 if let Some(events) = ipc_events.as_ref() {
+                    // Revive is an explicit sidebar action, not a background activation. Capture
+                    // its current native input epoch before app/daemon work; the same epoch used
+                    // by dialog launches is invalidated by newer keys, presses, modals or activation.
+                    let owns_focus = surface == WebKitSurface::Sidebar && ipc_view.upgrade().is_some_and(|view| {
+                        view.has_focus() && view.toplevel().and_downcast::<gtk::Window>().is_some_and(|window| {
+                            window.is_active() && window.has_toplevel_focus()
+                                && window.focused_widget().as_ref() == Some(view.upcast_ref::<gtk::Widget>())
+                        })
+                    });
+                    let dialog_focus_ticket = trusted_input_gate.focus_epoch
+                        .capture_sidebar_revival(&json, owns_focus);
                     if events
-                        .send(RendererEvent::ReactChromeIntent { json })
+                        .send(RendererEvent::ReactChromeIntent { json, dialog_focus_ticket })
                         .is_err()
                     {
                         eprintln!(
@@ -483,6 +506,7 @@ fn mount_webview(
                 surface_name(surface)
             );
             let inner = webview.webview();
+            mounted_view.set(Some(&inner));
             let crash_sender = webkit_recovery_sender(wake_proxy.clone());
             let crash_tracker = tracker.clone();
             let canonical_bytes = serving.url.len();

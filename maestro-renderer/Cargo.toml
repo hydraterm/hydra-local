@@ -61,3 +61,5 @@ wayland-sys = { version = "0.31", features = ["client", "dlopen"] }
 # no new crate is downloaded and the `wry::WebViewExtUnix::webview()` return type matches. Used only for the
 # dashboard WebView's web-process-crash / load-failed recovery signals in `linux_host` (presentation-only).
 webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
+# Same JavaScriptCore already locked through Wry/WebKitGTK; diagnostics need ValueExt, no new features.
+javascriptcore-rs = { version = "=1.1.2", default-features = false }

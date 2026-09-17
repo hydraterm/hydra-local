@@ -48,7 +48,10 @@ afterEach(() => {
 })
 
 describe('native topbar semantics and intents', () => {
-  it.each(['before', 'after'] as const)('drags across projects to the %s edge without changing active focus', async (edge) => {
+  it.each([
+    ['onDragEnter', 'before'], ['onDragEnter', 'after'],
+    ['onDragOver', 'before'], ['onDragOver', 'after'],
+  ] as const)('accepts %s then drops across projects at %s without changing active focus', async (acceptEvent, edge) => {
     const intents: Array<Record<string, unknown>> = []
     installWindow(intents)
     await mount()
@@ -59,7 +62,8 @@ describe('native topbar semantics and intents', () => {
       preventDefault: vi.fn(), clientX: edge === 'before' ? 10 : 90,
       currentTarget: { getBoundingClientRect: () => ({ left: 0, width: 100 }) },
     }
-    act(() => target.parent!.props.onDragOver(event))
+    act(() => target.parent!.props[acceptEvent]?.(event))
+    expect(event.preventDefault).toHaveBeenCalledOnce()
     expect(target.parent!.props.className).toContain(`drop-${edge}`)
     act(() => target.parent!.props.onDrop(event))
     expect(intents).toHaveLength(1)
@@ -73,6 +77,64 @@ describe('native topbar semantics and intents', () => {
       window.__HYDRA_DASHBOARD_RESOLVE_WINDOW_ORDER__!(String(request.request_id), { status: 'saved' })
     })
     expect(renderer!.root.findAllByProps({ role: 'alert' })).toHaveLength(0)
+  })
+
+  it.each([
+    ['onDragEnter', 'before'], ['onDragEnter', 'after'],
+    ['onDragOver', 'before'], ['onDragOver', 'after'],
+  ] as const)('clears the %s %s marker when a drag ends without a drop', async (acceptEvent, edge) => {
+    const intents: Array<Record<string, unknown>> = []
+    installWindow(intents)
+    await mount()
+    const source = renderer!.root.findByProps({ 'aria-label': 'Focus Analytics report in Sample Analytics' })
+    const target = renderer!.root.findByProps({ 'aria-label': 'Focus Dashboard build in Sample Workspace' })
+    const event = {
+      preventDefault: vi.fn(), clientX: edge === 'before' ? 10 : 90,
+      currentTarget: { getBoundingClientRect: () => ({ left: 0, width: 100 }) },
+    }
+    act(() => source.props.onDragStart({ dataTransfer: { setData: vi.fn() } }))
+    act(() => target.parent!.props[acceptEvent]?.(event))
+    expect(target.parent!.props.className).toContain(`drop-${edge}`)
+    act(() => source.props.onDragEnd())
+    expect(target.parent!.props.className).not.toMatch(/drop-(before|after)/)
+    // A later drop cannot reuse the ended drag's source or mutate order.
+    act(() => target.parent!.props.onDrop(event))
+    expect(intents).toEqual([])
+    expect(target.props['aria-pressed']).toBe(true)
+  })
+
+  it.each(['onDragEnter', 'onDragOver'] as const)('does not accept %s without a local drag or while saving order', async (acceptEvent) => {
+    const intents: Array<Record<string, unknown>> = []
+    installWindow(intents)
+    await mount()
+    const source = renderer!.root.findByProps({ 'aria-label': 'Focus Analytics report in Sample Analytics' })
+    const target = renderer!.root.findByProps({ 'aria-label': 'Focus Dashboard build in Sample Workspace' })
+    const event = {
+      preventDefault: vi.fn(), clientX: 90,
+      currentTarget: { getBoundingClientRect: () => ({ left: 0, width: 100 }) },
+    }
+    // A matching MIME type alone does not grant an external drag local ownership.
+    act(() => target.parent!.props[acceptEvent]?.({
+      ...event, dataTransfer: { types: ['application/x-hydra-topbar-window-id'] },
+    }))
+    expect(event.preventDefault).not.toHaveBeenCalled()
+    expect(target.parent!.props.className).not.toMatch(/drop-(before|after)/)
+    expect(intents).toEqual([])
+
+    act(() => source.props.onDragStart({ dataTransfer: { setData: vi.fn() } }))
+    act(() => target.props.onKeyDown({
+      key: 'ArrowRight', altKey: true, shiftKey: true,
+      preventDefault: vi.fn(), stopPropagation: vi.fn(),
+    }))
+    expect(intents).toHaveLength(1)
+    act(() => target.parent!.props[acceptEvent]?.(event))
+    expect(event.preventDefault).not.toHaveBeenCalled()
+    expect(target.parent!.props.className).not.toMatch(/drop-(before|after)/)
+    act(() => source.props.onDragEnd())
+    await act(async () => {
+      window.__HYDRA_DASHBOARD_RESOLVE_WINDOW_ORDER__!(String(intents[0].request_id), { status: 'saved' })
+    })
+    expect(intents).toHaveLength(1)
   })
 
   it('uses modified arrows for order, retains native failure, and does not intercept ordinary focus keys', async () => {

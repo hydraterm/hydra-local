@@ -248,6 +248,12 @@ impl ChromeHostServices for LinuxChromeServices {
         eprintln!("linux-host dashboard returned focus to terminal");
     }
 
+    fn finish_dialog_focus(&self, ticket: u64) {
+        if let Some(overlay) = self.overlay.as_ref() {
+            overlay.finish_dialog_focus(ticket);
+        }
+    }
+
     fn set_overlay_visible(&self, visible: bool) {
         if let Some(overlay) = self.overlay.as_ref() {
             overlay.set_visible(visible);
