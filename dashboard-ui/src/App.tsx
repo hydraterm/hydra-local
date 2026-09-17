@@ -17,6 +17,7 @@ import { TerminalHost } from './components/TerminalHost'
 import { EmptyState, ErrorState, LoadingState } from './components/States'
 import { AgentBadge } from './components/AgentBadge'
 import { ModelSelector } from './components/ModelSelector'
+import { preserveSplitEditorMouseFocus } from './split-action-focus'
 import {
   AGENT_PROVIDERS,
   SELECTABLE_AGENT_OPTIONS,
@@ -834,6 +835,7 @@ function OverlayChrome({
   const [sessionId, setSessionId] = useState<string | null>(null)
   // Name for the pane created by a split. Defaults to "Pane N"; user can override, keeping the default is fine.
   const [paneName, setPaneName] = useState<string>('')
+  const splitComposingEditorRef = useRef<EventTarget | null>(null)
   // Working directory for a split's new pane. `splitCwd` is the currently-selected folder (defaults to the source
   // window's folder). `splitWindowCwd` is that source-window default, kept separately so the picker can render it as
   // its own "Window folder" button (when it isn't a project folder) and distinguish it from an "Other folder…" pick.
@@ -939,6 +941,7 @@ function OverlayChrome({
   useEffect(() => {
     const hostWindow = window as OverlayHostWindow
     hostWindow.__HYDRA_SHOW_OVERLAY_MODAL__ = (next) => {
+      splitComposingEditorRef.current = null
       launchMutationAbortRef.current?.abort()
       cancelFolderSessionWork()
       const restoreParentFocus = deleteConfirmFocusOwnerRef.current && next !== null
@@ -1950,6 +1953,12 @@ function OverlayChrome({
           ref={syncParentDialogInert}
           onKeyDown={(event) => containDialogKeyboard(event, close)}
           onMouseDown={(e) => e.stopPropagation()}
+          onCompositionStartCapture={(event) => {
+            splitComposingEditorRef.current = event.target
+          }}
+          onCompositionEndCapture={(event) => {
+            if (splitComposingEditorRef.current === event.target) splitComposingEditorRef.current = null
+          }}
         >
           <div className="split-dialog__head">
             <div>
@@ -2157,13 +2166,19 @@ function OverlayChrome({
                 {launchPreflightError}
               </div>
             )}
-            <button type="button" className="split-dialog__cancel" onClick={close}>
+            <button
+              type="button"
+              className="split-dialog__cancel"
+              onMouseDown={(event) => preserveSplitEditorMouseFocus(event, splitComposingEditorRef.current)}
+              onClick={close}
+            >
               Cancel
             </button>
             <button
               type="button"
               className="split-dialog__submit"
               disabled={launchPreflightPending}
+              onMouseDown={(event) => preserveSplitEditorMouseFocus(event, splitComposingEditorRef.current)}
               onClick={() => void submitSplit()}
             >
               {launchPreflightPending ? 'Checking...' : 'Split'}
