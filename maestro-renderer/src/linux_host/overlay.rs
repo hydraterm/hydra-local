@@ -1076,6 +1076,25 @@ struct PendingProductIntentScope {
     recovery_generation: u64,
 }
 
+struct CapturedDialogLaunch {
+    ticket: u64,
+    scope: PendingProductIntentScope,
+    request_id: String,
+    trigger_ms: u32,
+    phase: CapturedLaunchPhase,
+}
+
+#[derive(Clone, Copy)]
+enum CapturedLaunchPhase {
+    Presented,
+    Restoring,
+    Hidden(u64),
+}
+
+fn native_event_precedes(event_ms: u32, trigger_ms: u32) -> bool {
+    event_ms != 0 && trigger_ms != 0 && matches!(trigger_ms.wrapping_sub(event_ms), 1..=0x7fff_ffff)
+}
+
 #[derive(Default)]
 struct PendingProductIntents {
     intents: VecDeque<String>,
@@ -1134,6 +1153,8 @@ struct OverlayRuntime {
     deadline_phase: OverlayDeadlinePhase,
     presentation_complete: bool,
     pending_product_intents: PendingProductIntents,
+    captured_launch: Option<CapturedDialogLaunch>,
+    launch_trigger: Option<(PendingProductIntentScope, u32)>,
 }
 
 impl OverlayRuntime {
@@ -1152,6 +1173,8 @@ impl OverlayRuntime {
             deadline_phase: OverlayDeadlinePhase::Idle,
             presentation_complete: false,
             pending_product_intents: PendingProductIntents::default(),
+            captured_launch: None,
+            launch_trigger: None,
         }
     }
 
@@ -1357,6 +1380,195 @@ impl OverlayRuntime {
 
     fn clear_pending_product_intents(&mut self) {
         self.pending_product_intents.clear();
+        self.captured_launch = None;
+        self.launch_trigger = None;
+    }
+
+    fn observe_dialog_trigger(&mut self, time_ms: u32, owns_overlay: bool) {
+        if !owns_overlay || !self.accepts_product_intents() || time_ms == 0 {
+            self.launch_trigger = None;
+            return;
+        }
+        let scope = PendingProductIntentScope {
+            presentation_token: self.presentation_token,
+            recovery_generation: self.recovery.generation(),
+        };
+        if let Some((prior_scope, prior)) = self.launch_trigger {
+            if prior_scope == scope {
+                if native_event_precedes(time_ms, prior) {
+                    return; // An asynchronously propagated old Return cannot move the trigger back.
+                }
+                if time_ms != prior && !native_event_precedes(prior, time_ms) {
+                    self.launch_trigger = None;
+                    return;
+                }
+            }
+        }
+        self.launch_trigger = Some((scope, time_ms));
+    }
+
+    fn remember_dialog_launch(&mut self, ticket: Option<u64>, json: &str) {
+        #[derive(Deserialize)]
+        struct Request {
+            #[serde(rename = "type")]
+            kind: String,
+            request_id: Option<String>,
+        }
+        self.captured_launch = ticket.and_then(|ticket| {
+            let request = serde_json::from_str::<Request>(json).ok()?;
+            // Only these launches have correlated admission replies; legacy tickets stay unchanged.
+            if !matches!(request.kind.as_str(), "createWindow" | "splitPane") {
+                return None;
+            }
+            let request_id = request.request_id.filter(|id| !id.trim().is_empty())?;
+            let (scope, trigger_ms) = self.launch_trigger?;
+            (self.accepts_product_intents()
+                && scope.presentation_token == self.presentation_token
+                && scope.recovery_generation == self.recovery.generation())
+            .then(|| CapturedDialogLaunch {
+                ticket,
+                scope,
+                request_id,
+                trigger_ms,
+                phase: CapturedLaunchPhase::Presented,
+            })
+        });
+    }
+
+    // Original GDK chronology only; all keys still propagate normally to GTK/WebKit.
+    fn observe_dialog_key(
+        &mut self,
+        epoch: &crate::host_services::DialogFocusEpoch,
+        key: gtk::gdk::keys::Key,
+        time_ms: u32,
+        active: bool,
+        owns_overlay: bool,
+    ) -> bool {
+        let retained = active
+            && self.captured_launch.as_ref().is_some_and(|launch| {
+                epoch.capture(true) == Some(launch.ticket)
+                    && launch.scope.recovery_generation == self.recovery.generation()
+                    && native_event_precedes(time_ms, launch.trigger_ms)
+                    && match launch.phase {
+                        CapturedLaunchPhase::Presented => {
+                            owns_overlay
+                                && self.accepts_product_intents()
+                                && launch.scope.presentation_token == self.presentation_token
+                        }
+                        CapturedLaunchPhase::Hidden(token) => {
+                            !self.visible && token == self.presentation_token
+                        }
+                        CapturedLaunchPhase::Restoring => false,
+                    }
+            });
+        if !retained {
+            epoch.changed();
+            self.captured_launch = None;
+        }
+        if matches!(
+            key,
+            gtk::gdk::keys::constants::Return | gtk::gdk::keys::constants::KP_Enter
+        ) {
+            self.observe_dialog_trigger(time_ms, active && owns_overlay);
+        }
+        retained
+    }
+
+    fn observe_dialog_close(&mut self, epoch: &crate::host_services::DialogFocusEpoch) {
+        // Successful close follows native hide. Visible close is Cancel, including accessibility.
+        if self.visible {
+            self.reject_dialog_launch(epoch);
+        }
+    }
+
+    fn observe_dialog_focus_target(
+        &mut self,
+        epoch: &crate::host_services::DialogFocusEpoch,
+        owns_overlay: bool,
+    ) {
+        if self.captured_launch.as_ref().is_some_and(|launch| {
+            !matches!(launch.phase, CapturedLaunchPhase::Restoring)
+                && (!self.visible || !owns_overlay)
+        }) {
+            self.reject_dialog_launch(epoch);
+        }
+    }
+
+    fn begin_dialog_hide(&mut self, epoch: &crate::host_services::DialogFocusEpoch) {
+        let valid = self.captured_launch.as_ref().is_some_and(|launch| {
+            epoch.capture(true) == Some(launch.ticket)
+                && launch.scope.recovery_generation == self.recovery.generation()
+                && match launch.phase {
+                    CapturedLaunchPhase::Presented => {
+                        self.visible && launch.scope.presentation_token == self.presentation_token
+                    }
+                    CapturedLaunchPhase::Hidden(token) => {
+                        !self.visible && token == self.presentation_token
+                    }
+                    CapturedLaunchPhase::Restoring => false,
+                }
+        });
+        if valid {
+            self.captured_launch.as_mut().unwrap().phase = CapturedLaunchPhase::Restoring;
+        } else {
+            self.captured_launch = None;
+        }
+        self.pending_product_intents.clear();
+        self.launch_trigger = None;
+    }
+
+    fn finish_dialog_hide(&mut self, epoch: &crate::host_services::DialogFocusEpoch) {
+        if let Some(launch) = self.captured_launch.as_mut() {
+            if matches!(launch.phase, CapturedLaunchPhase::Restoring)
+                && epoch.capture(true) == Some(launch.ticket)
+                && launch.scope.recovery_generation == self.recovery.generation()
+            {
+                launch.phase = CapturedLaunchPhase::Hidden(self.presentation_token);
+            } else {
+                self.captured_launch = None;
+            }
+        }
+    }
+
+    fn reject_dialog_launch(&mut self, epoch: &crate::host_services::DialogFocusEpoch) {
+        self.launch_trigger = None;
+        if self
+            .captured_launch
+            .take()
+            .is_some_and(|launch| epoch.capture(true) == Some(launch.ticket))
+        {
+            epoch.changed();
+        }
+    }
+
+    fn observe_launch_reply(
+        &mut self,
+        epoch: &crate::host_services::DialogFocusEpoch,
+        script: &str,
+    ) {
+        if self.captured_launch.is_none() || script.len() > MAX_PENDING_SCRIPT_BYTES {
+            return;
+        }
+        // Exact launch response tuple; never retain/log its message or use substring matching.
+        let Some(arguments) = script
+            .strip_prefix("window.__HYDRA_DASHBOARD_RESOLVE_LAUNCH_MUTATION__?.(...")
+            .and_then(|value| value.strip_suffix(");"))
+        else {
+            return;
+        };
+        let Ok((request, accepted, _)) =
+            serde_json::from_str::<(String, bool, Option<String>)>(arguments)
+        else {
+            return;
+        };
+        if !accepted
+            && self
+                .captured_launch
+                .as_ref()
+                .is_some_and(|launch| launch.request_id == request)
+        {
+            self.reject_dialog_launch(epoch);
+        }
     }
 
     fn can_begin_persistent_suppression(&self, force: bool) -> bool {
@@ -1753,6 +1965,206 @@ fn linux_overlay_input_trace_enabled() -> bool {
     std::env::var("HYDRA_LINUX_OVERLAY_INPUT_TRACE").as_deref() == Ok("1")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FocusTicketTraceEvent {
+    CreateProject,
+    CreateWindow,
+    SplitPane,
+    PlainKey,
+    NavigationKey,
+    ShortcutKey,
+    OtherKey,
+    PointerPress,
+    ActivationChanged,
+    Finish,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FocusTraceTrigger {
+    kind: FocusTicketTraceEvent,
+    time_ms: Option<u32>,
+    event_origin: &'static str,
+    scope: PendingProductIntentScope,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FocusTraceCapture {
+    ticket: Option<u64>,
+    scope: Option<PendingProductIntentScope>,
+    latest_observed_trigger: Option<FocusTraceTrigger>,
+}
+
+// Diagnostic state only: it never grants focus authority or changes a launch marker's lifetime.
+#[derive(Default)]
+struct FocusTraceChronology {
+    latest_observed_trigger: Option<FocusTraceTrigger>,
+    capture: Option<FocusTraceCapture>,
+}
+
+impl FocusTraceChronology {
+    fn capture(&mut self, ticket: Option<u64>, scope: Option<PendingProductIntentScope>) {
+        self.capture = Some(FocusTraceCapture {
+            ticket,
+            scope,
+            latest_observed_trigger: self.latest_observed_trigger,
+        });
+    }
+}
+
+struct FocusTicketObservation<'a> {
+    kind: FocusTicketTraceEvent,
+    ticket: Option<u64>,
+    native_event: Option<&'a gtk::gdk::Event>,
+    possible_trigger: bool,
+    chronology: &'a RefCell<FocusTraceChronology>,
+}
+
+fn focus_trace_event_time(time: u32) -> Option<u32> {
+    // GDK_CURRENT_TIME is the C macro 0; it is not a timestamp or a clock substitute.
+    (time != 0).then_some(time)
+}
+
+fn focus_ticket_key_category(
+    key: gtk::gdk::keys::Key,
+    modifiers: gtk::gdk::ModifierType,
+) -> FocusTicketTraceEvent {
+    use gtk::gdk::keys::constants as keys;
+    use gtk::gdk::ModifierType;
+    if modifiers.intersects(
+        ModifierType::CONTROL_MASK
+            | ModifierType::MOD1_MASK
+            | ModifierType::SUPER_MASK
+            | ModifierType::META_MASK,
+    ) {
+        FocusTicketTraceEvent::ShortcutKey
+    } else if matches!(
+        key,
+        keys::Tab
+            | keys::ISO_Left_Tab
+            | keys::Escape
+            | keys::Return
+            | keys::KP_Enter
+            | keys::Left
+            | keys::Right
+            | keys::Up
+            | keys::Down
+            | keys::Home
+            | keys::End
+            | keys::Page_Up
+            | keys::Page_Down
+    ) {
+        FocusTicketTraceEvent::NavigationKey
+    } else if key.to_unicode().is_some_and(|value| !value.is_control()) {
+        FocusTicketTraceEvent::PlainKey
+    } else {
+        FocusTicketTraceEvent::OtherKey
+    }
+}
+
+fn focus_ticket_trace_summary(
+    event: FocusTicketTraceEvent,
+    ticket: Option<u64>,
+    epoch: Option<u64>,
+    active: bool,
+    visible: Option<bool>,
+) -> String {
+    let result = match event {
+        FocusTicketTraceEvent::Finish if ticket.is_none() => "no_ticket",
+        FocusTicketTraceEvent::Finish if !active => "inactive",
+        FocusTicketTraceEvent::Finish if visible != Some(false) => "modal_visible_or_unknown",
+        FocusTicketTraceEvent::Finish if ticket != epoch => "epoch_changed",
+        FocusTicketTraceEvent::Finish => "eligible",
+        FocusTicketTraceEvent::CreateProject
+        | FocusTicketTraceEvent::CreateWindow
+        | FocusTicketTraceEvent::SplitPane => {
+            if ticket.is_some() {
+                "captured"
+            } else {
+                "no_ticket"
+            }
+        }
+        _ => "observed",
+    };
+    format!("event={event:?} ticket={ticket:?} epoch={epoch:?} active={active} visible={visible:?} result={result}")
+}
+
+// Existing opt-in trace only. Extract closed roles/timestamps, never format native event contents.
+// GDK time and host observation time stay separate: neither establishes launch causality alone.
+fn trace_focus_ticket(
+    observation: FocusTicketObservation<'_>,
+    epoch: &crate::host_services::DialogFocusEpoch,
+    window: &gtk::ApplicationWindow,
+    terminal: &gtk::DrawingArea,
+    underlays: &[Rc<wry::WebView>],
+    state: &std::rc::Weak<RefCell<OverlayRuntime>>,
+) {
+    let snapshot = state.upgrade().and_then(|state| {
+        let snapshot = state.try_borrow().ok().map(|state| {
+            (
+                state.visible,
+                state.webview.clone(),
+                PendingProductIntentScope {
+                    presentation_token: state.presentation_token,
+                    recovery_generation: state.recovery.generation(),
+                },
+            )
+        });
+        snapshot
+    });
+    let overlay = snapshot.as_ref().and_then(|(_, view, _)| view.as_deref());
+    let owner = native_focus_kind(
+        window.focused_widget().as_ref(),
+        terminal,
+        underlays,
+        overlay,
+    );
+    let summary = focus_ticket_trace_summary(
+        observation.kind,
+        observation.ticket,
+        epoch.capture(true),
+        window.is_active(),
+        snapshot.as_ref().map(|(visible, _, _)| *visible),
+    );
+    let scope = snapshot.as_ref().map(|(_, _, scope)| *scope);
+    let event_time_ms = observation
+        .native_event
+        .and_then(|event| focus_trace_event_time(event.time()));
+    let event_origin = observation.native_event.map_or("unknown", |event| {
+        let widget = gtk::event_widget(&mut event.clone());
+        match native_focus_kind(widget.as_ref(), terminal, underlays, overlay) {
+            "none" => "unknown",
+            role => role,
+        }
+    });
+    let mut chronology = observation.chronology.borrow_mut();
+    if observation.possible_trigger
+        && owner == "overlay"
+        && window.is_active()
+        && snapshot.as_ref().is_some_and(|(visible, _, _)| *visible)
+    {
+        if let Some(scope) = scope {
+            chronology.latest_observed_trigger = Some(FocusTraceTrigger {
+                kind: observation.kind,
+                time_ms: event_time_ms,
+                event_origin,
+                scope,
+            });
+        }
+    }
+    if matches!(
+        observation.kind,
+        FocusTicketTraceEvent::CreateProject
+            | FocusTicketTraceEvent::CreateWindow
+            | FocusTicketTraceEvent::SplitPane
+    ) {
+        chronology.capture(observation.ticket, scope);
+    }
+    eprintln!(
+        "linux-host focus-ticket host_monotonic_us={} owner={owner} {summary} event_time_ms={event_time_ms:?} event_origin={event_origin} latest_observed_trigger={:?} capture_anchor={:?}",
+        overlay_trace_monotonic_us(), chronology.latest_observed_trigger, chronology.capture
+    );
+}
+
 fn linux_geometry_trace_enabled() -> bool {
     std::env::var("HYDRA_LINUX_GEOMETRY_TRACE").as_deref() == Ok("1")
 }
@@ -1940,6 +2352,7 @@ pub struct LinuxOverlayHost {
     overlay_url: String,
     initialization_script: String,
     input_trace_enabled: bool,
+    focus_trace_chronology: Option<Rc<RefCell<FocusTraceChronology>>>,
     events: Option<ViewportEventSink>,
     wake_proxy: tao::event_loop::EventLoopProxy<LinuxLoopEvent>,
     state: Rc<RefCell<OverlayRuntime>>,
@@ -2108,6 +2521,8 @@ impl LinuxOverlayHost {
             &wake_proxy,
         );
         let input_trace_enabled = linux_overlay_input_trace_enabled();
+        let focus_trace_chronology =
+            input_trace_enabled.then(|| Rc::new(RefCell::new(FocusTraceChronology::default())));
 
         let focus_epoch = persistent_input_gate.focus_epoch.clone();
         let pending_opener: PendingOpener = Rc::new(RefCell::new(None));
@@ -2118,17 +2533,52 @@ impl LinuxOverlayHost {
         let epoch = focus_epoch.clone();
         let pending = pending_opener.clone();
         let views = underlay_webviews.clone();
-        let key_trace = input_trace_enabled.then(|| {
+        let key_trace = focus_trace_chronology.as_ref().map(|chronology| {
             (
                 terminal_slot.clone(),
                 underlay_webviews.clone(),
                 Rc::downgrade(&state),
+                chronology.clone(),
             )
         });
+        let key_state = Rc::downgrade(&state);
         let focus_key_signal = top_level.connect_key_press_event(move |window, event| {
-            epoch.changed();
+            let observed = key_state.upgrade().is_some_and(|state| {
+                let Ok(mut state) = state.try_borrow_mut() else {
+                    return false;
+                };
+                let owns_overlay = overlay_owns_focus(&state, window.focused_widget().as_ref());
+                state.observe_dialog_key(
+                    &epoch,
+                    event.keyval(),
+                    event.time(),
+                    window.is_active(),
+                    owns_overlay,
+                );
+                true
+            });
+            if !observed {
+                epoch.changed();
+            }
             cancel_pending_opener(&pending, &views);
-            if let Some((terminal, underlays, state)) = key_trace.as_ref() {
+            if let Some((terminal, underlays, state, chronology)) = key_trace.as_ref() {
+                trace_focus_ticket(
+                    FocusTicketObservation {
+                        kind: focus_ticket_key_category(event.keyval(), event.state()),
+                        ticket: None,
+                        native_event: Some(event),
+                        possible_trigger: matches!(
+                            event.keyval(),
+                            gtk::gdk::keys::constants::Return | gtk::gdk::keys::constants::KP_Enter
+                        ),
+                        chronology,
+                    },
+                    &epoch,
+                    window,
+                    terminal,
+                    underlays,
+                    state,
+                );
                 if matches!(
                     event.keyval(),
                     gtk::gdk::keys::constants::Return | gtk::gdk::keys::constants::KP_Enter
@@ -2146,20 +2596,99 @@ impl LinuxOverlayHost {
         let epoch = focus_epoch.clone();
         let pending = pending_opener.clone();
         let views = underlay_webviews.clone();
-        focus_pointer.connect_pressed(move |_, _, _, _| {
+        let pointer_state = Rc::downgrade(&state);
+        let pointer_window = top_level.downgrade();
+        let pointer_trace = focus_trace_chronology.as_ref().map(|chronology| {
+            (
+                top_level.downgrade(),
+                terminal_slot.clone(),
+                Rc::downgrade(&state),
+                chronology.clone(),
+            )
+        });
+        focus_pointer.connect_pressed(move |gesture, _, _, _| {
             epoch.changed();
             cancel_pending_opener(&pending, &views);
+            let event = gesture.last_event(gesture.current_sequence().as_ref());
+            if let (Some(state), Some(window)) = (pointer_state.upgrade(), pointer_window.upgrade())
+            {
+                if let Ok(mut state) = state.try_borrow_mut() {
+                    state.reject_dialog_launch(&epoch);
+                    let owns_overlay = window.is_active()
+                        && overlay_owns_focus(&state, window.focused_widget().as_ref());
+                    state.observe_dialog_trigger(
+                        event.as_ref().map_or(0, |event| event.time()),
+                        owns_overlay,
+                    );
+                }
+            }
+            if let Some((window, terminal, state, chronology)) = pointer_trace.as_ref() {
+                if let Some(window) = window.upgrade() {
+                    trace_focus_ticket(
+                        FocusTicketObservation {
+                            kind: FocusTicketTraceEvent::PointerPress,
+                            ticket: None,
+                            native_event: event.as_ref(),
+                            possible_trigger: true,
+                            chronology,
+                        },
+                        &epoch,
+                        &window,
+                        terminal,
+                        &views,
+                        state,
+                    );
+                }
+            }
         });
         let epoch = focus_epoch.clone();
         let pending = pending_opener.clone();
         let views = underlay_webviews.clone();
-        let focus_active_signal = top_level.connect_is_active_notify(move |_| {
+        let active_state = Rc::downgrade(&state);
+        let active_trace = focus_trace_chronology.as_ref().map(|chronology| {
+            (
+                terminal_slot.clone(),
+                Rc::downgrade(&state),
+                chronology.clone(),
+            )
+        });
+        let focus_active_signal = top_level.connect_is_active_notify(move |window| {
             epoch.changed();
             cancel_pending_opener(&pending, &views);
+            if let Some(state) = active_state.upgrade() {
+                if let Ok(mut state) = state.try_borrow_mut() {
+                    state.reject_dialog_launch(&epoch);
+                }
+            }
+            if let Some((terminal, state, chronology)) = active_trace.as_ref() {
+                *chronology.borrow_mut() = FocusTraceChronology::default();
+                trace_focus_ticket(
+                    FocusTicketObservation {
+                        kind: FocusTicketTraceEvent::ActivationChanged,
+                        ticket: None,
+                        native_event: None,
+                        possible_trigger: false,
+                        chronology,
+                    },
+                    &epoch,
+                    window,
+                    terminal,
+                    &views,
+                    state,
+                );
+            }
         });
         let pending = pending_opener.clone();
         let views = underlay_webviews.clone();
+        let target_state = Rc::downgrade(&state);
+        let epoch = focus_epoch.clone();
         let focus_target_signal = top_level.connect_set_focus(move |_, target| {
+            if let Some(state) = target_state.upgrade() {
+                if let Ok(mut state) = state.try_borrow_mut() {
+                    let owns_overlay = overlay_owns_focus(&state, target);
+                    state.observe_dialog_focus_target(&epoch, owns_overlay);
+                }
+            }
             let index = pending.borrow().as_ref().map(|pending| pending.target);
             if index.is_some_and(|index| {
                 views
@@ -2193,6 +2722,7 @@ impl LinuxOverlayHost {
                 input_trace_enabled,
             ),
             input_trace_enabled,
+            focus_trace_chronology,
             events,
             wake_proxy,
             state,
@@ -2212,11 +2742,17 @@ impl LinuxOverlayHost {
     /// accepted only while the overlay is active.
     pub fn evaluate_or_remember(&self, script: &str, kind: ReactChromeScriptKind) {
         if kind == ReactChromeScriptKind::Modal {
+            if let Some(chronology) = self.focus_trace_chronology.as_ref() {
+                *chronology.borrow_mut() = FocusTraceChronology::default();
+            }
             self.focus_epoch.changed();
             cancel_pending_opener(&self.pending_opener, &self.underlay_webviews);
         }
         let evaluate = {
             let mut state = self.state.borrow_mut();
+            if kind == ReactChromeScriptKind::Transient {
+                state.observe_launch_reply(&self.focus_epoch, script);
+            }
             // A new modal supersedes every request emitted by the previous modal render. The new
             // document/effect will issue fresh requests under its own request ids.
             if kind == ReactChromeScriptKind::Modal {
@@ -2257,11 +2793,28 @@ impl LinuxOverlayHost {
     }
 
     pub(crate) fn finish_dialog_focus(&self, ticket: u64) {
+        if let Some(chronology) = self.focus_trace_chronology.as_ref() {
+            trace_focus_ticket(
+                FocusTicketObservation {
+                    kind: FocusTicketTraceEvent::Finish,
+                    ticket: Some(ticket),
+                    native_event: None,
+                    possible_trigger: false,
+                    chronology,
+                },
+                &self.focus_epoch,
+                &self.top_level,
+                &self.terminal_slot,
+                &self.underlay_webviews,
+                &Rc::downgrade(&self.state),
+            );
+        }
         if self.focus_epoch.can_finish(
             ticket,
             self.top_level.is_active(),
             self.state.borrow().visible,
         ) {
+            self.state.borrow_mut().captured_launch = None;
             self.focus_epoch.changed(); // consume before GTK can deliver reentrant focus signals
             cancel_pending_opener(&self.pending_opener, &self.underlay_webviews);
             self.terminal_slot.grab_focus();
@@ -2662,6 +3215,9 @@ impl LinuxOverlayHost {
             self.hide_and_restore_focus();
             return;
         }
+        self.state
+            .borrow_mut()
+            .reject_dialog_launch(&self.focus_epoch);
         cancel_pending_opener(&self.pending_opener, &self.underlay_webviews);
         if self.state.borrow().recovery.is_exhausted() {
             eprintln!(
@@ -2820,14 +3376,18 @@ impl LinuxOverlayHost {
         let (was_visible, webview) = {
             let mut state = self.state.borrow_mut();
             let was_visible = state.visible;
+            state.begin_dialog_hide(&self.focus_epoch);
             state.visible = false;
             state.delivery.hide();
-            state.clear_pending_product_intents();
             (was_visible, state.webview.clone())
         };
+        // Only synchronous park/restore may retain the launch across paired None/opener signals.
         self.park_webview(webview.as_deref(), false);
         self.present_target.set_overlay_occluded(false);
         self.restore_underlay_inputs(was_visible);
+        self.state
+            .borrow_mut()
+            .finish_dialog_hide(&self.focus_epoch);
         self.top_level.queue_draw();
         if was_visible {
             eprintln!("linux-host dashboard overlay hidden");
@@ -2837,6 +3397,7 @@ impl LinuxOverlayHost {
     fn fail_closed_to_terminal(&self) {
         let (was_visible, webview) = {
             let mut state = self.state.borrow_mut();
+            state.reject_dialog_launch(&self.focus_epoch);
             let was_visible = state.visible;
             state.visible = false;
             state.delivery.hide();
@@ -3385,6 +3946,7 @@ impl LinuxOverlayHost {
                         RecoveryDecision::Dispatch { .. } | RecoveryDecision::Exhausted
                     ) {
                         state.delivery.page_started();
+                        state.reject_dialog_launch(&self.focus_epoch);
                         state.clear_pending_product_intents();
                     }
                     if decision == RecoveryDecision::Exhausted {
@@ -3474,6 +4036,7 @@ impl LinuxOverlayHost {
                     let webview = {
                         let mut state = self.state.borrow_mut();
                         state.delivery.page_started();
+                        state.reject_dialog_launch(&self.focus_epoch);
                         state.clear_pending_product_intents();
                         state.webview.clone()
                     };
@@ -3581,6 +4144,13 @@ impl LinuxOverlayHost {
         let ipc_state = Rc::downgrade(&self.state);
         let ipc_focus_epoch = self.focus_epoch.clone();
         let ipc_top_level = self.top_level.clone();
+        let ipc_focus_trace = self.focus_trace_chronology.as_ref().map(|chronology| {
+            (
+                self.terminal_slot.clone(),
+                self.underlay_webviews.clone(),
+                chronology.clone(),
+            )
+        });
         let page_state = Rc::downgrade(&self.state);
         let overlay_url = self.overlay_url.clone();
         let input_trace_enabled = self.input_trace_enabled;
@@ -3784,6 +4354,13 @@ impl LinuxOverlayHost {
                     let Some(forwarded_json) = forwarded_json else {
                         return;
                     };
+                    if serde_json::from_str::<ProductIntentDiscriminant>(&forwarded_json)
+                        .is_ok_and(|intent| intent.kind == "closeOverlay")
+                    {
+                        if let Some(state) = ipc_state.upgrade() {
+                            state.borrow_mut().observe_dialog_close(&ipc_focus_epoch);
+                        }
+                    }
                     if let Some(events) = ipc_events.as_ref() {
                         // Stamp the originating dialog, before app/daemon preparation. Late input,
                         // modal replacement or activation changes invalidate this exact epoch.
@@ -3792,14 +4369,32 @@ impl LinuxOverlayHost {
                         let owns_focus = explicit_launch && ipc_state.upgrade().is_some_and(|state| {
                             let state = state.borrow();
                             state.visible && ipc_top_level.is_active()
-                                && ipc_top_level.focused_widget().is_some_and(|focused| {
-                                    state.webview.as_ref().is_some_and(|webview| {
-                                        let widget: gtk::Widget = webview.webview().clone().upcast();
-                                        focused == widget || focused.is_ancestor(&widget)
-                                    })
-                                })
+                                && overlay_owns_focus(&state, ipc_top_level.focused_widget().as_ref())
                         });
                         let dialog_focus_ticket = ipc_focus_epoch.capture(owns_focus);
+                        if explicit_launch {
+                            if let Some(state) = ipc_state.upgrade() {
+                                state.borrow_mut().remember_dialog_launch(dialog_focus_ticket, &forwarded_json);
+                            }
+                        }
+                        if let Some((terminal, underlays, chronology)) = ipc_focus_trace.as_ref() {
+                            let event = serde_json::from_str::<ProductIntentDiscriminant>(&forwarded_json)
+                                .ok().and_then(|intent| match intent.kind.as_str() {
+                                    "createProject" => Some(FocusTicketTraceEvent::CreateProject),
+                                    "createWindow" => Some(FocusTicketTraceEvent::CreateWindow),
+                                    "splitPane" => Some(FocusTicketTraceEvent::SplitPane),
+                                    _ => None,
+                                });
+                            if let Some(event) = event {
+                                trace_focus_ticket(FocusTicketObservation {
+                                    kind: event,
+                                    ticket: dialog_focus_ticket,
+                                    native_event: None,
+                                    possible_trigger: false,
+                                    chronology,
+                                }, &ipc_focus_epoch, &ipc_top_level, terminal, underlays, &ipc_state);
+                            }
+                        }
                         if events
                             .send(RendererEvent::ReactChromeIntent {
                                 dialog_focus_ticket,
@@ -3807,6 +4402,11 @@ impl LinuxOverlayHost {
                             })
                             .is_err()
                         {
+                            if explicit_launch {
+                                if let Some(state) = ipc_state.upgrade() {
+                                    state.borrow_mut().reject_dialog_launch(&ipc_focus_epoch);
+                                }
+                            }
                             eprintln!("linux-host overlay ipc intent dropped: receiver closed");
                         }
                     } else {
@@ -4020,6 +4620,47 @@ impl Drop for LinuxOverlayHost {
     }
 }
 
+fn overlay_owns_focus(state: &OverlayRuntime, focused: Option<&gtk::Widget>) -> bool {
+    focused.is_some_and(|focused| {
+        state.webview.as_ref().is_some_and(|webview| {
+            let widget: gtk::Widget = webview.webview().upcast();
+            focused == &widget || focused.is_ancestor(&widget)
+        })
+    })
+}
+
+fn native_focus_kind(
+    candidate: Option<&gtk::Widget>,
+    terminal: &gtk::DrawingArea,
+    underlays: &[Rc<wry::WebView>],
+    overlay: Option<&wry::WebView>,
+) -> &'static str {
+    let Some(candidate) = candidate else {
+        return "none";
+    };
+    if candidate == terminal.upcast_ref::<gtk::Widget>() {
+        return "terminal";
+    }
+    for (index, webview) in underlays.iter().enumerate() {
+        let widget: gtk::Widget = webview.webview().upcast();
+        if candidate == &widget || candidate.is_ancestor(&widget) {
+            return match index {
+                0 => "sidebar",
+                1 => "topbar",
+                _ => "other",
+            };
+        }
+    }
+    if overlay.is_some_and(|webview| {
+        let widget: gtk::Widget = webview.webview().upcast();
+        candidate == &widget || candidate.is_ancestor(&widget)
+    }) {
+        "overlay"
+    } else {
+        "other"
+    }
+}
+
 fn trace_native_focus_snapshot(
     window: &gtk::ApplicationWindow,
     terminal: &gtk::DrawingArea,
@@ -4029,32 +4670,7 @@ fn trace_native_focus_snapshot(
     prior: Option<&gtk::Widget>,
 ) {
     let current = window.focused_widget();
-    let kind = |candidate: Option<&gtk::Widget>| {
-        let Some(candidate) = candidate else {
-            return "none";
-        };
-        if candidate == terminal.upcast_ref::<gtk::Widget>() {
-            return "terminal";
-        }
-        for (index, webview) in underlays.iter().enumerate() {
-            let widget: gtk::Widget = webview.webview().upcast();
-            if candidate == &widget || candidate.is_ancestor(&widget) {
-                return match index {
-                    0 => "sidebar",
-                    1 => "topbar",
-                    _ => "other",
-                };
-            }
-        }
-        if overlay.is_some_and(|webview| {
-            let widget: gtk::Widget = webview.webview().upcast();
-            candidate == &widget || candidate.is_ancestor(&widget)
-        }) {
-            "overlay"
-        } else {
-            "other"
-        }
-    };
+    let kind = |candidate| native_focus_kind(candidate, terminal, underlays, overlay);
     let exact_webview = |candidate: Option<&gtk::Widget>| {
         candidate.is_some_and(|candidate| {
             underlays
@@ -5937,6 +6553,313 @@ mod tests {
             "monotonic_ms": 4281,
         })
         .to_string()
+    }
+
+    fn presented_dialog_launch(epoch: &crate::host_services::DialogFocusEpoch) -> OverlayRuntime {
+        let mut runtime = runtime_awaiting_presentation();
+        runtime.persistent_suppression.begin(0);
+        assert!(runtime.mark_presented(runtime.presentation_token));
+        let intent = r#"{"type":"splitPane","request_id":"launch-one"}"#;
+        runtime.observe_dialog_trigger(1000, true);
+        runtime.remember_dialog_launch(epoch.capture(true), intent);
+        runtime
+    }
+
+    fn hide_captured_launch(
+        runtime: &mut OverlayRuntime,
+        epoch: &crate::host_services::DialogFocusEpoch,
+    ) {
+        runtime.begin_dialog_hide(epoch);
+        runtime.visible = false;
+        runtime.delivery.hide();
+        runtime.observe_dialog_focus_target(epoch, false); // paired GTK None/opener signals
+        runtime.end_deadline();
+        runtime.finish_dialog_hide(epoch);
+    }
+
+    #[test]
+    fn dialog_launch_native_key_callback_retains_only_original_pretrigger_events() {
+        use gtk::gdk::keys::constants as k;
+        let epoch = crate::host_services::DialogFocusEpoch::default();
+        let mut runtime = presented_dialog_launch(&epoch);
+        let ticket = epoch.capture(true).unwrap();
+        let scope = runtime.captured_launch.as_ref().unwrap().scope;
+        for hidden in [false, true] {
+            if hidden {
+                hide_captured_launch(&mut runtime, &epoch);
+            }
+            for key in [
+                k::a,
+                k::Z,
+                k::Tab,
+                k::Escape,
+                k::Left,
+                k::Shift_L,
+                k::Return,
+            ] {
+                assert!(runtime.observe_dialog_key(&epoch, key, 999, true, !hidden));
+                assert_eq!(epoch.capture(true), Some(ticket));
+            }
+        }
+        runtime.observe_dialog_close(&epoch); // late successful UI close after native revoke
+        hide_captured_launch(&mut runtime, &epoch); // duplicate native hide
+        let launch = runtime.captured_launch.as_ref().unwrap();
+        assert_eq!(
+            (launch.ticket, launch.scope, launch.trigger_ms),
+            (ticket, scope, 1000)
+        );
+        assert_eq!(launch.request_id, "launch-one");
+        assert!(epoch.can_finish(ticket, true, false));
+        assert!(!epoch.can_finish(ticket.wrapping_sub(1), true, false)); // stale Finish
+        assert_eq!(runtime.captured_launch.as_ref().unwrap().ticket, ticket);
+        runtime.observe_dialog_focus_target(&epoch, false); // later real focus, outside hide bracket
+        assert!(!epoch.can_finish(ticket, true, false));
+        assert!(runtime.captured_launch.is_none());
+    }
+
+    #[test]
+    fn dialog_launch_native_key_callback_rejects_new_unknown_and_ambiguous_events() {
+        use gtk::gdk::keys::constants as k;
+        for hidden in [false, true] {
+            for time in [0, 1000, 1001, 1000u32.wrapping_sub(0x8000_0000)] {
+                for key in [k::a, k::Tab, k::Shift_L, k::Return] {
+                    let epoch = crate::host_services::DialogFocusEpoch::default();
+                    let mut runtime = presented_dialog_launch(&epoch);
+                    let ticket = epoch.capture(true).unwrap();
+                    if hidden {
+                        hide_captured_launch(&mut runtime, &epoch);
+                    }
+                    assert!(!runtime.observe_dialog_key(&epoch, key, time, true, !hidden));
+                    assert!(!epoch.can_finish(ticket, true, false));
+                }
+            }
+        }
+        assert!(native_event_precedes(u32::MAX, 1));
+        assert!(!native_event_precedes(1, u32::MAX));
+        assert!(!native_event_precedes(1, 0));
+        assert!(!native_event_precedes(0, 1));
+    }
+
+    #[test]
+    fn dialog_launch_native_key_callback_never_keeps_expired_or_cancelled_ownership() {
+        use gtk::gdk::keys::constants as k;
+        for case in 0..9 {
+            let epoch = crate::host_services::DialogFocusEpoch::default();
+            let mut runtime = presented_dialog_launch(&epoch);
+            let ticket = epoch.capture(true).unwrap();
+            match case {
+                0 => runtime.visible = false, // not the checked hide transition
+                1 => {
+                    runtime.begin_presentation_deadline();
+                }
+                2 => {
+                    runtime.recovery.on_failure(Some(0));
+                }
+                3 => epoch.changed(), // native pointer/activation always advance the same epoch
+                4 => runtime.observe_dialog_focus_target(&epoch, false),
+                5 => runtime.observe_dialog_close(&epoch), // actual trusted visible Cancel caller
+                6 => runtime.clear_pending_product_intents(), // new modal/recovery
+                7 => runtime.reject_dialog_launch(&epoch), // send/timeout/refusal path
+                8 => {}                                    // inactive window
+                _ => unreachable!(),
+            }
+            assert!(!runtime.observe_dialog_key(&epoch, k::a, 999, case != 8, true));
+            assert!(!epoch.can_finish(ticket, true, false));
+        }
+    }
+
+    #[test]
+    fn dialog_launch_native_key_callback_requires_exact_correlated_capture_and_reply() {
+        use gtk::gdk::keys::constants as k;
+        let epoch = crate::host_services::DialogFocusEpoch::default();
+        for intent in [
+            r#"{"type":"createProject","request_id":"not-correlated"}"#,
+            r#"{"type":"createWindow"}"#,
+            r#"{"type":"splitPane","request_id":""}"#,
+            r#"{"type":"splitPane","request_id":"  "}"#,
+        ] {
+            let mut runtime = presented_dialog_launch(&epoch);
+            runtime.remember_dialog_launch(epoch.capture(true), intent);
+            assert!(runtime.captured_launch.is_none());
+            assert!(!runtime.observe_dialog_key(&epoch, k::a, 999, true, true));
+        }
+        let mut runtime = presented_dialog_launch(&epoch);
+        runtime.remember_dialog_launch(None, r#"{"type":"splitPane","request_id":"absent"}"#);
+        assert!(runtime.captured_launch.is_none());
+        runtime = presented_dialog_launch(&epoch);
+        let ticket = epoch.capture(true).unwrap();
+        for script in [
+            r#"window.__HYDRA_DASHBOARD_RESOLVE_LAUNCH_MUTATION__?.(...["other",false,"declined"]);"#,
+            r#"window.__HYDRA_DASHBOARD_RESOLVE_LAUNCH_MUTATION__?.(...["launch-one",true,null]);"#,
+            r#"window.__HYDRA_DASHBOARD_RESOLVE_LAUNCH_MUTATION__?.(...["launch-one",false,12]);"#,
+            r#"window.__HYDRA_DASHBOARD_RESOLVE_LAUNCH_MUTATION__?.(...["launch-one",false,null,"extra"]);"#,
+        ] {
+            runtime.observe_launch_reply(&epoch, script);
+            assert_eq!(epoch.capture(true), Some(ticket));
+        }
+        runtime.observe_launch_reply(&epoch,
+            r#"window.__HYDRA_DASHBOARD_RESOLVE_LAUNCH_MUTATION__?.(...["launch-one",false,"declined"]);"#);
+        assert!(runtime.captured_launch.is_none());
+        assert!(!epoch.can_finish(ticket, true, false));
+    }
+
+    #[test]
+    fn dialog_launch_native_trigger_is_trace_independent_and_cannot_move_backwards() {
+        use gtk::gdk::keys::constants as k;
+        let epoch = crate::host_services::DialogFocusEpoch::default();
+        let mut runtime = presented_dialog_launch(&epoch);
+        assert!(runtime.observe_dialog_key(&epoch, k::Return, 990, true, true));
+        assert_eq!(runtime.launch_trigger.unwrap().1, 1000);
+        assert!(!runtime.observe_dialog_key(&epoch, k::Return, 1001, true, true));
+        assert_eq!(runtime.launch_trigger.unwrap().1, 1001);
+        let intent = r#"{"type":"createWindow","request_id":"next"}"#;
+        runtime.remember_dialog_launch(epoch.capture(true), intent);
+        assert_eq!(runtime.captured_launch.as_ref().unwrap().trigger_ms, 1001);
+        for time in [0, 1001u32.wrapping_add(0x8000_0000)] {
+            runtime.observe_dialog_trigger(time, true);
+            runtime.remember_dialog_launch(epoch.capture(true), intent);
+            assert!(runtime.captured_launch.is_none());
+            runtime.observe_dialog_trigger(1001, true);
+        }
+        runtime.begin_presentation_deadline();
+        runtime.remember_dialog_launch(epoch.capture(true), intent);
+        assert!(runtime.captured_launch.is_none());
+    }
+
+    #[test]
+    fn focus_ticket_trace_chronology_preserves_unknown_and_wrapping_raw_times() {
+        assert_eq!(focus_trace_event_time(0), None);
+        for time in [1, 0x8000_0000, u32::MAX] {
+            assert_eq!(focus_trace_event_time(time), Some(time));
+        }
+        let mut chronology = FocusTraceChronology::default();
+        chronology.capture(None, None);
+        assert_eq!(chronology.capture.unwrap().latest_observed_trigger, None);
+        assert_eq!(chronology.capture.unwrap().scope, None);
+    }
+
+    #[test]
+    fn focus_ticket_trace_chronology_keeps_capture_independent_of_later_observations() {
+        let scope = PendingProductIntentScope {
+            presentation_token: 7,
+            recovery_generation: 2,
+        };
+        let trigger = FocusTraceTrigger {
+            kind: FocusTicketTraceEvent::PointerPress,
+            time_ms: Some(120),
+            event_origin: "unknown",
+            scope,
+        };
+        let mut chronology = FocusTraceChronology {
+            latest_observed_trigger: Some(trigger),
+            capture: None,
+        };
+        chronology.capture(Some(32), Some(scope));
+        let capture = chronology.capture;
+        chronology.latest_observed_trigger = Some(FocusTraceTrigger {
+            time_ms: Some(140),
+            ..trigger
+        });
+        let mut runtime = OverlayRuntime::new(0);
+        runtime.clear_pending_product_intents();
+        assert_eq!(chronology.capture, capture);
+        assert_eq!(capture.unwrap().latest_observed_trigger, Some(trigger));
+        chronology.capture(Some(33), Some(scope));
+        assert_eq!(
+            chronology
+                .capture
+                .unwrap()
+                .latest_observed_trigger
+                .unwrap()
+                .time_ms,
+            Some(140)
+        );
+        let summary = format!("{:?}", chronology.capture);
+        assert!(summary.contains("latest_observed_trigger"));
+        assert!(!summary.contains("keyval") && !summary.contains("keycode"));
+    }
+
+    #[test]
+    fn focus_ticket_trace_reports_capture_and_all_finish_gates_without_changing_epoch() {
+        use FocusTicketTraceEvent::{Finish, SplitPane};
+        let epoch = crate::host_services::DialogFocusEpoch::default();
+        let ticket = epoch.capture(true);
+        let capture = focus_ticket_trace_summary(SplitPane, ticket, ticket, true, Some(true));
+        assert_eq!(capture, "event=SplitPane ticket=Some(0) epoch=Some(0) active=true visible=Some(true) result=captured");
+        assert!(
+            focus_ticket_trace_summary(SplitPane, None, ticket, true, Some(true))
+                .ends_with("result=no_ticket")
+        );
+        for (active, visible, result) in [
+            (true, Some(false), "eligible"),
+            (false, Some(false), "inactive"),
+            (true, Some(true), "modal_visible_or_unknown"),
+            (true, None, "modal_visible_or_unknown"),
+        ] {
+            assert!(focus_ticket_trace_summary(
+                Finish,
+                ticket,
+                epoch.capture(true),
+                active,
+                visible
+            )
+            .ends_with(result));
+            assert_eq!(
+                epoch.can_finish(ticket.unwrap(), active, visible.unwrap_or(true)),
+                result == "eligible"
+            );
+            assert_eq!(
+                epoch.capture(true),
+                ticket,
+                "trace does not consume ownership"
+            );
+        }
+        epoch.changed();
+        assert!(
+            focus_ticket_trace_summary(Finish, ticket, epoch.capture(true), true, Some(false))
+                .ends_with("result=epoch_changed")
+        );
+        assert!(!epoch.can_finish(ticket.unwrap(), true, false));
+    }
+
+    #[test]
+    fn focus_ticket_trace_collapses_key_values_to_closed_categories() {
+        use gtk::gdk::{keys::constants as key, ModifierType};
+        for value in [key::a, key::Z, key::space, key::exclam] {
+            assert_eq!(
+                focus_ticket_key_category(value, ModifierType::empty()),
+                FocusTicketTraceEvent::PlainKey
+            );
+        }
+        for value in [key::Tab, key::Escape, key::Return, key::Left] {
+            assert_eq!(
+                focus_ticket_key_category(value, ModifierType::empty()),
+                FocusTicketTraceEvent::NavigationKey
+            );
+        }
+        for modifier in [
+            ModifierType::CONTROL_MASK,
+            ModifierType::MOD1_MASK,
+            ModifierType::SUPER_MASK,
+            ModifierType::META_MASK,
+        ] {
+            assert_eq!(
+                focus_ticket_key_category(key::a, modifier),
+                FocusTicketTraceEvent::ShortcutKey
+            );
+        }
+        assert_eq!(
+            focus_ticket_key_category(key::Shift_L, ModifierType::SHIFT_MASK),
+            FocusTicketTraceEvent::OtherKey
+        );
+        let summary = focus_ticket_trace_summary(
+            FocusTicketTraceEvent::PlainKey,
+            None,
+            Some(7),
+            true,
+            Some(true),
+        );
+        assert_eq!(summary, "event=PlainKey ticket=None epoch=Some(7) active=true visible=Some(true) result=observed");
     }
 
     #[test]
