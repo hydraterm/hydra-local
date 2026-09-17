@@ -4078,6 +4078,51 @@ pub fn run_new_tab_foreground_pipeline_with_consent(
     env: &impl maestro_shell::EnvLookup,
     runtime: &mut RendererTabRuntime,
 ) -> Result<NewTabForegroundSuccess, NewTabForegroundError> {
+    run_new_tab_foreground_pipeline_with_workspace(request, fresh_workspace, None, env, runtime)
+}
+
+/// Explicit Other-folder split: the selected child Workspace is inserted with the child, not
+/// separately. The original source Workspace remains sealed independently through publication.
+pub fn run_new_split_foreground_pipeline_in_selected_workspace(
+    request: NewTabForegroundRequest<'_>,
+    child_workspace: &maestro_shell::Workspace,
+    source_workspace: &maestro_shell::Workspace,
+    env: &impl maestro_shell::EnvLookup,
+    runtime: &mut RendererTabRuntime,
+) -> Result<NewTabForegroundSuccess, NewTabForegroundError> {
+    if child_workspace.policy != maestro_shell::WorkspacePolicy::RepoWrite
+        || request.split_from.is_none()
+        || request.split_source_session.is_none()
+    {
+        return Err(NewTabForegroundError::PreparedSessionStart {
+            cwd: PathBuf::new(),
+            scratch: None,
+            error: NewTabPreparedSessionError::GraphAuthority {
+                detail: "selected directory requires RepoWrite and an exact split source".into(),
+            },
+        });
+    }
+    run_new_tab_foreground_pipeline_with_workspace(
+        request,
+        child_workspace,
+        Some(source_workspace),
+        env,
+        runtime,
+    )
+}
+
+struct NewTabReviewedWorkspace {
+    workspace: maestro_shell::Workspace,
+    fresh_split_source: Option<maestro_shell::Workspace>,
+}
+
+fn run_new_tab_foreground_pipeline_with_workspace(
+    request: NewTabForegroundRequest<'_>,
+    fresh_workspace: &maestro_shell::Workspace,
+    fresh_split_source: Option<&maestro_shell::Workspace>,
+    env: &impl maestro_shell::EnvLookup,
+    runtime: &mut RendererTabRuntime,
+) -> Result<NewTabForegroundSuccess, NewTabForegroundError> {
     if runtime.handoff_is_pending() {
         return Err(NewTabForegroundError::WorkspacePrepare(
             NewTabWorkspacePrepareError::RendererHandoffPending,
@@ -4139,7 +4184,10 @@ pub fn run_new_tab_foreground_pipeline_with_consent(
         request,
         prepared,
         scratch,
-        Some(fresh_workspace.clone()),
+        Some(NewTabReviewedWorkspace {
+            workspace: fresh_workspace.clone(),
+            fresh_split_source: fresh_split_source.cloned(),
+        }),
         env,
         runtime,
     )
@@ -4174,7 +4222,7 @@ fn run_new_tab_foreground_pipeline_from_prepared(
     request: NewTabForegroundRequest<'_>,
     prepared: maestro_shell::PreparedWorkspace,
     scratch: Option<NewTabScratchRemovalAuthority>,
-    reviewed_workspace: Option<maestro_shell::Workspace>,
+    reviewed_workspace: Option<NewTabReviewedWorkspace>,
     env: &impl maestro_shell::EnvLookup,
     runtime: &mut RendererTabRuntime,
 ) -> Result<NewTabForegroundSuccess, NewTabForegroundError> {
@@ -4196,7 +4244,7 @@ fn run_new_tab_foreground_pipeline_from_prepared_with_reprobe<R>(
     request: NewTabForegroundRequest<'_>,
     prepared: maestro_shell::PreparedWorkspace,
     mut scratch: Option<NewTabScratchRemovalAuthority>,
-    reviewed_workspace: Option<maestro_shell::Workspace>,
+    reviewed_workspace: Option<NewTabReviewedWorkspace>,
     env: &impl maestro_shell::EnvLookup,
     runtime: &mut RendererTabRuntime,
     mut reprobe: R,
@@ -4297,8 +4345,22 @@ where
             },
         ));
     }
-    let workspace = match reviewed_workspace {
-        Some(workspace) => workspace,
+    let fresh_split_source = reviewed_workspace
+        .as_ref()
+        .and_then(|reviewed| reviewed.fresh_split_source.as_ref());
+    if fresh_split_source.is_some()
+        && (request.split_from.is_none() || request.split_source_session.is_none())
+    {
+        return Err(prepared_new_tab_failure(
+            &prepared,
+            &mut scratch,
+            NewTabPreparedSessionError::GraphAuthority {
+                detail: "selected Workspace requires an exact split source".into(),
+            },
+        ));
+    }
+    let workspace = match &reviewed_workspace {
+        Some(reviewed) => reviewed.workspace.clone(),
         None => match maestro_shell::load_one::<maestro_shell::Workspace>(
             request.paths,
             maestro_shell::RecordKind::Workspace,
@@ -4351,6 +4413,19 @@ where
     }
     let sealed_start = match request.split_from.as_ref() {
         Some(split) => match request.split_source_session {
+            Some(source) if fresh_split_source.is_some() => windows
+                .prepare_new_split_session_in_fresh_workspace(
+                    &proof.window,
+                    &proof.project,
+                    fresh_split_source.expect("matched selected split source"),
+                    source,
+                    &workspace,
+                    session_spec,
+                    &split.from_tab_id,
+                    &tab_id,
+                    &title,
+                    split.axis,
+                ),
             Some(source) => windows.prepare_new_split_session_from_source_with_spec(
                 &proof.window,
                 &proof.project,
@@ -6928,6 +7003,185 @@ mod tests {
             None,
             "textual seed facts cannot invent a proven renderer lifetime"
         );
+    }
+
+    #[test]
+    fn selected_directory_split_foreground_preserves_source_and_cleans_only_owned_rows() {
+        use maestro_shell::{LoadOutcome, RecordKind, SessionRecord, Workspace, WorkspacePolicy};
+        for case in [
+            "live",
+            "no-peer",
+            "wrong-policy",
+            "no-source",
+            "missing-directory",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let paths = maestro_shell::AppPaths::with_base(tmp.path());
+            one_existing_tab_window(&paths, "maestro-app-dev-project");
+            let LoadOutcome::Loaded(source_workspace) = maestro_shell::load_one::<Workspace>(
+                &paths,
+                RecordKind::Workspace,
+                "maestro-app-dev",
+            )
+            .unwrap()
+            .unwrap() else {
+                panic!("source Workspace")
+            };
+            let LoadOutcome::Loaded(source) =
+                maestro_shell::load_one::<SessionRecord>(&paths, RecordKind::Session, "sess-t0")
+                    .unwrap()
+                    .unwrap()
+            else {
+                panic!("source Session")
+            };
+            let mut before = maestro_shell::WindowLayoutService::new(&paths)
+                .load("w1")
+                .unwrap()
+                .unwrap();
+            if case == "no-peer" {
+                before.tabs[0].pane_rect = Some(maestro_shell::records::PaneRect::from_unit([
+                    0.0, 0.0, 1.0, 1.0,
+                ]));
+            }
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("sentinel"), b"keep").unwrap();
+            let mut child = Workspace {
+                workspace_id: "selected-workspace".into(),
+                root: directory.path().to_string_lossy().into_owned(),
+                policy: if case == "wrong-policy" {
+                    WorkspacePolicy::Worktree
+                } else {
+                    WorkspacePolicy::RepoWrite
+                },
+                consent: maestro_shell::WorkspaceConsent {
+                    repo_write: true,
+                    worktree_create: true,
+                    granted_at_ms: Some(1),
+                },
+                ..source_workspace.clone()
+            };
+            if case == "missing-directory" {
+                child.root.push_str("/missing");
+            }
+            let mut policy = scratch_policy();
+            policy.workspace_id = child.workspace_id.clone();
+            policy.workspace = child.policy;
+            policy.cwd_basis = NewTabCwdBasis::WorkspaceDerived;
+            let plan = plan_new_tab(
+                Some(&policy),
+                &snapshot_with(&[], &[]),
+                &mut ScriptedIdGen::new(&["selected-tab"], &["selected-session"]),
+            );
+            let socket_dir = tempfile::tempdir().unwrap();
+            let socket = socket_dir.path().join("stub.sock");
+            let expected_cwd = child.root.clone();
+            let stub = (case == "live").then(|| StubDaemon::spawn_at(socket.clone(), serve_grid_with_start_observer(
+                s("selected-session"), s("selected-generation"), move |request| {
+                    assert!(matches!(request, maestro_protocol::ClientRequest::StartSession { cwd, .. } if cwd == &expected_cwd));
+                },
+            )));
+            let (mut runtime, rx) = RendererTabRuntime::new();
+            let result = run_new_split_foreground_pipeline_in_selected_workspace(
+                NewTabForegroundRequest {
+                    paths: &paths,
+                    socket_path: socket,
+                    window_id: "w1",
+                    plan: &plan,
+                    launch: NewTabForegroundLaunch::shell_adhoc(&[s("/bin/sh"), s("-l")]),
+                    cols: 80,
+                    rows: 24,
+                    now_ms: 50,
+                    split_from: Some(NewTabSplitFrom {
+                        from_tab_id: s("t0"),
+                        axis: maestro_shell::SplitAxis::Right,
+                    }),
+                    split_source_session: (case != "no-source").then_some(&source),
+                    expected_project_id: Some("maestro-app-dev-project"),
+                    dialog_focus_ticket: None,
+                },
+                &child,
+                &source_workspace,
+                &MapEnv::new(&[]),
+                &mut runtime,
+            );
+            if case == "live" {
+                assert!(result.is_ok(), "{result:?}");
+                expect_single_handoff_command(&rx, "selected-session", 2);
+                let LoadOutcome::Loaded(record) = maestro_shell::load_one::<SessionRecord>(
+                    &paths,
+                    RecordKind::Session,
+                    "selected-session",
+                )
+                .unwrap()
+                .unwrap() else {
+                    panic!("child Session")
+                };
+                assert_eq!(record.cwd_resolved, child.root);
+                assert_eq!(record.workspace_id, child.workspace_id);
+                assert_eq!(record.status, maestro_shell::SessionStatus::Live);
+            } else {
+                assert!(result.is_err(), "{case}");
+                if matches!(case, "wrong-policy" | "no-source") {
+                    assert!(
+                        matches!(
+                            result,
+                            Err(NewTabForegroundError::PreparedSessionStart {
+                                error: NewTabPreparedSessionError::GraphAuthority { .. },
+                                ..
+                            })
+                        ),
+                        "the narrow API rejects before any Workspace preparation"
+                    );
+                }
+                assert!(maestro_shell::load_one::<Workspace>(
+                    &paths,
+                    RecordKind::Workspace,
+                    &child.workspace_id
+                )
+                .unwrap()
+                .is_none());
+                assert!(maestro_shell::load_one::<SessionRecord>(
+                    &paths,
+                    RecordKind::Session,
+                    "selected-session"
+                )
+                .unwrap()
+                .is_none());
+                assert_eq!(
+                    maestro_shell::WindowLayoutService::new(&paths)
+                        .load("w1")
+                        .unwrap()
+                        .unwrap(),
+                    before
+                );
+                assert!(rx.try_recv().is_err());
+            }
+            let LoadOutcome::Loaded(after) = maestro_shell::load_one::<Workspace>(
+                &paths,
+                RecordKind::Workspace,
+                &source_workspace.workspace_id,
+            )
+            .unwrap()
+            .unwrap() else {
+                panic!("source Workspace")
+            };
+            assert_eq!(after, source_workspace);
+            let LoadOutcome::Loaded(after) = maestro_shell::load_one::<SessionRecord>(
+                &paths,
+                RecordKind::Session,
+                &source.session_id,
+            )
+            .unwrap()
+            .unwrap() else {
+                panic!("source Session")
+            };
+            assert_eq!(after, source);
+            assert_eq!(
+                std::fs::read(directory.path().join("sentinel")).unwrap(),
+                b"keep"
+            );
+            drop(stub);
+        }
     }
 
     #[test]

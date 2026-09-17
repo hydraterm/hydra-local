@@ -3971,7 +3971,23 @@ fn prepare_react_selected_directory(
     root: &str,
     now_ms: u64,
 ) -> Result<(Workspace, maestro_shell::PreparedWorkspace), maestro_shell::WorkspaceExecError> {
-    let workspace = Workspace {
+    let workspace = react_selected_directory_workspace(project_id, workspace_id, root, now_ms);
+    let prepared = maestro_shell::prepare_workspace_with_consent(
+        paths,
+        workspace.policy,
+        &workspace,
+        session_id,
+    )?;
+    Ok((workspace, prepared))
+}
+
+fn react_selected_directory_workspace(
+    project_id: &str,
+    workspace_id: String,
+    root: &str,
+    now_ms: u64,
+) -> Workspace {
+    Workspace {
         workspace_id,
         project_id: project_id.to_string(),
         root: root.to_string(),
@@ -3981,14 +3997,7 @@ fn prepare_react_selected_directory(
             granted_at_ms: Some(now_ms),
             ..WorkspaceConsent::default()
         },
-    };
-    let prepared = maestro_shell::prepare_workspace_with_consent(
-        paths,
-        workspace.policy,
-        &workspace,
-        session_id,
-    )?;
-    Ok((workspace, prepared))
+    }
 }
 
 enum PreparedReactFreshLaunch {
@@ -19124,12 +19133,21 @@ fn spawn_window_event_listener(
                                         continue;
                                     }
                                 };
-                                if !react_split_cwd_matches_workspace(cwd.as_deref(), &workspace) {
-                                    launch_mutation::reject(&mut tab_runtime, request_id.as_deref(),
-                                        "attach-tab: React splitPane declined before mutation: requested cwd does not match the sealed source Workspace".into()
-                                    );
-                                    continue;
-                                }
+                                let selected_workspace = if react_split_cwd_matches_workspace(
+                                    cwd.as_deref(),
+                                    &workspace,
+                                ) {
+                                    None
+                                } else {
+                                    Some(react_selected_directory_workspace(
+                                        &project_id,
+                                        uuid::Uuid::new_v4().to_string(),
+                                        cwd.as_deref().expect("explicit selected split directory"),
+                                        now_ms(),
+                                    ))
+                                };
+                                let launch_workspace =
+                                    selected_workspace.as_ref().unwrap_or(&workspace);
                                 let fallback_argv = effective_session_argv(
                                     &[],
                                     listener_shell_default_argv.as_deref(),
@@ -19138,7 +19156,7 @@ fn spawn_window_event_listener(
                                 let prepared_launch = match prepare_react_agent_launch(
                                     resolved_launch_command.as_deref(),
                                     agent.as_deref(),
-                                    Path::new(&workspace.root),
+                                    Path::new(&launch_workspace.root),
                                     &listener_socket_path,
                                 ) {
                                     Ok(prepared) => prepared,
@@ -19190,8 +19208,8 @@ fn spawn_window_event_listener(
                                     .to_string();
                                 let policy = maestro_app::NewTabLaunchPolicy {
                                     source: plan_source,
-                                    workspace: workspace.policy,
-                                    workspace_id: workspace.workspace_id.clone(),
+                                    workspace: launch_workspace.policy,
+                                    workspace_id: launch_workspace.workspace_id.clone(),
                                     cwd_basis: maestro_app::NewTabCwdBasis::WorkspaceDerived,
                                     title: pane_title,
                                 };
@@ -19243,12 +19261,15 @@ fn spawn_window_event_listener(
                                     expected_project_id: Some(project_id.as_str()),
                                     dialog_focus_ticket,
                                 };
-                                match run_new_tab_foreground_pipeline_with_consent(
-                                    request,
-                                    &workspace,
-                                    &ProcessEnv,
-                                    &mut tab_runtime,
-                                ) {
+                                let result = match selected_workspace.as_ref() {
+                                    Some(child) => maestro_app::run_new_split_foreground_pipeline_in_selected_workspace(
+                                        request, child, &workspace, &ProcessEnv, &mut tab_runtime,
+                                    ),
+                                    None => run_new_tab_foreground_pipeline_with_consent(
+                                        request, &workspace, &ProcessEnv, &mut tab_runtime,
+                                    ),
+                                };
+                                match result {
                                     Ok(success) => {
                                         eprintln!(
                                             "attach-tab: React splitPane PENDING exact renderer Claim tab_id={planned_tab_id:?} session_id={planned_session_id:?} from={split_source_tab_id:?} axis={split_axis:?}"
@@ -23168,7 +23189,7 @@ mod react_session_insert_only_tests {
     }
 
     #[test]
-    fn react_split_custom_cwd_requires_raw_exact_repo_write_root() {
+    fn react_split_inheritance_requires_raw_exact_repo_write_root() {
         let workspace = |policy| Workspace {
             workspace_id: "react-cwd-workspace".into(),
             project_id: "react-cwd-project".into(),

@@ -815,9 +815,12 @@ enum PreparedNewSessionPlacement {
     },
 }
 
+#[derive(Clone)]
 struct PreparedSplitSource {
     tab_id: String,
     session: SessionRecord,
+    /// Present only when this split owns a fresh child Workspace, independent of its source.
+    workspace: Option<Workspace>,
 }
 
 /// Exact AgentTask transition sealed into one prepared Session start. `before` is either the
@@ -1363,12 +1366,13 @@ impl PreparedNewSessionStart {
                 project,
                 post_layout,
                 tab_id,
-                ..
+                split_source,
             } => PreparedNewSessionCompensationPlacement::ExistingWindow {
                 project,
                 workspace: self.workspace,
                 post_layout,
                 tab_id,
+                fresh_split_source: split_source.filter(|source| source.workspace.is_some()),
             },
             PreparedNewSessionPlacement::FreshWindowGraph { receipt, .. } => {
                 PreparedNewSessionCompensationPlacement::FreshWindowGraph(receipt)
@@ -1417,12 +1421,16 @@ impl PreparedNewSessionStart {
                 project,
                 post_layout,
                 tab_id,
-                ..
+                split_source,
             } => PreparedNewSessionCompensationPlacement::ExistingWindow {
                 project: project.clone(),
                 workspace: self.workspace.clone(),
                 post_layout: post_layout.clone(),
                 tab_id: tab_id.clone(),
+                fresh_split_source: split_source
+                    .as_ref()
+                    .filter(|source| source.workspace.is_some())
+                    .cloned(),
             },
             PreparedNewSessionPlacement::FreshWindowGraph {
                 receipt,
@@ -1505,6 +1513,7 @@ enum PreparedNewSessionCompensationPlacement {
         workspace: Workspace,
         post_layout: WindowLayoutSnapshot,
         tab_id: String,
+        fresh_split_source: Option<PreparedSplitSource>,
     },
     FreshWindowGraph(FreshWindowGraphReceipt),
 }
@@ -1596,6 +1605,7 @@ impl fmt::Debug for PreparedNewSessionCompensationReceipt {
                 workspace: _,
                 post_layout,
                 tab_id,
+                ..
             } => (
                 post_layout.layout.window_id.as_str(),
                 tab_id.as_str(),
@@ -2212,6 +2222,51 @@ fn prepared_project_order_matches(
     Ok(owners == [expected_project_id])
 }
 
+fn prepared_split_source_matches(
+    conn: &rusqlite::Connection,
+    layout: &WindowLayoutSnapshot,
+    source: &PreparedSplitSource,
+    child_workspace_id: &str,
+) -> Result<bool, StoreError> {
+    let source_tabs = layout
+        .layout
+        .tabs
+        .iter()
+        .filter(|tab| tab.tab_id == source.tab_id)
+        .collect::<Vec<_>>();
+    let workspace_id = match &source.workspace {
+        Some(workspace) => {
+            if workspace.workspace_id == child_workspace_id
+                || layout.project_id.as_deref() != Some(workspace.project_id.as_str())
+                || load_graph_record_for_prepared::<Workspace>(
+                    conn,
+                    RecordKind::Workspace,
+                    &workspace.workspace_id,
+                    "split source Workspace",
+                )?
+                .as_ref()
+                    != Some(workspace)
+            {
+                return Ok(false);
+            }
+            workspace.workspace_id.as_str()
+        }
+        None => child_workspace_id,
+    };
+    Ok(source.session.workspace_id == workspace_id
+        && source_tabs.len() == 1
+        && !source_tabs[0].stashed
+        && source_tabs[0].session_id == source.session.session_id
+        && load_graph_record_for_prepared::<SessionRecord>(
+            conn,
+            RecordKind::Session,
+            &source.session.session_id,
+            "split source Session",
+        )?
+        .as_ref()
+            == Some(&source.session))
+}
+
 fn prepared_existing_window_placement_matches(
     conn: &rusqlite::Connection,
     expected_project: &Project,
@@ -2252,25 +2307,12 @@ fn prepared_existing_window_placement_matches(
         return Ok(false);
     }
     if let Some(source) = expected_split_source {
-        let source_tabs = expected_layout
-            .layout
-            .tabs
-            .iter()
-            .filter(|tab| tab.tab_id == source.tab_id)
-            .collect::<Vec<_>>();
-        if source.session.workspace_id != expected_session.workspace_id
-            || source_tabs.len() != 1
-            || source_tabs[0].stashed
-            || source_tabs[0].session_id != source.session.session_id
-            || load_graph_record_for_prepared::<SessionRecord>(
-                conn,
-                RecordKind::Session,
-                &source.session.session_id,
-                "split source Session",
-            )?
-            .as_ref()
-                != Some(&source.session)
-        {
+        if !prepared_split_source_matches(
+            conn,
+            expected_layout,
+            source,
+            &expected_session.workspace_id,
+        )? {
             return Ok(false);
         }
     }
@@ -2282,7 +2324,7 @@ fn prepared_existing_window_placement_matches(
                 project_id,
                 &expected_layout.layout.window_id,
                 expected_tab_id,
-                false,
+                expected_split_source.is_some_and(|source| source.workspace.is_some()),
                 allowed_worktree_provenance,
             )?,
     )
@@ -5298,6 +5340,7 @@ impl<'a> WindowLayoutService<'a> {
                 workspace,
                 post_layout,
                 tab_id,
+                fresh_split_source,
             } => {
                 if journal.is_some() {
                     return Err(WindowLayoutError::Store(StoreError::Map(
@@ -5311,6 +5354,7 @@ impl<'a> WindowLayoutService<'a> {
                     &session,
                     Some(&project),
                     Some(&workspace),
+                    fresh_split_source.as_ref(),
                     &PreResolvedSessionGenerations::new(),
                     now_ms,
                 )
@@ -6197,6 +6241,7 @@ impl<'a> WindowLayoutService<'a> {
             expected_session,
             None,
             None,
+            None,
             pre_resolved,
             now_ms,
         )
@@ -6209,6 +6254,7 @@ impl<'a> WindowLayoutService<'a> {
         expected_session: &SessionRecord,
         expected_project: Option<&Project>,
         expected_workspace: Option<&Workspace>,
+        fresh_split_source: Option<&PreparedSplitSource>,
         pre_resolved: &PreResolvedSessionGenerations,
         now_ms: u64,
     ) -> Result<ConditionalCreatedTabSessionRollback, WindowLayoutError> {
@@ -6298,6 +6344,33 @@ impl<'a> WindowLayoutService<'a> {
             return Ok(ConditionalCreatedTabSessionRollback::Changed);
         }
 
+        if let Some(source) = fresh_split_source {
+            if source.workspace.is_none()
+                || !prepared_split_source_matches(
+                    &tx,
+                    &current_layout,
+                    source,
+                    &current_session.workspace_id,
+                )?
+            {
+                return Ok(ConditionalCreatedTabSessionRollback::Changed);
+            }
+            let Some(project) = expected_project else {
+                return Ok(ConditionalCreatedTabSessionRollback::Changed);
+            };
+            if !prepared_session_soft_refs_match(
+                &tx,
+                &current_session,
+                &project.project_id,
+                window_id,
+                created_tab_id,
+                true,
+                None,
+            )? {
+                return Ok(ConditionalCreatedTabSessionRollback::Referenced);
+            }
+        }
+
         let ownership = crate::project::session_ownership_graph(&tx).map_err(|error| {
             StoreError::Map(format!(
                 "created-tab rollback could not prove session ownership: {error}"
@@ -6357,6 +6430,10 @@ impl<'a> WindowLayoutService<'a> {
             removed,
             "the exact Session row was read in this transaction"
         );
+        if fresh_split_source.is_some() {
+            crate::store_sqlite::delete(&tx, RecordKind::Workspace, &expected_session.workspace_id)
+                .map_err(|error| StoreError::Map(error.to_string()))?;
+        }
         crate::db::bump_window_mutation_epoch(&tx)
             .map_err(|error| StoreError::Db(error.to_string()))?;
         tx.commit()
@@ -6374,6 +6451,14 @@ impl<'a> WindowLayoutService<'a> {
             now_ms,
         );
         crate::write_trace::trace_delete(self.paths.base(), "Session", session_id, now_ms);
+        if fresh_split_source.is_some() {
+            crate::write_trace::trace_delete(
+                self.paths.base(),
+                "Workspace",
+                &expected_session.workspace_id,
+                now_ms,
+            );
+        }
         Ok(ConditionalCreatedTabSessionRollback::RolledBack(
             CreatedTabSessionRollback {
                 layout,
@@ -7650,6 +7735,7 @@ impl<'a> WindowLayoutService<'a> {
             expected_window,
             expected_project,
             expected_workspace,
+            None,
             session,
             tab_id,
             PreparedExistingWindowPlacement::Open {
@@ -7680,6 +7766,7 @@ impl<'a> WindowLayoutService<'a> {
             expected_window,
             expected_project,
             expected_workspace,
+            None,
             session,
             tab_id,
             PreparedExistingWindowPlacement::Open {
@@ -7733,6 +7820,7 @@ impl<'a> WindowLayoutService<'a> {
             expected_window,
             expected_project,
             expected_workspace,
+            None,
             session,
             tab_id,
             PreparedExistingWindowPlacement::Split {
@@ -7792,6 +7880,7 @@ impl<'a> WindowLayoutService<'a> {
             expected_window,
             expected_project,
             expected_workspace,
+            None,
             session,
             tab_id,
             PreparedExistingWindowPlacement::Split {
@@ -7803,11 +7892,44 @@ impl<'a> WindowLayoutService<'a> {
         )
     }
 
+    /// Atomically create a selected-directory child Workspace and split without changing the
+    /// original pane's Workspace. The new Workspace is owned by the prepared compensation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_new_split_session_in_fresh_workspace(
+        &self,
+        expected_window: &WindowLayoutSnapshot,
+        expected_project: &Project,
+        source_workspace: &Workspace,
+        source_session: &SessionRecord,
+        child_workspace: &Workspace,
+        session: PreparedSessionSpec,
+        from_tab_id: &str,
+        tab_id: &str,
+        title: &str,
+        axis: SplitAxis,
+    ) -> Result<PreparedNewSessionStart, WindowLayoutError> {
+        self.prepare_new_session_in_existing_window(
+            expected_window,
+            expected_project,
+            child_workspace,
+            Some(source_workspace),
+            session,
+            tab_id,
+            PreparedExistingWindowPlacement::Split {
+                from_tab_id,
+                expected_source_session: Some(source_session),
+                title,
+                axis,
+            },
+        )
+    }
+
     fn prepare_new_session_in_existing_window(
         &self,
         expected_window: &WindowLayoutSnapshot,
         expected_project: &Project,
         expected_workspace: &Workspace,
+        fresh_split_source_workspace: Option<&Workspace>,
         session: PreparedSessionSpec,
         tab_id: &str,
         placement: PreparedExistingWindowPlacement<'_>,
@@ -7830,6 +7952,17 @@ impl<'a> WindowLayoutService<'a> {
                 workspace_id: expected_workspace.workspace_id.clone(),
             });
         }
+        if fresh_split_source_workspace.is_some() {
+            if expected_workspace.policy != crate::WorkspacePolicy::RepoWrite
+                || expected_workspace.root != params.cwd
+            {
+                return Err(WindowLayoutError::WorkspaceChanged {
+                    workspace_id: expected_workspace.workspace_id.clone(),
+                });
+            }
+            crate::check_policy_consent(expected_workspace, expected_workspace.policy)
+                .map_err(|error| StoreError::Map(error.to_string()))?;
+        }
         if let PreparedExistingWindowPlacement::Split {
             from_tab_id,
             expected_source_session: Some(source),
@@ -7842,7 +7975,10 @@ impl<'a> WindowLayoutService<'a> {
                 .iter()
                 .filter(|tab| tab.tab_id == *from_tab_id)
                 .collect::<Vec<_>>();
-            if source.workspace_id != expected_workspace.workspace_id
+            if source.workspace_id
+                != fresh_split_source_workspace
+                    .unwrap_or(expected_workspace)
+                    .workspace_id
                 || source_tabs.len() != 1
                 || source_tabs[0].stashed
                 || source_tabs[0].session_id != source.session_id
@@ -7885,7 +8021,21 @@ impl<'a> WindowLayoutService<'a> {
             &expected_workspace.workspace_id,
             "Workspace",
         )?;
-        if current_workspace.as_ref() != Some(expected_workspace) {
+        if if fresh_split_source_workspace.is_some() {
+            current_workspace.is_some()
+                || fresh_graph_row_exists(
+                    &tx,
+                    "SELECT COUNT(*) FROM sessions WHERE workspace_id = ?1",
+                    &expected_workspace.workspace_id,
+                )?
+                || fresh_graph_row_exists(
+                    &tx,
+                    "SELECT COUNT(*) FROM worktree_provenance WHERE workspace_id = ?1",
+                    &expected_workspace.workspace_id,
+                )?
+        } else {
+            current_workspace.as_ref() != Some(expected_workspace)
+        } {
             return Err(WindowLayoutError::WorkspaceChanged {
                 workspace_id: expected_workspace.workspace_id.clone(),
             });
@@ -7954,9 +8104,22 @@ impl<'a> WindowLayoutService<'a> {
             } => Some(PreparedSplitSource {
                 tab_id: (*from_tab_id).to_string(),
                 session: (*source).clone(),
+                workspace: fresh_split_source_workspace.cloned(),
             }),
             _ => None,
         };
+        if let Some(source) = &split_source {
+            if !prepared_split_source_matches(
+                &tx,
+                expected_window,
+                source,
+                &expected_workspace.workspace_id,
+            )? {
+                return Err(WindowLayoutError::WindowLayoutChanged {
+                    window_id: window_id.to_string(),
+                });
+            }
+        }
         let mut layout = current_window
             .expect("exact window equality proved a current row")
             .layout;
@@ -7994,6 +8157,22 @@ impl<'a> WindowLayoutService<'a> {
         }
         crate::db::preflight_window_mutation_epoch_bump(&tx)
             .map_err(|error| StoreError::Db(error.to_string()))?;
+        if fresh_split_source_workspace.is_some() {
+            let value = serde_json::to_value(expected_workspace)
+                .map_err(|error| StoreError::Map(error.to_string()))?;
+            if !crate::store_sqlite::insert_fresh_workspace(
+                &tx,
+                &expected_workspace.workspace_id,
+                &value,
+            )
+            .map_err(|error| StoreError::Map(error.to_string()))?
+            {
+                return Err(WindowLayoutError::WorkspaceChanged {
+                    workspace_id: expected_workspace.workspace_id.clone(),
+                });
+            }
+            fresh_graph_stage(window_id, "after-prepared-split-workspace")?;
+        }
         let session_value = serde_json::to_value(&unknown)
             .map_err(|error| StoreError::Map(format!("serialize Session: {error}")))?;
         if !crate::store_sqlite::insert_fresh_session(&tx, &unknown.session_id, &session_value)
@@ -11468,6 +11647,366 @@ mod tests {
         let session_id = &window.layout.tabs[0].session_id;
         loaded_record(paths, RecordKind::Session, session_id)
             .expect("prepared fixture source Session exists")
+    }
+
+    #[test]
+    fn prepared_selected_directory_split_inserts_child_workspace_atomically() {
+        let (_tmp, paths) = temp_paths();
+        let source_dir = TempDir::new().unwrap();
+        let child_dir = TempDir::new().unwrap();
+        let (project, source_workspace, window) =
+            prepared_existing_target(&paths, source_dir.path(), "selected-split");
+        let source = prepared_source_session(&paths, &window);
+        let child_workspace = Workspace {
+            workspace_id: "selected-split-child-workspace".into(),
+            root: child_dir.path().to_string_lossy().into_owned(),
+            policy: crate::WorkspacePolicy::RepoWrite,
+            consent: crate::WorkspaceConsent {
+                repo_write: true,
+                granted_at_ms: Some(50),
+                ..Default::default()
+            },
+            ..source_workspace.clone()
+        };
+        let start = svc(&paths)
+            .prepare_new_split_session_in_fresh_workspace(
+                &window,
+                &project,
+                &source_workspace,
+                &source,
+                &child_workspace,
+                PreparedSessionSpec::from_legacy_shell(prepared_params(
+                    &child_workspace.workspace_id,
+                    "selected-split-child",
+                    child_dir.path(),
+                )),
+                &window.layout.tabs[0].tab_id,
+                "selected-split-child-tab",
+                "Other folder",
+                SplitAxis::Right,
+            )
+            .expect("an explicit selected folder creates its own child Workspace and split");
+        assert!(start.graph_matches_in_snapshot(&paths).unwrap());
+        assert_eq!(start.workspace(), &child_workspace);
+        assert_eq!(start.unknown().cwd_resolved, child_workspace.root);
+        assert_eq!(prepared_source_session(&paths, &window), source);
+        assert_eq!(
+            loaded_record::<Workspace>(
+                &paths,
+                RecordKind::Workspace,
+                &source_workspace.workspace_id
+            ),
+            Some(source_workspace)
+        );
+    }
+
+    fn selected_split_child(workspace: &Workspace, dir: &std::path::Path) -> Workspace {
+        Workspace {
+            workspace_id: "selected-child-workspace".into(),
+            root: dir.to_string_lossy().into_owned(),
+            policy: crate::WorkspacePolicy::RepoWrite,
+            consent: crate::WorkspaceConsent {
+                repo_write: true,
+                granted_at_ms: Some(50),
+                ..Default::default()
+            },
+            ..workspace.clone()
+        }
+    }
+
+    fn selected_split_start(
+        paths: &AppPaths,
+        project: &Project,
+        workspace: &Workspace,
+        window: &WindowLayoutSnapshot,
+        child: &Workspace,
+        axis: SplitAxis,
+    ) -> Result<PreparedNewSessionStart, WindowLayoutError> {
+        svc(paths).prepare_new_split_session_in_fresh_workspace(
+            window,
+            project,
+            workspace,
+            &prepared_source_session(paths, window),
+            child,
+            PreparedSessionSpec::from_legacy_shell(prepared_params(
+                &child.workspace_id,
+                "selected-child",
+                std::path::Path::new(&child.root),
+            )),
+            &window.layout.tabs[0].tab_id,
+            "selected-child-tab",
+            "Selected folder",
+            axis,
+        )
+    }
+
+    #[test]
+    fn prepared_selected_directory_split_cancel_and_rebased_release_keep_directories() {
+        for (index, axis) in [SplitAxis::Right, SplitAxis::Down].into_iter().enumerate() {
+            let (_tmp, paths) = temp_paths();
+            let source_dir = TempDir::new().unwrap();
+            let child_dir = TempDir::new().unwrap();
+            for dir in [&source_dir, &child_dir] {
+                std::fs::write(dir.path().join("sentinel"), b"user-owned").unwrap();
+            }
+            let (project, workspace, window) = prepared_existing_target(
+                &paths,
+                source_dir.path(),
+                &format!("selected-cancel-{index}"),
+            );
+            let source = prepared_source_session(&paths, &window);
+            let child = selected_split_child(&workspace, child_dir.path());
+            let start =
+                selected_split_start(&paths, &project, &workspace, &window, &child, axis).unwrap();
+            let layout = svc(&paths).load(&window.layout.window_id).unwrap().unwrap();
+            let expected = match axis {
+                SplitAxis::Right => [0.5, 0.0, 0.5, 1.0],
+                SplitAxis::Down => [0.0, 0.5, 1.0, 0.5],
+            };
+            assert_eq!(
+                layout.tabs[1].pane_rect,
+                Some(PaneRect::from_unit(expected))
+            );
+            let receipt = if index == 0 {
+                start.initial_compensation()
+            } else {
+                let live = start
+                    .publication_record_for_generation_and_status(
+                        "selected-generation",
+                        SessionStatus::Live,
+                    )
+                    .unwrap();
+                crate::write_record(&paths, RecordKind::Session, &live.session_id, 60, &live)
+                    .unwrap();
+                start.rebased_compensation(&live).unwrap()
+            };
+            let outcome = svc(&paths)
+                .compensate_prepared_new_session(receipt, 61)
+                .unwrap();
+            let ConditionalPreparedNewSessionCompensation::ExistingWindow(
+                ConditionalCreatedTabSessionRollback::RolledBack(rollback),
+            ) = outcome
+            else {
+                panic!("exact owned child rollback")
+            };
+            assert_eq!(rollback.release_receipt.is_some(), index == 1);
+            assert_eq!(pending_release_count(&paths), index as i64);
+            assert!(
+                loaded_record::<Workspace>(&paths, RecordKind::Workspace, &child.workspace_id)
+                    .is_none()
+            );
+            assert!(
+                loaded_record::<SessionRecord>(&paths, RecordKind::Session, "selected-child")
+                    .is_none()
+            );
+            // Existing reduction normalizes the implicit full pane to an explicit full rect.
+            let mut restored = window.layout.clone();
+            restored.tabs[0].pane_rect = Some(PaneRect::from_unit([0.0, 0.0, 1.0, 1.0]));
+            assert_eq!(
+                svc(&paths).load(&window.layout.window_id).unwrap().unwrap(),
+                restored
+            );
+            assert_eq!(prepared_source_session(&paths, &window), source);
+            assert_eq!(
+                loaded_record::<Workspace>(&paths, RecordKind::Workspace, &workspace.workspace_id),
+                Some(workspace)
+            );
+            for dir in [&source_dir, &child_dir] {
+                assert_eq!(
+                    std::fs::read(dir.path().join("sentinel")).unwrap(),
+                    b"user-owned"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_selected_directory_split_conflicts_and_sql_failure_publish_nothing() {
+        for case in [
+            "workspace",
+            "session",
+            "after-prepared-split-workspace",
+            "before-prepared-session-commit",
+        ] {
+            let (_tmp, paths) = temp_paths();
+            let dir = TempDir::new().unwrap();
+            let (project, workspace, window) = prepared_existing_target(&paths, dir.path(), case);
+            let child = selected_split_child(&workspace, dir.path());
+            if case == "workspace" {
+                crate::write_record(
+                    &paths,
+                    RecordKind::Workspace,
+                    &child.workspace_id,
+                    1,
+                    &child,
+                )
+                .unwrap();
+            }
+            if case == "session" {
+                let mut winner = prepared_source_session(&paths, &window);
+                winner.session_id = "selected-child".into();
+                crate::write_record(&paths, RecordKind::Session, &winner.session_id, 1, &winner)
+                    .unwrap();
+            }
+            let before_workspace =
+                raw_record_value(&paths, RecordKind::Workspace, &child.workspace_id);
+            let before_session = raw_record_value(&paths, RecordKind::Session, "selected-child");
+            let _failure = crate::store_sqlite::install_window_layout_test_failure(
+                window.layout.window_id.clone(),
+                case,
+            );
+            assert!(
+                selected_split_start(
+                    &paths,
+                    &project,
+                    &workspace,
+                    &window,
+                    &child,
+                    SplitAxis::Right
+                )
+                .is_err(),
+                "{case}"
+            );
+            assert_eq!(
+                raw_record_value(&paths, RecordKind::Workspace, &child.workspace_id),
+                before_workspace,
+                "{case}"
+            );
+            assert_eq!(
+                raw_record_value(&paths, RecordKind::Session, "selected-child"),
+                before_session,
+                "{case}"
+            );
+            assert_eq!(
+                svc(&paths).load_snapshot(&window.layout.window_id).unwrap(),
+                Some(window),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_selected_directory_split_fences_source_and_child_ownership() {
+        for case in [
+            "source-session",
+            "source-workspace",
+            "child-workspace",
+            "project",
+            "layout",
+            "foreign-child",
+        ] {
+            let (_tmp, paths) = temp_paths();
+            let dir = TempDir::new().unwrap();
+            let (mut project, mut workspace, window) =
+                prepared_existing_target(&paths, dir.path(), case);
+            let mut child = selected_split_child(&workspace, dir.path());
+            let start = selected_split_start(
+                &paths,
+                &project,
+                &workspace,
+                &window,
+                &child,
+                SplitAxis::Down,
+            )
+            .unwrap();
+            assert!(start.graph_matches_in_snapshot(&paths).unwrap());
+            match case {
+                "source-session" => {
+                    let mut source = prepared_source_session(&paths, &window);
+                    source.last_attached_at_ms += 1;
+                    crate::write_record(
+                        &paths,
+                        RecordKind::Session,
+                        &source.session_id,
+                        60,
+                        &source,
+                    )
+                    .unwrap();
+                }
+                "source-workspace" => {
+                    workspace.root.push_str("/changed");
+                    crate::write_record(
+                        &paths,
+                        RecordKind::Workspace,
+                        &workspace.workspace_id,
+                        60,
+                        &workspace,
+                    )
+                    .unwrap();
+                }
+                "child-workspace" => {
+                    child.root.push_str("/changed");
+                    crate::write_record(
+                        &paths,
+                        RecordKind::Workspace,
+                        &child.workspace_id,
+                        60,
+                        &child,
+                    )
+                    .unwrap();
+                }
+                "project" => {
+                    project.name.push_str(" changed");
+                    crate::write_record(
+                        &paths,
+                        RecordKind::Project,
+                        &project.project_id,
+                        60,
+                        &project,
+                    )
+                    .unwrap();
+                }
+                "layout" => {
+                    let name = window.layout.name.as_deref().unwrap();
+                    svc(&paths)
+                        .rename_window(&window.layout.window_id, "changed", 60)
+                        .unwrap();
+                    svc(&paths)
+                        .rename_window(&window.layout.window_id, name, 61)
+                        .unwrap();
+                }
+                "foreign-child" => {
+                    let mut foreign = start.unknown().clone();
+                    foreign.session_id = "foreign-child".into();
+                    crate::write_record(
+                        &paths,
+                        RecordKind::Session,
+                        &foreign.session_id,
+                        60,
+                        &foreign,
+                    )
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(!start.graph_matches_in_snapshot(&paths).unwrap(), "{case}");
+            let before = svc(&paths).load_snapshot(&window.layout.window_id).unwrap();
+            assert!(
+                matches!(
+                    svc(&paths).cancel_prepared_new_session(start, 62).unwrap(),
+                    ConditionalPreparedNewSessionCompensation::ExistingWindow(
+                        ConditionalCreatedTabSessionRollback::Changed
+                            | ConditionalCreatedTabSessionRollback::Referenced
+                    )
+                ),
+                "{case}"
+            );
+            assert_eq!(
+                svc(&paths).load_snapshot(&window.layout.window_id).unwrap(),
+                before,
+                "{case}"
+            );
+            assert!(
+                loaded_record::<SessionRecord>(&paths, RecordKind::Session, "selected-child")
+                    .is_some(),
+                "{case}"
+            );
+            assert_eq!(
+                loaded_record::<Workspace>(&paths, RecordKind::Workspace, &child.workspace_id),
+                Some(child),
+                "{case}"
+            );
+        }
     }
 
     #[test]
