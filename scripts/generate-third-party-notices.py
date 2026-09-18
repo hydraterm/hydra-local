@@ -23,9 +23,12 @@ def markdown(value: str) -> str:
     return value.replace("|", "\\|").replace("\n", " ").strip()
 
 
-def rust_dependencies() -> list[tuple[str, str, str, str]]:
+def rust_dependencies(*, agent: bool = False) -> list[tuple[str, str, str, str]]:
+    command = ["cargo", "metadata", "--locked", "--format-version", "1"]
+    if agent:
+        command += ["--manifest-path", "hydra-agent/Cargo.toml", "--features", "webrtc"]
     raw = subprocess.check_output(
-        ["cargo", "metadata", "--locked", "--format-version", "1"],
+        command,
         cwd=ROOT,
         text=True,
     )
@@ -34,6 +37,15 @@ def rust_dependencies() -> list[tuple[str, str, str, str]]:
     rows: set[tuple[str, str, str, str]] = set()
     for package in metadata["packages"]:
         if package["id"] in workspace:
+            continue
+        if agent and package.get("source") is None:
+            manifest = pathlib.Path(package["manifest_path"]).resolve()
+            try:
+                manifest.relative_to(ROOT)
+            except ValueError:
+                raise SystemExit("dependency-notices: agent path dependency outside public source")
+            if package.get("license") != "MIT" or package.get("publish") != []:
+                raise SystemExit("dependency-notices: agent first-party metadata drifted")
             continue
         license_expression = package.get("license")
         if not license_expression:
@@ -95,7 +107,11 @@ def table(rows: list[tuple[str, str, str, str]]) -> list[str]:
 
 
 def main() -> int:
+    if sys.argv[1:] not in ([], ["--check"]):
+        raise SystemExit("usage: generate-third-party-notices.py [--check]")
+    check = sys.argv[1:] == ["--check"]
     rust = rust_dependencies()
+    agent = rust_dependencies(agent=True)
     npm = npm_dependencies(NPM_LOCKS[0])
     browser = npm_dependencies(NPM_LOCKS[1])
     broker = npm_dependencies(NPM_LOCKS[2])
@@ -104,12 +120,15 @@ def main() -> int:
         "",
         "Hydra's first-party public source is MIT licensed. It uses third-party software under the terms",
         "listed below. This inventory covers the locked Rust and dashboard graphs plus the separate",
-        "Remote library development-tool locks; it does not change or replace any upstream licence.",
+        "Remote browser/broker tool locks and the separate WebRTC agent source graph. It does not",
+        "change or replace any upstream licence.",
         "",
         f"- `Cargo.lock` SHA-256: `{sha256(ROOT / 'Cargo.lock')}`",
         "- `dashboard-ui/package-lock.json` SHA-256: "
         f"`{sha256(ROOT / 'dashboard-ui/package-lock.json')}`",
         f"- Rust dependency versions: {len(rust)}",
+        f"- `hydra-agent/Cargo.lock` SHA-256: `{sha256(ROOT / 'hydra-agent/Cargo.lock')}`",
+        f"- Standalone WebRTC agent dependency versions: {len(agent)}",
         f"- npm dependency versions: {len(npm)}",
         f"- `web-client/package-lock.json` SHA-256: `{sha256(ROOT / NPM_LOCKS[1])}`",
         f"- Browser-core development dependency versions: {len(browser)}",
@@ -144,6 +163,17 @@ def main() -> int:
         "",
         *table(rust),
         "",
+        "## Locked standalone WebRTC agent source dependencies",
+        "",
+        "This independent source graph is resolved from `hydra-agent/Cargo.toml` with `webrtc`",
+        "enabled and its own locked versions. First-party public path crates are excluded from",
+        "the table. It includes build/test and optional-platform records, not an exact shipped",
+        "binary closure. Agent binary distributors must separately review and carry the actual",
+        "licences, copyright notices and source obligations for their artifact. The four desktop",
+        "binary policies and their locked graph are unchanged by this source-only inventory.",
+        "",
+        *table(agent),
+        "",
         "## Locked dashboard dependencies",
         "",
         *table(npm),
@@ -169,15 +199,20 @@ def main() -> int:
         "",
         "## Updating this file",
         "",
-        "Run `python3 scripts/generate-third-party-notices.py` after any of the four lockfiles changes, then",
+        "Run `python3 scripts/generate-third-party-notices.py` after any of the five lockfiles changes, then",
         "review every changed licence expression and upstream source before accepting the result.",
         "The generator failing on missing licence metadata is intentional.",
         "",
     ]
-    OUTPUT.write_text("\n".join(lines), encoding="utf-8")
+    rendered = "\n".join(lines)
+    if check:
+        if not OUTPUT.is_file() or OUTPUT.read_text(encoding="utf-8") != rendered:
+            raise SystemExit("dependency-notices: checked-in inventory is stale")
+    else:
+        OUTPUT.write_text(rendered, encoding="utf-8")
     print(
-        f"dependency-notices: wrote {OUTPUT} with {len(rust)} Rust, {len(npm)} dashboard, "
-        f"{len(browser)} browser-tool and {len(broker)} broker-tool rows"
+        f"dependency-notices: {'checked' if check else 'wrote'} {OUTPUT} with {len(rust)} Rust, {len(npm)} dashboard, "
+        f"{len(agent)} standalone-agent, {len(browser)} browser-tool and {len(broker)} broker-tool rows"
     )
     return 0
 

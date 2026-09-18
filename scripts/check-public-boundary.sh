@@ -61,7 +61,7 @@ allowed_root_entries = {
     "CODE_OF_CONDUCT.md", "CONTRIBUTING.md", "Cargo.lock", "Cargo.toml",
     "DCO.md", "DEVELOPMENT.md", "FAQ.md", "LICENSE", "README.md", "SECURITY.md",
     "THIRD_PARTY_NOTICES.md", "TRADEMARKS.md", "TROUBLESHOOTING.md", "dashboard-ui", "docs",
-    "hydra-cloud", "web-client",
+    "hydra-agent", "hydra-cloud", "web-client",
     "hydra-launcher", "maestro-app",
     "maestro-extension-api", "maestro-local-services", "maestro-protocol",
     "maestro-renderer", "maestro-shell", "packaging", "pty-daemon", "rust-toolchain.toml",
@@ -161,6 +161,56 @@ for path in sorted(candidate for candidate in source_paths if candidate.is_file(
 # Only the reviewed reusable library leaves belong here; hosted composition stays private.
 # Source eligibility and exact runtime/test bytes are bound by the separate sync manifest.
 remote_core_files = {
+    "hydra-agent/Cargo.lock",
+    "hydra-agent/Cargo.toml",
+    "hydra-agent/README.md",
+    "hydra-agent/build.rs",
+    "hydra-agent/build_support.rs",
+    "hydra-agent/self-managed.example.json",
+    "hydra-agent/src/agent_dir.rs",
+    "hydra-agent/src/authority_migration.rs",
+    "hydra-agent/src/browser_cert.rs",
+    "hydra-agent/src/browser_pop.rs",
+    "hydra-agent/src/conn_trace.rs",
+    "hydra-agent/src/consistency.rs",
+    "hydra-agent/src/device_identity.rs",
+    "hydra-agent/src/device_request_auth.rs",
+    "hydra-agent/src/enrollment_migration.rs",
+    "hydra-agent/src/extension.rs",
+    "hydra-agent/src/headless.rs",
+    "hydra-agent/src/health.rs",
+    "hydra-agent/src/heartbeat.rs",
+    "hydra-agent/src/heartbeat_status.rs",
+    "hydra-agent/src/input_rate.rs",
+    "hydra-agent/src/launchd.rs",
+    "hydra-agent/src/lib.rs",
+    "hydra-agent/src/lifecycle_cleanup.rs",
+    "hydra-agent/src/main.rs",
+    "hydra-agent/src/release_trust.rs",
+    "hydra-agent/src/remote_access.rs",
+    "hydra-agent/src/remote_bridge.rs",
+    "hydra-agent/src/remote_control.rs",
+    "hydra-agent/src/remote_daemon_backend.rs",
+    "hydra-agent/src/remote_frame.rs",
+    "hydra-agent/src/remote_peer.rs",
+    "hydra-agent/src/remote_policy.rs",
+    "hydra-agent/src/remote_signaling.rs",
+    "hydra-agent/src/remote_token.rs",
+    "hydra-agent/src/remote_webrtc.rs",
+    "hydra-agent/src/resume_launch.rs",
+    "hydra-agent/src/revocation.rs",
+    "hydra-agent/src/seen_set.rs",
+    "hydra-agent/src/service.rs",
+    "hydra-agent/src/service_readiness.rs",
+    "hydra-agent/src/session_creator.rs",
+    "hydra-agent/src/setup_deadline.rs",
+    "hydra-agent/src/supervise.rs",
+    "hydra-agent/src/systemd.rs",
+    "hydra-agent/src/viewport_control.rs",
+    "hydra-agent/src/winsize_owner.rs",
+    "hydra-agent/tests/agent_signaling.rs",
+    "hydra-agent/tests/s4_live_pty_smoke.rs",
+    "hydra-agent/tests/webrtc_peer.rs",
     "hydra-cloud/package-lock.json",
     "hydra-cloud/package.json",
     "hydra-cloud/src/domain/clock.ts",
@@ -174,27 +224,133 @@ remote_core_files = {
     "hydra-cloud/tsconfig.json",
     "web-client/package-lock.json",
     "web-client/package.json",
+    "web-client/src/bridge/account-reset.test.ts",
+    "web-client/src/bridge/account-reset.ts",
+    "web-client/src/bridge/auth-contract.test.ts",
+    "web-client/src/bridge/auth-contract.ts",
+    "web-client/src/bridge/bounded-chunk-reassembler.ts",
+    "web-client/src/bridge/browser-engine-boundary.test.ts",
+    "web-client/src/bridge/channel-router.test.ts",
+    "web-client/src/bridge/channel-router.ts",
+    "web-client/src/bridge/channel-terminal-bank.test.ts",
+    "web-client/src/bridge/channel-terminal-bank.ts",
+    "web-client/src/bridge/conn-trace.test.ts",
+    "web-client/src/bridge/conn-trace.ts",
     "web-client/src/bridge/connect-deadline.test.ts",
     "web-client/src/bridge/connect-deadline.ts",
     "web-client/src/bridge/datachannel-send-queue.test.ts",
     "web-client/src/bridge/datachannel-send-queue.ts",
+    "web-client/src/bridge/device-identity.ts",
+    "web-client/src/bridge/device-label-store.test.ts",
+    "web-client/src/bridge/device-label-store.ts",
+    "web-client/src/bridge/diagnostic-flags.test.ts",
+    "web-client/src/bridge/diagnostic-flags.ts",
     "web-client/src/bridge/ice-candidate-security.test.ts",
     "web-client/src/bridge/ice-candidate-security.ts",
     "web-client/src/bridge/ice-path-classifier.test.ts",
     "web-client/src/bridge/ice-path-classifier.ts",
+    "web-client/src/bridge/inspector-hooks.ts",
+    "web-client/src/bridge/last-opened-store.test.ts",
+    "web-client/src/bridge/last-opened-store.ts",
+    "web-client/src/bridge/layout-preset-store.test.ts",
+    "web-client/src/bridge/layout-preset-store.ts",
+    "web-client/src/bridge/multi-attach-manager.test.ts",
+    "web-client/src/bridge/multi-attach-manager.ts",
+    "web-client/src/bridge/multi-pane-terminal.test.ts",
+    "web-client/src/bridge/multi-pane-terminal.ts",
+    "web-client/src/bridge/pane-search-bank.test.ts",
+    "web-client/src/bridge/pane-search-bank.ts",
+    "web-client/src/bridge/pane-selection-bank.test.ts",
+    "web-client/src/bridge/pane-selection-bank.ts",
+    "web-client/src/bridge/passkey.test.ts",
+    "web-client/src/bridge/passkey.ts",
+    "web-client/src/bridge/reconnect-hints.ts",
+    "web-client/src/bridge/relay-credential-cache.test.ts",
+    "web-client/src/bridge/relay-credential-cache.ts",
     "web-client/src/bridge/relay-fallback.test.ts",
     "web-client/src/bridge/relay-fallback.ts",
+    "web-client/src/bridge/remote-client.ts",
+    "web-client/src/bridge/remote-entitlement.test.ts",
+    "web-client/src/bridge/remote-entitlement.ts",
+    "web-client/src/bridge/remote-layout-cloud.test.ts",
+    "web-client/src/bridge/remote-layout-cloud.ts",
+    "web-client/src/bridge/remote-layout-contract.test.ts",
+    "web-client/src/bridge/remote-layout-contract.ts",
+    "web-client/src/bridge/remote-layout-schema.ts",
+    "web-client/src/bridge/remote-session.test.ts",
+    "web-client/src/bridge/remote-session.ts",
     "web-client/src/bridge/remote-transport.ts",
+    "web-client/src/bridge/render-metrics.test.ts",
+    "web-client/src/bridge/render-metrics.ts",
+    "web-client/src/bridge/safe-message.test.ts",
+    "web-client/src/bridge/safe-message.ts",
+    "web-client/src/bridge/scoped-storage-key.test.ts",
+    "web-client/src/bridge/scoped-storage-key.ts",
     "web-client/src/bridge/sdp-security.test.ts",
     "web-client/src/bridge/sdp-security.ts",
+    "web-client/src/bridge/session-cache-store.test.ts",
+    "web-client/src/bridge/session-cache-store.ts",
+    "web-client/src/bridge/session-favorites-store.test.ts",
+    "web-client/src/bridge/session-favorites-store.ts",
+    "web-client/src/bridge/session-label-store.test.ts",
+    "web-client/src/bridge/session-label-store.ts",
+    "web-client/src/bridge/session-order-store.test.ts",
+    "web-client/src/bridge/session-order-store.ts",
+    "web-client/src/bridge/session-visibility-store.test.ts",
+    "web-client/src/bridge/session-visibility-store.ts",
+    "web-client/src/bridge/setup-refusal-contract.test.ts",
     "web-client/src/bridge/setup-refusal-contract.ts",
+    "web-client/src/bridge/signaling-client.test.ts",
+    "web-client/src/bridge/signaling-client.ts",
     "web-client/src/bridge/signaling-contract.test.ts",
     "web-client/src/bridge/signaling-contract.ts",
+    "web-client/src/bridge/terminal-codec-decoder.test.ts",
+    "web-client/src/bridge/terminal-codec-decoder.ts",
     "web-client/src/bridge/webrtc-attempt-ownership.test.ts",
     "web-client/src/bridge/webrtc-bridge.ts",
     "web-client/src/bridge/webrtc-security.test.ts",
+    "web-client/src/model/agent-provider-core.ts",
+    "web-client/src/model/create-session-messages.test.ts",
+    "web-client/src/model/create-session-messages.ts",
+    "web-client/src/model/layout-preset.test.ts",
+    "web-client/src/model/layout-preset.ts",
+    "web-client/src/model/pane-layout.test.ts",
+    "web-client/src/model/pane-layout.ts",
+    "web-client/src/model/session-order.test.ts",
+    "web-client/src/model/session-order.ts",
+    "web-client/src/model/session-row.ts",
+    "web-client/src/model/session-visibility.test.ts",
+    "web-client/src/model/session-visibility.ts",
+    "web-client/src/model/token-scope.test.ts",
+    "web-client/src/model/token-scope.ts",
+    "web-client/src/model/workspace-tree.ts",
     "web-client/src/protocol/bounded-control-json.test.ts",
     "web-client/src/protocol/bounded-control-json.ts",
+    "web-client/src/protocol/control-messages.test.ts",
+    "web-client/src/protocol/control-messages.ts",
+    "web-client/src/protocol/terminal-frame.test.ts",
+    "web-client/src/protocol/terminal-frame.ts",
+    "web-client/src/protocol/web-protocol.test.ts",
+    "web-client/src/protocol/web-protocol.ts",
+    "web-client/src/terminal/grid-renderer.test.ts",
+    "web-client/src/terminal/grid-renderer.ts",
+    "web-client/src/terminal/input-encoder.test.ts",
+    "web-client/src/terminal/input-encoder.ts",
+    "web-client/src/terminal/search-highlight.test.ts",
+    "web-client/src/terminal/search-highlight.ts",
+    "web-client/src/terminal/search.test.ts",
+    "web-client/src/terminal/search.ts",
+    "web-client/src/terminal/selection-controller.test.ts",
+    "web-client/src/terminal/selection-controller.ts",
+    "web-client/src/terminal/selection.test.ts",
+    "web-client/src/terminal/selection.ts",
+    "web-client/src/terminal/terminal-sync.test.ts",
+    "web-client/src/terminal/terminal-sync.ts",
+    "web-client/src/terminal/theme.test.ts",
+    "web-client/src/terminal/theme.ts",
+    "web-client/src/terminal/viewport.test.ts",
+    "web-client/src/terminal/viewport.ts",
+    "web-client/src/vite-env.d.ts",
     "web-client/tsconfig.core-build.json",
     "web-client/tsconfig.json",
     "web-client/vite.config.ts",
@@ -206,7 +362,7 @@ remote_core_dirs = {
     if parent.as_posix() != "."
 }
 actual_remote_files = set()
-for package in ("hydra-cloud", "web-client"):
+for package in ("hydra-agent", "hydra-cloud", "web-client"):
     package_root = root / package
     if not package_root.is_dir():
         raise SystemExit(f"public-boundary: ERROR: missing Remote core package: {package}")
@@ -229,16 +385,20 @@ if actual_remote_files != remote_core_files:
 # Exact bytes close exports, runtime dependencies, tooling, locks and build callers together.
 # Build outputs and package LICENSE copies are generated, not additional source leaves.
 remote_core_metadata = {
+    "Cargo.lock": "26d6dd5cfd23c9af278ebe66eeb3dd882aef87a20572ccbc9351fbf8f7c7fce1",
+    "Cargo.toml": "6864ad0639702ca59042634585776e3cbb77128b77f04e9e055c755fb8e05ab2",
     "LICENSE": "763a6e17187e1e6998d6d1af0d323c276e89fd54eff401bea96f20ba55d7828b",
+    "hydra-agent/Cargo.lock": "7975a2d18916737df32457a372eedfb1f60c19217841999ec8671b022beb88d4",
+    "hydra-agent/Cargo.toml": "c7d3b6f18fc647f9343c34beb602802d1f850b6aeef2e5bc4533c26100e048cc",
     "hydra-cloud/package-lock.json": "325f475dd0ab2f374d3086d4ed895da61fa0fb59a7c3affc9b1fb9115996d3c8",
     "hydra-cloud/package.json": "e7a03ce33c58941da71b7a281001c0a251a5e0d17da7ae421ee14c173de66809",
     "hydra-cloud/tsconfig.core-build.json": "14dac3664fc66ea4bfd2459158c2f9e0f7569975ff8b2cdb91253b07793b9ac4",
     "hydra-cloud/tsconfig.json": "55686b33aaa6786496c8a8a3c0b49d1f095a7e4a03a4190170b118a2361da4a4",
     "web-client/package-lock.json": "ef9c130a7481c2c23f7a02197beccc12a6925c99bc1ab281d347ba9a952c88e3",
-    "web-client/package.json": "f908a8a1db1c62e635dddb6624bc83939c798c130898d6931d9f32f0826ce8f9",
+    "web-client/package.json": "4cb8463263513acdf747fdbdf98a82ac9f0b3c4f2b77afa75323b4919dd3344b",
     "web-client/tsconfig.core-build.json": "d5d492691452dd3ac69cc2657d6dbda0379d0b1cb90cf986e43572d35c145c1d",
     "web-client/tsconfig.json": "60c13f7d2d8b39dad5f29e8bb39598f26126c41021a129d7f43cf6c3f8edcbef",
-    "web-client/vite.config.ts": "9e3df78c1e438fe868435ed21c7c4549d43a6b7351fe0cba90f0a45713cc5fa5",
+    "web-client/vite.config.ts": "fd9710e76937601cef18b3907e654ca81a5e7728747d56aa10314a85b2b671b8"
 }
 for name, expected_digest in remote_core_metadata.items():
     if hashlib.sha256((root / name).read_bytes()).hexdigest() != expected_digest:
@@ -258,6 +418,35 @@ if set(packages) != expected:
     raise SystemExit(
         f"public-boundary: ERROR: unexpected workspace packages: {sorted(packages)}"
     )
+# The agent is a separate excluded workspace, not a ninth desktop package.
+if set(metadata["workspace_members"]) != {package["id"] for package in packages.values()}:
+    raise SystemExit("public-boundary: ERROR: desktop workspace membership drifted")
+agent_metadata = json.loads(subprocess.check_output(
+    ["cargo", "metadata", "--locked", "--format-version", "1", "--no-deps",
+     "--manifest-path", "hydra-agent/Cargo.toml", "--features", "webrtc"],
+    cwd=root,
+    text=True,
+))
+agent_packages = agent_metadata["packages"]
+if len(agent_packages) != 1 or agent_packages[0]["name"] != "hydra-agent":
+    raise SystemExit("public-boundary: ERROR: standalone agent package drifted")
+agent_package = agent_packages[0]
+if (agent_metadata["workspace_members"] != [agent_package["id"]]
+        or pathlib.Path(agent_metadata["workspace_root"]).resolve() != root / "hydra-agent"
+        or pathlib.Path(agent_package["manifest_path"]).resolve() != root / "hydra-agent/Cargo.toml"):
+    raise SystemExit("public-boundary: ERROR: standalone agent workspace identity drifted")
+agent_paths = {
+    dependency["name"]: pathlib.Path(dependency["path"]).resolve()
+    for dependency in agent_package["dependencies"] if dependency.get("path") is not None
+}
+expected_agent_paths = {
+    name: root / name for name in
+    ("maestro-protocol", "maestro-local-services", "maestro-shell", "maestro-extension-api")
+}
+if agent_paths != expected_agent_paths:
+    raise SystemExit("public-boundary: ERROR: standalone agent path dependency closure drifted")
+# Apply the existing MIT/publish=false/inside-root checks to both workspaces.
+packages["hydra-agent"] = agent_package
 for name, package in packages.items():
     if package.get("publish") != []:
         raise SystemExit(f"public-boundary: ERROR: {name} is publishable to a registry")
@@ -281,7 +470,7 @@ for name, package in packages.items():
             raise SystemExit(
                 f"public-boundary: ERROR: {name} path dependency resolves outside the public tree"
             )
-print(f"public-boundary: {len(packages)} local-only packages checked")
+print("public-boundary: 8 desktop packages and 1 standalone agent checked")
 PY
 
 printf 'public-boundary: PASS\n'

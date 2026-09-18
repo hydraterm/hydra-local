@@ -16,29 +16,152 @@ const fixtures = ['browser-consumer.ts', 'broker-fixture.ts', 'consumer.test.ts'
 const pins = {
   LICENSE: '763a6e17187e1e6998d6d1af0d323c276e89fd54eff401bea96f20ba55d7828b',
   'web-client/package-lock.json': 'ef9c130a7481c2c23f7a02197beccc12a6925c99bc1ab281d347ba9a952c88e3',
-  'web-client/package.json': 'f908a8a1db1c62e635dddb6624bc83939c798c130898d6931d9f32f0826ce8f9',
+  'web-client/package.json': '4cb8463263513acdf747fdbdf98a82ac9f0b3c4f2b77afa75323b4919dd3344b',
   'web-client/tsconfig.json': '60c13f7d2d8b39dad5f29e8bb39598f26126c41021a129d7f43cf6c3f8edcbef',
   'web-client/tsconfig.core-build.json': 'd5d492691452dd3ac69cc2657d6dbda0379d0b1cb90cf986e43572d35c145c1d',
-  'web-client/vite.config.ts': '9e3df78c1e438fe868435ed21c7c4549d43a6b7351fe0cba90f0a45713cc5fa5',
+  'web-client/vite.config.ts': 'fd9710e76937601cef18b3907e654ca81a5e7728747d56aa10314a85b2b671b8',
   'hydra-cloud/package-lock.json': '325f475dd0ab2f374d3086d4ed895da61fa0fb59a7c3affc9b1fb9115996d3c8',
   'hydra-cloud/package.json': 'e7a03ce33c58941da71b7a281001c0a251a5e0d17da7ae421ee14c173de66809',
   'hydra-cloud/tsconfig.json': '55686b33aaa6786496c8a8a3c0b49d1f095a7e4a03a4190170b118a2361da4a4',
   'hydra-cloud/tsconfig.core-build.json': '14dac3664fc66ea4bfd2459158c2f9e0f7569975ff8b2cdb91253b07793b9ac4',
 }
-const browserUnits = ['connect-deadline', 'datachannel-send-queue', 'ice-candidate-security',
-  'ice-path-classifier', 'relay-fallback', 'remote-transport', 'sdp-security',
-  'setup-refusal-contract', 'signaling-contract', 'webrtc-bridge']
-const browserTests = ['connect-deadline', 'datachannel-send-queue', 'ice-candidate-security',
-  'ice-path-classifier', 'relay-fallback', 'sdp-security', 'signaling-contract',
-  'webrtc-attempt-ownership', 'webrtc-security']
+const browserUnits = [
+  'bridge/account-reset',
+  'bridge/auth-contract',
+  'bridge/bounded-chunk-reassembler',
+  'bridge/channel-router',
+  'bridge/channel-terminal-bank',
+  'bridge/conn-trace',
+  'bridge/connect-deadline',
+  'bridge/datachannel-send-queue',
+  'bridge/device-identity',
+  'bridge/device-label-store',
+  'bridge/diagnostic-flags',
+  'bridge/ice-candidate-security',
+  'bridge/ice-path-classifier',
+  'bridge/inspector-hooks',
+  'bridge/last-opened-store',
+  'bridge/layout-preset-store',
+  'bridge/multi-attach-manager',
+  'bridge/multi-pane-terminal',
+  'bridge/pane-search-bank',
+  'bridge/pane-selection-bank',
+  'bridge/passkey',
+  'bridge/reconnect-hints',
+  'bridge/relay-credential-cache',
+  'bridge/relay-fallback',
+  'bridge/remote-client',
+  'bridge/remote-entitlement',
+  'bridge/remote-layout-cloud',
+  'bridge/remote-layout-contract',
+  'bridge/remote-layout-schema',
+  'bridge/remote-session',
+  'bridge/remote-transport',
+  'bridge/render-metrics',
+  'bridge/safe-message',
+  'bridge/scoped-storage-key',
+  'bridge/sdp-security',
+  'bridge/session-cache-store',
+  'bridge/session-favorites-store',
+  'bridge/session-label-store',
+  'bridge/session-order-store',
+  'bridge/session-visibility-store',
+  'bridge/setup-refusal-contract',
+  'bridge/signaling-client',
+  'bridge/signaling-contract',
+  'bridge/terminal-codec-decoder',
+  'bridge/webrtc-bridge',
+  'model/agent-provider-core',
+  'model/create-session-messages',
+  'model/layout-preset',
+  'model/pane-layout',
+  'model/session-order',
+  'model/session-row',
+  'model/session-visibility',
+  'model/token-scope',
+  'model/workspace-tree',
+  'protocol/bounded-control-json',
+  'protocol/control-messages',
+  'protocol/terminal-frame',
+  'protocol/web-protocol',
+  'terminal/grid-renderer',
+  'terminal/input-encoder',
+  'terminal/search-highlight',
+  'terminal/search',
+  'terminal/selection-controller',
+  'terminal/selection',
+  'terminal/terminal-sync',
+  'terminal/theme',
+  'terminal/viewport',
+]
+const browserTests = [
+  'bridge/account-reset',
+  'bridge/auth-contract',
+  'bridge/browser-engine-boundary',
+  'bridge/channel-router',
+  'bridge/channel-terminal-bank',
+  'bridge/conn-trace',
+  'bridge/connect-deadline',
+  'bridge/datachannel-send-queue',
+  'bridge/device-label-store',
+  'bridge/diagnostic-flags',
+  'bridge/ice-candidate-security',
+  'bridge/ice-path-classifier',
+  'bridge/last-opened-store',
+  'bridge/layout-preset-store',
+  'bridge/multi-attach-manager',
+  'bridge/multi-pane-terminal',
+  'bridge/pane-search-bank',
+  'bridge/pane-selection-bank',
+  'bridge/passkey',
+  'bridge/relay-credential-cache',
+  'bridge/relay-fallback',
+  'bridge/remote-entitlement',
+  'bridge/remote-layout-cloud',
+  'bridge/remote-layout-contract',
+  'bridge/remote-session',
+  'bridge/render-metrics',
+  'bridge/safe-message',
+  'bridge/scoped-storage-key',
+  'bridge/sdp-security',
+  'bridge/session-cache-store',
+  'bridge/session-favorites-store',
+  'bridge/session-label-store',
+  'bridge/session-order-store',
+  'bridge/session-visibility-store',
+  'bridge/setup-refusal-contract',
+  'bridge/signaling-client',
+  'bridge/signaling-contract',
+  'bridge/terminal-codec-decoder',
+  'bridge/webrtc-attempt-ownership',
+  'bridge/webrtc-security',
+  'model/create-session-messages',
+  'model/layout-preset',
+  'model/pane-layout',
+  'model/session-order',
+  'model/session-visibility',
+  'model/token-scope',
+  'protocol/bounded-control-json',
+  'protocol/control-messages',
+  'protocol/terminal-frame',
+  'protocol/web-protocol',
+  'terminal/grid-renderer',
+  'terminal/input-encoder',
+  'terminal/search-highlight',
+  'terminal/search',
+  'terminal/selection-controller',
+  'terminal/selection',
+  'terminal/terminal-sync',
+  'terminal/theme',
+  'terminal/viewport',
+]
 const brokerUnits = ['clock', 'content-blind', 'offer-wake', 'signaling-ports', 'signaling', 'types']
 const leaves = [...Object.keys(pins),
-  ...browserUnits.map(name => `web-client/src/bridge/${name}.ts`),
-  ...browserTests.map(name => `web-client/src/bridge/${name}.test.ts`),
-  'web-client/src/protocol/bounded-control-json.ts', 'web-client/src/protocol/bounded-control-json.test.ts',
+  ...browserUnits.map(name => `web-client/src/${name}.ts`),
+  ...browserTests.map(name => `web-client/src/${name}.test.ts`), 'web-client/src/vite-env.d.ts',
   ...brokerUnits.map(name => `hydra-cloud/src/domain/${name}.ts`), 'hydra-cloud/test/signaling-port.test.ts',
 ].sort()
-assert.equal(leaves.length, 38)
+assert.equal(leaves.length, 144)
 
 function safePath(path, existing = true) {
   assert.ok(isAbsolute(path) && resolve(path) === path, 'Use an absolute non-escaping path')
@@ -140,8 +263,8 @@ export async function qualify({ source, output, npmCli, cache }) {
       const declared = json(join(root, 'package.json'))
       assert.equal(pack.name, declared.name); assert.equal(pack.version, '0.0.0')
       const runtime = pkg === 'web-client' ? walk(join(root, 'dist')).filter(p => !p.endsWith(sep)).map(p => relative(root, p)) : brokerUnits.map(name => 'dist/domain/' + name + '.js')
-      const types = pkg === 'web-client' ? [...browserUnits.map(name => `types/bridge/${name}.d.ts`), 'types/protocol/bounded-control-json.d.ts'] : brokerUnits.map(name => 'dist/domain/' + name + '.d.ts')
-      assert.equal(runtime.length, pkg === 'web-client' ? 5 : 6)
+      const types = pkg === 'web-client' ? browserUnits.map(name => `types/${name}.d.ts`) : brokerUnits.map(name => 'dist/domain/' + name + '.d.ts')
+      assert.equal(runtime.length, pkg === 'web-client' ? 26 : 6)
       assert.ok(runtime.every(path => path.endsWith('.js')))
       const expected = ['LICENSE', 'package.json', ...runtime, ...types].sort()
       assert.deepEqual(pack.files.map(row => row.path).sort(), expected, 'Unexpected packed payload')
@@ -152,7 +275,9 @@ export async function qualify({ source, output, npmCli, cache }) {
       report.packages[pkg] = { ...pack, sha256: sha(readFileSync(join(output, 'artifacts', pack.filename))) }
       if (pkg === 'web-client') {
         const graph = json(join(root, '.qa-build-graph.json'))
-        assert.ok(graph.modules.length > 0 && graph.modules.every(p => inputs['web-client/' + p] && !p.endsWith('.test.ts')), 'Unexpected browser source graph')
+        assert.deepEqual([...graph.modules].sort(), browserUnits.map(name => `src/${name}.ts`).sort(), 'Unexpected browser source graph')
+        const chunks = new Set(graph.chunks.map(chunk => chunk.file))
+        assert.ok(graph.chunks.every(chunk => chunk.imports.every(path => chunks.has(path))), 'External browser chunk')
         report.browserSourceGraph = graph
       }
       save()
@@ -188,7 +313,7 @@ export async function qualify({ source, output, npmCli, cache }) {
         if (path.endsWith('.js')) javascript.push(path)
       }
     }
-    assert.equal(declarations.length, 17)
+    assert.equal(declarations.length, 73)
     write(join(consumer, 'declarations.json'), encode({ compilerOptions: { ...compilerOptions, types: [] }, files: declarations }))
     run('installed-declarations', [join(consumer, 'node_modules/typescript/bin/tsc'), '-p', 'declarations.json'], consumer)
     for (const action of ['typecheck', 'test']) npm('consumer-' + action, ['run', action], consumer)
@@ -198,13 +323,17 @@ for(const path of files) { const ast=ts.createSourceFile(path,readFileSync(path,
 function visit(node) { if((ts.isImportDeclaration(node)||ts.isExportDeclaration(node))&&node.moduleSpecifier) { const target=node.moduleSpecifier.text;
 if(target==='node:crypto' && /\\/signaling-broker-core\\/dist\\/domain\\/(offer-wake|signaling)\\.js$/.test(path)) builtins++; else { assert.ok(target.startsWith('.')); assert.ok(allowed.has(resolve(dirname(path),target))); } }
 if(ts.isCallExpression(node)) assert.ok(node.expression.kind!==ts.SyntaxKind.ImportKeyword && !(ts.isIdentifier(node.expression)&&node.expression.text==='require')); ts.forEachChild(node,visit); } visit(ast); }
-assert.equal(builtins,2); const browser=await import('@hydraterm/remote-browser-core'); const broker=await import('@hydraterm/signaling-broker-core'); assert.equal(typeof browser.WebrtcBridge,'function'); assert.equal(typeof broker.SignalingBroker,'function'); console.log('Own-only runtime plus broker node:crypto and native ESM exports pass');`
+assert.equal(builtins,2); const browser=await import('@hydraterm/remote-browser-core'); const broker=await import('@hydraterm/signaling-broker-core'); assert.equal(typeof browser.WebrtcBridge,'function'); assert.equal(typeof broker.SignalingBroker,'function');
+const manifest=JSON.parse(readFileSync(new URL('./node_modules/@hydraterm/remote-browser-core/package.json',import.meta.url))); assert.equal(Object.keys(manifest.exports).length,20);
+for(const key of Object.keys(manifest.exports)) await import('@hydraterm/remote-browser-core'+(key==='.'?'':key.slice(1)));
+console.log('Own-only runtime plus broker node:crypto and all native ESM exports pass');`
     write(join(consumer, 'runtime-check.mjs'), runtimeCheck)
     run('runtime-and-native-esm', ['runtime-check.mjs'], consumer)
     const bundleCheck = `import { build } from 'vite'; import { writeFileSync } from 'node:fs'; import { resolve, relative } from 'node:path';
 await build({configFile:false,envDir:false,publicDir:false,build:{minify:false,lib:{entry:'browser-consumer.ts',formats:['es'],fileName:()=> 'browser-consumer.js'}},plugins:[{name:'prove-installed-core',generateBundle(_,bundle){
 const modules=[...new Set(Object.values(bundle).flatMap(c=>c.type==='chunk'?Object.keys(c.modules):[]))].sort(); const local=modules.map(p=>relative(process.cwd(),p));
-if(!local.includes('node_modules/@hydraterm/remote-browser-core/dist/bridge.js')||local.some(p=>p!=='browser-consumer.ts'&&!p.startsWith('node_modules/@hydraterm/remote-browser-core/dist/')))throw Error('Unexpected consumer module graph');
+// The grid export is a pure re-export; Rollup retains its real renderer chunk, not necessarily the wrapper.
+if(!['bridge','controller','input','signaling-http','layout'].every(name=>local.includes('node_modules/@hydraterm/remote-browser-core/dist/'+name+'.js'))||!local.some(p=>p.startsWith('node_modules/@hydraterm/remote-browser-core/dist/grid-renderer-')&&p.endsWith('.js'))||local.some(p=>p!=='browser-consumer.ts'&&!p.startsWith('node_modules/@hydraterm/remote-browser-core/dist/')))throw Error('Unexpected consumer module graph');
 writeFileSync('consumer-graph.json',JSON.stringify(local,null,2)+'\\n');}}]});`
     write(join(consumer, 'bundle-check.mjs'), bundleCheck)
     run('consumer-browser-bundle', ['bundle-check.mjs'], consumer)

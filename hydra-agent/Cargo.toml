@@ -1,0 +1,116 @@
+[package]
+publish = false
+name = "hydra-agent"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Hydra desktop agent: enrollment, supervision, and authenticated WebRTC bridging to the local pty-daemon. See README.md."
+
+[lib]
+name = "hydra_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hydra-agent"
+path = "src/main.rs"
+
+[dependencies]
+maestro-protocol = { path = "../maestro-protocol" }
+maestro-local-services = { path = "../maestro-local-services" }
+maestro-shell = { path = "../maestro-shell" }
+maestro-extension-api = { path = "../maestro-extension-api" }
+tokio = { workspace = true }
+futures-util = { workspace = true }
+rustls = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+uuid = { workspace = true }
+libc = { workspace = true }
+# Verify signed device/session-scoped tokens offline (agent is the verifier) + base64 for the token
+# wire form.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+# Browser proof-of-possession: verify the browser's per-connection offer signature. The browser key is
+# Ed25519 where supported, else ECDSA P-256 (Safari) — support both. `spki` parses the base64 SPKI public
+# key the browser exports; `p256`/`ecdsa` verify the P-256 case; ed25519-dalek handles the Ed25519 case.
+p256 = { version = "0.13", features = ["ecdsa"] }
+ecdsa = "0.16"
+spki = "0.7"
+# Passkey assertions may use RS256 on Chromium/Windows authenticators. Reuse ring's audited, verify-only
+# RSA implementation with its explicit 2048–8192-bit policy; no PEM, RNG fallback, or signing API is needed.
+ring = { version = "0.17.14", default-features = false, features = ["std"] }
+base64 = { workspace = true }
+# WebRTC peer + control DataChannel, isolated behind the `RtcTransport` trait (remote_webrtc.rs).
+# Optional via the `webrtc` feature so the security-boundary core (token/control) builds + tests without
+# pulling the heavy WebRTC stack. ICE configuration comes from Hydra-managed STUN/TURN policy; terminal
+# content remains inside authenticated DTLS DataChannels.
+webrtc = { version = "0.11", optional = true }
+# `bytes` is used only by the remote-peer (DataChannel send); pulled in by webrtc anyway, declared for the
+# `webrtc` feature.
+bytes = { version = "1", optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# enroll: a one-shot HTTPS POST to the cloud /v1/link/redeem. rustls (no openssl); not a hot path.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
+dirs = "5"
+# Per-event gzip for the negotiated terminal hot path. Compression is performed on the blocking pool;
+# the default/legacy wire remains byte-identical when the capability is not selected.
+flate2 = "1"
+zeroize = "1"
+
+[features]
+default = []
+# Non-shipping inspector RPCs for explicitly instrumented QA binaries. A browser query flag is never authority:
+# production/default `webrtc` builds omit the request variants, handlers, ledger reads, and snapshot serializer.
+remote-diagnostics = ["webrtc"]
+# Build the actual webrtc-rs transport. The token/control security boundary is feature-independent
+# and always built + tested. The live integration test needs sign_token, so pull token-sign too.
+webrtc = ["dep:webrtc", "dep:bytes", "token-sign"]
+# Expose sign_token outside tests (the cloud signs; included for cross-checks / future cloud-Rust use).
+token-sign = []
+
+[build-dependencies]
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+ed25519-dalek = "2"
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
+url = "2"
+tokio = { workspace = true, features = ["test-util"] }
+
+[workspace]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+rust-version = "1.88"
+
+[workspace.dependencies]
+anyhow = "1"
+base64 = "0.22"
+futures-util = "0.3"
+libc = "0.2"
+rand = "0.8"
+rustls = "0.23"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sha2 = "0.10"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.dev.package.hydra-agent]
+# Preserve the canonical agent dev-build settings.
+debug = 0
+incremental = false

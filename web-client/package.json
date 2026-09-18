@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "license": "MIT",
-  "description": "Reusable Hydra WebRTC transport core; not a complete Remote application.",
+  "description": "Hydra Remote browser controller, terminal rendering, protocol and transport engine; injectable authority, not the hosted account UI or a turnkey service.",
   "packageManager": "npm@10.9.8",
   "engines": {
     "node": "22.23.1",
@@ -31,6 +31,70 @@
     "./transport": {
       "types": "./types/bridge/remote-transport.d.ts",
       "import": "./dist/transport.js"
+    },
+    "./controller": {
+      "types": "./types/bridge/remote-client.d.ts",
+      "import": "./dist/controller.js"
+    },
+    "./session": {
+      "types": "./types/bridge/remote-session.d.ts",
+      "import": "./dist/session.js"
+    },
+    "./auth": {
+      "types": "./types/bridge/auth-contract.d.ts",
+      "import": "./dist/auth.js"
+    },
+    "./identity": {
+      "types": "./types/bridge/device-identity.d.ts",
+      "import": "./dist/identity.js"
+    },
+    "./passkey": {
+      "types": "./types/bridge/passkey.d.ts",
+      "import": "./dist/passkey.js"
+    },
+    "./signaling-http": {
+      "types": "./types/bridge/signaling-client.d.ts",
+      "import": "./dist/signaling-http.js"
+    },
+    "./relay": {
+      "types": "./types/bridge/relay-credential-cache.d.ts",
+      "import": "./dist/relay.js"
+    },
+    "./layout": {
+      "types": "./types/bridge/remote-layout-cloud.d.ts",
+      "import": "./dist/layout.js"
+    },
+    "./protocol": {
+      "types": "./types/protocol/control-messages.d.ts",
+      "import": "./dist/protocol.js"
+    },
+    "./terminal-protocol": {
+      "types": "./types/protocol/web-protocol.d.ts",
+      "import": "./dist/terminal-protocol.js"
+    },
+    "./grid": {
+      "types": "./types/terminal/grid-renderer.d.ts",
+      "import": "./dist/grid.js"
+    },
+    "./input": {
+      "types": "./types/terminal/input-encoder.d.ts",
+      "import": "./dist/input.js"
+    },
+    "./viewport": {
+      "types": "./types/terminal/viewport.d.ts",
+      "import": "./dist/viewport.js"
+    },
+    "./selection": {
+      "types": "./types/terminal/selection-controller.d.ts",
+      "import": "./dist/selection.js"
+    },
+    "./theme": {
+      "types": "./types/terminal/theme.d.ts",
+      "import": "./dist/theme.js"
+    },
+    "./providers": {
+      "types": "./types/model/agent-provider-core.d.ts",
+      "import": "./dist/providers.js"
     }
   },
   "scripts": {

@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["hydra-agent"]
 members = [
     "pty-daemon",
     "maestro-renderer",

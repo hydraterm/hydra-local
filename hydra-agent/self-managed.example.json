@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "app_origin": "https://app.example.invalid",
+  "api_origin": "https://broker.example.invalid",
+  "token_verification_public_key": "REPLACE_WITH_BASE64_ED25519_PUBLIC_KEY"
+}

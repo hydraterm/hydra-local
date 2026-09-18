@@ -7,6 +7,9 @@ import type { ControlState } from '@hydraterm/remote-browser-core/transport'
 import { SESSION_TTL_MS } from '@hydraterm/signaling-broker-core'
 import { fixture } from './broker-fixture.js'
 import { createTransport, currentAuthority } from './browser-consumer.js'
+import { createEngine, createHttpAdapters, encodePaste, AGENT_PROVIDERS } from './browser-consumer.js'
+import { StubDeviceIdentity } from '@hydraterm/remote-browser-core/identity'
+import type { AuthProvider } from '@hydraterm/remote-browser-core/auth'
 
 const bridges: WebrtcBridge[] = []
 afterEach(() => {
@@ -132,4 +135,42 @@ it('keeps broker account and expiry refusals in the installed artifact', async (
   const row = await c.broker.createSession({ accountId, sourceDeviceId: 'browser', targetDeviceId: 'desktop', offer: 'opaque' })
   c.advance(SESSION_TTL_MS)
   await expect(c.broker.getSession(accountId, 'browser', row.sessionId)).rejects.toMatchObject({ refusal: 'expired' })
+})
+
+it('runs the installed controller with injected auth without hosted SDKs or enrollment fallback', async () => {
+  const absent = vi.fn(async () => null)
+  const auth: AuthProvider = { signIn: absent, signUp: absent, restore: absent, resumeIdentitySession: absent,
+    current: () => null, signOut: async () => {} }
+  const prepareConnection = vi.fn(async () => { throw new Error('No enrollment in consumer') })
+  const makeTransport = vi.fn((): never => { throw new Error('No connection in consumer') })
+  const engine = createEngine({ auth, identity: new StubDeviceIdentity('synthetic-consumer'),
+    listDesktops: async () => [], issueLinkCode: async () => null, revokeDevice: async () => false,
+    prepareConnection, makeTransport, reconnectLifecycle: null })
+  try {
+    await engine.restoreSession()
+    expect(engine.snapshot().phase).toBe('signed_out')
+    expect(prepareConnection).not.toHaveBeenCalled()
+    expect(makeTransport).not.toHaveBeenCalled()
+  } finally { engine.dispose() }
+})
+
+it('uses the installed explicit HTTP adapters with injected fetch, without making network requests', async () => {
+  const fetchImpl = vi.fn<typeof fetch>()
+    .mockResolvedValueOnce(new Response(JSON.stringify({ sessionId: 'synthetic-session' }), { status: 201 }))
+    .mockResolvedValueOnce(new Response(JSON.stringify({ layout: null }), { status: 200 }))
+  const adapters = createHttpAdapters({ baseUrl: 'https://signal.invalid', authToken: 'synthetic-test-authority', deviceId: 'browser' },
+    { baseUrl: 'https://layout.invalid', authToken: 'cookie' }, fetchImpl)
+  try {
+    expect(await adapters.signaling.createSession('desktop', 'opaque-offer')).toBe('synthetic-session')
+    expect(fetchImpl.mock.calls[0][0]).toBe('https://signal.invalid/v1/signal/sessions')
+    expect(fetchImpl.mock.calls[0][1]?.headers).toMatchObject({ authorization: 'Bearer synthetic-test-authority' })
+    expect(await adapters.layout.fetchLayout('desktop')).toBeNull()
+    expect(fetchImpl.mock.calls[1][1]?.credentials).toBe('include')
+    expect(fetchImpl.mock.calls[1][1]?.headers).toBeUndefined()
+  } finally { adapters.layout.dispose() }
+})
+
+it('keeps terminal paste encoding and icon-free provider metadata in the installed engine', () => {
+  expect(encodePaste('synthetic', true)).toBe('\u001b[200~synthetic\u001b[201~')
+  expect(Object.values(AGENT_PROVIDERS).every(provider => !provider.icon)).toBe(true)
 })
