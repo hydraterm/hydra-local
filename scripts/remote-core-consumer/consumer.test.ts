@@ -1,5 +1,9 @@
 import { afterEach, expect, it, vi } from 'vitest'
 import { generateKeyPairSync, sign } from 'node:crypto'
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import postcss from 'postcss'
 import { WebrtcBridge } from '@hydraterm/remote-browser-core'
 import { SignalSessionDead, type SignalingPort } from '@hydraterm/remote-browser-core/signaling'
 import { StableSetupRefusal } from '@hydraterm/remote-browser-core/refusal'
@@ -18,6 +22,26 @@ afterEach(() => {
 })
 const accountId = 'synthetic-account'
 const fingerprint = Array.from({ length: 32 }, (_, i) => i.toString(16).padStart(2, '0')).join(':')
+
+it.each(['absolute', 'relative'] as const)('does not disclose an external source map through %s CSS paths', async kind => {
+  const root = mkdtempSync(join(tmpdir(), 'hydra-postcss-regression-'))
+  try {
+    const input = join(root, 'input')
+    mkdirSync(input)
+    const map = join(root, 'outside.map')
+    const marker = 'HYDRA_SYNTHETIC_SOURCE_MAP_CONTENT'
+    writeFileSync(map, JSON.stringify({ version: 3, sources: ['outside.ts'], sourcesContent: [marker], names: [], mappings: 'AAAA' }))
+    const annotation = kind === 'absolute' ? map : '../outside.map'
+    const result = await postcss().process(`a{color:red}\n/*# sourceMappingURL=${annotation} */`, {
+      from: kind === 'absolute' ? undefined : join(input, 'input.css'),
+      map: { inline: false, annotation: false },
+    })
+    expect(result.css).toContain('color:red')
+    expect(result.map?.toString() ?? '').not.toContain(marker)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
 
 function consumer() {
   const { broker, advance } = fixture()

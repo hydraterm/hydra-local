@@ -27,7 +27,7 @@
     }
   },
   "scripts": {
-    "test": "vitest run test/signaling-port.test.ts --maxWorkers 2 --minWorkers 1",
+    "test": "vitest run test/signaling-port.test.ts --maxWorkers 2",
     "typecheck": "tsc --noEmit",
     "build": "tsc --project tsconfig.core-build.json && node -e \"require('node:fs').copyFileSync('../LICENSE', 'LICENSE')\""
   },
@@ -35,6 +35,9 @@
     "@types/node": "22.20.0",
     "typescript": "5.9.3",
     "vite": "6.4.3",
-    "vitest": "3.2.6"
+    "vitest": "4.1.11"
+  },
+  "overrides": {
+    "postcss": "8.5.26"
   }
 }

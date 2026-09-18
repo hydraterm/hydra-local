@@ -14,7 +14,8 @@
     "noEmit": true,
     "skipLibCheck": true,
     "types": [
-      "vitest/globals"
+      "vitest/globals",
+      "node"
     ]
   },
   "include": [

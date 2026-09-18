@@ -15,13 +15,13 @@ const packages = ['web-client', 'hydra-cloud']
 const fixtures = ['browser-consumer.ts', 'broker-fixture.ts', 'consumer.test.ts']
 const pins = {
   LICENSE: '763a6e17187e1e6998d6d1af0d323c276e89fd54eff401bea96f20ba55d7828b',
-  'web-client/package-lock.json': 'ef9c130a7481c2c23f7a02197beccc12a6925c99bc1ab281d347ba9a952c88e3',
-  'web-client/package.json': '4cb8463263513acdf747fdbdf98a82ac9f0b3c4f2b77afa75323b4919dd3344b',
-  'web-client/tsconfig.json': '60c13f7d2d8b39dad5f29e8bb39598f26126c41021a129d7f43cf6c3f8edcbef',
+  'web-client/package-lock.json': '82a5509d84c09e94c73944ef5c757d892fff2bb5c3435dca1d96207330908168',
+  'web-client/package.json': 'eb3e7c53eb953932fbda26a4afc845baeb52d24d401b58b2e1bb1b72c5822cd7',
+  'web-client/tsconfig.json': '725558f0dc7536ee201cf8915bd8bdc5d6088d03b1f9dfcd3f90e4eca030eddd',
   'web-client/tsconfig.core-build.json': 'd5d492691452dd3ac69cc2657d6dbda0379d0b1cb90cf986e43572d35c145c1d',
   'web-client/vite.config.ts': 'fd9710e76937601cef18b3907e654ca81a5e7728747d56aa10314a85b2b671b8',
-  'hydra-cloud/package-lock.json': '325f475dd0ab2f374d3086d4ed895da61fa0fb59a7c3affc9b1fb9115996d3c8',
-  'hydra-cloud/package.json': 'e7a03ce33c58941da71b7a281001c0a251a5e0d17da7ae421ee14c173de66809',
+  'hydra-cloud/package-lock.json': '7f5ddebc65344d243e81b92debe52a231e7c5111a1d7abd007ebbffc81eea1ba',
+  'hydra-cloud/package.json': '6a180d37a1c4eb42feed061f4b86d1efcdfd0c196aa702c66af76f169ec3a66c',
   'hydra-cloud/tsconfig.json': '55686b33aaa6786496c8a8a3c0b49d1f095a7e4a03a4190170b118a2361da4a4',
   'hydra-cloud/tsconfig.core-build.json': '14dac3664fc66ea4bfd2459158c2f9e0f7569975ff8b2cdb91253b07793b9ac4',
 }
@@ -284,8 +284,8 @@ export async function qualify({ source, output, npmCli, cache }) {
     }
     const consumer = join(output, 'consumer'), browser = JSON.parse(inputs['web-client/package.json'])
     const manifest = { name: 'hydra-remote-core-consumer-check', version: '0.0.0', private: true, type: 'module',
-      scripts: { typecheck: 'tsc --noEmit', test: 'vitest run consumer.test.ts --maxWorkers 2 --minWorkers 1' },
-      dependencies: {}, devDependencies: browser.devDependencies }
+      scripts: { typecheck: 'tsc --noEmit', test: 'vitest run consumer.test.ts --maxWorkers 2' },
+      dependencies: {}, devDependencies: browser.devDependencies, overrides: browser.overrides }
     const lock = JSON.parse(inputs['web-client/package-lock.json'])
     lock.name = manifest.name
     for (const pkg of packages) {
@@ -341,7 +341,7 @@ writeFileSync('consumer-graph.json',JSON.stringify(local,null,2)+'\\n');}}]});`
     report.installedDeclarations = declarations.map(p => ({ path: relative(output, p), sha256: sha(readRegular(p)) }))
     report.consumerLockSha256 = consumerLock
     report.consumerToolLocationCount = Object.keys(lock.packages).length - 3
-    assert.equal(report.consumerToolLocationCount, 108)
+    assert.equal(report.consumerToolLocationCount, 97)
     for (const [path, bytes] of Object.entries(inputs)) {
       assert.deepEqual(readRegular(join(source, path)), bytes, 'Source changed during qualification')
       assert.deepEqual(readRegular(join(output, path)), bytes, 'Staged input changed during qualification')
