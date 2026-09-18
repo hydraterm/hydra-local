@@ -71,7 +71,7 @@ the daemon crate's version; it is not necessarily the Hydra installer version.
 
 Programs deliberately run as the same OS user can access that user's local daemon. See the
 [public/private boundary](../public-private-boundary.md). This starter does not weaken that
-boundary or grant private Remote authority. It adds no network-off, command sandbox, or read-only
+boundary or grant hosted Remote authority. It adds no network-off, command sandbox, or read-only
 policy to your programs. Only run integrations you intend to trust as your local account.
 
 Supply the exact socket path rather than guessing which running profile you meant. Official

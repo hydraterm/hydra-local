@@ -1,7 +1,7 @@
 # Local desktop and Remote library architecture
 
-This page describes the open local desktop and reusable Remote libraries in this repository. It
-does not describe the private desktop agent or hosted service composition.
+This page describes the open local desktop and Remote engine/agent components. Hosted account,
+billing and service deployment composition remain outside this repository.
 
 ## Process and ownership map
 
@@ -50,19 +50,23 @@ processes. Closing or crashing the UI can disconnect a client without terminatin
 | `dashboard-ui` | Supplies React presentation chrome; it owns no PTY or generic shell execution |
 | `maestro-extension-api` | Defines the bounded, version-negotiated request seam for an optional sibling extension |
 
-## Reusable Remote libraries
+## Remote engine and agent source
 
-These separately built library objects sit outside the desktop process/ownership map above:
+These separately built components sit outside the desktop process/ownership map above:
+
+The [Remote agent](../hydra-agent/README.md) adds authenticated peer handling, enrollment client,
+local supervision and retained-PTY bridging. Its trust is explicit at build time. The browser
+engine also exports its session/controller, terminal rendering, input and layout implementation.
 
 - `web-client` provides the browser `WebrtcBridge`, connection lifecycle and typed signaling interfaces.
 - `hydra-cloud` provides the Node `SignalingBroker` and typed storage interfaces for bounded opaque
   offer/answer/ICE metadata.
 
-They neither own PTYs nor acquire daemon authority. The browser transport validates pinned desktop
+The browser engine and broker neither own PTYs nor acquire daemon authority. The browser transport validates pinned desktop
 answer proof and connection ownership; the broker checks device/account membership, revocation and
 session expiry. A deployment still supplies identity, enrollment, authorization, persistence and
 network composition. A connected DataChannel is not an authenticated terminal session, and the
-private desktop agent remains the final authority for Hydra terminal operations.
+desktop agent remains the final authority for Hydra terminal operations.
 
 See the [Remote library quickstart](developer/remote-core-quickstart.md) and
 [public/private boundary](public-private-boundary.md). These libraries are not a complete Remote app.

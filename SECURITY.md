@@ -8,7 +8,7 @@ Email [security@hydraterms.com](mailto:security@hydraterms.com). If this reposit
 **Security** tab offers a private **Report a vulnerability** form, that form reaches the same
 private reporting process.
 
-Reports about the public desktop and Remote libraries, and the hosted Hydra Remote service, are
+Reports about the public desktop, Remote agent/browser engine, and hosted Hydra Remote service are
 accepted through these private routes. For non-security support, use
 [info@hydraterms.com](mailto:info@hydraterms.com).
 

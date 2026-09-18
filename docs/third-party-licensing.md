@@ -47,14 +47,24 @@ checks live on the private composition side so the public verifier does not publ
 needles it is meant to detect. A boundary match fails packaging rather than publishing a diagnostic
 string from the builder's machine.
 
-## Separate Remote library source and development tools
+## Separate Remote source graphs
 
-The browser transport and signaling-broker libraries are separately built source packages, not
+The browser terminal/controller engine and signaling-broker libraries are separately built source packages, not
 new dependencies of the desktop binary. Their `web-client/package-lock.json` and
 `hydra-cloud/package-lock.json` contain pinned build/test tools, with no runtime package
 dependencies. `scripts/generate-third-party-notices.py` lists each tool graph separately and
-binds all four source lock hashes. This inventory includes optional platform records; it is not
+binds all five source lock hashes. This inventory includes optional platform records; it is not
 proof that every platform archive or all bundled-tool attribution was reviewed.
+
+The Remote agent is a separate excluded Cargo workspace with its own
+hydra-agent/Cargo.lock; it does not become a ninth desktop package. The source-notices
+generator adds a distinct locked agent table using --manifest-path hydra-agent/Cargo.toml
+and --features webrtc, excluding first-party public path crates. That source graph includes
+build/test and optional-platform records. It is not a licence artifact for an agent binary
+and does not alter the existing four desktop target policies or their dependency closures.
+Anyone distributing an agent binary must review the exact artifact's dependencies and carry
+their required licence, copyright and source materials. The local desktop packagers continue
+to reject a bundled hydra-agent; source publication is not new binary packaging authority.
 
 The library build scripts copy the public root MIT licence into each local tarball. The package
 gate must prove the actual exports, declarations, MIT payload and emitted runtime module closure.
@@ -62,9 +72,10 @@ Current reviewed artifacts contain only Hydra code/types and no bundled third-pa
 modules; this does not waive a future dependency's licence or notice obligations. Do not copy
 development `node_modules` into those artifacts or mistake their licence labels for a full legal review.
 
-After either Remote tool lock changes, regenerate the source notices and review every changed
+After a Remote tool or agent lock changes, regenerate the source notices and review every changed
 version, licence, upstream and applicable material, then rerun the library build/package/consumer
-gates. Preserve compatible pinned versions rather than upgrading opportunistically. Changes to
+gates; qualify agent changes through its explicit standalone build/tests. Preserve compatible
+pinned versions rather than upgrading opportunistically. Changes to
 these separate development locks do not change the desktop four-target policy below; a real
 desktop graph change still requires that independent policy review.
 

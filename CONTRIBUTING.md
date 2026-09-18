@@ -1,6 +1,6 @@
 # Contributing to Hydra
 
-Thank you for helping improve Hydra's local desktop and reusable Remote libraries.
+Thank you for helping improve Hydra's local desktop, Remote agent and browser engine.
 
 ## Accepted contribution scope
 
@@ -22,9 +22,9 @@ Independent integrations with the published Remote interfaces are welcome; the l
 require HydraTerms' hosted identity or billing providers. See the
 [Remote library quickstart](docs/developer/remote-core-quickstart.md).
 
-Do not submit private hosted implementations, credentials or deployment data. The desktop remote
-agent and hosted account/billing, enrollment, authorization-service and deployment composition are
-outside this repository. Changes to protocol or authority boundaries still require architectural
+Do not submit private hosted implementations, credentials or deployment data. Hosted account/billing,
+enrollment, authorization-service and deployment composition remain private. Contributions to the
+published Remote agent, browser engine and broker are welcome. Changes to protocol or authority boundaries still require architectural
 agreement and security review; a library adapter is not permission to weaken those checks.
 
 ## Before opening a pull request

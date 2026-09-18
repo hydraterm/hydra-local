@@ -1,7 +1,7 @@
 # Development
 
-This repository builds the local Hydra desktop and, separately, reusable Remote libraries. Neither
-build requires the private hosted repository or desktop remote agent.
+This repository builds the local Hydra desktop and, separately, the Remote agent, browser engine
+and signaling broker. Source builds do not require the private hosted repository or Clerk/Stripe.
 
 ## Toolchains
 
@@ -92,21 +92,23 @@ Hydra package.
 Use the platform's unsigned packaging smoke below when testing the installed-product shape. The
 macOS archive contains the native Hydra launcher, local app, retained PTY daemon and dashboard. The
 Linux archive contains its wrapper and the same local pieces. Neither archive contains Hydra
-Remote or the private agent. Extract the resulting archive to a disposable directory, then launch
+Remote or the separately built agent. Extract the resulting archive to a disposable directory, then launch
 `Hydra.app` on macOS or `bin/hydra-local` on Linux.
 
-If the optional private extension is absent or incompatible, the local desktop must remain usable
-and Remote controls must remain unavailable. A source build must not need a sibling private
-repository to compile or run.
+If the optional extension is absent or incompatible, the local desktop must remain usable
+and Remote controls must remain unavailable. The local desktop must not require the Remote
+agent to compile or run.
 
 ## Remote library build
 
 The browser transport and signaling broker have separate package manifests, tests and ESM builds.
 Follow the [Remote library quickstart](docs/developer/remote-core-quickstart.md) for pinned commands,
-local tarballs and adapter examples. They are reusable components, not a complete self-hosted
-application or desktop remote agent.
+local tarballs and adapter examples, including the browser controller and terminal renderer.
+Build the [Remote agent](hydra-agent/README.md) separately with an explicit public trust descriptor.
+Its isolated Cargo workspace/lock preserves the local desktop dependency graph. These components
+do not supply a turnkey self-hosted account/enrollment service.
 
-The unsigned desktop packaging scripts do not bundle these libraries or a private agent. The
+The unsigned desktop packaging scripts do not bundle these libraries or a separately built agent. The
 optional extension's absence/incompatibility behavior above is unchanged. Library integration must
 supply identity, authorization, persistence and network composition; transport connectivity alone
 does not authorize terminal operations.
@@ -187,7 +189,7 @@ that migration, not a patch-level dependency update.
 
 ## Unsigned local-only packaging smoke
 
-These scripts prove that this repository can assemble a runnable local layout without the private
+These scripts prove that this repository can assemble a runnable local layout without bundling the separately built Remote
 agent. They are contributor artifacts, not notarized or supported Hydra releases:
 
 ```sh
@@ -212,7 +214,7 @@ model-catalog metadata automatically. The fixed-origin `maestro-app/official-dis
 feature enables the public model-catalog feed for HydraTerms' separately controlled official
 package build, but the unsigned desktop update feed remains disabled for every feature set until
 the binary can verify an application-pinned signed manifest and downloaded artifact bytes. The
-feature exposes no runtime URL override and does not add the private remote agent.
+feature exposes no runtime URL override and does not add the separately built remote agent.
 
 ## Design boundaries
 

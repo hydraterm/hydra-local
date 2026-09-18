@@ -6,8 +6,8 @@ Hydra is a local-first terminal desktop for running terminal sessions and coding
 retained PTY service owns the live terminal processes, while the desktop supplies projects, panes,
 layouts, provider-session discovery and a native terminal view.
 
-This repository contains the complete local desktop and reusable Remote transport/signaling
-libraries. Official packages may also include the separate proprietary agent and hosted-service
+This repository contains the local desktop and Remote agent, browser engine and broker source.
+Official packages also integrate the independently operated hosted-service
 composition described in the
 [public/private boundary](docs/public-private-boundary.md).
 
@@ -48,20 +48,21 @@ The current provider coverage and its limits are listed in the
 
 ## Which parts of Hydra Remote are open source?
 
-The reusable browser WebRTC transport and content-blind signaling broker are MIT-licensed here.
-They expose typed interfaces for independent adapters and do not require Clerk or Stripe. See the
-[Remote library quickstart](docs/developer/remote-core-quickstart.md).
+The local desktop, desktop/headless Remote agent, browser terminal/controller engine and
+signaling broker in this repository are open source under the [MIT License](LICENSE).
+They can be inspected, built, forked and extended without Clerk or Stripe dependencies.
 
-These libraries are not a complete self-hosted Remote application or desktop agent. The hosted
-account website, identity/billing integrations, enrollment and authorization-service composition,
-deployment configuration, relay operation and desktop agent remain outside this source release.
-The local desktop remains usable independently, and installing the libraries does not grant hosted
-service access or enable Remote controls in a source-built desktop.
+The browser engine provides terminal rendering, session/layout control, reconnect and encrypted
+transport. The agent authenticates and authorizes remote operations before forwarding them to
+retained local PTYs. Independent integrations supply services through the typed interfaces.
 
-This is a product and source boundary, not a claim that secrecy provides security. The private
-agent must authenticate and authorize remote operations; a modified public app cannot grant itself
-remote authority. The exact scope and trust model are documented in the
-[public/private boundary](docs/public-private-boundary.md).
+The hosted account website and its surrounding UI, Clerk/Stripe integrations, hosted enrollment
+and authorization-service composition, billing operations, deployment configuration and relay
+infrastructure remain private. This is a source release, not a turnkey self-hosted service or
+a new installer. Building the source does not grant access to HydraTerms' hosted service.
+
+See the [browser/broker quickstart](docs/developer/remote-core-quickstart.md),
+[agent build guide](hydra-agent/README.md) and [public/private boundary](docs/public-private-boundary.md).
 
 ## What is Hydra's local security model?
 
@@ -91,7 +92,7 @@ existing agent CLIs.
 ## What is the difference between an official package and a source build?
 
 A source build contains the public local desktop and uses development-only state when run through
-the fast developer harness. It is unsigned, does not contain the private remote agent and does not
+the fast developer harness. It is unsigned, does not contain the separately built remote agent and does not
 receive official update or model-catalog metadata by default.
 
 Official packages are signed production artifacts with the installed launcher and service topology.
