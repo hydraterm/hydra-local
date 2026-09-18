@@ -11,10 +11,10 @@ change or replace any upstream licence.
 - `hydra-agent/Cargo.lock` SHA-256: `7975a2d18916737df32457a372eedfb1f60c19217841999ec8671b022beb88d4`
 - Standalone WebRTC agent dependency versions: 343
 - npm dependency versions: 188
-- `web-client/package-lock.json` SHA-256: `ef9c130a7481c2c23f7a02197beccc12a6925c99bc1ab281d347ba9a952c88e3`
-- Browser-core development dependency versions: 105
-- `hydra-cloud/package-lock.json` SHA-256: `325f475dd0ab2f374d3086d4ed895da61fa0fb59a7c3affc9b1fb9115996d3c8`
-- Broker-core development dependency versions: 104
+- `web-client/package-lock.json` SHA-256: `82a5509d84c09e94c73944ef5c757d892fff2bb5c3435dca1d96207330908168`
+- Browser-core development dependency versions: 95
+- `hydra-cloud/package-lock.json` SHA-256: `7f5ddebc65344d243e81b92debe52a231e7c5111a1d7abd007ebbffc81eea1ba`
+- Broker-core development dependency versions: 94
 
 The source repository does not vendor these dependencies. Package managers retrieve each
 dependency from its named upstream, where the complete corresponding licence and copyright
@@ -1177,7 +1177,7 @@ than bundled tool notices. Tool redistributors must review the actual material t
 | `@esbuild/win32-arm64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/win32-arm64) |
 | `@esbuild/win32-ia32` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/win32-ia32) |
 | `@esbuild/win32-x64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/win32-x64) |
-| `@jridgewell/sourcemap-codec` | `1.5.5` | `MIT` | [source](https://www.npmjs.com/package/@jridgewell/sourcemap-codec) |
+| `@jridgewell/sourcemap-codec` | `1.6.0` | `MIT` | [source](https://www.npmjs.com/package/@jridgewell/sourcemap-codec) |
 | `@rollup/rollup-android-arm-eabi` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-android-arm-eabi) |
 | `@rollup/rollup-android-arm64` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-android-arm64) |
 | `@rollup/rollup-darwin-arm64` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-darwin-arm64) |
@@ -1203,58 +1203,48 @@ than bundled tool notices. Tool redistributors must review the actual material t
 | `@rollup/rollup-win32-ia32-msvc` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-win32-ia32-msvc) |
 | `@rollup/rollup-win32-x64-gnu` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-win32-x64-gnu) |
 | `@rollup/rollup-win32-x64-msvc` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-win32-x64-msvc) |
+| `@standard-schema/spec` | `1.1.0` | `MIT` | [source](https://www.npmjs.com/package/@standard-schema/spec) |
 | `@types/chai` | `5.2.3` | `MIT` | [source](https://www.npmjs.com/package/@types/chai) |
 | `@types/deep-eql` | `4.0.2` | `MIT` | [source](https://www.npmjs.com/package/@types/deep-eql) |
 | `@types/estree` | `1.0.9` | `MIT` | [source](https://www.npmjs.com/package/@types/estree) |
 | `@types/node` | `26.0.1` | `MIT` | [source](https://www.npmjs.com/package/@types/node) |
-| `@vitest/expect` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/expect) |
-| `@vitest/mocker` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/mocker) |
-| `@vitest/pretty-format` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/pretty-format) |
-| `@vitest/pretty-format` | `3.2.7` | `MIT` | [source](https://www.npmjs.com/package/@vitest/pretty-format) |
-| `@vitest/runner` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/runner) |
-| `@vitest/snapshot` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/snapshot) |
-| `@vitest/spy` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/spy) |
-| `@vitest/utils` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/utils) |
+| `@vitest/expect` | `4.1.11` | `MIT` | [source](https://www.npmjs.com/package/@vitest/expect) |
+| `@vitest/mocker` | `4.1.11` | `MIT` | [source](https://www.npmjs.com/package/@vitest/mocker) |
+| `@vitest/pretty-format` | `4.1.11` | `MIT` | [source](https://www.npmjs.com/package/@vitest/pretty-format) |
+| `@vitest/runner` | `4.1.11` | `MIT` | [source](https://www.npmjs.com/package/@vitest/runner) |
+| `@vitest/snapshot` | `4.1.11` | `MIT` | [source](https://www.npmjs.com/package/@vitest/snapshot) |
+| `@vitest/spy` | `4.1.11` | `MIT` | [source](https://www.npmjs.com/package/@vitest/spy) |
+| `@vitest/utils` | `4.1.11` | `MIT` | [source](https://www.npmjs.com/package/@vitest/utils) |
 | `assertion-error` | `2.0.1` | `MIT` | [source](https://www.npmjs.com/package/assertion-error) |
-| `cac` | `6.7.14` | `MIT` | [source](https://www.npmjs.com/package/cac) |
-| `chai` | `5.3.3` | `MIT` | [source](https://www.npmjs.com/package/chai) |
-| `check-error` | `2.1.3` | `MIT` | [source](https://www.npmjs.com/package/check-error) |
-| `debug` | `4.4.3` | `MIT` | [source](https://www.npmjs.com/package/debug) |
-| `deep-eql` | `5.0.2` | `MIT` | [source](https://www.npmjs.com/package/deep-eql) |
-| `es-module-lexer` | `1.7.0` | `MIT` | [source](https://www.npmjs.com/package/es-module-lexer) |
+| `chai` | `6.2.2` | `MIT` | [source](https://www.npmjs.com/package/chai) |
+| `convert-source-map` | `2.0.0` | `MIT` | [source](https://www.npmjs.com/package/convert-source-map) |
+| `es-module-lexer` | `2.3.2` | `MIT` | [source](https://www.npmjs.com/package/es-module-lexer) |
 | `esbuild` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/esbuild) |
 | `estree-walker` | `3.0.3` | `MIT` | [source](https://www.npmjs.com/package/estree-walker) |
 | `expect-type` | `1.3.0` | `Apache-2.0` | [source](https://www.npmjs.com/package/expect-type) |
 | `fdir` | `6.5.0` | `MIT` | [source](https://www.npmjs.com/package/fdir) |
 | `fsevents` | `2.3.3` | `MIT` | [source](https://www.npmjs.com/package/fsevents) |
-| `js-tokens` | `9.0.1` | `MIT` | [source](https://www.npmjs.com/package/js-tokens) |
-| `loupe` | `3.2.1` | `MIT` | [source](https://www.npmjs.com/package/loupe) |
 | `magic-string` | `0.30.21` | `MIT` | [source](https://www.npmjs.com/package/magic-string) |
-| `ms` | `2.1.3` | `MIT` | [source](https://www.npmjs.com/package/ms) |
-| `nanoid` | `3.3.15` | `MIT` | [source](https://www.npmjs.com/package/nanoid) |
+| `nanoid` | `3.3.19` | `MIT` | [source](https://www.npmjs.com/package/nanoid) |
+| `obug` | `2.2.1` | `MIT` | [source](https://www.npmjs.com/package/obug) |
 | `pathe` | `2.0.3` | `MIT` | [source](https://www.npmjs.com/package/pathe) |
-| `pathval` | `2.0.1` | `MIT` | [source](https://www.npmjs.com/package/pathval) |
 | `picocolors` | `1.1.1` | `ISC` | [source](https://www.npmjs.com/package/picocolors) |
 | `picomatch` | `4.0.4` | `MIT` | [source](https://www.npmjs.com/package/picomatch) |
 | `picomatch` | `4.0.5` | `MIT` | [source](https://www.npmjs.com/package/picomatch) |
-| `postcss` | `8.5.15` | `MIT` | [source](https://www.npmjs.com/package/postcss) |
+| `postcss` | `8.5.26` | `MIT` | [source](https://www.npmjs.com/package/postcss) |
 | `rollup` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/rollup) |
 | `siginfo` | `2.0.0` | `ISC` | [source](https://www.npmjs.com/package/siginfo) |
 | `source-map-js` | `1.2.1` | `BSD-3-Clause` | [source](https://www.npmjs.com/package/source-map-js) |
 | `stackback` | `0.0.2` | `MIT` | [source](https://www.npmjs.com/package/stackback) |
-| `std-env` | `3.10.0` | `MIT` | [source](https://www.npmjs.com/package/std-env) |
-| `strip-literal` | `3.1.0` | `MIT` | [source](https://www.npmjs.com/package/strip-literal) |
+| `std-env` | `4.2.0` | `MIT` | [source](https://www.npmjs.com/package/std-env) |
 | `tinybench` | `2.9.0` | `MIT` | [source](https://www.npmjs.com/package/tinybench) |
-| `tinyexec` | `0.3.2` | `MIT` | [source](https://www.npmjs.com/package/tinyexec) |
+| `tinyexec` | `1.3.1` | `MIT` | [source](https://www.npmjs.com/package/tinyexec) |
 | `tinyglobby` | `0.2.17` | `MIT` | [source](https://www.npmjs.com/package/tinyglobby) |
-| `tinypool` | `1.1.1` | `MIT` | [source](https://www.npmjs.com/package/tinypool) |
-| `tinyrainbow` | `2.0.0` | `MIT` | [source](https://www.npmjs.com/package/tinyrainbow) |
-| `tinyspy` | `4.0.4` | `MIT` | [source](https://www.npmjs.com/package/tinyspy) |
+| `tinyrainbow` | `3.1.1` | `MIT` | [source](https://www.npmjs.com/package/tinyrainbow) |
 | `typescript` | `5.9.3` | `Apache-2.0` | [source](https://www.npmjs.com/package/typescript) |
 | `undici-types` | `8.3.0` | `MIT` | [source](https://www.npmjs.com/package/undici-types) |
 | `vite` | `6.4.3` | `MIT` | [source](https://www.npmjs.com/package/vite) |
-| `vite-node` | `3.2.4` | `MIT` | [source](https://www.npmjs.com/package/vite-node) |
-| `vitest` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/vitest) |
+| `vitest` | `4.1.11` | `MIT` | [source](https://www.npmjs.com/package/vitest) |
 | `why-is-node-running` | `2.3.0` | `MIT` | [source](https://www.npmjs.com/package/why-is-node-running) |
 
 ### Locked broker-core development dependencies
@@ -1287,7 +1277,7 @@ than bundled tool notices. Tool redistributors must review the actual material t
 | `@esbuild/win32-arm64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/win32-arm64) |
 | `@esbuild/win32-ia32` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/win32-ia32) |
 | `@esbuild/win32-x64` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/@esbuild/win32-x64) |
-| `@jridgewell/sourcemap-codec` | `1.5.5` | `MIT` | [source](https://www.npmjs.com/package/@jridgewell/sourcemap-codec) |
+| `@jridgewell/sourcemap-codec` | `1.6.0` | `MIT` | [source](https://www.npmjs.com/package/@jridgewell/sourcemap-codec) |
 | `@rollup/rollup-android-arm-eabi` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-android-arm-eabi) |
 | `@rollup/rollup-android-arm64` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-android-arm64) |
 | `@rollup/rollup-darwin-arm64` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-darwin-arm64) |
@@ -1313,57 +1303,47 @@ than bundled tool notices. Tool redistributors must review the actual material t
 | `@rollup/rollup-win32-ia32-msvc` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-win32-ia32-msvc) |
 | `@rollup/rollup-win32-x64-gnu` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-win32-x64-gnu) |
 | `@rollup/rollup-win32-x64-msvc` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/@rollup/rollup-win32-x64-msvc) |
+| `@standard-schema/spec` | `1.1.0` | `MIT` | [source](https://www.npmjs.com/package/@standard-schema/spec) |
 | `@types/chai` | `5.2.3` | `MIT` | [source](https://www.npmjs.com/package/@types/chai) |
 | `@types/deep-eql` | `4.0.2` | `MIT` | [source](https://www.npmjs.com/package/@types/deep-eql) |
 | `@types/estree` | `1.0.9` | `MIT` | [source](https://www.npmjs.com/package/@types/estree) |
 | `@types/node` | `22.20.0` | `MIT` | [source](https://www.npmjs.com/package/@types/node) |
-| `@vitest/expect` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/expect) |
-| `@vitest/mocker` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/mocker) |
-| `@vitest/pretty-format` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/pretty-format) |
-| `@vitest/pretty-format` | `3.2.7` | `MIT` | [source](https://www.npmjs.com/package/@vitest/pretty-format) |
-| `@vitest/runner` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/runner) |
-| `@vitest/snapshot` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/snapshot) |
-| `@vitest/spy` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/spy) |
-| `@vitest/utils` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/@vitest/utils) |
+| `@vitest/expect` | `4.1.11` | `MIT` | [source](https://www.npmjs.com/package/@vitest/expect) |
+| `@vitest/mocker` | `4.1.11` | `MIT` | [source](https://www.npmjs.com/package/@vitest/mocker) |
+| `@vitest/pretty-format` | `4.1.11` | `MIT` | [source](https://www.npmjs.com/package/@vitest/pretty-format) |
+| `@vitest/runner` | `4.1.11` | `MIT` | [source](https://www.npmjs.com/package/@vitest/runner) |
+| `@vitest/snapshot` | `4.1.11` | `MIT` | [source](https://www.npmjs.com/package/@vitest/snapshot) |
+| `@vitest/spy` | `4.1.11` | `MIT` | [source](https://www.npmjs.com/package/@vitest/spy) |
+| `@vitest/utils` | `4.1.11` | `MIT` | [source](https://www.npmjs.com/package/@vitest/utils) |
 | `assertion-error` | `2.0.1` | `MIT` | [source](https://www.npmjs.com/package/assertion-error) |
-| `cac` | `6.7.14` | `MIT` | [source](https://www.npmjs.com/package/cac) |
-| `chai` | `5.3.3` | `MIT` | [source](https://www.npmjs.com/package/chai) |
-| `check-error` | `2.1.3` | `MIT` | [source](https://www.npmjs.com/package/check-error) |
-| `debug` | `4.4.3` | `MIT` | [source](https://www.npmjs.com/package/debug) |
-| `deep-eql` | `5.0.2` | `MIT` | [source](https://www.npmjs.com/package/deep-eql) |
-| `es-module-lexer` | `1.7.0` | `MIT` | [source](https://www.npmjs.com/package/es-module-lexer) |
+| `chai` | `6.2.2` | `MIT` | [source](https://www.npmjs.com/package/chai) |
+| `convert-source-map` | `2.0.0` | `MIT` | [source](https://www.npmjs.com/package/convert-source-map) |
+| `es-module-lexer` | `2.3.2` | `MIT` | [source](https://www.npmjs.com/package/es-module-lexer) |
 | `esbuild` | `0.25.12` | `MIT` | [source](https://www.npmjs.com/package/esbuild) |
 | `estree-walker` | `3.0.3` | `MIT` | [source](https://www.npmjs.com/package/estree-walker) |
 | `expect-type` | `1.3.0` | `Apache-2.0` | [source](https://www.npmjs.com/package/expect-type) |
 | `fdir` | `6.5.0` | `MIT` | [source](https://www.npmjs.com/package/fdir) |
 | `fsevents` | `2.3.3` | `MIT` | [source](https://www.npmjs.com/package/fsevents) |
-| `js-tokens` | `9.0.1` | `MIT` | [source](https://www.npmjs.com/package/js-tokens) |
-| `loupe` | `3.2.1` | `MIT` | [source](https://www.npmjs.com/package/loupe) |
 | `magic-string` | `0.30.21` | `MIT` | [source](https://www.npmjs.com/package/magic-string) |
-| `ms` | `2.1.3` | `MIT` | [source](https://www.npmjs.com/package/ms) |
-| `nanoid` | `3.3.16` | `MIT` | [source](https://www.npmjs.com/package/nanoid) |
+| `nanoid` | `3.3.19` | `MIT` | [source](https://www.npmjs.com/package/nanoid) |
+| `obug` | `2.2.1` | `MIT` | [source](https://www.npmjs.com/package/obug) |
 | `pathe` | `2.0.3` | `MIT` | [source](https://www.npmjs.com/package/pathe) |
-| `pathval` | `2.0.1` | `MIT` | [source](https://www.npmjs.com/package/pathval) |
 | `picocolors` | `1.1.1` | `ISC` | [source](https://www.npmjs.com/package/picocolors) |
 | `picomatch` | `4.0.5` | `MIT` | [source](https://www.npmjs.com/package/picomatch) |
-| `postcss` | `8.5.21` | `MIT` | [source](https://www.npmjs.com/package/postcss) |
+| `postcss` | `8.5.26` | `MIT` | [source](https://www.npmjs.com/package/postcss) |
 | `rollup` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/rollup) |
 | `siginfo` | `2.0.0` | `ISC` | [source](https://www.npmjs.com/package/siginfo) |
 | `source-map-js` | `1.2.1` | `BSD-3-Clause` | [source](https://www.npmjs.com/package/source-map-js) |
 | `stackback` | `0.0.2` | `MIT` | [source](https://www.npmjs.com/package/stackback) |
-| `std-env` | `3.10.0` | `MIT` | [source](https://www.npmjs.com/package/std-env) |
-| `strip-literal` | `3.1.0` | `MIT` | [source](https://www.npmjs.com/package/strip-literal) |
+| `std-env` | `4.2.0` | `MIT` | [source](https://www.npmjs.com/package/std-env) |
 | `tinybench` | `2.9.0` | `MIT` | [source](https://www.npmjs.com/package/tinybench) |
-| `tinyexec` | `0.3.2` | `MIT` | [source](https://www.npmjs.com/package/tinyexec) |
+| `tinyexec` | `1.3.1` | `MIT` | [source](https://www.npmjs.com/package/tinyexec) |
 | `tinyglobby` | `0.2.17` | `MIT` | [source](https://www.npmjs.com/package/tinyglobby) |
-| `tinypool` | `1.1.1` | `MIT` | [source](https://www.npmjs.com/package/tinypool) |
-| `tinyrainbow` | `2.0.0` | `MIT` | [source](https://www.npmjs.com/package/tinyrainbow) |
-| `tinyspy` | `4.0.4` | `MIT` | [source](https://www.npmjs.com/package/tinyspy) |
+| `tinyrainbow` | `3.1.1` | `MIT` | [source](https://www.npmjs.com/package/tinyrainbow) |
 | `typescript` | `5.9.3` | `Apache-2.0` | [source](https://www.npmjs.com/package/typescript) |
 | `undici-types` | `6.21.0` | `MIT` | [source](https://www.npmjs.com/package/undici-types) |
 | `vite` | `6.4.3` | `MIT` | [source](https://www.npmjs.com/package/vite) |
-| `vite-node` | `3.2.4` | `MIT` | [source](https://www.npmjs.com/package/vite-node) |
-| `vitest` | `3.2.6` | `MIT` | [source](https://www.npmjs.com/package/vitest) |
+| `vitest` | `4.1.11` | `MIT` | [source](https://www.npmjs.com/package/vitest) |
 | `why-is-node-running` | `2.3.0` | `MIT` | [source](https://www.npmjs.com/package/why-is-node-running) |
 
 ## Updating this file
