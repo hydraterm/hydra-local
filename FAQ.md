@@ -78,16 +78,21 @@ in [SECURITY.md](SECURITY.md).
 
 ## How is Hydra different from Herdr?
 
-[Herdr](https://herdr.dev/) describes itself as a terminal-native agent runtime and multiplexer: one
-server owns panes, its TUI runs in an existing terminal, and a local socket API lets tools and agents
-control the runtime.
+**Herdr is an agent-aware multiplexer. Hydra combines an agent-aware native terminal,
+multiplexer, and cloud connectivity.**
 
-Hydra is a desktop terminal product. It combines a native WGPU terminal with project organization,
-provider-history discovery, graphical panes and dashboard workflows. Both products retain terminal
-sessions independently of the UI that is currently attached, but their interfaces and automation
-models are different. Herdr is the stronger fit when terminal-native multiplexing and a socket API
-are the priority; Hydra is designed for users who want a dedicated desktop workspace around their
-existing agent CLIs.
+Herdr's interface runs inside an existing terminal emulator. Hydra includes its own native,
+GPU-rendered terminal and a mouse-first desktop interface: organize projects, rename windows,
+split panes, and discover existing provider sessions without assembling separate tools.
+
+The Remote setup is different too. [Herdr's documented remote workflow requires SSH access
+to the target machine](https://herdr.dev/docs/connecting-machines/). Hydra Remote connects
+you to the same sessions from a browser or phone without configuring an SSH server, SSH keys,
+or an inbound SSH port. The sessions stay on your machine; Remote gives you another way to
+reach them.
+
+Both retain running sessions independently of the attached interface. Hydra brings the terminal,
+multiplexing, session discovery, and remote access together in one product.
 
 ## What is the difference between an official package and a source build?
 
