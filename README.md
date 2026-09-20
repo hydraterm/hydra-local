@@ -1,49 +1,78 @@
 # Hydra
 
-Hydra is a local-first terminal desktop for macOS and Linux, built for terminal sessions and coding
-agents.
+**Pick up the coding sessions you already started.**
 
-[Download](https://hydraterms.com/#direct-downloads-heading) ·
-[Features](#what-is-in-this-repository) · [Remote source](#open-source-and-hydra-remote) · [Build](#build) ·
+Hydra is a local-first terminal workspace for macOS and Linux. Find existing coding-agent
+sessions, organize them by project, and keep jobs running when you close the app.
+Optional Remote access brings the same workspace to your browser or phone.
+
+[Download](https://hydraterms.com/#install) · [What you can do](#what-you-can-do) ·
+[First minute](#your-first-minute) · [Build with Remote](#open-source-and-hydra-remote) ·
 [Privacy](https://hydraterms.com/privacy.html)
 
-![Synthetic Hydra local desktop showing a neutral project, retained panes and a local test run](docs/assets/hydra-local-demo.gif)
+[![Real Hydra project dialog showing an existing coding-agent session available to resume](https://hydraterms.com/assets/product/resume-bebc33e22155.webp)](https://hydraterms.com/assets/product/resume-bebc33e22155.webp)
 
-*Synthetic product illustration; no account, terminal transcript, personal path or live desktop was
-recorded.*
+*Real product capture. Open it at full size to inspect the previous-session list.
+Permission-bypass options visible in this older capture are not needed for discovery or resume.*
 
-Projects, windows, panes, terminal history and retained PTY sessions live on your machine.
+## What you can do
 
-## Start here
+- **Find earlier work.** Point Hydra at a project folder and discover supported agents’ local
+  session history, including sessions started outside Hydra.
+- **Close the app, not the job.** A separate local daemon retains the live terminals when the
+  desktop interface closes. Your machine must remain running.
+- **Keep related work together.** Organize projects, windows and panes, with different agents
+  beside one another.
+- **Check the same terminal remotely.** Official packages include optional browser and phone
+  access without exposing an inbound Hydra terminal port.
 
-- [Remote engine quickstart](docs/developer/remote-core-quickstart.md) — build the browser
-  controller, terminal renderer and broker, and implement your own adapters.
-- [Remote agent build guide](hydra-agent/README.md) — compile the desktop/headless agent separately.
-
-- [Frequently asked questions](FAQ.md) — tmux, Electron, retention, Remote, security and Herdr.
-- [Architecture](docs/architecture.md) — PTY ownership, native rendering, dashboard composition and
-  the macOS/Linux host split.
-- [Troubleshooting](TROUBLESHOOTING.md) — local-data migration, agent discovery and Linux display
-  backends.
-- [Development](DEVELOPMENT.md) and [contributing](CONTRIBUTING.md) — build, test and contribution
-  contracts.
+Closing the app is not rebooting the machine. A reboot ends running processes; supported agent
+conversations can resume in new processes. See [retention and other limits](FAQ.md).
 
 ## Install
 
-Official macOS package:
+Local desktop use does not require a Hydra account. Your chosen agent may need its own login.
+
+macOS with Homebrew:
 
 ```sh
 brew install --cask hydraterm/hydra/hydraterms
 ```
 
-Official Linux package:
+Ubuntu/Debian through the official installer:
 
 ```sh
 curl -fsSL https://hydraterms.com/install.sh | sh
 ```
 
+Prefer to inspect the installer first? [Read install.sh](https://hydraterms.com/install.sh).
+[Direct packages and portable archives](https://hydraterms.com/#direct-downloads-heading)
+are also available. Check the installation page for supported formats and architectures.
+
 Official packages include Hydra Remote integration. This repository contains the local desktop
 and separately buildable Remote engine/agent source, not the hosted account website or service access.
+
+## Your first minute
+
+1. Open Hydra and choose **New project**.
+2. Choose a folder where you have already used a supported coding agent.
+3. Select that agent and look for a previous session in the project dialog.
+4. Choose the session to resume, then create the project.
+5. Add windows or split panes as you need them.
+
+No sessions listed? Check the selected folder, provider and operating-system user first.
+History support differs between providers. See [provider interoperability](#provider-interoperability)
+and [troubleshooting](TROUBLESHOOTING.md).
+
+## Help and developer resources
+
+- [Frequently asked questions](FAQ.md) — retention, provider support, Remote and security.
+- [Troubleshooting](TROUBLESHOOTING.md) — discovery, local-data migration and Linux display backends.
+- [Remote engine quickstart](docs/developer/remote-core-quickstart.md) — build the browser engine
+  and broker for your own integration.
+- [Remote agent build guide](hydra-agent/README.md) — build the desktop/headless agent separately.
+- [Architecture](docs/architecture.md) — PTY ownership, native rendering and desktop composition.
+- [Development](DEVELOPMENT.md) and [contributing](CONTRIBUTING.md) — build, test and contribution contracts.
 
 ## What is in this repository
 
