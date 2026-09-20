@@ -10,10 +10,9 @@ Optional Remote access brings the same workspace to your browser or phone.
 [First minute](#your-first-minute) · [Build with Remote](#open-source-and-hydra-remote) ·
 [Privacy](https://hydraterms.com/privacy.html)
 
-[![Real Hydra project dialog showing an existing coding-agent session available to resume](https://hydraterms.com/assets/product/resume-bebc33e22155.webp)](https://hydraterms.com/assets/product/resume-bebc33e22155.webp)
+[![Real Hydra app: rename a window, collapse the sidebar, then reopen it](docs/assets/hydra-sidebar-82e88d7ec829.gif)](docs/assets/hydra-sidebar-82e88d7ec829.gif)
 
-*Real product capture. Open it at full size to inspect the previous-session list.
-Permission-bypass options visible in this older capture are not needed for discovery or resume.*
+*8-second desktop demo: rename a window and collapse/reopen the sidebar.*
 
 ## What you can do
 
@@ -63,6 +62,11 @@ and separately buildable Remote engine/agent source, not the hosted account webs
 No sessions listed? Check the selected folder, provider and operating-system user first.
 History support differs between providers. See [provider interoperability](#provider-interoperability)
 and [troubleshooting](TROUBLESHOOTING.md).
+
+[![Real Hydra project dialog showing an existing coding-agent session available to resume](https://hydraterms.com/assets/product/resume-bebc33e22155.webp)](https://hydraterms.com/assets/product/resume-bebc33e22155.webp)
+
+*Real product capture. Open it at full size to inspect the previous-session list.
+Permission-bypass options visible in this older capture are not needed for discovery or resume.*
 
 ## Help and developer resources
 

@@ -30,7 +30,14 @@ readonly REVIEWED_DEMO_SHA256='ff400ac46275e299120a720279f1a1cc849a0aa65b895290b
 [[ "$(shasum -a 256 "$REVIEWED_DEMO" | awk '{print $1}')" == "$REVIEWED_DEMO_SHA256" ]] || \
   fail "reviewed synthetic demo digest changed"
 
-if find . -path './.git' -prune -o -type f ! -path "./$REVIEWED_DEMO" \( \
+readonly REVIEWED_SIDEBAR='docs/assets/hydra-sidebar-82e88d7ec829.gif'
+readonly REVIEWED_SIDEBAR_SHA256='82e88d7ec829f999488a4a447d2fef17fe6a4f3027d7af6f5be337490918a12f'
+[[ -f "$REVIEWED_SIDEBAR" && ! -L "$REVIEWED_SIDEBAR" ]] || \
+  fail "reviewed sidebar demo is missing or is not a regular file"
+[[ "$(shasum -a 256 "$REVIEWED_SIDEBAR" | awk '{print $1}')" == "$REVIEWED_SIDEBAR_SHA256" ]] || \
+  fail "reviewed sidebar demo digest changed"
+
+if find . -path './.git' -prune -o -type f ! -path "./$REVIEWED_DEMO" ! -path "./$REVIEWED_SIDEBAR" \( \
   -iname '*.png' -o -iname '*.svg' -o -iname '*.gif' -o -iname '*.webp' \
   -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.mov' -o -iname '*.mp4' \
   -o -iname '*.pdf' -o -iname '*.zip' -o -iname '*.tar' -o -iname '*.gz' \
@@ -40,7 +47,7 @@ if find . -path './.git' -prune -o -type f ! -path "./$REVIEWED_DEMO" \( \
   fail "unreviewed binary, image, recording, archive, installer, or font asset is present"
 fi
 
-python3 - "$ROOT" "$REVIEWED_DEMO" "$REVIEWED_DEMO_SHA256" <<'PY'
+python3 - "$ROOT" "$REVIEWED_DEMO" "$REVIEWED_DEMO_SHA256" "$REVIEWED_SIDEBAR" "$REVIEWED_SIDEBAR_SHA256" <<'PY'
 import json
 import hashlib
 import ipaddress
@@ -55,6 +62,7 @@ reviewed_demo = sys.argv[2]
 reviewed_demo_sha256 = sys.argv[3]
 reviewed_binary_files = {
     reviewed_demo: reviewed_demo_sha256,
+    sys.argv[4]: sys.argv[5],
 }
 allowed_root_entries = {
     ".editorconfig", ".git", ".github", ".gitignore", ".nvmrc", ".python-version",
@@ -74,6 +82,7 @@ if unexpected_root:
 allowed_docs = {
     "architecture.md",
     "assets/hydra-local-demo.gif",
+    "assets/hydra-sidebar-82e88d7ec829.gif",
     "public-private-boundary.md",
     "third-party-licensing.md",
     "developer/local-control-quickstart.md",
