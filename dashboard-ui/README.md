@@ -31,6 +31,24 @@ npm --prefix dashboard-ui run build
 The production build is inlined by `scripts/inline-dist.mjs` and packaged as trusted application
 assets. Hosts still validate every message through the Rust intent decoder.
 
+### Optional submit-button paint check
+
+With an already installed Playwright module and matching browser (no automatic downloads):
+
+```bash
+HYDRA_BROWSER_MODULE=/absolute/path/to/playwright/index.mjs npm run test:submit-paint -- /new/evidence/directory
+```
+
+`HYDRA_BROWSER_ENGINE=webkit` selects WebKit instead of Chromium; an optional
+`HYDRA_BROWSER_EXECUTABLE` selects an explicit matching executable. The output directory must not
+exist, so earlier results and screenshots cannot be overwritten. The test bundles the real React
+creation dialogs, selects an agent/model, checks screenshot pixels for button fill and label ink,
+and verifies exactly one creation intent after synthetic preflight acceptance. It covers disabled,
+enabled, hover, keyboard-focus and checking states. All network requests are isolated to the fixture.
+One matrix removes unsupported `color-mix()` declarations using a CSS parser; the other uses the
+unchanged stylesheet. This proves the fallback cascade, not an old system WebKit or installed-app
+compatibility matrix. Native screenshot qualification remains required for a reported Mac failure.
+
 ## Change rules
 
 - Update React intent types and the Rust decoder/dispatcher together.
