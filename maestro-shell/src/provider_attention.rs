@@ -9,6 +9,83 @@ pub enum ProviderAttentionObservation {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum ObservedProvider {
+    OpenCode,
+    Codex,
+}
+
+/// Narrow recorded Codex 0.159.2 UI observation; this never infers task completion.
+pub fn classify_codex_grid(rows: &[&str]) -> ProviderAttentionObservation {
+    use ProviderAttentionObservation::{Idle, Unknown, Waiting, Working};
+    if rows.len() > 256 || rows.iter().map(|row| row.len()).sum::<usize>() > 64 * 1024 {
+        return Unknown;
+    }
+    let rows = rows.iter().map(|row| row.trim()).collect::<Vec<_>>();
+    let bottom = &rows[..];
+    if bottom.last() == Some(&"Press enter to confirm or esc to cancel") {
+        let Some(header) = bottom
+            .iter()
+            .rposition(|row| *row == "Would you like to run the following command?")
+        else {
+            return Unknown;
+        };
+        let panel = bottom[header + 1..]
+            .iter()
+            .map(|row| row.strip_prefix("› ").unwrap_or(row))
+            .filter(|row| !row.is_empty())
+            .collect::<Vec<_>>();
+        // Commands/reasons may wrap, but all ordered provider actions and the actual bottom
+        // confirmation footer must coexist. A transcript mention above the composer is not UI.
+        let Some(yes) = panel.iter().position(|row| *row == "1. Yes, proceed (y)") else {
+            return Unknown;
+        };
+        let before = &panel[..yes];
+        let actions = &panel[yes..];
+        return if before.first() == Some(&"Environment: local")
+            && before.iter().any(|row| row.starts_with("Reason: "))
+            && before.iter().any(|row| row.starts_with("$ "))
+            && actions.get(1).is_some_and(|row| {
+                row.starts_with("2. Yes, and don't ask again for commands that start with `")
+            })
+            && actions.len() >= 4
+            && actions[actions.len() - 2] == "3. No, and tell Codex what to do differently (esc)"
+            && actions.last() == Some(&"Press enter to confirm or esc to cancel")
+        {
+            Waiting
+        } else {
+            Unknown
+        };
+    }
+    // Positive recovery requires the recorded bottom input composer and provider shortcut
+    // footer, not assistant text claiming approval/completion. Other layouts stay unknown.
+    if rows
+        .last()
+        .is_some_and(|row| row.starts_with("? for shortcuts"))
+    {
+        if let Some(composer) = rows
+            .iter()
+            .rposition(|row| *row == "› Ask Codex to do anything")
+        {
+            if rows.len() - composer == 4 {
+                return if rows[composer.saturating_sub(5)..composer]
+                    .iter()
+                    .any(|row| row.starts_with("• Working (") && row.ends_with("esc to interrupt)"))
+                {
+                    Working
+                } else {
+                    Idle
+                };
+            }
+        }
+    }
+    Unknown
+}
+
+#[cfg(test)]
+#[path = "provider_attention_codex_tests.rs"]
+mod codex_tests;
+
 /// Classify only OpenCode's recorded UI structure, not words in its assistant transcript.
 /// Unknown output never means success, and an idle input composer never finishes a Hydra task.
 pub fn classify_opencode_grid(rows: &[&str]) -> ProviderAttentionObservation {

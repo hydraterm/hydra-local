@@ -1,0 +1,15 @@
+{
+  "provider": "OpenCode",
+  "version": "1.18.23",
+  "cli_sha256": "de0724a36eaf3166e7f1ff38d0f4478b95ccc47725e9597b3fe66d3d3e18baa2",
+  "daemon_sha256": "88c50971f43069955fa7ddd4004b38c7626d86f92a654ee4b9e36f9a940f5ffc",
+  "source": "Real installed headless CLI owned by the actual daemon; deterministic synthetic loopback HTTP400, no paid provider or credentials",
+  "capture_argv": ["<installed-opencode>", "run", "--model", "fixture/fixture", "--format", "json", "Write the isolated fixture response without using tools."],
+  "derivation": "Exact session_exited event from the recorded lifecycle receipt; JSON whitespace normalized only. The replay's durable recipe and accepted-grid generation are synthetic test authority, not extra fields captured on the daemon wire.",
+  "lifecycle_receipt_sha256": "b9bca292e5b8e7c6540e24961eca10590182d2b01306cc9eca006fa82370dc30",
+  "daemon_events_sha256": "6b075b19a7d34d952d9e102008d2ad51f4844e1ece09128c9b2995e11f347dba",
+  "retained_error_grid_sha256": "dbfe3f64516c5a4eeae7a1c205b8664967c203cd70fdce3682b15a40313326f0",
+  "expected_attention": "error",
+  "expected_source": "process",
+  "limits": "Headless process lifecycle proof, not an ordinary interactive KnownSafe/Bound/Fresh launch acceptance. The actual interactive APIError stayed live. No TaskFailed/Blocked/Done inference; printed TUI error text without typed exit is not process failure. No GUI, installed, authenticated provider or generic-agent acceptance claim."
+}

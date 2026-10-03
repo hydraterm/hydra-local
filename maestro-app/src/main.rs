@@ -14726,7 +14726,18 @@ fn observe_renderer_session_exit(
     observed_generation: Option<&str>,
 ) -> bool {
     match SessionService::new(paths).observe_exit(session_id, observed_generation, now_ms()) {
-        Ok(SessionExitObservation::MarkedExited) | Ok(SessionExitObservation::AlreadyExited) => {
+        Ok(
+            outcome
+            @ (SessionExitObservation::MarkedExited | SessionExitObservation::AlreadyExited),
+        ) => {
+            maestro_app::provider_attention::observe_exit(
+                paths,
+                session_id,
+                code,
+                observed_generation,
+                outcome,
+                now_ms(),
+            );
             eprintln!("attach-tab: session exit recorded session={session_id:?} code={code:?}");
             true
         }

@@ -1,0 +1,16 @@
+{
+  "provider": "Codex",
+  "version": "0.159.2",
+  "cli_sha256": "1748767b230ebfc3d4ab7e4e254920d0c0ad9691fd8c11f190e7d44511a4a92e",
+  "model": "gpt-6-luna",
+  "capture": "Real installed interactive CLI in a new owned conversation/workdir under an isolated Hydra development GUI and daemon, software X11; actual authenticated provider response, not a fabricated approval panel",
+  "argv": ["<installed-codex>", "--no-daemon", "--model", "gpt-6-luna", "--sandbox", "read-only", "--ask-for-approval", "on-request"],
+  "rows": 37,
+  "cols": 84,
+  "derivation": "Decoded current daemon grid cells; owned temporary cwd replaced with an equal-character-width placeholder. Blank rows and all provider text retained. Synthetic wire envelopes in tests are not original captured grids.",
+  "permission": {"revision": 3069, "raw_rows_sha256": "975b7bc858fb7cabc0df5160fefcbefc103947ac6117764c6500dcc3dd669d31", "fixture_sha256": "809b5e232a3b94c3d4eb948c498c26313d1e8d9996e06941ec7ea54ef79be092"},
+  "working": {"revision": 3104, "raw_rows_sha256": "7b61f5ab3f46663ce8b70ccff7fdff2660fbd4a33923c1c8790e272c1d376969", "fixture_sha256": "e2bc9b79bd3ed8c7b2a107308c706f2134a9dccab9faa6e4b444c92b259fd2f0"},
+  "idle": {"revision": 3250, "raw_rows_sha256": "85f9b4ac8b43010295129ffde315c6547e291c57e1b29e701df0717bcd6562f4", "fixture_sha256": "fe547bf28e17db0faa0bf4c08593e0af2e2178c9450bae7f96e077bd0514dec3"},
+  "sequence": "One-time Yes/proceed ran only /usr/bin/printf HYDRA_CODEX_QA_OK > proof.txt; exact bytes independently verified, followed by real Working and idle composer. Idle transcript says approval pending even though provider approval panel is gone: a genuine text false-positive control.",
+  "limits": "UI-shape evidence from an owned shell pane, not a validated Bound/Fresh provider recipe acceptance. Capture-only flags such as --no-daemon must not become eligible stored recipes. No task completion/error inference, normal user transcript, credential copy, installed release, Mac or native Wayland claim."
+}

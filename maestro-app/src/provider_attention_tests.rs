@@ -113,6 +113,21 @@ fn recorded_plan_yes_and_no_clear_only_observer_attention_for_unlinked_session()
 }
 
 fn recorded_prompt_recovery(waiting: &'static str, recovery: &'static str) {
+    recorded_prompt_recovery_for_launch(
+        waiting,
+        recovery,
+        LaunchSpec::KnownSafe {
+            launch_spec_id: "opencode".into(),
+            params: vec![],
+        },
+    );
+}
+
+pub(super) fn recorded_prompt_recovery_for_launch(
+    waiting: &'static str,
+    recovery: &'static str,
+    launch: LaunchSpec,
+) {
     let temp = tempfile::tempdir().unwrap();
     let paths = AppPaths::with_base(temp.path().join("base"));
     maestro_shell::ProjectService::new(&paths)
@@ -142,10 +157,7 @@ fn recorded_prompt_recovery(waiting: &'static str, recovery: &'static str) {
         session_id: "session".into(),
         workspace_id: "workspace".into(),
         kind: SessionKind::Agent,
-        launch: LaunchSpec::KnownSafe {
-            launch_spec_id: "opencode".into(),
-            params: vec![],
-        },
+        launch,
         cwd_resolved: temp.path().to_string_lossy().into_owned(),
         agent_task_id: None,
         created_at_ms: 1,
@@ -203,7 +215,13 @@ fn recorded_prompt_recovery(waiting: &'static str, recovery: &'static str) {
     let cohort = observation_cohort(&paths).unwrap();
     assert_eq!(
         cohort,
-        BTreeMap::from([("session".into(), "generation".into())])
+        BTreeMap::from([(
+            "session".into(),
+            ProviderLifetime {
+                provider: provider_identity(&record).unwrap(),
+                generation: "generation".into(),
+            }
+        )])
     );
     let before = serde_json::to_vec(&records(&paths).unwrap()["session"]).unwrap();
     let changes = || {
@@ -308,6 +326,7 @@ fn recorded_prompt_recovery(waiting: &'static str, recovery: &'static str) {
     shared.lock().unwrap().signals.insert(
         "session".into(),
         Signal {
+            provider: provider_identity(&record).unwrap(),
             generation: "generation".into(),
             revision: 99,
             waiting_since: Some(20),
