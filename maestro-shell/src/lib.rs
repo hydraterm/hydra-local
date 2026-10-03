@@ -120,6 +120,7 @@ pub use launch_environment::{
     login_shell_program, shell_quote_login_arg, LaunchEnvLookup, ProcessLaunchEnv,
     LOGIN_SHELL_COMMAND_FLAGS,
 };
+pub mod provider_attention;
 mod provider_executable;
 mod provider_launch_selection;
 pub use layout_preset::{

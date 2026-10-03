@@ -268,9 +268,10 @@ pub fn clear_tab_attention_and_refresh_strip(
     let report = maestro_shell::agent_task_reconcile::AgentTaskReconciler::new(paths)
         .reconcile()
         .map_err(TabAttentionClearRefreshError::TaskReconcile)?;
-    let views = maestro_shell::WindowLayoutService::new(paths)
+    let mut views = maestro_shell::WindowLayoutService::new(paths)
         .tab_view(window_id, &report)
         .map_err(TabAttentionClearRefreshError::TabView)?;
+    crate::provider_attention::apply_tab_views(paths, &mut views);
     let view_tabs: Vec<WindowViewTabJson> = views.iter().map(window_tab_view_to_json).collect();
 
     let model = build_tab_strip_model_from_window_view(window_id, &view_tabs, active_tab_id)
@@ -355,9 +356,10 @@ pub fn rebuild_live_tab_strip_model(
     let report = maestro_shell::agent_task_reconcile::AgentTaskReconciler::new(paths)
         .reconcile()
         .map_err(LiveTabStripRefreshError::TaskReconcile)?;
-    let views = maestro_shell::WindowLayoutService::new(paths)
+    let mut views = maestro_shell::WindowLayoutService::new(paths)
         .tab_view(window_id, &report)
         .map_err(LiveTabStripRefreshError::TabView)?;
+    crate::provider_attention::apply_tab_views(paths, &mut views);
     let view_tabs: Vec<WindowViewTabJson> = views.iter().map(window_tab_view_to_json).collect();
 
     build_tab_strip_model_from_window_view(window_id, &view_tabs, active_tab_id)

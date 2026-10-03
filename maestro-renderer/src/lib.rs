@@ -43,6 +43,8 @@
 //! not as a quick, returning helper.
 
 mod client;
+pub mod provider_observation;
+mod selection_span;
 // Private bundled-dashboard asset origin shared by the macOS WKWebView and Linux WebKitGTK hosts.
 // Both WRY IPC backends require the current document to parse as an HTTP-style URI, which a
 // `file:///...` bundle URL does not. Keep the serving/path policy in one cross-platform boundary.
@@ -111,9 +113,10 @@ use client::{
     command_palette_escape_dismisses, command_palette_nav, compute_dims_with_chrome_rows,
     encode_focus, encode_key, encode_mouse, extract_grid_selection, pixel_to_cell_with_top_offset,
     scroll_key_action_for, wheel_input_action_for, CellPos, CommandPaletteNavKey,
-    DesiredPaneBinding, DesiredViewportBinding, MouseButton as MouseBtn, MouseEvent as MouseEv,
-    PreparedScrollAction, ResizeCoalescer, ScrollAction, ScrollKey, ScrollRequestIntent, Shared,
-    TermModes, WheelAccumulator, WheelDirection, WheelInputAction, OUTBOUND_CAP_BYTES,
+    DesiredPaneBinding, DesiredViewportBinding, HistoryRequestIntent, MouseButton as MouseBtn,
+    MouseEvent as MouseEv, PreparedScrollAction, ResizeCoalescer, ScrollAction, ScrollKey,
+    ScrollRequestIntent, Shared, TermModes, WheelAccumulator, WheelDirection, WheelInputAction,
+    OUTBOUND_CAP_BYTES,
 };
 #[cfg(not(target_os = "linux"))]
 use client::{paste_payload, Clipboard, SystemClipboard};
@@ -11736,7 +11739,16 @@ struct PendingOwnerBatch {
     expected_generation: SessionGeneration,
     requests: Vec<ClientRequest>,
     framed_bytes: usize,
-    scroll_intent: Option<ScrollRequestIntent>,
+    history_intent: Option<HistoryRequestIntent>,
+}
+
+struct PendingSelectionSpan {
+    binding: ViewportBindingToken,
+    acquisition: selection_span::Acquisition,
+    request: selection_span::PageRequest,
+    /// None until the initiating release; only an unconsumed local release can authorize Copy.
+    /// A consumed release or a disabled preference cannot acquire authority from a later reply.
+    copy_after_release: Option<bool>,
 }
 
 /// Owner-loop intent before a PTY lifetime has been bound to its wire bytes. This private type
@@ -12105,6 +12117,11 @@ struct App {
     sel_anchor: Option<CellPos>,
     sel_focus: Option<CellPos>,
     sel_unit_anchor: Option<(CellPos, CellPos, SelectionUnit)>,
+    sel_scrolled: Option<terminal_selection::ScrolledSelection>,
+    sel_span: Option<PendingSelectionSpan>,
+    sel_span_ticket: u64,
+    #[cfg(test)]
+    sel_span_outcome: Option<Result<(), selection_span::Failure>>,
     last_selection_click: Option<(Instant, CellPos, String, String, u8)>,
     selecting: bool,
     copy_on_select: bool,
@@ -12311,6 +12328,11 @@ impl App {
             sel_anchor: None,
             sel_focus: None,
             sel_unit_anchor: None,
+            sel_scrolled: None,
+            sel_span: None,
+            sel_span_ticket: 0,
+            #[cfg(test)]
+            sel_span_outcome: None,
             last_selection_click: None,
             selecting: false,
             copy_on_select: false,
@@ -12700,6 +12722,8 @@ impl App {
         }
         let focus_id = self.focused_session_id();
         let primary = self.session_id.clone();
+        // Capture the accepted pixels before prepare_scroll_action can discard them on ToLive.
+        let selection_source = self.selection_source_for_scroll();
         let prepared = self
             .shared
             .prepare_scroll_action(&focus_id, &primary, action);
@@ -12714,11 +12738,7 @@ impl App {
             PreparedScrollAction::NoMove => return true,
             PreparedScrollAction::ToLive => {
                 self.cancel_pending_scrollback(&focus_id);
-                // Returned to the live bottom: the historical window is dropped so `draw` paints the
-                // focused pane's live grid, which live Damage has kept current. The painted rows change
-                // under the same generation, so a selection cut for the old viewport no longer maps to
-                // what's on screen — clear it.
-                self.clear_selection();
+                self.retain_selection_after_scroll(selection_source);
                 self.request_redraw();
                 return true;
             }
@@ -12728,9 +12748,7 @@ impl App {
                 count,
             } => (binding, request, count),
         };
-        // Viewport moved: invalidate any selection (its cell coords now cover
-        // different content). Mirrors the resize/scale/generation clears.
-        self.clear_selection();
+        self.retain_selection_after_scroll(selection_source);
         // Ask the daemon for the window at the new offset; the reply (ScrollbackRows)
         // builds the historical snapshot and wakes us to repaint. Target the FOCUSED pane's
         // session so a scroll gesture pages the pane the user is interacting with across an N-pane
@@ -16118,7 +16136,8 @@ impl App {
     fn cancel_pending_scrollback(&mut self, session_id: &str) {
         let mut removed_bytes = 0usize;
         self.pending_owner_requests.retain(|batch| {
-            let remove = batch.requests.len() == 1
+            let remove = matches!(batch.history_intent, Some(HistoryRequestIntent::View(_)))
+                && batch.requests.len() == 1
                 && matches!(
                     &batch.requests[0],
                     ClientRequest::Scrollback { id, .. } if id == session_id
@@ -16180,7 +16199,14 @@ impl App {
                 (
                     ClientRequest::Scrollback { id: old, .. },
                     ClientRequest::Scrollback { id: new, .. },
-                ) => old == new,
+                ) => {
+                    old == new
+                        && last
+                            .history_intent
+                            .as_ref()
+                            .zip(batch.history_intent.as_ref())
+                            .is_some_and(|(old, new)| old.same_purpose(new))
+                }
                 _ => false,
             }
         });
@@ -16246,6 +16272,21 @@ impl App {
         expected_generation: SessionGeneration,
         scroll_intent: Option<ScrollRequestIntent>,
     ) -> OwnerBatchAdmission {
+        self.admit_or_retain_history_batch(
+            binding,
+            requests,
+            expected_generation,
+            scroll_intent.map(HistoryRequestIntent::View),
+        )
+    }
+
+    fn admit_or_retain_history_batch(
+        &mut self,
+        binding: ViewportBindingToken,
+        requests: Vec<OwnerRequest>,
+        expected_generation: SessionGeneration,
+        history_intent: Option<HistoryRequestIntent>,
+    ) -> OwnerBatchAdmission {
         let contains_mutation = requests.iter().any(OwnerRequest::is_mutation);
         if !self.connection_alive
             || self.outbound_hard_refusal
@@ -16269,7 +16310,7 @@ impl App {
             expected_generation,
             requests,
             framed_bytes,
-            scroll_intent,
+            history_intent,
         };
         if !self.pending_owner_requests.is_empty() {
             return if self.retain_owner_batch(batch) {
@@ -16278,11 +16319,11 @@ impl App {
                 OwnerBatchAdmission::Rejected
             };
         }
-        match self.shared.send_request_batch_for_binding(
+        match self.shared.send_history_batch_for_binding(
             &batch.binding,
             &batch.requests,
             &batch.expected_generation,
-            batch.scroll_intent.as_ref(),
+            batch.history_intent.as_ref(),
         ) {
             None => OwnerBatchAdmission::Rejected,
             Some(admission) if admission.is_admitted() => {
@@ -16329,11 +16370,11 @@ impl App {
                     .saturating_sub(batch.framed_bytes);
                 continue;
             }
-            match self.shared.send_request_batch_for_binding(
+            match self.shared.send_history_batch_for_binding(
                 &batch.binding,
                 &batch.requests,
                 &batch.expected_generation,
-                batch.scroll_intent.as_ref(),
+                batch.history_intent.as_ref(),
             ) {
                 None => {
                     self.pending_owner_requests.pop_front();
@@ -16384,6 +16425,7 @@ impl App {
     }
 
     fn retry_pending_outbound(&mut self) {
+        self.poll_selection_span();
         // Token retirement is lifecycle authority, so it gets the first writable slot. A retained
         // Cancel always stays on the same FIFO as its earlier Claim and cannot be overtaken by a
         // replacement topology transaction.
@@ -17335,6 +17377,13 @@ impl App {
             }
             UserEvent::SetCopyOnSelect { enabled } => {
                 self.copy_on_select = enabled;
+                if !enabled {
+                    if let Some(pending) = self.sel_span.as_mut() {
+                        if pending.copy_after_release == Some(true) {
+                            pending.copy_after_release = Some(false);
+                        }
+                    }
+                }
             }
             UserEvent::SetProgramClipboard { enabled } => {
                 self.allow_program_clipboard = enabled;
@@ -17799,6 +17848,21 @@ impl App {
                 } else {
                     false
                 };
+                let pending_copy_release = button == MouseButton::Left
+                    && !pressed
+                    && self
+                        .sel_span
+                        .as_ref()
+                        .is_some_and(|pending| pending.copy_after_release.is_none());
+                if pressed {
+                    // Even a chrome/non-left press supersedes the asynchronous gesture.
+                    self.cancel_selection_span(selection_span::Failure::Cancelled);
+                    self.copy_drag_started = false;
+                } else if pending_copy_release {
+                    if let Some(pending) = self.sel_span.as_mut() {
+                        pending.copy_after_release = Some(false);
+                    }
+                }
                 // Picker overlay is a foreground MODAL: while shown it owns the whole window and
                 // consumes EVERY mouse event so nothing falls through to the tab strip, dashboard
                 // panel, grid, or PTY mouse reporting. Handled FIRST. A left-press over a selectable
@@ -18596,7 +18660,7 @@ impl App {
                                 self.context_menu_click_in_progress = true;
                                 self.mouse_held = None;
                                 self.last_reported_cell = None;
-                                let can_copy = self.current_selection().is_some();
+                                let can_copy = self.has_owned_selection();
                                 if let Some(host) = self.clipboard_host.as_ref() {
                                     let _ = host.show_context_menu(can_copy);
                                 }
@@ -18653,6 +18717,11 @@ impl App {
                         }
                         ElementState::Released => {
                             self.selecting = false;
+                            if pending_copy_release {
+                                if let Some(pending) = self.sel_span.as_mut() {
+                                    pending.copy_after_release = Some(self.copy_on_select);
+                                }
+                            }
                             // A zero-distance click (press == release on same cell)
                             // is not a selection — clear it so Cmd-C is a no-op.
                             if self.sel_anchor == self.sel_focus && self.sel_unit_anchor.is_none() {
@@ -19681,8 +19750,7 @@ impl App {
 
         // Escape clears an active selection (in addition to being sent to the PTY
         // as usual below, so editors still receive Escape).
-        if matches!(&event.key, HostKey::Named(HostNamedKey::Escape))
-            && self.current_selection().is_some()
+        if matches!(&event.key, HostKey::Named(HostNamedKey::Escape)) && self.has_owned_selection()
         {
             self.clear_selection();
             self.request_redraw();
@@ -20297,29 +20365,284 @@ impl App {
 
     /// The active selection range, or `None` if there is none. Invalidated (and
     /// cleared lazily by the caller via `clear_selection`) when stale.
+    #[cfg(test)]
     fn current_selection(&self) -> Option<(CellPos, CellPos)> {
         let owner = self.sel_session_id.as_deref()?;
-        if self.focused_session_id() != owner {
+        let grid = self.focused_pane_grid(owner)?;
+        self.selection_for_painted_grid(&grid)
+    }
+
+    fn selection_for_painted_grid(
+        &self,
+        grid: &Arc<wire::GridSnapshot>,
+    ) -> Option<(CellPos, CellPos)> {
+        if !self.has_owned_selection() {
             return None;
         }
-        let generation = self
-            .shared
-            .pane_paint(owner, &self.session_id)
-            .paint_grid()
-            .map(|grid| grid.generation.0.clone());
-        if self.sel_generation != generation {
-            return None;
+        let (a, b) = (self.sel_anchor?, self.sel_focus?);
+        if let Some(source) = self.sel_scrolled.as_ref() {
+            let owner = self.sel_session_id.as_deref()?;
+            let paint = self.shared.pane_paint(owner, &self.session_id);
+            // The reader may accept a new history reply between frame planning and selection
+            // projection. Never project its offset onto an older frame's pixels.
+            if !Arc::ptr_eq(grid, &paint.paint_grid()?) {
+                return None;
+            }
+            return source.project(a, b, grid, paint.scrolled_offset());
         }
+        Some((a, b))
+    }
+
+    /// Copy availability is separate from highlight visibility: scrolling can move the entire
+    /// range off screen without relinquishing its source or the exact pane authority.
+    fn has_owned_selection(&self) -> bool {
+        self.owned_selection_is_current().is_some()
+    }
+
+    fn owned_selection_is_current(&self) -> Option<()> {
+        self.selection_owner_is_current()?;
         match (self.sel_anchor, self.sel_focus) {
-            (Some(a), Some(b)) if a != b || self.sel_unit_anchor.is_some() => Some((a, b)),
+            (Some(a), Some(b)) if a != b || self.sel_unit_anchor.is_some() => Some(()),
             _ => None,
         }
     }
 
+    // A valid press has an owner before its first motion makes a nonempty selection.
+    fn selection_owner_is_current(&self) -> Option<()> {
+        if !self.viewport_is_bound() {
+            return None;
+        }
+        let owner = self.sel_session_id.as_deref()?;
+        if self.focused_session_id() != owner {
+            return None;
+        }
+        let paint = self.shared.pane_paint(owner, &self.session_id);
+        let grid = paint.paint_grid()?;
+        if self.sel_generation.as_deref() != Some(grid.generation.0.as_str()) {
+            return None;
+        }
+        if let Some(source) = self.sel_scrolled.as_ref() {
+            let live = paint.live.as_ref()?;
+            if live.generation != source.grid.generation
+                || live.alt_screen != source.live_alt_screen
+            {
+                return None;
+            }
+        }
+        Some(())
+    }
+
+    fn selection_source_for_scroll(&self) -> Option<terminal_selection::ScrolledSelection> {
+        self.owned_selection_is_current()?;
+        self.capture_selection_source()
+    }
+
+    fn capture_selection_source(&self) -> Option<terminal_selection::ScrolledSelection> {
+        self.selection_owner_is_current()?;
+        if let Some(source) = &self.sel_scrolled {
+            return Some(source.clone());
+        }
+        let owner = self.sel_session_id.as_deref()?;
+        let paint = self.shared.pane_paint(owner, &self.session_id);
+        let origin = if let Some(layout) = self.current_split_layout() {
+            let pane = layout.panes.iter().find(|pane| pane.session_id == owner)?;
+            let content = pane_content_region_for_layout(pane.region, layout.panes.len());
+            CellPos {
+                col: content.col as usize,
+                row: content.row as usize,
+            }
+        } else if owner == self.session_id {
+            CellPos { col: 0, row: 0 }
+        } else {
+            return None;
+        };
+        Some(terminal_selection::ScrolledSelection {
+            grid: paint.paint_grid()?,
+            served_offset: paint.scrolled_offset(),
+            origin,
+            live_alt_screen: paint.live.as_ref()?.alt_screen,
+        })
+    }
+
+    fn retain_selection_after_scroll(
+        &mut self,
+        source: Option<terminal_selection::ScrolledSelection>,
+    ) {
+        if source.is_none() {
+            self.clear_selection();
+            return;
+        }
+        self.sel_scrolled = source;
+        self.selecting = false;
+        self.copy_drag_started = false;
+        if let Some(pending) = self.sel_span.as_mut() {
+            pending.copy_after_release = Some(false);
+        }
+        self.last_selection_click = None;
+    }
+
+    fn cancel_selection_span(&mut self, _reason: selection_span::Failure) {
+        let Some(pending) = self.sel_span.take() else {
+            return;
+        };
+        let mut removed = 0;
+        self.pending_owner_requests.retain(|batch| {
+            let matches = batch.binding == pending.binding
+                && matches!(batch.history_intent.as_ref(), Some(HistoryRequestIntent::Selection(page))
+                    if page.ticket == pending.request.ticket);
+            if matches { removed += batch.framed_bytes; }
+            !matches
+        });
+        self.pending_owner_request_bytes = self.pending_owner_request_bytes.saturating_sub(removed);
+        if self.pending_owner_requests.is_empty() && !self.outbound_hard_refusal {
+            self.outbound_stalled = false;
+        }
+        // Never erase an admitted query: its untagged response must retire the FIFO slot first.
+        #[cfg(test)]
+        {
+            self.sel_span_outcome = Some(Err(_reason));
+        }
+    }
+
+    fn start_selection_span(&mut self, pos: CellPos) {
+        use selection_span::Failure;
+        let prepared = (|| {
+            self.owned_selection_is_current().ok_or(Failure::Stale)?;
+            let owner = self.sel_session_id.as_deref().ok_or(Failure::Stale)?;
+            let binding = self
+                .shared
+                .binding_token_for_session(owner)
+                .ok_or(Failure::Stale)?;
+            let paint = self.shared.pane_paint(owner, &self.session_id);
+            let source = self.sel_scrolled.clone().ok_or(Failure::Stale)?;
+            let ticket = self.sel_span_ticket.checked_add(1).ok_or(Failure::Bounds)?;
+            let acquisition = selection_span::Acquisition::new(
+                ticket,
+                source,
+                self.sel_anchor.ok_or(Failure::Stale)?,
+                paint.paint_grid().ok_or(Failure::Stale)?,
+                paint.scrolled_offset(),
+                pos,
+            )?;
+            let request = acquisition.request().ok_or(Failure::Bounds)?;
+            Ok::<_, Failure>((
+                ticket,
+                PendingSelectionSpan {
+                    binding,
+                    acquisition,
+                    request,
+                    copy_after_release: None,
+                },
+            ))
+        })();
+        match prepared {
+            Ok((ticket, pending)) => {
+                self.sel_span_ticket = ticket;
+                #[cfg(test)]
+                {
+                    self.sel_span_outcome = None;
+                }
+                self.sel_span = Some(pending);
+                self.enqueue_selection_page();
+            }
+            Err(_reason) => {
+                #[cfg(test)]
+                {
+                    self.sel_span_outcome = Some(Err(_reason));
+                }
+            }
+        }
+    }
+
+    fn enqueue_selection_page(&mut self) {
+        let Some(pending) = self.sel_span.as_ref() else {
+            return;
+        };
+        let request = pending.request.clone();
+        let binding = pending.binding.clone();
+        let Some(owner) = self.sel_session_id.clone() else {
+            self.cancel_selection_span(selection_span::Failure::Stale);
+            return;
+        };
+        let admission = self.admit_or_retain_history_batch(
+            binding,
+            vec![OwnerRequest::Scrollback {
+                id: owner,
+                offset_from_top: request.offset,
+                count: request.count,
+            }],
+            request.generation.clone(),
+            Some(HistoryRequestIntent::Selection(request)),
+        );
+        if matches!(admission, OwnerBatchAdmission::Rejected) {
+            self.cancel_selection_span(selection_span::Failure::QueueRefused);
+        }
+    }
+
+    fn poll_selection_span(&mut self) {
+        use selection_span::{Failure, PageStatus};
+        let Some(pending) = self.sel_span.as_ref() else {
+            return;
+        };
+        if !self.has_owned_selection() || !self.shared.viewport_token_is_current(&pending.binding) {
+            self.cancel_selection_span(Failure::Stale);
+            return;
+        }
+        let queued = self.pending_owner_requests.iter().any(|batch| {
+            batch.binding == pending.binding
+                && batch.history_intent.as_ref()
+                    == Some(&HistoryRequestIntent::Selection(pending.request.clone()))
+        });
+        match self
+            .shared
+            .selection_page_status(&pending.binding, &pending.request)
+        {
+            PageStatus::Waiting => {}
+            PageStatus::Missing if queued => {}
+            PageStatus::Missing => self.cancel_selection_span(Failure::QueueRefused),
+            PageStatus::Ready(reply) => {
+                let result = self.sel_span.as_mut().unwrap().acquisition.accept(reply);
+                if let Err(reason) = result {
+                    self.cancel_selection_span(reason);
+                    return;
+                }
+                if let Some(next) = self.sel_span.as_ref().unwrap().acquisition.request() {
+                    self.sel_span.as_mut().unwrap().request = next;
+                    self.enqueue_selection_page();
+                } else {
+                    let pending = self.sel_span.take().unwrap();
+                    if let Some((source, anchor, focus)) = pending.acquisition.finish() {
+                        self.sel_scrolled = Some(source);
+                        self.sel_anchor = Some(anchor);
+                        self.sel_focus = Some(focus);
+                        self.sel_unit_anchor = None;
+                        #[cfg(test)]
+                        {
+                            self.sel_span_outcome = Some(Ok(()));
+                        }
+                        match pending.copy_after_release {
+                            None => self.copy_drag_started = true,
+                            Some(true) if self.copy_on_select => self.copy_selection(),
+                            Some(_) => {}
+                        }
+                        self.request_redraw();
+                    } else {
+                        #[cfg(test)]
+                        {
+                            self.sel_span_outcome = Some(Err(Failure::InvalidPage));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn clear_selection(&mut self) {
+        self.cancel_selection_span(selection_span::Failure::Cancelled);
         self.sel_anchor = None;
         self.sel_focus = None;
         self.sel_unit_anchor = None;
+        self.sel_scrolled = None;
         self.last_selection_click = None;
         self.selecting = false;
         self.copy_drag_started = false;
@@ -20331,12 +20654,14 @@ impl App {
     /// caller supplies the already-authoritative hit-test result so mouse geometry remains shared
     /// with reporting/drawing. A miss records no owner/generation and therefore cannot later copy.
     fn begin_local_selection(&mut self, pos: Option<CellPos>) {
+        self.cancel_selection_span(selection_span::Failure::Cancelled);
         // A real local press supersedes any stale PTY mouse-reporting drag.
         self.mouse_held = None;
         self.last_reported_cell = None;
         self.sel_anchor = pos;
         self.sel_focus = pos;
         self.sel_unit_anchor = None;
+        self.sel_scrolled = None;
         self.selecting = true;
         self.copy_drag_started = pos.is_some();
         self.hovered_terminal_link = None;
@@ -20347,14 +20672,31 @@ impl App {
                 .paint_grid()
                 .map(|grid| grid.generation.0.clone())
         });
+        // Capture at the press, not on the first scroll or release: output can replace live
+        // pixels at these coordinates while the gesture is still held.
+        self.sel_scrolled = self.capture_selection_source();
     }
 
     fn begin_local_selection_gesture(&mut self, pos: Option<CellPos>, now: Instant) {
+        self.cancel_selection_span(selection_span::Failure::Cancelled);
         let previous = self.last_selection_click.take();
-        if self.modifiers.shift && pos.is_some() && self.current_selection().is_some() {
+        if self.modifiers.shift && pos.is_some() && self.has_owned_selection() {
             self.mouse_held = None;
             self.last_reported_cell = None;
-            self.sel_focus = pos;
+            if self.sel_scrolled.is_some() {
+                let Some(mapped) = pos.and_then(|pos| self.scrolled_selection_position(pos)) else {
+                    // Preserve even a one-cell word/line range, including its unit marker.
+                    self.selecting = false;
+                    self.copy_drag_started = false;
+                    if let Some(pos) = pos {
+                        self.start_selection_span(pos);
+                    }
+                    return;
+                };
+                self.sel_focus = Some(mapped);
+            } else {
+                self.sel_focus = pos;
+            }
             self.sel_unit_anchor = None;
             self.selecting = true;
             self.copy_drag_started = true;
@@ -20394,22 +20736,27 @@ impl App {
     }
 
     fn selection_unit_at(&self, pos: CellPos, unit: SelectionUnit) -> Option<(CellPos, CellPos)> {
-        let owner = self.sel_session_id.as_deref()?;
-        let grid = self.focused_pane_grid(owner)?;
-        let (local, origin) = if let Some(layout) = self.current_split_layout() {
-            let pane = layout.panes.iter().find(|pane| pane.session_id == owner)?;
-            let content = pane_content_region_for_layout(pane.region, layout.panes.len());
-            (
-                pane_local_cellpos(pos, content),
-                CellPos {
-                    col: content.col as usize,
-                    row: content.row as usize,
-                },
-            )
-        } else if owner == self.session_id {
-            (pos, CellPos { col: 0, row: 0 })
+        let (grid, local, origin) = if let Some(source) = &self.sel_scrolled {
+            (source.grid.clone(), source.local(pos)?, source.origin)
         } else {
-            return None;
+            let owner = self.sel_session_id.as_deref()?;
+            let grid = self.focused_pane_grid(owner)?;
+            let (local, origin) = if let Some(layout) = self.current_split_layout() {
+                let pane = layout.panes.iter().find(|pane| pane.session_id == owner)?;
+                let content = pane_content_region_for_layout(pane.region, layout.panes.len());
+                (
+                    pane_local_cellpos(pos, content),
+                    CellPos {
+                        col: content.col as usize,
+                        row: content.row as usize,
+                    },
+                )
+            } else if owner == self.session_id {
+                (pos, CellPos { col: 0, row: 0 })
+            } else {
+                return None;
+            };
+            (grid, local, origin)
         };
         let (start, end) = match unit {
             SelectionUnit::Word => terminal_selection::word_range(&grid.rows_cells, local),
@@ -20423,6 +20770,14 @@ impl App {
     }
 
     fn extend_local_selection(&mut self, pos: Option<CellPos>) {
+        let pos = if self.sel_scrolled.is_some() {
+            let Some(pos) = pos.and_then(|pos| self.scrolled_selection_position(pos)) else {
+                return;
+            };
+            Some(pos)
+        } else {
+            pos
+        };
         if let (Some((start, end, unit)), Some(pos)) = (self.sel_unit_anchor, pos) {
             if let Some((unit_start, unit_end)) = self.selection_unit_at(pos, unit) {
                 if (pos.row, pos.col) < (start.row, start.col) {
@@ -20438,6 +20793,14 @@ impl App {
         self.sel_focus = pos;
     }
 
+    fn scrolled_selection_position(&self, pos: CellPos) -> Option<CellPos> {
+        self.selection_owner_is_current()?;
+        let source = self.sel_scrolled.as_ref()?;
+        let owner = self.sel_session_id.as_deref()?;
+        let paint = self.shared.pane_paint(owner, &self.session_id);
+        source.source_position(pos, paint.paint_grid()?.as_ref(), paint.scrolled_offset())
+    }
+
     /// Copy the current selection to the clipboard. No-op (returns without
     /// touching the clipboard) when there is no selection — so Cmd-C never sends
     /// a stray 'c' to the PTY and an empty selection does nothing.
@@ -20448,14 +20811,21 @@ impl App {
         self.store_clipboard_text(text);
     }
 
-    /// Extract exactly what the current selection paints, without touching the native clipboard.
+    /// Extract the exact selected source, including a range retained offscreen after scrolling,
+    /// without touching the native clipboard.
     /// Keeping this projection separate makes pane ownership/coordinate translation independently
     /// testable on every host; [`Self::copy_selection`] remains the only native side-effect boundary.
     fn selected_text(&self) -> Option<String> {
         if !self.viewport_is_bound() {
             return None;
         }
-        let (anchor, focus) = self.current_selection()?;
+        self.owned_selection_is_current()?;
+        let (anchor, focus) = (self.sel_anchor?, self.sel_focus?);
+        if let Some(source) = self.sel_scrolled.as_ref() {
+            let text =
+                extract_grid_selection(&source.grid, source.local(anchor)?, source.local(focus)?);
+            return (!text.is_empty()).then_some(text);
+        }
         let owner = self.sel_session_id.as_deref()?;
         // Read from the selection OWNER rather than inferring the source from layout shape. A zoomed
         // child is intentionally represented by a collapsed one-pane layout, so a focus-based
@@ -20817,25 +21187,21 @@ impl App {
             })
         };
 
-        // Invalidate a selection whose grid generation no longer matches what we are
-        // about to paint (content was replaced, e.g. a new session or alt-screen swap).
+        // Invalidate revoked owner/screen/geometry authority, not a merely offscreen range.
         if matches!((self.sel_anchor, self.sel_focus), (Some(a), Some(b)) if a != b || self.sel_unit_anchor.is_some())
+            && !self.has_owned_selection()
         {
-            let owner_matches_focus = self
-                .sel_session_id
-                .as_deref()
-                .is_some_and(|owner| self.focused_session_id() == owner);
-            let selection_generation = self.sel_session_id.as_deref().and_then(|id| {
-                self.shared
-                    .pane_paint(id, &self.session_id)
-                    .paint_grid()
-                    .map(|pane_grid| pane_grid.generation.0.clone())
-            });
-            if !owner_matches_focus || self.sel_generation != selection_generation {
-                self.clear_selection();
-            }
+            self.clear_selection();
         }
-        let selection = self.current_selection();
+        let selection_grid = if split_active {
+            extra_panes
+                .iter()
+                .find(|pane| Some(pane.session_id.as_str()) == self.sel_session_id.as_deref())
+                .and_then(|pane| pane.grid.as_ref())
+        } else {
+            paint.as_ref()
+        };
+        let selection = selection_grid.and_then(|grid| self.selection_for_painted_grid(grid));
         // The symmetric split renderer paints every pane from a content-local grid. Carry the one
         // selection only on its owning pane; render.rs translates these absolute cells at the final
         // paint boundary. Other panes remain `None`.
@@ -38746,6 +39112,7 @@ mod terminal_selection_ownership_tests {
     mod logical_line_selection;
     mod program_clipboard;
     mod scroll_projection;
+    mod span_acquisition;
     mod word_selection;
 
     #[cfg(target_os = "macos")]

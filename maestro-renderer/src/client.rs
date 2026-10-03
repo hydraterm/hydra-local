@@ -881,7 +881,9 @@ pub struct ScrollbackState {
     /// newer scroll or return-to-live intent.
     pub(crate) intent_epoch: u64,
     pub(crate) intent_exhausted: bool,
-    pub(crate) admitted_request: Option<(u64, u32, SessionGeneration)>,
+    pub(crate) admitted_request: Option<HistoryRequestIntent>,
+    /// Selection replies retire the same FIFO slot but never alter historical/view metadata.
+    pub(crate) selection_result: Option<crate::selection_span::PageResult>,
     /// A live generation/screen transition occurred after the admitted untagged reply
     /// was requested. The reply must still retire ordering, but none of its old history
     /// metadata may be installed into the new screen context.
@@ -908,6 +910,26 @@ impl HistoricalView {
 }
 
 impl ScrollbackState {
+    fn selection_page_status(
+        &mut self,
+        request: &crate::selection_span::PageRequest,
+    ) -> crate::selection_span::PageStatus {
+        use crate::selection_span::PageStatus;
+        if let Some(result) = self
+            .selection_result
+            .take()
+            .filter(|result| &result.request == request)
+        {
+            return PageStatus::Ready(result);
+        }
+        if self.admitted_request.as_ref() == Some(&HistoryRequestIntent::Selection(request.clone()))
+        {
+            PageStatus::Waiting
+        } else {
+            PageStatus::Missing
+        }
+    }
+
     /// Is history requested? Keep routing local while a scroll reply is still pending.
     pub fn is_scrolled(&self) -> bool {
         self.view_offset > 0
@@ -942,6 +964,7 @@ impl ScrollbackState {
         self.view_offset = 0;
         self.history_len = None;
         self.historical = None;
+        self.selection_result = None;
     }
 }
 
@@ -1006,6 +1029,61 @@ pub(crate) struct ScrollRequestIntent {
     pub(crate) intent_epoch: u64,
     pub(crate) requested_offset: u32,
     pub(crate) expected_generation: SessionGeneration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum HistoryRequestIntent {
+    View(ScrollRequestIntent),
+    Selection(crate::selection_span::PageRequest),
+}
+
+impl HistoryRequestIntent {
+    fn offset(&self) -> u32 {
+        match self {
+            Self::View(view) => view.requested_offset,
+            Self::Selection(page) => page.offset,
+        }
+    }
+
+    fn generation(&self) -> &SessionGeneration {
+        match self {
+            Self::View(view) => &view.expected_generation,
+            Self::Selection(page) => &page.generation,
+        }
+    }
+
+    fn still_current(&self, scrollback: &ScrollbackState) -> bool {
+        match self {
+            Self::View(view) => {
+                scrollback.intent_epoch == view.intent_epoch
+                    && scrollback.view_offset == view.requested_offset
+            }
+            // Selection cancellation is owned by App; an admitted reply must still retire FIFO.
+            // Exact binding and live generation are revalidated by the shared admission transaction.
+            Self::Selection(_) => true,
+        }
+    }
+
+    pub(crate) fn same_purpose(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::View(_), Self::View(_)) => true,
+            (Self::Selection(a), Self::Selection(b)) => a.ticket == b.ticket && a.page == b.page,
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<(u64, u32, SessionGeneration)> for HistoryRequestIntent {
+    fn from(
+        (intent_epoch, requested_offset, expected_generation): (u64, u32, SessionGeneration),
+    ) -> Self {
+        Self::View(ScrollRequestIntent {
+            intent_epoch,
+            requested_offset,
+            expected_generation,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1364,10 +1442,48 @@ fn apply_scrollback_payload(
     // request before applying generation gates: an old-generation reply after a new Grid must release
     // the slot so the owner can admit its coalesced current-generation intent.
     let discard_metadata = std::mem::take(&mut sb.discard_admitted_reply_metadata);
-    let Some((reply_intent_epoch, requested_offset, expected_generation)) =
-        sb.admitted_request.take()
-    else {
+    let Some(request) = sb.admitted_request.take() else {
         return false;
+    };
+    if let HistoryRequestIntent::Selection(request) = request {
+        use crate::selection_span::{Failure, PageResult};
+        let result = if discard_metadata
+            || request.generation != generation
+            || live_generation.as_ref() != Some(&generation)
+            || request.revision != revision
+        {
+            Err(Failure::Stale)
+        } else if request.offset != offset_from_top
+            || offset_from_top > history_len
+            || rows.is_empty()
+            || rows.len() > usize::from(request.count)
+            || rows.iter().any(|row| row.len() != request.cols)
+            || row_copy.is_none()
+            || !crate::wire::terminal_link_cells_within_cap(&rows)
+            || !crate::wire::row_copy_cells_valid(&rows, row_copy.as_deref())
+        {
+            Err(Failure::InvalidPage)
+        } else {
+            Ok(Arc::new(scrollback_snapshot(
+                generation,
+                revision,
+                (rows, row_copy),
+            )))
+        };
+        sb.selection_result = Some(PageResult {
+            request,
+            history_len,
+            result,
+        });
+        return false;
+    }
+    let HistoryRequestIntent::View(ScrollRequestIntent {
+        intent_epoch: reply_intent_epoch,
+        requested_offset,
+        expected_generation,
+    }) = request
+    else {
+        unreachable!()
     };
     if expected_generation != generation || live_generation.as_ref() != Some(&generation) {
         return false;
@@ -2319,12 +2435,24 @@ impl Shared {
     /// admission result. Serialization happens before locking. The active guard spans validation
     /// through the approved fail-fast queue try-lock, so clear cannot linearize between check and
     /// admission. No authority guard survives into logging, proxy work, or socket I/O.
+    #[cfg(test)]
     pub fn send_request_batch_for_binding(
         &self,
         token: &ViewportBindingToken,
         reqs: &[ClientRequest],
         expected_generation: &SessionGeneration,
         scroll_intent: Option<&ScrollRequestIntent>,
+    ) -> Option<RequestAdmission> {
+        let intent = scroll_intent.cloned().map(HistoryRequestIntent::View);
+        self.send_history_batch_for_binding(token, reqs, expected_generation, intent.as_ref())
+    }
+
+    pub(crate) fn send_history_batch_for_binding(
+        &self,
+        token: &ViewportBindingToken,
+        reqs: &[ClientRequest],
+        expected_generation: &SessionGeneration,
+        scroll_intent: Option<&HistoryRequestIntent>,
     ) -> Option<RequestAdmission> {
         if self.connection_is_closed() {
             return Some(Self::closed_admission());
@@ -2353,8 +2481,19 @@ impl Shared {
             [ClientRequest::Scrollback {
                 id,
                 offset_from_top,
-                ..
-            }] if *offset_from_top == intent.requested_offset => Some((id.as_str(), intent)),
+                count,
+            }] if *offset_from_top == intent.offset()
+                && match intent {
+                    HistoryRequestIntent::View(_) => true,
+                    HistoryRequestIntent::Selection(page) => {
+                        *count == page.count
+                            && page.count > 0
+                            && page.count <= crate::wire::MAX_SCROLLBACK_ROWS_PER_REQUEST
+                    }
+                } =>
+            {
+                Some((id.as_str(), intent))
+            }
             _ => None,
         });
         let has_scrollback = reqs
@@ -2389,16 +2528,17 @@ impl Shared {
                     if request_id != token.session_id {
                         return None;
                     }
-                    if expected_generation != &intent.expected_generation {
+                    if expected_generation != intent.generation()
+                        || (matches!(intent, HistoryRequestIntent::Selection(_))
+                            && grid.as_ref().is_none_or(|grid| grid.alt_screen))
+                    {
                         return None;
                     }
                     let mut scrollback = self.scrollback.lock().unwrap();
                     if self.connection_is_closed() {
                         return Some(Self::closed_admission());
                     }
-                    if scrollback.intent_epoch != intent.intent_epoch
-                        || scrollback.view_offset != intent.requested_offset
-                    {
+                    if !intent.still_current(&scrollback) {
                         return None;
                     }
                     if scrollback.admitted_request.is_some() {
@@ -2410,11 +2550,10 @@ impl Shared {
                         });
                     }
                     scrollback.discard_admitted_reply_metadata = false;
-                    scrollback.admitted_request = Some((
-                        intent.intent_epoch,
-                        intent.requested_offset,
-                        intent.expected_generation.clone(),
-                    ));
+                    scrollback.admitted_request = Some(intent.clone());
+                    if matches!(intent, HistoryRequestIntent::Selection(_)) {
+                        scrollback.selection_result = None;
+                    }
                     let admission = self.outbound.get().map_or(
                         RequestAdmission::Unavailable {
                             reason: OutboundUnavailable::NotConnected,
@@ -2475,9 +2614,10 @@ impl Shared {
                     if request_id != session_id {
                         return None;
                     }
-                    if expected_generation != &intent.expected_generation
-                        || entry.scrollback.intent_epoch != intent.intent_epoch
-                        || entry.scrollback.view_offset != intent.requested_offset
+                    if expected_generation != intent.generation()
+                        || !intent.still_current(&entry.scrollback)
+                        || (matches!(intent, HistoryRequestIntent::Selection(_))
+                            && entry.grid.as_ref().is_none_or(|grid| grid.alt_screen))
                     {
                         return None;
                     }
@@ -2491,11 +2631,10 @@ impl Shared {
                         });
                     }
                     entry.scrollback.discard_admitted_reply_metadata = false;
-                    entry.scrollback.admitted_request = Some((
-                        intent.intent_epoch,
-                        intent.requested_offset,
-                        intent.expected_generation.clone(),
-                    ));
+                    entry.scrollback.admitted_request = Some(intent.clone());
+                    if matches!(intent, HistoryRequestIntent::Selection(_)) {
+                        entry.scrollback.selection_result = None;
+                    }
                     let admission = self.outbound.get().map_or(
                         RequestAdmission::Unavailable {
                             reason: OutboundUnavailable::NotConnected,
@@ -2633,6 +2772,39 @@ impl Shared {
             }
         };
         !self.connection_is_closed() && current
+    }
+
+    pub(crate) fn selection_page_status(
+        &self,
+        token: &ViewportBindingToken,
+        request: &crate::selection_span::PageRequest,
+    ) -> crate::selection_span::PageStatus {
+        use crate::selection_span::PageStatus;
+        match token {
+            ViewportBindingToken::Active(token) => {
+                let active = self.active.lock().unwrap();
+                if self.connection_is_closed()
+                    || active.epoch != token.epoch
+                    || active.id.as_deref() != Some(token.session_id.as_str())
+                    || active.output_generation != Some(token.output_generation)
+                {
+                    return PageStatus::Missing;
+                }
+                let mut scrollback = self.scrollback.lock().unwrap();
+                if self.connection_is_closed() {
+                    return PageStatus::Missing;
+                }
+                scrollback.selection_page_status(request)
+            }
+            ViewportBindingToken::Pane { pane_kind, .. } => {
+                let mut status = PageStatus::Missing;
+                self.with_current_pane_store(token, *pane_kind, |entry| {
+                    status = entry.scrollback.selection_page_status(request);
+                    true
+                });
+                status
+            }
+        }
     }
 
     /// Resolve the exact current route authority for `session_id` in one fixed lock order. Active
@@ -4117,6 +4289,47 @@ impl Shared {
             .get()
             .map(|queue| queue.drain_requests())
             .unwrap_or_default()
+    }
+
+    /// Exercise the production route-specific reply commit without a socket in owner-loop tests.
+    #[cfg(test)]
+    pub(crate) fn commit_test_history_reply(
+        &self,
+        binding: &ViewportBindingToken,
+        grid: GridSnapshot,
+        history_len: u32,
+        offset: u32,
+    ) -> bool {
+        let rows = (grid.rows_cells, grid.row_copy);
+        match binding {
+            ViewportBindingToken::Active(active) => self.commit_active_scrollback(
+                active,
+                grid.generation,
+                grid.revision,
+                history_len,
+                offset,
+                rows,
+            ),
+            ViewportBindingToken::Pane {
+                pane_kind: PaneKind::Sibling,
+                ..
+            } => self.commit_sibling_scrollback(
+                binding,
+                grid.generation,
+                grid.revision,
+                history_len,
+                offset,
+                rows,
+            ),
+            ViewportBindingToken::Pane { .. } => self.commit_pane_scrollback(
+                binding,
+                grid.generation,
+                grid.revision,
+                history_len,
+                offset,
+                rows,
+            ),
+        }
     }
 
     #[cfg(test)]
@@ -9083,11 +9296,14 @@ mod scrollback_view_tests {
             .advance_intent()
             .expect("test scroll intent remains representable");
         scrollback.view_offset = offset;
-        scrollback.admitted_request = Some((
-            intent,
-            offset,
-            SessionGeneration(expected_generation.to_string()),
-        ));
+        scrollback.admitted_request = Some(
+            (
+                intent,
+                offset,
+                SessionGeneration(expected_generation.to_string()),
+            )
+                .into(),
+        );
     }
 
     // --- 1: view_offset clamps to [0, history_len] --------------------------
@@ -9440,7 +9656,7 @@ mod scrollback_view_tests {
             seed(&mut primary, 5, "primary-gen");
             let intent = primary.advance_intent().unwrap();
             primary.admitted_request =
-                Some((intent, 5, SessionGeneration("primary-gen".to_string())));
+                Some((intent, 5, SessionGeneration("primary-gen".to_string())).into());
         }
         shared.with_pane_scrollback("sibling", "primary", |sibling| {
             seed(sibling, 7, "sibling-gen");
@@ -9537,7 +9753,7 @@ mod scrollback_view_tests {
         for (revision, row_copy) in [(50, Some(metadata.clone())), (51, None)] {
             let intent = sb.advance_intent().unwrap();
             sb.view_offset = 1;
-            sb.admitted_request = Some((intent, 1, generation.clone()));
+            sb.admitted_request = Some((intent, 1, generation.clone()).into());
             assert!(apply_scrollback_payload(
                 Some(generation.clone()),
                 &mut sb,
@@ -9556,7 +9772,7 @@ mod scrollback_view_tests {
         }
         let old = sb.historical.clone();
         let intent = sb.advance_intent().unwrap();
-        sb.admitted_request = Some((intent, 1, generation.clone()));
+        sb.admitted_request = Some((intent, 1, generation.clone()).into());
         let mut bad = metadata;
         bad[0].excluded_columns = vec![0];
         assert!(!apply_scrollback_payload(
@@ -9581,7 +9797,7 @@ mod scrollback_view_tests {
         let mut scrollback = ScrollbackState::default();
         let intent = scrollback.advance_intent().unwrap();
         scrollback.view_offset = 1;
-        scrollback.admitted_request = Some((intent, 1, generation.clone()));
+        scrollback.admitted_request = Some((intent, 1, generation.clone()).into());
         let mut linked = cell("x");
         linked.hyperlink = Some("https://scrollback-cap.example.test".to_owned());
 
@@ -9659,7 +9875,8 @@ mod scrollback_view_tests {
 
         let old_intent = scrollback.advance_intent().unwrap();
         scrollback.view_offset = 5;
-        scrollback.admitted_request = Some((old_intent, 5, SessionGeneration("gen-old".into())));
+        scrollback.admitted_request =
+            Some((old_intent, 5, SessionGeneration("gen-old".into())).into());
 
         // A new baseline arrives, the user explicitly returns to live, then starts a new scroll
         // intent against that baseline. The old ordered reply must release the sole admission slot.
@@ -9686,7 +9903,7 @@ mod scrollback_view_tests {
         assert_eq!(scrollback.view_offset, 9);
         assert!(scrollback.historical.is_none());
 
-        scrollback.admitted_request = Some(pending_current);
+        scrollback.admitted_request = Some(pending_current.into());
         assert!(apply_scrollback_payload(
             Some(SessionGeneration("gen-current".into())),
             &mut scrollback,
@@ -13345,7 +13562,8 @@ mod rebind_tests {
             scrollback.view_offset = 4;
             scrollback.history_len = Some(20);
             scrollback.historical = Some(HistoricalView::new(Arc::new(grid("gen-a", 5)), 4, 20));
-            scrollback.admitted_request = Some((old_intent, 4, SessionGeneration("gen-a".into())));
+            scrollback.admitted_request =
+                Some((old_intent, 4, SessionGeneration("gen-a".into())).into());
         }
         assert_eq!(
             shared
@@ -13403,7 +13621,7 @@ mod rebind_tests {
             let current_intent = scrollback.advance_intent().unwrap();
             scrollback.view_offset = 2;
             scrollback.admitted_request =
-                Some((current_intent, 2, SessionGeneration("gen-b".into())));
+                Some((current_intent, 2, SessionGeneration("gen-b".into())).into());
         }
         assert!(shared.commit_active_scrollback(
             &token,
@@ -13433,7 +13651,8 @@ mod rebind_tests {
             scrollback.view_offset = 4;
             scrollback.history_len = Some(20);
             scrollback.historical = Some(HistoricalView::new(Arc::new(grid("gen-a", 5)), 4, 20));
-            scrollback.admitted_request = Some((old_intent, 4, SessionGeneration("gen-a".into())));
+            scrollback.admitted_request =
+                Some((old_intent, 4, SessionGeneration("gen-a".into())).into());
         });
 
         assert!(shared.commit_pane_grid(&token, Arc::new(grid("gen-b", 9))));
@@ -13465,7 +13684,7 @@ mod rebind_tests {
             let current_intent = scrollback.advance_intent().unwrap();
             scrollback.view_offset = 2;
             scrollback.admitted_request =
-                Some((current_intent, 2, SessionGeneration("gen-b".into())));
+                Some((current_intent, 2, SessionGeneration("gen-b".into())).into());
         });
         assert!(shared.commit_pane_scrollback(
             &token,
@@ -14016,7 +14235,7 @@ mod user_event_sender_tests {
         assert!(app.pending_owner_requests.is_empty());
         assert!(matches!(
             shared.scrollback.lock().unwrap().admitted_request.as_ref(),
-            Some((_, 1, generation)) if generation.0 == "gen-b"
+            Some(HistoryRequestIntent::View(ScrollRequestIntent { requested_offset: 1, expected_generation, .. })) if expected_generation.0 == "gen-b"
         ));
 
         // The current reply now paints B history; A never reopened the viewport.

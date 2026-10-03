@@ -3079,6 +3079,7 @@ fn dashboard_react_model_with_active_and_report(
 ) -> serde_json::Value {
     let mut model = match DashboardSnapshotService::new(paths).snapshot(session_report) {
         Ok(mut snapshot) => {
+            maestro_app::provider_attention::apply_dashboard(paths, &mut snapshot);
             let order = maestro_app::apply_window_presentation_order(paths, &mut snapshot);
             let session_agents = session_agent_index(paths);
             let mut model =
@@ -13752,6 +13753,25 @@ fn classify_window_event_receive<T>(
     }
 }
 
+/// Read-only observation must progress even when renderer events never leave an idle gap. Keep
+/// the existing event order and stop boundary; this does NOT run idle lifecycle maintenance.
+fn receive_window_event_after_observation<T>(
+    receiver: &mpsc::Receiver<T>,
+    stop: &AtomicBool,
+    timeout: Duration,
+    preserved: Option<T>,
+    observe: impl FnOnce(),
+) -> WindowEventListenerReceive<T> {
+    if stop.load(Ordering::Acquire) {
+        return WindowEventListenerReceive::Stop;
+    }
+    observe();
+    match preserved {
+        Some(event) => classify_window_event_receive(Ok(event), stop),
+        None => receive_window_event(receiver, stop, timeout),
+    }
+}
+
 /// Standalone renderer-event listener thread extracted from `run_attach_tab`'s foreground arm so
 /// every foreground path can reuse it. It has an explicit stop boundary because WebView callback
 /// ownership can outlive the renderer and keep an event-sender clone alive after window close.
@@ -14814,6 +14834,7 @@ fn spawn_window_event_listener(
         // idle tick rebuilds the React model and re-sends it ONLY when it differs from the last one delivered — so any
         // dropped refresh from any site converges within ~750ms. Cheap: snapshot(None) is a disk read, gated on change.
         let mut last_sent_react_model: Option<String> = None;
+        let mut last_provider_attention_revision = 0;
         // EXTERNAL-write detector: `PRAGMA data_version` read on this process's ONE cached connection
         // changes ONLY when a DIFFERENT connection committed — and since every write in this process
         // rides the same cached connection, "different" means another local process. `None` when the
@@ -15856,14 +15877,36 @@ fn spawn_window_event_listener(
                 &mut tab_runtime,
                 &mut last_sent_react_model,
             );
-            let received = match preserved_navigation_event {
-                Some(event) => classify_window_event_receive(Ok(event), &listener_stop),
-                None => receive_window_event(
-                    &renderer_events_rx,
-                    &listener_stop,
-                    LISTENER_TICK_INTERVAL,
-                ),
-            };
+            let received = receive_window_event_after_observation(
+                &renderer_events_rx,
+                &listener_stop,
+                LISTENER_TICK_INTERVAL,
+                preserved_navigation_event,
+                || {
+                    maestro_app::provider_attention::service(
+                        &listener_paths,
+                        &listener_socket_path,
+                        &mut last_provider_attention_revision,
+                        || {
+                            let model = dashboard_react_model_with_active_and_report(
+                                &listener_paths,
+                                tab_runtime.active_window_id(),
+                                tab_runtime.active_tab_id(),
+                                latest_session_report.as_ref(),
+                            );
+                            let model_json = model.to_string();
+                            if last_sent_react_model.as_deref() != Some(model_json.as_str()) {
+                                if let Err(error) = tab_runtime.set_react_chrome_model(&model) {
+                                    eprintln!("attach-tab: provider attention projection failed (non-fatal): {error}");
+                                    return false;
+                                }
+                                last_sent_react_model = Some(model_json);
+                            }
+                            true
+                        },
+                    );
+                },
+            );
             let event = match received {
                 WindowEventListenerReceive::Event(event) => {
                     history_results_due_after_event = true;
@@ -21905,12 +21948,43 @@ fn spawn_window_event_listener(
 #[cfg(test)]
 mod window_event_listener_lifecycle_tests {
     use super::{
-        classify_window_event_receive, receive_window_event, WindowEventListenerHandle,
+        classify_window_event_receive, receive_window_event,
+        receive_window_event_after_observation, WindowEventListenerHandle,
         WindowEventListenerReceive, WindowEventListenerShutdown,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn continuous_events_and_preserved_navigation_do_not_starve_observation() {
+        let (tx, rx) = mpsc::channel();
+        for event in 1..=8 {
+            tx.send(event).unwrap();
+        }
+        let stop = AtomicBool::new(false);
+        let observed = AtomicUsize::new(0);
+        for expected in 0..=8 {
+            let received = receive_window_event_after_observation(
+                &rx,
+                &stop,
+                Duration::ZERO,
+                (expected == 0).then_some(0),
+                || {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                },
+            );
+            assert_eq!(received, WindowEventListenerReceive::Event(expected));
+        }
+        assert_eq!(observed.load(Ordering::Relaxed), 9);
+        stop.store(true, Ordering::Release);
+        assert_eq!(
+            receive_window_event_after_observation(&rx, &stop, Duration::ZERO, Some(9), || panic!(
+                "stopped listener observed"
+            ),),
+            WindowEventListenerReceive::Stop
+        );
+    }
 
     fn event_loop<T: Send + 'static>(receiver: mpsc::Receiver<T>) -> WindowEventListenerHandle {
         WindowEventListenerHandle::spawn(move |stop| {

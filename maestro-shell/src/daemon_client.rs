@@ -2177,6 +2177,20 @@ impl DaemonClient {
         budget: &GenerationKillBudget,
         during: &'static str,
     ) -> Result<Option<ShellEvent>, DaemonClientError> {
+        let Some(buf) = self.read_frame_before(budget, during, MAX_LINE_BYTES)? else {
+            return Ok(None);
+        };
+        let event = Self::decode_event_buffer(&buf)?;
+        budget.remaining(during)?;
+        Ok(event)
+    }
+
+    fn read_frame_before(
+        &mut self,
+        budget: &GenerationKillBudget,
+        during: &'static str,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, DaemonClientError> {
         let mut buf = Vec::new();
         loop {
             let timeout = budget.read_timeout(during)?;
@@ -2204,7 +2218,7 @@ impl DaemonClient {
                 if available.is_empty() {
                     (0, false, true)
                 } else {
-                    let capacity = (MAX_LINE_BYTES + 1).saturating_sub(buf.len());
+                    let capacity = (max_bytes + 1).saturating_sub(buf.len());
                     let newline_len = available
                         .iter()
                         .position(|byte| *byte == b'\n')
@@ -2222,10 +2236,10 @@ impl DaemonClient {
                 }
                 break;
             }
-            if buf.len() > MAX_LINE_BYTES {
+            if buf.len() > max_bytes {
                 return Err(DaemonClientError::LineTooLong {
                     direction: Direction::Inbound,
-                    limit: MAX_LINE_BYTES,
+                    limit: max_bytes,
                 });
             }
             if terminated {
@@ -2234,9 +2248,39 @@ impl DaemonClient {
         }
 
         budget.remaining(during)?;
-        let event = Self::decode_event_buffer(&buf)?;
-        budget.remaining(during)?;
-        Ok(event)
+        Ok(Some(buf))
+    }
+
+    /// Read one CURRENT structured grid frame, without Attach, raw output, history or mutation.
+    /// The caller must validate the existing Grid schema and exact session/generation before using
+    /// any observation. No terminal bytes may be logged or forwarded to dashboard JavaScript.
+    /// Uses the connection timeout as one absolute send/read deadline, including byte trickles.
+    pub fn current_grid_frame(&mut self, session_id: &str) -> Result<Vec<u8>, DaemonClientError> {
+        const DURING: &str = "reading current provider grid";
+        let budget = GenerationKillBudget::with_deadline(
+            self.reader
+                .get_ref()
+                .read_timeout()
+                .map_err(DaemonClientError::Io)?,
+            self.writer.write_timeout().map_err(DaemonClientError::Io)?,
+            Instant::now() + self.connect_timeout,
+        );
+        let result = (|| {
+            self.send_before(
+                &ClientRequest::Snapshot {
+                    id: SessionId(session_id.into()),
+                },
+                &budget,
+                DURING,
+            )?;
+            self.read_frame_before(&budget, DURING, 2 * 1024 * 1024)?
+                .ok_or(DaemonClientError::UnexpectedEof { during: DURING })
+        })();
+        let restored = self.restore_timeouts(&budget);
+        match (result, restored) {
+            (Ok(frame), Ok(())) => Ok(frame),
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        }
     }
 
     /// Read ONE newline-delimited reply line, bounded to [`MAX_LINE_BYTES`], and decode it into a
@@ -2767,6 +2811,28 @@ impl DaemonClient {
         match (result, restored) {
             (Ok(snapshot), Ok(())) => Ok(snapshot),
             (Ok(_), Err(error)) | (Err(error), _) => Err(error),
+        }
+    }
+
+    /// Read-only strict live-generation inventory with the connection timeout as one absolute
+    /// deadline. Observers reuse the existing v3/completeness validation, but gain no release or
+    /// attachment authority. The longer mutation API budget above is deliberately unchanged.
+    pub fn current_live_generations(
+        &mut self,
+    ) -> Result<GenerationMutationSnapshot, DaemonClientError> {
+        let mut budget = GenerationKillBudget::with_deadline(
+            self.reader
+                .get_ref()
+                .read_timeout()
+                .map_err(DaemonClientError::Io)?,
+            self.writer.write_timeout().map_err(DaemonClientError::Io)?,
+            Instant::now() + self.connect_timeout,
+        );
+        let result = self.generation_mutation_snapshot_before(&mut budget);
+        let restored = self.restore_timeouts(&budget);
+        match (result, restored) {
+            (Ok(snapshot), Ok(())) => Ok(snapshot),
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
         }
     }
 
@@ -4988,6 +5054,173 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::mpsc;
     use std::thread::JoinHandle;
+
+    #[test]
+    fn current_grid_frame_sends_snapshot_only_never_attach() {
+        let stub = StubDaemon::spawn(|tx, stream| {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let request = read_request(&mut reader, tx).unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&request).unwrap(),
+                serde_json::json!({"op":"snapshot","id":"provider-session"})
+            );
+            stream.write_all(b"{\"ev\":\"grid\"}\n").unwrap();
+            let mut remainder = String::new();
+            assert_eq!(reader.read_line(&mut remainder).unwrap(), 0);
+        });
+        let mut client =
+            DaemonClient::connect_with_timeout(&stub.path, Duration::from_millis(200)).unwrap();
+        assert_eq!(
+            client.current_grid_frame("provider-session").unwrap(),
+            b"{\"ev\":\"grid\"}\n"
+        );
+    }
+
+    #[test]
+    fn current_grid_frame_has_a_bounded_frame_and_eof() {
+        for oversized in [false, true] {
+            let stub = StubDaemon::spawn(move |tx, stream| {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                read_request(&mut reader, tx).unwrap();
+                if oversized {
+                    let _ = stream.write_all(&vec![b'x'; 2 * 1024 * 1024 + 1]);
+                    let mut remainder = String::new();
+                    assert_eq!(reader.read_line(&mut remainder).unwrap(), 0);
+                }
+            });
+            let mut client =
+                DaemonClient::connect_with_timeout(&stub.path, Duration::from_secs(2)).unwrap();
+            let error = client.current_grid_frame("provider-session").unwrap_err();
+            if oversized {
+                assert!(
+                    matches!(error, DaemonClientError::LineTooLong { .. }),
+                    "{error:?}"
+                );
+            } else {
+                assert!(matches!(error, DaemonClientError::UnexpectedEof { .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn current_grid_frame_enforces_cap_including_terminating_newline() {
+        const CAP: usize = 2 * 1024 * 1024;
+        for length in [CAP, CAP + 1] {
+            let stub = StubDaemon::spawn(move |tx, stream| {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                read_request(&mut reader, tx).unwrap();
+                let mut frame = vec![b'x'; length];
+                *frame.last_mut().unwrap() = b'\n';
+                let _ = stream.write_all(&frame);
+                let mut remainder = String::new();
+                assert_eq!(reader.read_line(&mut remainder).unwrap(), 0);
+            });
+            let mut client =
+                DaemonClient::connect_with_timeout(&stub.path, Duration::from_secs(2)).unwrap();
+            let result = client.current_grid_frame("provider-session");
+            if length == CAP {
+                assert_eq!(result.unwrap().len(), CAP);
+            } else {
+                assert!(matches!(result, Err(DaemonClientError::LineTooLong { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn current_grid_frame_byte_trickle_cannot_extend_absolute_deadline() {
+        let stub = StubDaemon::spawn(|tx, stream| {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            read_request(&mut reader, tx).unwrap();
+            for _ in 0..12 {
+                if stream.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let mut client =
+            DaemonClient::connect_with_timeout(&stub.path, Duration::from_millis(80)).unwrap();
+        let start = Instant::now();
+        assert!(matches!(
+            client.current_grid_frame("provider-session"),
+            Err(DaemonClientError::Timeout { .. })
+        ));
+        assert!(start.elapsed() < Duration::from_millis(220));
+    }
+
+    #[test]
+    fn current_live_generations_is_strict_read_only_inventory() {
+        let stub = StubDaemon::spawn(|tx, stream| {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            assert_eq!(
+                read_request(&mut reader, tx).as_deref(),
+                Some(r#"{"op":"daemon_info"}"#)
+            );
+            writeln!(
+                stream,
+                "{}",
+                strict_daemon_info_line("22222222222242228222222222222222", true)
+            )
+            .unwrap();
+            assert_eq!(
+                read_request(&mut reader, tx).as_deref(),
+                Some(r#"{"op":"list_sessions"}"#)
+            );
+            writeln!(
+                stream,
+                "{}",
+                serde_json::json!({"ev":"sessions","ids":["provider"],
+                "sessions":[{"id":"provider","generation":"exact-generation"}]})
+            )
+            .unwrap();
+            let mut remainder = String::new();
+            assert_eq!(
+                reader.read_line(&mut remainder).unwrap(),
+                0,
+                "no mutation frames"
+            );
+        });
+        let mut client =
+            DaemonClient::connect_with_timeout(&stub.path, Duration::from_millis(200)).unwrap();
+        let live = client.current_live_generations().unwrap();
+        assert_eq!(live.generation_for("provider"), Some("exact-generation"));
+        assert_eq!(live.session_count(), 1);
+    }
+
+    #[test]
+    fn current_live_generations_trickle_cannot_extend_absolute_deadline() {
+        let stub = StubDaemon::spawn(|tx, stream| {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            assert_eq!(
+                read_request(&mut reader, tx).as_deref(),
+                Some(r#"{"op":"daemon_info"}"#)
+            );
+            writeln!(
+                stream,
+                "{}",
+                strict_daemon_info_line("22222222222242228222222222222222", true)
+            )
+            .unwrap();
+            assert_eq!(
+                read_request(&mut reader, tx).as_deref(),
+                Some(r#"{"op":"list_sessions"}"#)
+            );
+            for _ in 0..12 {
+                if stream.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let mut client =
+            DaemonClient::connect_with_timeout(&stub.path, Duration::from_millis(80)).unwrap();
+        let start = Instant::now();
+        assert!(matches!(
+            client.current_live_generations(),
+            Err(DaemonClientError::Timeout { .. })
+        ));
+        assert!(start.elapsed() < Duration::from_millis(220));
+    }
 
     #[test]
     fn kernel_peer_identity_accepts_only_the_same_effective_uid() {

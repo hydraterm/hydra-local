@@ -49,6 +49,7 @@ mod picker;
 pub mod plugin_catalog;
 pub mod plugin_invocations;
 pub mod plugins;
+pub mod provider_attention;
 mod settings;
 pub mod startup_failure;
 /// Non-blocking new-release check against the published downloads manifest.

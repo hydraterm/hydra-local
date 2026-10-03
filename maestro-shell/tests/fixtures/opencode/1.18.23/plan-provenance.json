@@ -1,0 +1,46 @@
+{
+  "provider": "OpenCode",
+  "version": "1.18.23",
+  "cli_sha256": "de0724a36eaf3166e7f1ff38d0f4478b95ccc47725e9597b3fe66d3d3e18baa2",
+  "source": "Real installed CLI PTY output; deterministic synthetic loopback model, no paid provider or copied credentials",
+  "experimental_opt_in": "OPENCODE_EXPERIMENTAL_PLAN_MODE=1 in isolated capture process only",
+  "scope": "Actual provider-owned plan_exit Question; no claim of a model-authored plan or plan-file correctness",
+  "upstream_source": "https://raw.githubusercontent.com/anomalyco/opencode/v1.18.23/packages/opencode/src/tool/plan.ts",
+  "grid_parser_tree": "cdf0b049604b6df6af60642f6918d8e4de8705fc",
+  "daemon_sha256": "88c50971f43069955fa7ddd4004b38c7626d86f92a654ee4b9e36f9a940f5ffc",
+  "derivation": "Concatenate actual daemon Cell.text, blank hidden cells, trim right padding; replace only disposable plan/workspace paths. Preserve all 40 rows and original wrapping. Working is unchanged captured prefix ending at synchronized-frame boundary.",
+  "recovery": "Yes produced actual plan_exit approval tool result and Build response/composer; No returned to Plan composer without another model request. Neither is task success.",
+  "limits": "Narrow recorded plan-exit Question only, not generic questions or other providers. Genuine nonzero CLI exit is separately captured and does not alter this classifier.",
+  "cases": [
+    {
+      "name": "plan-approval",
+      "expected_attention_observation": "waiting",
+      "raw_capture_sha256": "b59571c582dec4c92ac9b76e3ffb6e4b3e8e0bfbc75d8a025676160e73beef15",
+      "replayed_grid_sha256": "246b39be9e3aa5be33d9b2375f8b3c68b4083964fbfe7052bece8b662de6930b"
+    },
+    {
+      "name": "plan-accepted",
+      "expected_attention_observation": "idle",
+      "raw_capture_sha256": "848029e33b56587d9de56a02a31a289e4d4f8b784747f62e4151a26ccbf26efa",
+      "replayed_grid_sha256": "60e9333088f5ab4a349445782c6c98565b568318938ba0863213d0c6190d0129"
+    },
+    {
+      "name": "plan-rejected",
+      "expected_attention_observation": "idle",
+      "raw_capture_sha256": "9a3e3814d784645d59a8cc8e87126063512d0f690e831e3e526a879b954be4fd",
+      "replayed_grid_sha256": "cafa3f509d3fac7841db8f5241e2424ccf71d137977d9f0386ab828fd0aacb8d"
+    },
+    {
+      "name": "plan-idle",
+      "expected_attention_observation": "idle",
+      "raw_capture_sha256": "1bbde04a50fed60ba01471f3e105dc34c01eee7f286513f9bad22f096bd27ef6",
+      "replayed_grid_sha256": "28e9a44b58667c73cdbc3dc9fb346e442b41a8bdd40bba81d2f4534a800e1cb2"
+    },
+    {
+      "name": "plan-working",
+      "expected_attention_observation": "working",
+      "raw_capture_sha256": "440dab2be3eba9e87bcc552921a34d157332e115cc794ff7398e73200c109a47",
+      "replayed_grid_sha256": "b3e149ff7e56e5096a326806aed3d0c81094a9c8e2447941b1be09515f772757"
+    }
+  ]
+}

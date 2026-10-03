@@ -233,9 +233,13 @@ fn recover_or_refuse(
             return Err(failure);
         }
     };
+    require_replacement_executable(daemon_bin)?;
     if !confirm(&failure) {
         return Err(failure);
     }
+    // The bundle can be moved, removed or lose execute access while the dialog is open.
+    // This is a fail-fast check, not an atomic guarantee that the subsequent spawn will succeed.
+    require_replacement_executable(daemon_bin)?;
     recovery
         .stop_confirmed(Instant::now() + DAEMON_CONNECT_TIMEOUT)
         .map_err(|error| {
@@ -248,6 +252,17 @@ fn recover_or_refuse(
     // Recovery gets no recursive confirmation or automatic retry against a new process.
     ensure_daemon(socket_path, daemon_bin, log_dir)
         .map_err(|error| LaunchFailure::new("daemon_recovery_failed", error.message))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn require_replacement_executable(daemon_bin: &Path) -> Result<(), LaunchFailure> {
+    if crate::launch_preflight::is_executable_file(daemon_bin) {
+        return Ok(());
+    }
+    Err(LaunchFailure::new(
+        "daemon_recovery_failed",
+        "Restart is unavailable because this Hydra copy's replacement pty-daemon is missing or is not an executable file. The retained terminal service was left running. Reinstall or restore this Hydra app, then try again.",
+    ))
 }
 
 pub(super) fn restart_unusable_retained_daemon(

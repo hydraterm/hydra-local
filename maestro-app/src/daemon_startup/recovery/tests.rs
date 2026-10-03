@@ -131,7 +131,7 @@ fn cancel_preserves_process_socket_and_never_attempts_spawn() {
     let mut confirmations = 0;
     let error = crate::daemon_startup::ensure_daemon_with_confirmation(
         &fixture.path,
-        Path::new("/must-not-be-spawned"),
+        &std::env::current_exe().unwrap(),
         None,
         Instant::now() + Duration::from_secs(2),
         &mut |_| {
@@ -162,13 +162,25 @@ fn headless_retained_failure_keeps_exact_nonrecovery_contract() {
     assert!(fixture.child.try_wait().unwrap().is_none());
 }
 
-#[test]
-fn silent_proven_owner_can_recover_after_bounded_identity_timeout() {
+fn unavailable_replacement_preserves_retained_owner(kind: &str) {
     let mut fixture = Fixture::with_mode("pty-daemon", "silent");
+    let replacement = fixture._dir.path().join("replacement-daemon");
+    match kind {
+        "missing" => {}
+        "non-executable" => {
+            std::fs::write(&replacement, b"not executable").unwrap();
+            std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        "directory" => std::fs::create_dir(&replacement).unwrap(),
+        _ => panic!("unknown test case"),
+    }
+    let saved = fixture._dir.path().join("saved-project-and-history");
+    std::fs::write(&saved, b"saved project and provider history").unwrap();
+    let original_inode = socket_identity(&fixture.path).unwrap();
     let mut confirmations = 0;
     let error = crate::daemon_startup::ensure_daemon_with_confirmation(
         &fixture.path,
-        Path::new("/fresh-daemon-does-not-exist"),
+        &replacement,
         None,
         Instant::now() + Duration::from_millis(150),
         &mut |failure| {
@@ -179,13 +191,77 @@ fn silent_proven_owner_can_recover_after_bounded_identity_timeout() {
     )
     .err()
     .unwrap();
-    assert_eq!(confirmations, 1);
+    assert!(
+        fixture.child.try_wait().unwrap().is_none(),
+        "{kind}: owner was stopped"
+    );
+    assert_eq!(socket_identity(&fixture.path).unwrap(), original_inode);
+    assert_eq!(
+        std::fs::read(saved).unwrap(),
+        b"saved project and provider history"
+    );
+    assert_eq!(confirmations, 0, "do not offer a known-unavailable restart");
     assert_eq!(error.error_kind, "daemon_recovery_failed");
     assert!(
-        error.message.contains("failed to spawn pty-daemon"),
+        error
+            .message
+            .contains("retained terminal service was left running"),
         "{error:?}"
     );
-    assert!(fixture.child.wait().unwrap().code().is_none());
+    assert!(error.message.contains("Reinstall or restore"), "{error:?}");
+}
+
+#[test]
+fn missing_replacement_after_bounded_probe_preserves_retained_owner() {
+    unavailable_replacement_preserves_retained_owner("missing");
+}
+
+#[test]
+fn nonexecutable_replacement_preserves_retained_owner() {
+    unavailable_replacement_preserves_retained_owner("non-executable");
+}
+
+#[test]
+fn directory_replacement_preserves_retained_owner() {
+    unavailable_replacement_preserves_retained_owner("directory");
+}
+
+#[test]
+fn replacement_removed_during_confirmation_preserves_retained_owner() {
+    let mut fixture = Fixture::start("pty-daemon");
+    let replacement = fixture._dir.path().join("replacement-daemon");
+    std::fs::copy(std::env::current_exe().unwrap(), &replacement).unwrap();
+    let saved = fixture._dir.path().join("saved-project-and-history");
+    std::fs::write(&saved, b"saved project and provider history").unwrap();
+    let original_inode = socket_identity(&fixture.path).unwrap();
+    let mut confirmations = 0;
+    let error = crate::daemon_startup::ensure_daemon_with_confirmation(
+        &fixture.path,
+        &replacement,
+        None,
+        Instant::now() + Duration::from_secs(2),
+        &mut |_| {
+            confirmations += 1;
+            std::fs::remove_file(&replacement).unwrap();
+            true
+        },
+    )
+    .err()
+    .unwrap();
+    assert!(
+        fixture.child.try_wait().unwrap().is_none(),
+        "owner was stopped"
+    );
+    assert_eq!(confirmations, 1);
+    assert_eq!(socket_identity(&fixture.path).unwrap(), original_inode);
+    assert_eq!(
+        std::fs::read(saved).unwrap(),
+        b"saved project and provider history"
+    );
+    assert_eq!(error.error_kind, "daemon_recovery_failed");
+    assert!(error
+        .message
+        .contains("retained terminal service was left running"));
 }
 
 #[test]
@@ -253,7 +329,7 @@ fn socket_replacement_during_confirmation_is_preserved_and_refused() {
     let mut replacement = None;
     let error = crate::daemon_startup::ensure_daemon_with_confirmation(
         &fixture.path,
-        Path::new("/must-not-be-spawned"),
+        &std::env::current_exe().unwrap(),
         None,
         Instant::now() + Duration::from_secs(2),
         &mut |_| {

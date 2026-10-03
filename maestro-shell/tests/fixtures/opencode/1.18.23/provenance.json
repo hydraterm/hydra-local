@@ -1,0 +1,48 @@
+{
+  "provider": "OpenCode",
+  "version": "1.18.23",
+  "cli_sha256": "de0724a36eaf3166e7f1ff38d0f4478b95ccc47725e9597b3fe66d3d3e18baa2",
+  "source": "Real installed CLI PTY output; deterministic synthetic loopback model responses, no paid provider or copied credentials",
+  "grid_parser": "Actual Hydra PTY daemon, source aa5216f1d12dba7d5afdc6e264d4aa7ffb914c91",
+  "daemon_sha256": "88c50971f43069955fa7ddd4004b38c7626d86f92a654ee4b9e36f9a940f5ffc",
+  "derivation": "Concatenate existing daemon Cell.text per row, trim right padding, replace only disposable workspace footer path with <isolated-workspace>. Store all40 rows as JSON strings, including blank rows. No prompt/control text invented. Streaming/resumed are exact synchronized-frame prefixes.",
+  "limits": "Visible permission attention only. Idle is not task success; error-ui is upstream rejection, not process exit. Other providers and plan approval remain unqualified.",
+  "cases": [
+    {
+      "name": "permission",
+      "expected_attention_observation": "waiting",
+      "raw_capture_sha256": "636adacd8a4e2b726667ba8488fdf70a9afe462a8e6f18d8397b8ecb73973fa3",
+      "replayed_grid_sha256": "a5093537cc18f7cadfc491624498f5a3f698d3f7b0b8750d97e78897aabe7366"
+    },
+    {
+      "name": "streaming",
+      "expected_attention_observation": "working",
+      "raw_capture_sha256": "45a41638e105511ede9de558140e2d42539fc53db93b85dc7d842cd2f2e4542e",
+      "replayed_grid_sha256": "0980f94eaf4fc3b63bfc15558a944b6b54e0f3e0dfe61dc1a8c27f28027456bb"
+    },
+    {
+      "name": "idle",
+      "expected_attention_observation": "idle",
+      "raw_capture_sha256": "5836fe4cd7ef8a8d22e580eee13bcc339be0b39f8a6c310ae77ffef163ed6b10",
+      "replayed_grid_sha256": "d198d3379f671817d45e84f8665ed6059c3f8f49c7fe21df8e0601fd5d1ebcfc"
+    },
+    {
+      "name": "resumed",
+      "expected_attention_observation": "working",
+      "raw_capture_sha256": "6a9ce9d94b1efb30f7ed7958675e12befc58fcf5d67880ea140896749a7d4170",
+      "replayed_grid_sha256": "422875f4f5af14d98b35f6c47870a239f873e0c15011c4cb39611757e7969de2"
+    },
+    {
+      "name": "error-ui",
+      "expected_attention_observation": "idle",
+      "raw_capture_sha256": "c3c6f763093630b8318f451ad6b43df10ef484118d2b6384c50b1371d1327995",
+      "replayed_grid_sha256": "f25655281f9b74b839d88ae7e2891a592fe98cb152c09c48357928a4f1b9c40c"
+    },
+    {
+      "name": "lookalike",
+      "expected_attention_observation": "idle",
+      "raw_capture_sha256": "ab908d4d5f467c0c7a5ef40a88c80b3acdf25204bc6c31e1fc8823a53c440d9f",
+      "replayed_grid_sha256": "6a3ba482200b8db73784154a2ab86029836b82b79d117f40e30ad86b6e762359"
+    }
+  ]
+}
