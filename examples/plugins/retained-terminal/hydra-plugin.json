@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "id": "example.retained-terminal",
+  "name": "Retained Terminal",
+  "version": "0.1.0",
+  "actions": [
+    {
+      "id": "open",
+      "title": "Plugin: open a retained terminal",
+      "command": ["python3", "new_terminal.py"]
+    }
+  ]
+}

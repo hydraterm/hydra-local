@@ -373,6 +373,9 @@ pub(crate) enum PreparedSessionBinding {
     /// token-redacted, while live bytes are derived through the user's login shell; A and B remain
     /// the same non-replayable AdHoc recipe.
     AgentAdHocLoginShell,
+    /// First launch only: a closed fresh profile and absolute locator, with no conversation or
+    /// replay authority. Unknown A and published B are identical audit records.
+    ProviderFreshAudit,
     /// An exact reviewed provider conversation. A and B use the same canonical KnownSafe recipe.
     ProviderExact,
     /// A provider launch explicitly selecting latest/import/search/index. A is token-redacted and
@@ -628,7 +631,42 @@ impl PreparedWorkspace {
         let (mode, canonical_publication) =
             crate::restart_recipe::strict_prepared_provider_launch(selected_provider, source_argv)
                 .ok_or(WorkspaceExecError::InvalidPreparedSessionSpec)?;
-        let wire_argv = crate::launch_environment::login_shell_argv(source_argv, env);
+        let selected_executable = env
+            .selected_provider_path(selected_provider)
+            .map(|path| {
+                path.to_str()
+                    .filter(|_| path.is_absolute())
+                    .filter(|value| value.len() <= 4096 && !value.as_bytes().contains(&0))
+                    .map(str::to_owned)
+                    .ok_or(WorkspaceExecError::InvalidPreparedSessionSpec)
+            })
+            .transpose()?;
+        let canonical_publication = match selected_executable.as_deref() {
+            Some(executable) => match canonical_publication {
+                LaunchSpec::KnownSafe {
+                    launch_spec_id,
+                    params,
+                } => LaunchSpec::BoundProvider {
+                    launch_spec_id,
+                    params,
+                    executable: executable.to_owned(),
+                },
+                other => other,
+            },
+            None => canonical_publication,
+        };
+        // Seal the wire and audit from one selection, even for an injected environment whose
+        // answer could change between reads. Do not pin an updater-managed physical target.
+        let selected = selected_executable.as_ref().map(|executable| {
+            crate::ProviderExecutable::new(selected_provider.to_owned(), executable.into())
+        });
+        let wire_argv = crate::launch_environment::login_shell_argv(
+            source_argv,
+            &crate::SelectedProviderLaunchEnv {
+                env,
+                selected: selected.as_ref(),
+            },
+        );
         let (command, args) = wire_argv
             .split_first()
             .filter(|(command, _)| !command.trim().is_empty())
@@ -640,11 +678,26 @@ impl PreparedWorkspace {
                 canonical_publication,
                 PreparedSessionBinding::ProviderExact,
             ),
-            crate::restart_recipe::PreparedProviderLaunchMode::FreshUnassigned => (
-                source_launch.clone(),
-                source_launch,
-                PreparedSessionBinding::AgentAdHocLoginShell,
-            ),
+            crate::restart_recipe::PreparedProviderLaunchMode::FreshUnassigned => {
+                if let Some(executable) = selected_executable {
+                    let audit = LaunchSpec::FreshProvider {
+                        launch_spec_id: selected_provider.into(),
+                        params: source_argv[1..].to_vec(),
+                        executable,
+                    };
+                    (
+                        audit.clone(),
+                        audit,
+                        PreparedSessionBinding::ProviderFreshAudit,
+                    )
+                } else {
+                    (
+                        source_launch.clone(),
+                        source_launch,
+                        PreparedSessionBinding::AgentAdHocLoginShell,
+                    )
+                }
+            }
             crate::restart_recipe::PreparedProviderLaunchMode::ExplicitNonExact => (
                 source_launch,
                 canonical_publication,
@@ -1606,6 +1659,74 @@ mod tests {
     }
 
     struct PreparedLaunchEnv;
+
+    #[test]
+    fn prepared_provider_retains_the_selected_stable_launcher() {
+        struct SelectedEnv(PathBuf);
+        impl LaunchEnvLookup for SelectedEnv {
+            fn shell_utf8(&self) -> Option<String> {
+                Some("/bin/sh".into())
+            }
+            fn home_os(&self) -> Option<std::ffi::OsString> {
+                None
+            }
+            fn selected_provider_path(&self, provider: &str) -> Option<PathBuf> {
+                matches!(provider, "claude" | "codex").then(|| self.0.clone())
+            }
+        }
+        let cwd = TempDir::new().unwrap();
+        let locator = cwd.path().join("stable launcher");
+        let prepared = PreparedWorkspace::unsealed(
+            WorkspacePolicy::ScratchCwd,
+            "provider-ws",
+            "provider-session",
+            cwd.path(),
+        );
+        let spec = prepared
+            .provider_session_spec(
+                "claude",
+                &[
+                    "claude".into(),
+                    "--resume".into(),
+                    "00000000-0000-4000-8000-000000000017".into(),
+                ],
+                &SelectedEnv(locator.clone()),
+                80,
+                24,
+                10,
+            )
+            .unwrap();
+        let durable = serde_json::to_value(&spec.publication_launch).unwrap();
+        assert_eq!(durable["executable"], locator.to_str().unwrap());
+        assert_eq!(durable["launch_spec_id"], "claude");
+        assert!(crate::known_safe_provider_has_exact_resume(
+            &spec.publication_launch
+        ));
+        assert_eq!(spec.params.launch, spec.publication_launch);
+        let fresh = prepared
+            .provider_session_spec(
+                "codex",
+                &["codex".into()],
+                &SelectedEnv(locator.clone()),
+                80,
+                24,
+                10,
+            )
+            .unwrap();
+        let fresh_durable = serde_json::to_value(&fresh.publication_launch).unwrap();
+        assert_eq!(fresh_durable["tier"], "fresh_provider");
+        assert_eq!(fresh_durable["executable"], locator.to_str().unwrap());
+        assert_eq!(fresh_durable["params"], serde_json::json!([]));
+        assert!(!crate::known_safe_provider_has_exact_resume(
+            &fresh.publication_launch
+        ));
+        assert_eq!(fresh.params.launch, fresh.publication_launch);
+        assert!(fresh
+            .params
+            .args
+            .iter()
+            .any(|arg| arg.contains(locator.to_str().unwrap())));
+    }
 
     impl LaunchEnvLookup for PreparedLaunchEnv {
         fn shell_utf8(&self) -> Option<String> {

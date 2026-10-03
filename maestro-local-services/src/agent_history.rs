@@ -753,10 +753,27 @@ pub fn agent_from_session_record(record: &SessionRecord) -> Option<&'static str>
 }
 
 pub fn agent_from_launch(launch: &LaunchSpec) -> Option<&'static str> {
+    if matches!(launch, LaunchSpec::FreshProvider { .. }) && launch.fresh_provider_audit().is_none()
+    {
+        return None;
+    }
+    if matches!(launch, LaunchSpec::BoundProvider { .. }) && launch.provider_recipe().is_none() {
+        return None;
+    }
     match launch {
         LaunchSpec::KnownSafe {
             launch_spec_id,
             params,
+        }
+        | LaunchSpec::BoundProvider {
+            launch_spec_id,
+            params,
+            ..
+        }
+        | LaunchSpec::FreshProvider {
+            launch_spec_id,
+            params,
+            ..
         } => {
             if launch_spec_id == "agent" {
                 return Some("cursor");
@@ -900,10 +917,18 @@ fn is_user_session_name(title: &str) -> bool {
 }
 
 fn provider_session_id_from_launch(launch: &LaunchSpec) -> Option<String> {
+    if matches!(launch, LaunchSpec::BoundProvider { .. }) && launch.provider_recipe().is_none() {
+        return None;
+    }
     match launch {
         LaunchSpec::KnownSafe {
             launch_spec_id,
             params,
+        }
+        | LaunchSpec::BoundProvider {
+            launch_spec_id,
+            params,
+            ..
         } => {
             if matches!(launch_spec_id.as_str(), "claude" | "devin" | "droid") {
                 return opaque_resume_id_from_params(params);
@@ -916,7 +941,7 @@ fn provider_session_id_from_launch(launch: &LaunchSpec) -> Option<String> {
         LaunchSpec::AdHocRedacted { argv, .. } => {
             provider_session_id_from_tokens(argv.iter().map(String::as_str), false)
         }
-        LaunchSpec::OptOut => None,
+        LaunchSpec::OptOut | LaunchSpec::FreshProvider { .. } => None,
     }
 }
 
@@ -1219,6 +1244,48 @@ mod tests {
             )
             .unwrap();
         connection
+    }
+
+    #[test]
+    fn bound_provider_history_identity_matches_legacy_recipe_not_wrapper_basename() {
+        for (provider, params) in [
+            (
+                "claude",
+                vec!["--resume", "20000000-0000-4000-8000-000000000001"],
+            ),
+            (
+                "codex",
+                vec!["resume", "20000000-0000-4000-8000-000000000001"],
+            ),
+            (
+                "agent",
+                vec!["--resume", "20000000-0000-4000-8000-000000000001"],
+            ),
+        ] {
+            let params: Vec<String> = params.into_iter().map(str::to_owned).collect();
+            let legacy = LaunchSpec::KnownSafe {
+                launch_spec_id: provider.into(),
+                params: params.clone(),
+            };
+            let bound = LaunchSpec::BoundProvider {
+                launch_spec_id: provider.into(),
+                params,
+                executable: "/stable/renamed-wrapper-v2".into(),
+            };
+            assert_eq!(agent_from_launch(&bound), agent_from_launch(&legacy));
+            assert_eq!(
+                provider_session_id_from_launch(&bound),
+                provider_session_id_from_launch(&legacy)
+            );
+            assert!(provider_session_id_from_launch(&bound).is_some());
+            let fresh = LaunchSpec::FreshProvider {
+                launch_spec_id: provider.into(),
+                params: vec![],
+                executable: "/stable/renamed-wrapper-v2".into(),
+            };
+            assert_eq!(agent_from_launch(&fresh), agent_from_launch(&legacy));
+            assert!(provider_session_id_from_launch(&fresh).is_none());
+        }
     }
 
     #[test]

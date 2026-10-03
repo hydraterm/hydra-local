@@ -206,6 +206,28 @@ beforeAll(async () => {
   linuxHostSource = fs.readFileSync('../maestro-renderer/src/linux_host/overlay.rs', 'utf8')
 })
 
+it('registers one native overlay focus authority, without shadowing live GTK observers', () => {
+  // Structural integration guard: two registrations keep both handlers alive, while shadowed
+  // locals store only the second epoch/handler IDs in Self. Pure epoch tests cannot detect that
+  // constructor wiring error. This check is not native event-order or first-key qualification.
+  const constructor = linuxHostSource.split('impl LinuxOverlayHost {')[1]
+    .split('pub(super) fn new(')[1].split('Ok(Self {')[0]
+  for (const registration of [
+    'let focus_epoch =',
+    'let pending_opener: PendingOpener =',
+    'top_level.connect_key_press_event(',
+    'gtk::GestureMultiPress::new(&top_level)',
+    'top_level.connect_is_active_notify(',
+    'top_level.connect_set_focus(',
+  ]) {
+    expect(constructor.split(registration).length - 1, registration).toBe(1)
+  }
+  expect(constructor).toContain('state.observe_dialog_key(')
+  expect(constructor).toContain('let focus_epoch = persistent_input_gate.focus_epoch.clone();')
+  expect(constructor).toContain('state.observe_dialog_trigger(')
+  expect(constructor).toContain('state.observe_dialog_focus_target(')
+})
+
 function linuxFocusRealm() {
   const listeners = new Map<string, Set<(event: { type: string; target: unknown }) => void>>()
   const messages: Array<{ type: string; token: string }> = []

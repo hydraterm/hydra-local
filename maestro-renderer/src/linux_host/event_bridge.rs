@@ -23,6 +23,12 @@ use crate::host_event::{
     HostPointerButton, HostScrollDelta,
 };
 
+/// App owns click counting. GDK's double/triple summaries follow the ordinary press and must not
+/// become extra presses (including extra mouse reports to a terminal application).
+pub(super) fn is_terminal_button_press(event_type: gdk::EventType) -> bool {
+    event_type == gdk::EventType::ButtonPress
+}
+
 /// Map a GDK modifier mask to the neutral [`HostModifiers`] (the four the renderer checks). `MOD1` is the
 /// customary X11/Wayland "Alt"; `SUPER`/`META` both map to the neutral super/command bit so an Alt-as-Meta or
 /// super-chord matches the macOS path.
@@ -192,6 +198,40 @@ pub fn ime_preedit_event(text: &str) -> HostEvent {
 mod tests {
     use super::*;
 
+    #[test]
+    fn gdk_multiclick_sequences_emit_one_press_per_physical_click() {
+        use gtk::gdk::EventType::*;
+        // GDK adds click-summary events immediately after the ordinary press:
+        // https://docs.gtk.org/gdk3/struct.EventButton.html
+        let double = [
+            ButtonPress,
+            ButtonRelease,
+            ButtonPress,
+            DoubleButtonPress,
+            ButtonRelease,
+        ];
+        let triple = [
+            ButtonPress,
+            ButtonRelease,
+            ButtonPress,
+            DoubleButtonPress,
+            ButtonRelease,
+            ButtonPress,
+            TripleButtonPress,
+            ButtonRelease,
+        ];
+        for (events, expected) in [(double.as_slice(), 2), (triple.as_slice(), 3)] {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| super::is_terminal_button_press(**event))
+                    .count(),
+                expected
+            );
+        }
+        assert!(super::is_terminal_button_press(ButtonPress));
+        assert!(!super::is_terminal_button_press(ButtonRelease));
+    }
     #[test]
     fn named_keys_map_to_neutral() {
         assert_eq!(host_named_key(key::Left), Some(HostNamedKey::ArrowLeft));

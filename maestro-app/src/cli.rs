@@ -22,6 +22,8 @@ use crate::{
 /// Which top-level subcommand was requested.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
+    /// Manage and invoke trusted local executable plugins.
+    Plugin(crate::plugins::PluginCommand),
     /// Print usage and exit 0.
     Help,
     /// Run the one-session dev harness. Boxed so this large-payload variant does not bloat every
@@ -884,6 +886,11 @@ pub fn usage() -> &'static str {
      \n\
      USAGE:\n\
      \x20\x20maestro-app --help\n\
+     \x20\x20maestro-app plugin install-local <dir> [--base <dir>]\n\
+     \x20\x20maestro-app plugin list [--base <dir>]\n\
+     \x20\x20maestro-app plugin enable|disable|remove <id> [--base <dir>]\n\
+     \x20\x20maestro-app plugin run <id> <action> [--base <dir>] [--socket <path>] [-- args...]\n\
+     \x20\x20Plugins execute trusted local code as your user, without a sandbox.\n\
      \x20\x20maestro-app launch [FLAGS] [-- <session-command> [args...]]\n\
      \x20\x20maestro-app dashboard [--base <dir>] [--with-session-reconcile [--socket <path>]]\n\
      \x20\x20maestro-app agent-start [FLAGS] -- <agent-command> [args...]\n\
@@ -1169,6 +1176,9 @@ pub fn parse_args(args: &[String]) -> Result<Command, ParseError> {
     };
 
     match first.as_str() {
+        "plugin" => crate::plugins::parse(&args[1..])
+            .map(Command::Plugin)
+            .map_err(ParseError::new),
         "--help" | "-h" | "help" => Ok(Command::Help),
         "launch" => parse_launch(iter).map(|a| Command::Launch(Box::new(a))),
         "dashboard" => parse_dashboard(iter).map(Command::Dashboard),

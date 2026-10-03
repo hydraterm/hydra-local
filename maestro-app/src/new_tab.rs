@@ -382,8 +382,9 @@ impl NewTabForegroundLaunch {
         };
         let mut check = |argv: &[String], agent: Option<&str>| {
             if let Some(selected) = env.selected {
-                crate::launch_preflight::reprobe_selected_provider(argv, selected)
-                    .map_err(|_| NewTabStartParamsError::PreparedLaunch)
+                crate::launch_preflight::reprobe_selected_provider(argv, selected).map_err(
+                    |error| NewTabStartParamsError::ProviderPreflight(error.user_message()),
+                )
             } else {
                 reprobe(argv, agent, &prepared.cwd)
             }
@@ -473,6 +474,8 @@ pub enum NewTabStartParamsError {
     /// A reviewed provider/custom launch could not be reprobed or sealed at the actual prepared
     /// cwd. This occurs before the Unknown+placement transaction and before any daemon byte.
     PreparedLaunch,
+    /// Bounded secret-free native preflight text; retain the useful history/launcher distinction.
+    ProviderPreflight(String),
     /// The launch carrier and secret-free plan source disagree. Refused before graph/wire.
     PreparedLaunchSourceMismatch,
 }
@@ -1769,6 +1772,10 @@ impl std::fmt::Display for NewTabForegroundError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NewTabForegroundError::WorkspacePrepare(e) => write!(f, "{e}"),
+            NewTabForegroundError::StartParams {
+                error: NewTabStartParamsError::ProviderPreflight(message),
+                ..
+            } => f.write_str(message),
             NewTabForegroundError::StartParams { error, .. } => {
                 write!(f, "new-tab start params failed: {error:?}")
             }
@@ -4235,7 +4242,7 @@ fn run_new_tab_foreground_pipeline_from_prepared(
         runtime,
         |source_argv, selected_agent, cwd| {
             crate::launch_preflight::reprobe_prepared_argv(source_argv, selected_agent, cwd)
-                .map_err(|_| NewTabStartParamsError::PreparedLaunch)
+                .map_err(|error| NewTabStartParamsError::ProviderPreflight(error.user_message()))
         },
     )
 }
@@ -5124,8 +5131,22 @@ mod tests {
             launch.into_session_spec_with_reprobe(&prepared, 80, 24, 1, |_, _, _| panic!(
                 "missing selected executable must not fall back"
             )),
-            Err(NewTabStartParamsError::PreparedLaunch)
+            Err(NewTabStartParamsError::ProviderPreflight(message)) if message.contains("Claude")
         ));
+    }
+
+    #[test]
+    fn selected_provider_preflight_message_survives_new_tab_error_display() {
+        let message = "Hydra found Claude's history storage, but its launcher is unavailable.";
+        let error = NewTabForegroundError::StartParams {
+            cwd: PathBuf::new(),
+            scratch: None,
+            error: NewTabStartParamsError::ProviderPreflight(message.into()),
+        };
+        assert_eq!(error.to_string(), message);
+        let diagnostic = classify_new_tab_foreground_failure(&error);
+        assert!(!diagnostic.session_started);
+        assert!(!diagnostic.layout_record_persisted);
     }
 
     #[test]
@@ -11976,9 +11997,9 @@ mod tests {
             &error,
             NewTabForegroundError::StartParams {
                 scratch: Some(_),
-                error: NewTabStartParamsError::PreparedLaunch,
+                error: NewTabStartParamsError::ProviderPreflight(message),
                 ..
-            }
+            } if message == &crate::launch_preflight::LaunchPreflightError::MissingCommand.user_message()
         ));
         assert!(
             expected.is_dir(),

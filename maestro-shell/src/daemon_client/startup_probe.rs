@@ -8,6 +8,13 @@ struct StartupIdentity {
 }
 
 impl DaemonClient {
+    /// Duplicate this exact connected socket for app-owned, explicitly confirmed startup recovery.
+    /// This grants no protocol compatibility and performs no daemon/session lifecycle operation.
+    #[cfg(unix)]
+    pub fn duplicate_startup_peer_socket(&self) -> std::io::Result<OwnedFd> {
+        self.writer.try_clone().map(Into::into)
+    }
+
     /// Connect within the caller's existing startup deadline. This does not start a daemon,
     /// create a socket or change the lifetime of any retained session.
     pub fn connect_before(

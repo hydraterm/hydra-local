@@ -1659,6 +1659,16 @@ fn main() {
     maestro_shell::write_trace::set_writer_tag("desktop-app");
     let args: Vec<String> = std::env::args().skip(1).collect();
     match maestro_app::parse_args(&args) {
+        Ok(Command::Plugin(command)) => match run_plugin_command(command) {
+            Ok(code) => std::process::exit(code),
+            Err(message) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"ok": false, "error": "plugin_error", "message": message})
+                );
+                std::process::exit(1);
+            }
+        },
         Ok(Command::Help) => {
             print!("{}", maestro_app::usage());
             std::process::exit(0);
@@ -1954,19 +1964,50 @@ fn window_command_label(sub: Option<&str>) -> &'static str {
     }
 }
 
-/// Run the `dashboard` command. Resolve the records base (the explicit `--base` or the same
-/// dev-safe default `launch` uses), then project a [`DashboardSnapshot`] via
-/// [`DashboardSnapshotService`].
-///
-/// - Default (local-only): build the snapshot with NO daemon report (`None`); connect to no daemon,
-///   spawn nothing, touch no sockets/worktrees/renderer. Reports `session_reconcile: false`.
-/// - Opt-in (`--with-session-reconcile`): first run [`ShellRuntime::reconcile_sessions`] (resolving
-///   `--socket` or the stored/default endpoint, connecting, persisting the endpoint only after a
-///   successful connect), then project with `snapshot(Some(&report))` so reconciled live/exited
-///   statuses and recovered sessions flow into the dashboard. Reports `session_reconcile: true` and
-///   the socket the reconcile used. The only record mutations are the normal `SessionService`
-///   reconcile side effects owned by `ShellRuntime`; this command writes nothing else.
-///
+/// App-native plugin management and explicit executable invocation.
+fn run_plugin_command(command: maestro_app::plugins::PluginCommand) -> Result<i32, String> {
+    use maestro_app::plugins::{self, Operation};
+    let runtime_base = runtime_base_dir(|k| std::env::var(k).ok());
+    let base = command
+        .base
+        .unwrap_or_else(|| default_base_dir(|k| std::env::var(k).ok(), &runtime_base));
+    let result = match command.operation {
+        Operation::InstallLocal(root) => {
+            serde_json::to_value(plugins::install_local(&base, &root)?)
+        }
+        Operation::List => serde_json::to_value(plugins::inventory(&base)?),
+        Operation::Enable(id, enabled) => {
+            serde_json::to_value(plugins::set_enabled(&base, &id, enabled)?)
+        }
+        Operation::Remove(id) => {
+            plugins::remove(&base, &id)?;
+            Ok(serde_json::json!({"removed": id}))
+        }
+        Operation::Run {
+            plugin,
+            action,
+            args,
+        } => {
+            let mut child = plugins::spawn_action(
+                &base,
+                command.socket.as_deref(),
+                &plugin,
+                &action,
+                &args,
+                &plugins::Context::default(),
+                true,
+            )?;
+            return child
+                .wait()
+                .map(|status| status.code().unwrap_or(1))
+                .map_err(|e| e.to_string());
+        }
+    }
+    .map_err(|e| e.to_string())?;
+    println!("{}", serde_json::json!({"ok": true, "result": result}));
+    Ok(0)
+}
+
 /// Build the `command-palette --list` JSON. Resolves the display `base` via the same dev-safe
 /// default-base policy used by `settings show`/`dashboard` (`--base` overrides), then serializes the
 /// pure, deterministic action catalog via [`build_command_palette`]. Strictly read-only and
@@ -2289,11 +2330,28 @@ fn command_palette_to_renderer_model(
     };
     let selected_row = if rows.is_empty() { None } else { Some(0) };
     maestro_renderer::RendererCommandPaletteModel {
+        refresh_generation: Some(0),
         title,
         query: initial_query,
         rows,
         selected_row,
     }
+}
+
+fn cached_command_palette_model(
+    base: &Path,
+    catalog: Option<&maestro_app::plugin_catalog::PluginCatalog>,
+    generation: u64,
+) -> maestro_renderer::RendererCommandPaletteModel {
+    let full =
+        with_command_palette_preview(build_command_palette(base.to_string_lossy().into_owned()));
+    let mut model = command_palette_to_renderer_model(&full, None);
+    model.refresh_generation = Some(generation);
+    if let Some(catalog) = catalog {
+        model.rows.extend_from_slice(catalog.rows());
+    }
+    model.selected_row = (!model.rows.is_empty()).then_some(0);
+    model
 }
 
 /// Build the `settings show` JSON. It resolves the effective app-support base via the same dev-safe
@@ -2376,6 +2434,18 @@ fn run_settings_reset(args: SettingsResetArgs) -> Result<String, SettingsFailure
     Ok(serde_json::to_string(&success).expect("SettingsSetSuccess serializes"))
 }
 
+/// Run the `dashboard` command. Resolve the records base (the explicit `--base` or the same
+/// dev-safe default `launch` uses), then project a [`DashboardSnapshot`] via
+/// [`DashboardSnapshotService`].
+///
+/// - Default (local-only): build the snapshot with NO daemon report (`None`); connect to no daemon,
+///   spawn nothing, touch no sockets/worktrees/renderer. Reports `session_reconcile: false`.
+/// - Opt-in (`--with-session-reconcile`): first run [`ShellRuntime::reconcile_sessions`] (resolving
+///   `--socket` or the stored/default endpoint, connecting, persisting the endpoint only after a
+///   successful connect), then project with `snapshot(Some(&report))` so reconciled live/exited
+///   statuses and recovered sessions flow into the dashboard. Reports `session_reconcile: true` and
+///   the socket the reconcile used. The only record mutations are the normal `SessionService`
+///   reconcile side effects owned by `ShellRuntime`; this command writes nothing else.
 fn run_dashboard(args: DashboardArgs) -> Result<String, DashboardFailure> {
     let runtime_base = runtime_base_dir(|k| std::env::var(k).ok());
     let base = args
@@ -4062,7 +4132,7 @@ impl PreparedReactFreshLaunch {
         } else {
             launch_preflight::reprobe_prepared_argv(source_argv, selected_agent, &prepared.cwd)
         })
-        .map_err(|error| format!("prepared cwd launch reprobe: {}", error.code()))?;
+        .map_err(|error| error.user_message())?;
         let env = maestro_shell::SelectedProviderLaunchEnv {
             env: &maestro_shell::ProcessLaunchEnv,
             selected: executable,
@@ -4241,9 +4311,11 @@ fn prepared_react_shell_argv(
             ..
         } if !argv.is_empty() => Some(argv.clone()),
         LaunchSpec::OptOut if !fallback_argv.is_empty() => Some(fallback_argv.to_vec()),
-        LaunchSpec::KnownSafe { .. } | LaunchSpec::AdHocRedacted { .. } | LaunchSpec::OptOut => {
-            None
-        }
+        LaunchSpec::KnownSafe { .. }
+        | LaunchSpec::BoundProvider { .. }
+        | LaunchSpec::FreshProvider { .. }
+        | LaunchSpec::AdHocRedacted { .. }
+        | LaunchSpec::OptOut => None,
     }
 }
 
@@ -6867,6 +6939,12 @@ fn recorded_session_live_argv(session: &SessionRecord, fallback: &[String]) -> V
     // records are converted to restart recipes explicitly during application startup; doing that
     // conversion here also affected the first launch and made "New session" resume an old one.
     match &session.launch {
+        LaunchSpec::FreshProvider { .. } => Vec::new(),
+        LaunchSpec::BoundProvider { .. } => maestro_shell::known_safe_provider_login_shell_argv(
+            &session.launch,
+            &maestro_shell::ProcessLaunchEnv,
+        )
+        .unwrap_or_default(),
         // KnownSafe (remote-split / new-window agent panes: launch_spec_id="claude", params=["--model",…])
         // restarts by re-running [launch_spec_id, ...params]; agents go through the login shell like the
         // AdHocRedacted arm. Previously KnownSafe hit `_` and restarted as bare bash.
@@ -6968,6 +7046,10 @@ fn canonical_restart_after_started_provider(
 ) -> Option<LaunchSpec> {
     let launch_spec_id = canonical_provider_launch_spec_id(selected_agent?)?;
     match launch {
+        LaunchSpec::BoundProvider {
+            launch_spec_id: id, ..
+        } if id == launch_spec_id && launch.provider_recipe().is_some() => Some(launch.clone()),
+        LaunchSpec::BoundProvider { .. } | LaunchSpec::FreshProvider { .. } => None,
         LaunchSpec::KnownSafe {
             launch_spec_id: id, ..
         } if id == launch_spec_id => Some(maestro_shell::canonical_launch_for_restart(launch)),
@@ -11288,7 +11370,7 @@ fn product_existing_start_authority(
         return Ok(None);
     };
     match &target.session.launch {
-        LaunchSpec::KnownSafe { .. } => {
+        LaunchSpec::KnownSafe { .. } | LaunchSpec::BoundProvider { .. } => {
             let start = if restart_authority == ProductRestartAuthority::ExplicitUserRestart
                 && target.session.status == SessionStatus::Exited
             {
@@ -11359,7 +11441,7 @@ fn product_existing_start_authority(
                 Ok(None)
             }
         }
-        LaunchSpec::AdHocRedacted { .. } => Ok(None),
+        LaunchSpec::AdHocRedacted { .. } | LaunchSpec::FreshProvider { .. } => Ok(None),
     }
 }
 
@@ -11762,6 +11844,21 @@ fn authorized_product_restart_argv_with_authority(
     authority: ProductRestartAuthority,
 ) -> Result<Option<Vec<String>>, String> {
     match &target.session.launch {
+        LaunchSpec::BoundProvider { .. }
+            if target.session.kind == SessionKind::Agent
+                && (authority == ProductRestartAuthority::ExplicitUserRestart
+                    || (authority == ProductRestartAuthority::FreshDaemonRecovery
+                        && maestro_shell::known_safe_provider_has_exact_resume(
+                            &target.session.launch,
+                        ))) =>
+        {
+            maestro_shell::known_safe_provider_login_shell_argv(
+                &target.session.launch,
+                &maestro_shell::ProcessLaunchEnv,
+            ).map(Some).ok_or_else(|| {
+                "The saved provider launcher is missing, not executable, or its recipe is invalid. Restore the original launcher location before reopening this conversation; Hydra will not substitute a different executable from PATH.".to_string()
+            })
+        }
         LaunchSpec::KnownSafe { launch_spec_id, .. }
             if !launch_spec_id.is_empty()
                 && (authority == ProductRestartAuthority::ExplicitUserRestart
@@ -11801,9 +11898,11 @@ fn authorized_product_restart_argv_with_authority(
         {
             Ok(Some(fallback_argv.to_vec()))
         }
-        LaunchSpec::KnownSafe { .. } | LaunchSpec::AdHocRedacted { .. } | LaunchSpec::OptOut => {
-            Ok(None)
-        }
+        LaunchSpec::KnownSafe { .. }
+        | LaunchSpec::BoundProvider { .. }
+        | LaunchSpec::FreshProvider { .. }
+        | LaunchSpec::AdHocRedacted { .. }
+        | LaunchSpec::OptOut => Ok(None),
     }
 }
 
@@ -12476,8 +12575,33 @@ fn run_launch(launch: LaunchArgs) -> Result<LaunchSuccess, LaunchFailure> {
     // 5b. Ensure a connectable daemon at `socket_path`: reuse if already up, else spawn + wait.
     //     `spawned` (if any) is killed on drop unless we `keep()` it after a clean launch. When a
     //     `--log-dir` is set, a daemon WE spawn has its stdout/stderr captured to files there.
-    let (mut spawned, reused_daemon_protocol, mut retained_daemon_client) =
-        ensure_daemon(&socket_path, &daemon_bin, log_dir.as_deref()).inspect_err(|failure| {
+    let recovery_allowed =
+        launch.product_startup && !launch.no_run_renderer && !launch.detach_renderer;
+    let mut recovery_presented = false;
+    let mut confirm_recovery = |failure: &LaunchFailure| {
+        if !recovery_allowed {
+            return false;
+        }
+        recovery_presented = true;
+        let dialog = maestro_app::startup_failure::recovery_confirmation_dialog(&failure.message);
+        maestro_renderer::confirm_startup_recovery(dialog.title, &dialog.message).unwrap_or(false)
+    };
+    let startup = if recovery_allowed {
+        daemon_startup::ensure_daemon_with_confirmation(
+            &socket_path,
+            &daemon_bin,
+            log_dir.as_deref(),
+            Instant::now() + DAEMON_CONNECT_TIMEOUT,
+            &mut confirm_recovery,
+        )
+    } else {
+        ensure_daemon(&socket_path, &daemon_bin, log_dir.as_deref())
+    };
+    let (mut spawned, mut reused_daemon_protocol, mut retained_daemon_client) = startup
+        .inspect_err(|failure| {
+            if recovery_presented && failure.error_kind != "daemon_recovery_failed" {
+                return;
+            }
             if let Some(dialog) = maestro_app::startup_failure::startup_failure_dialog(
                 launch.product_startup,
                 launch.no_run_renderer,
@@ -12491,13 +12615,44 @@ fn run_launch(launch: LaunchArgs) -> Result<LaunchSuccess, LaunchFailure> {
                 let _ = maestro_renderer::show_startup_error_dialog(dialog.title, &dialog.message);
             }
         })?;
-    let retained_attach_only = spawned.is_none() && reused_daemon_protocol.is_attach_only();
+    let mut retained_attach_only = spawned.is_none() && reused_daemon_protocol.is_attach_only();
     if retained_attach_only && product_startup_target.is_none() {
         // A retained legacy/v2 daemon may still own an exit-latched final Grid even though every
         // durable visible pane is Exited. Preserve one status-agnostic pre-daemon candidate and let
         // the unchanged same-client ListSessions -> Attach compatibility path prove it. Current-v3
         // startup never receives this candidate and therefore retains its complete-live policy.
         product_startup_target = retained_product_startup_candidate;
+    }
+    if recovery_allowed && retained_attach_only && product_startup_target.is_none() {
+        let failure = retained_startup_target_unavailable(&launch, |_| {});
+        if let Some(client) = retained_daemon_client.as_ref() {
+            let mut presented = false;
+            let result = daemon_startup::restart_unusable_retained_daemon(
+                client,
+                &socket_path,
+                &daemon_bin,
+                log_dir.as_deref(),
+                failure,
+                &mut |failure| {
+                    presented = true;
+                    let dialog = maestro_app::startup_failure::recovery_confirmation_dialog(
+                        &failure.message,
+                    );
+                    maestro_renderer::confirm_startup_recovery(dialog.title, &dialog.message)
+                        .unwrap_or(false)
+                },
+            );
+            let replacement = result.inspect_err(|failure| {
+                if !presented || failure.error_kind == "daemon_recovery_failed" {
+                    let _ = maestro_renderer::show_startup_error_dialog(
+                        "Hydra could not restart",
+                        &failure.message,
+                    );
+                }
+            })?;
+            (spawned, reused_daemon_protocol, retained_daemon_client) = replacement;
+            retained_attach_only = spawned.is_none() && reused_daemon_protocol.is_attach_only();
+        }
     }
     if retained_attach_only && !launch.session_argv.is_empty() {
         return Err(LaunchFailure::new(
@@ -14626,6 +14781,14 @@ fn spawn_window_event_listener(
     listener_window_context: ListenerWindowContext,
 ) -> WindowEventListenerHandle {
     WindowEventListenerHandle::spawn(move |listener_stop| {
+        let (plugin_updates_tx, plugin_updates_rx) =
+            std::sync::mpsc::channel::<maestro_app::plugins::ActionUpdate>();
+        let mut plugin_palette_generation = 0_u64;
+        let mut plugin_invocations = maestro_app::plugin_invocations::PluginInvocations::default();
+        let mut plugin_catalog =
+            maestro_app::plugin_catalog::PluginCatalog::new(listener_base.clone())
+                .map_err(|error| eprintln!("plugin: {error}"))
+                .ok();
         if listener_stop.load(Ordering::Acquire) {
             if let Some(authority) = listener_initial_handoff_authority.take() {
                 retain_unresolved_attachment_handoff(authority);
@@ -15641,6 +15804,29 @@ fn spawn_window_event_listener(
             }
             if listener_stop.load(Ordering::Acquire) {
                 break;
+            }
+            for update in plugin_updates_rx.try_iter() {
+                if !plugin_invocations.accepts(&update) {
+                    continue;
+                }
+                let _ = tab_runtime.set_command_palette_action_result(
+                    update.generation,
+                    update.action_id,
+                    maestro_renderer::RendererCommandPaletteResult { text: update.text },
+                );
+            }
+            if let Some((generation, result)) =
+                plugin_catalog.as_mut().and_then(|catalog| catalog.poll())
+            {
+                if result.is_err() {
+                    eprintln!("plugin: could not refresh palette actions; use plugin list for diagnostics");
+                }
+                let model = cached_command_palette_model(
+                    &listener_base,
+                    plugin_catalog.as_ref(),
+                    generation,
+                );
+                let _ = tab_runtime.refresh_command_palette_rows(generation, model.rows);
             }
             drain_optional_extension_updates(
                 &optional_extension,
@@ -21248,6 +21434,40 @@ fn spawn_window_event_listener(
                 // `command-palette:` prefix AND surfaced to the overlay as exactly ONE bounded,
                 // sanitized, display-only `result: …` line via `SetCommandPaletteResult`.
                 maestro_renderer::RendererEvent::CommandPaletteActionActivated { action_id } => {
+                    if action_id.starts_with(maestro_app::plugins::ACTION_PREFIX) {
+                        let context = maestro_app::plugins::Context {
+                            window_id: listener_window_context
+                                .is_bound()
+                                .then(|| listener_window_id.clone()),
+                            session_id: tab_runtime.active_session_id().map(str::to_owned),
+                        };
+                        let invocation =
+                            plugin_invocations.begin(plugin_palette_generation, &action_id);
+                        let result = maestro_app::plugins::start_background(
+                            &listener_base,
+                            &listener_socket_path,
+                            &action_id,
+                            context,
+                            maestro_app::plugins::InvocationIdentity {
+                                generation: plugin_palette_generation,
+                                invocation,
+                            },
+                            plugin_updates_tx.clone(),
+                        );
+                        let text = match result {
+                            Ok(()) => "plugin action queued".to_string(),
+                            Err(error) => format!(
+                                "plugin: {}",
+                                sanitize_command_palette_result_fragment(&error)
+                            ),
+                        };
+                        let _ = tab_runtime.set_command_palette_action_result(
+                            plugin_palette_generation,
+                            action_id,
+                            maestro_renderer::RendererCommandPaletteResult { text },
+                        );
+                        continue;
+                    }
                     let outcome = run_command_palette_action_activation(
                         &action_id,
                         Some(listener_base.clone()),
@@ -21302,20 +21522,24 @@ fn spawn_window_event_listener(
                 }
                 // Command-palette open/reopen intent. The renderer reports ONLY that the
                 // foreground open shortcut fired while the overlay was hidden; the app is the
-                // sole catalog authority. We rebuild the SAME deterministic catalog + preview
-                // used by launch-time `--command-palette` (full catalog, default base policy),
-                // project it through `command_palette_to_renderer_model`, and send EXACTLY ONE
-                // display-only `SetCommandPaletteOverlay { Some(model) }` with an empty initial
-                // query, no result line, and a deterministic initial selection from the model.
+                // sole catalog authority. Show the deterministic built-ins plus cached plugin rows
+                // immediately, and request a coalesced registry refresh off the listener. The later
+                // rows-only projection preserves a live query/selection and cannot reopen a closed
+                // palette. Opening itself resets the initial query/result and seeds selection.
                 // Opening the palette executes nothing: it runs no action, mutates no
                 // record/setting, contacts no daemon, launches no session, changes no tab/window,
                 // and writes no file. A closed renderer channel is non-fatal — logged, listener
                 // stays alive.
                 maestro_renderer::RendererEvent::CommandPaletteOpenRequested => {
-                    let full = with_command_palette_preview(build_command_palette(
-                        listener_base.to_string_lossy().into_owned(),
-                    ));
-                    let model = command_palette_to_renderer_model(&full, None);
+                    plugin_palette_generation = plugin_palette_generation.wrapping_add(1);
+                    if let Some(catalog) = &plugin_catalog {
+                        catalog.request(plugin_palette_generation);
+                    }
+                    let model = cached_command_palette_model(
+                        &listener_base,
+                        plugin_catalog.as_ref(),
+                        plugin_palette_generation,
+                    );
                     if let Err(e) = tab_runtime.set_command_palette_overlay(Some(model)) {
                         eprintln!(
                             "attach-tab: command-palette open could not reach the renderer \
@@ -23548,7 +23772,13 @@ mod react_session_insert_only_tests {
             prepared_react_fresh_launch(SessionKind::Agent, &launch, source, Some("claude"), false)
                 .unwrap();
         missing.select_executable(Some(selected));
-        assert!(missing.seal_at_prepared_cwd(&prepared, 1).is_err());
+        let error = missing.seal_at_prepared_cwd(&prepared, 1).unwrap_err();
+        assert!(
+            error.contains("Claude"),
+            "must preserve the user-facing provider message: {error}"
+        );
+        assert!(!error.contains("agent_executable_missing"));
+        assert!(!error.contains("launch_executable_missing"));
     }
 
     #[test]
@@ -31112,6 +31342,50 @@ mod command_palette_overlay_projection {
     };
 
     #[test]
+    fn registered_plugin_action_is_visible_and_disable_hides_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        let source = temp.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(
+            source.join("hydra-plugin.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1, "id": "example.palette", "name": "Example", "version": "0.1.0",
+                "actions": [{"id": "run", "title": "Run example", "command": ["true"]}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        maestro_app::plugins::install_local(&base, &source).unwrap();
+        let mut catalog = maestro_app::plugin_catalog::PluginCatalog::new(base.clone()).unwrap();
+        let wait_for_snapshot = |catalog: &mut maestro_app::plugin_catalog::PluginCatalog| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Some((_, result)) = catalog.poll() {
+                    result.unwrap();
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+        };
+        wait_for_snapshot(&mut catalog);
+        let rows = super::cached_command_palette_model(&base, Some(&catalog), 0).rows;
+        assert!(rows
+            .iter()
+            .any(|row| row.id == "plugin:example.palette:run"));
+        maestro_app::plugins::set_enabled(&base, "example.palette", false).unwrap();
+        catalog.request(1);
+        wait_for_snapshot(&mut catalog);
+        assert!(
+            !super::cached_command_palette_model(&base, Some(&catalog), 1)
+                .rows
+                .iter()
+                .any(|row| row.id.starts_with("plugin:"))
+        );
+    }
+
+    #[test]
     fn projection_seeds_selected_row_zero_when_rows_present() {
         let palette = with_command_palette_preview(build_command_palette("/tmp/base"));
         let model = command_palette_to_renderer_model(&palette, None);
@@ -32781,6 +33055,71 @@ mod product_startup_target_tests {
             .unwrap()
             .is_none());
         target.session.status = SessionStatus::Exited;
+        assert!(authorized_product_restart_argv(&paths, &target, &fallback)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn fresh_provider_audit_never_authorizes_product_reopen_or_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::with_base(tmp.path().join("base"));
+        let mut target = seed_user_target(&paths, tmp.path());
+        target.session.kind = SessionKind::Agent;
+        target.session.status = SessionStatus::Exited;
+        target.session.launch = LaunchSpec::FreshProvider {
+            launch_spec_id: "codex".into(),
+            params: vec![],
+            executable: "/fixture/stable-codex".into(),
+        };
+        let fallback = vec!["never-use-fallback".into()];
+        assert!(super::recorded_session_live_argv(&target.session, &fallback).is_empty());
+        for authority in [
+            ProductRestartAuthority::Automatic,
+            ProductRestartAuthority::ExplicitUserRestart,
+            ProductRestartAuthority::FreshDaemonRecovery,
+        ] {
+            assert!(authorized_product_restart_argv_with_authority(
+                &paths, &target, &fallback, authority
+            )
+            .unwrap()
+            .is_none());
+        }
+        assert!(super::canonical_restart_after_started_provider(
+            &target.session.launch,
+            Some("codex")
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn bound_provider_missing_locator_surfaces_an_actionable_reopen_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::with_base(tmp.path().join("base"));
+        let mut target = seed_user_target(&paths, tmp.path());
+        target.session.kind = SessionKind::Agent;
+        target.session.status = SessionStatus::Exited;
+        target.session.launch = LaunchSpec::BoundProvider {
+            launch_spec_id: "codex".into(),
+            params: vec![
+                "resume".into(),
+                "20000000-0000-4000-8000-000000000001".into(),
+            ],
+            executable: tmp.path().join("missing-codex").to_str().unwrap().into(),
+        };
+        let fallback = vec!["must-not-be-used".into()];
+        assert!(super::recorded_session_live_argv(&target.session, &fallback).is_empty());
+        for authority in [
+            ProductRestartAuthority::ExplicitUserRestart,
+            ProductRestartAuthority::FreshDaemonRecovery,
+        ] {
+            let error = authorized_product_restart_argv_with_authority(
+                &paths, &target, &fallback, authority,
+            )
+            .unwrap_err();
+            assert!(error.contains("Restore the original launcher location"));
+            assert!(error.contains("will not substitute"));
+        }
         assert!(authorized_product_restart_argv(&paths, &target, &fallback)
             .unwrap()
             .is_none());

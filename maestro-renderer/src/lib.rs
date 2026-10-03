@@ -140,7 +140,7 @@ fn attach_selection_to_owner(
 /// Re-export the stress-mode enum so the binary can parse `--stress <mode>` without
 /// reaching into a private module.
 pub use scene::StressMode;
-pub use startup_error::show_startup_error_dialog;
+pub use startup_error::{confirm_startup_recovery, show_startup_error_dialog};
 
 /// Re-export the launch-time theme selector so app-shell callers and the bare-renderer binary can
 /// build a [`RendererLaunch`] / parse `--theme <id>` without reaching into a private module.
@@ -2163,6 +2163,8 @@ pub const COMMAND_PALETTE_QUERY_MAX_CHARS: usize = 120;
 /// action-activation intents; it never executes an action. An empty `rows` is the empty-state model.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RendererCommandPaletteModel {
+    /// App-owned overlay identity. Async refreshes for older/replaced overlays are ignored.
+    pub refresh_generation: Option<u64>,
     /// The overlay title (e.g. `"Command Palette"`). Drawn as the first header row.
     pub title: String,
     /// The normalized query echoed in a header row when the palette was filtered, else `None` (no query
@@ -2173,8 +2175,8 @@ pub struct RendererCommandPaletteModel {
     /// Display-only selected action-row index into [`rows`](Self::rows) (NOT into the composed
     /// title/query/empty-state lines). `Some(i)` requests that action row `i` be drawn highlighted;
     /// `None` (or an out-of-range / max-cap-truncated index) draws no highlight. At most one action row
-    /// is ever marked selected. Keyboard navigation and activation operate on this selection; there is
-    /// no mouse hit testing, and execution remains app-owned.
+    /// is ever marked selected. Keyboard navigation and pointer activation share this selection;
+    /// execution remains app-owned.
     pub selected_row: Option<usize>,
 }
 
@@ -9334,6 +9336,17 @@ pub enum UserEvent {
     SetCommandPaletteResult {
         result: Option<RendererCommandPaletteResult>,
     },
+    /// Replace rows only while visible; preserve query, selected action identity, and result.
+    RefreshCommandPaletteRows {
+        generation: u64,
+        rows: Vec<RendererCommandPaletteRow>,
+    },
+    /// Async action feedback is visible only for the same overlay and selected action.
+    SetCommandPaletteActionResult {
+        generation: u64,
+        action_id: String,
+        result: RendererCommandPaletteResult,
+    },
     /// Dismiss/clear the command-palette overlay from an app command, matching unmodified-Escape
     /// cleanup exactly: it clears the composed overlay lines, the full model, the local query, AND any
     /// held execution result (so no stale `result: …` survives a later re-seed). Display-only: it runs
@@ -9543,6 +9556,17 @@ pub enum RendererCommand {
     SetCommandPaletteResult {
         result: Option<RendererCommandPaletteResult>,
     },
+    /// Refresh a visible palette's rows without resetting query/selection or reopening it.
+    RefreshCommandPaletteRows {
+        generation: u64,
+        rows: Vec<RendererCommandPaletteRow>,
+    },
+    /// Project async feedback only to its original overlay and selected action.
+    SetCommandPaletteActionResult {
+        generation: u64,
+        action_id: String,
+        result: RendererCommandPaletteResult,
+    },
     /// Dismiss/clear the command-palette overlay. Translated to [`UserEvent::DismissCommandPalette`].
     /// Display only: clears overlay lines, model, query, and any held result line (matching Escape
     /// cleanup); it never rebinds the viewport, runs anything, mutates any record, or contacts a daemon,
@@ -9708,6 +9732,18 @@ pub fn user_event_for_command(command: RendererCommand) -> UserEvent {
         RendererCommand::SetCommandPaletteResult { result } => {
             UserEvent::SetCommandPaletteResult { result }
         }
+        RendererCommand::RefreshCommandPaletteRows { generation, rows } => {
+            UserEvent::RefreshCommandPaletteRows { generation, rows }
+        }
+        RendererCommand::SetCommandPaletteActionResult {
+            generation,
+            action_id,
+            result,
+        } => UserEvent::SetCommandPaletteActionResult {
+            generation,
+            action_id,
+            result,
+        },
         RendererCommand::DismissCommandPalette => UserEvent::DismissCommandPalette,
         RendererCommand::SetCommandPaletteOverlay { command_palette } => {
             UserEvent::SetCommandPaletteOverlay { command_palette }
@@ -12010,6 +12046,10 @@ struct App {
     /// overlay is dismissed, the query is edited, or the selection moves — so a result never lingers onto
     /// a different action or a dismissed overlay. Carries no execution authority; display-chrome only.
     command_palette_result: Option<RendererCommandPaletteResult>,
+    /// Releases remain palette-owned even if an activated action dismisses it before mouse-up.
+    command_palette_pointer_buttons: u8,
+    /// Optional palette-entry completion belongs to the exact pane incarnation of the real press.
+    mouse_press_owner: Option<(String, ViewportBindingToken, SessionGeneration)>,
     /// The split-pane shortcut hint overlay as composed display lines, or `None` when hidden. Toggled by
     /// the hint chord (`Command+Option+/` on macOS, `Ctrl+Alt+/` elsewhere) and dismissed by the same
     /// chord, Escape, a tab-strip refresh, or a tab switch. Display-only and renderer-local: it lists the
@@ -12244,6 +12284,8 @@ impl App {
             command_palette_query: String::new(),
             command_palette_model: None,
             command_palette_result: None,
+            command_palette_pointer_buttons: 0,
+            mouse_press_owner: None,
             shortcut_hint_lines: None,
             picker_click_in_progress: false,
             events: AppRendererEvents(events),
@@ -12845,6 +12887,33 @@ impl App {
         let Some(cell) = self.hit_test(self.cursor_px) else {
             return;
         };
+        self.report_mouse_at_cell(event, cell);
+    }
+
+    fn report_mouse_at_cell(&mut self, event: MouseEv, cell: CellPos) {
+        if matches!(event, MouseEv::Press(_) | MouseEv::Release(_)) {
+            self.mouse_press_owner = None;
+        }
+        if let Some(seq) = self.mouse_sequence_at_cell(event, cell) {
+            self.last_reported_cell = Some(cell);
+            if matches!(event, MouseEv::Press(_)) && self.viewport_is_bound() {
+                let id = self.focused_session_id();
+                self.mouse_press_owner =
+                    self.shared
+                        .binding_token_for_session(&id)
+                        .and_then(|binding| {
+                            self.shared
+                                .live_generation_for_binding(&binding)
+                                .map(|generation| (id, binding, generation))
+                        });
+            }
+            // Normal mouse encoding/routing remains unchanged. The captured token is used only for
+            // optional palette-entry completion, and can never authorize a newer binding.
+            self.write_to_pty(seq);
+        }
+    }
+
+    fn mouse_sequence_at_cell(&self, event: MouseEv, cell: CellPos) -> Option<String> {
         // Coordinates the report carries. When the keyboard focus is on a NON-ACTIVE pane of the
         // N-pane layout, translate the absolute hit cell to that pane's local origin (a pane offset
         // right/down expects (0,0)-relative coords); a hit outside the focused pane reports nothing.
@@ -12857,19 +12926,13 @@ impl App {
             // nothing. A pane with no header has `pane_content_region == region`, so this is a no-op there.
             Some((_, region)) => {
                 let content = pane_content_region(region);
-                match pane_local_cell_in_region(content, cell.col, cell.row) {
-                    Some(local) => local,
-                    None => return,
-                }
+                pane_local_cell_in_region(content, cell.col, cell.row)?
             }
             None => (cell.col, cell.row),
         };
         let modes = self.current_modes();
         let m = self.modifiers;
-        if let Some(seq) = encode_mouse(event, rep_col, rep_row, modes, m.shift, m.alt, m.control) {
-            self.last_reported_cell = Some(cell);
-            self.write_to_pty(seq);
-        }
+        encode_mouse(event, rep_col, rep_row, modes, m.shift, m.alt, m.control)
     }
 
     /// Force the PRIMARY pane's viewport back to the live bottom (on resize, alt-screen entry, or
@@ -13898,6 +13961,7 @@ impl App {
         self.terminal_link_click_in_progress = false;
         self.mouse_held = None;
         self.last_reported_cell = None;
+        self.mouse_press_owner = None;
         self.reset_cursor_icon();
         had_drag
     }
@@ -14258,11 +14322,95 @@ impl App {
     }
 
     /// Whether the read-only command-palette overlay is currently shown. Like the picker it is a
-    /// foreground modal: while shown it consumes every key so none reaches the PTY, scrollback, or
-    /// copy/paste shortcuts. SEPARATE state from the picker — the parser forbids both at once, but the
-    /// two are handled independently here.
+    /// foreground modal: while shown it consumes keys and native pointer input so none reaches the
+    /// PTY, scrollback, or copy/paste shortcuts. SEPARATE state from the picker — the parser forbids
+    /// both at once, but the two are handled independently here.
     fn command_palette_shown(&self) -> bool {
         self.command_palette_lines.is_some()
+    }
+
+    fn command_palette_layout(&self) -> Option<render::CommandPaletteLayout> {
+        let renderer = self.renderer.as_ref()?;
+        render::CommandPaletteLayout::new(
+            renderer.surface_size_physical(),
+            (self.terminal_grid_origin_x_px(), self.grid_top_offset_px()),
+            renderer.cell_size_logical().1 * renderer.window_scale_factor(),
+            self.command_palette_lines.as_ref()?,
+        )
+    }
+
+    fn activate_command_palette_line(&mut self, index: usize) {
+        let Some(action_index) = self
+            .command_palette_lines
+            .as_ref()
+            .and_then(|lines| lines.get(index))
+            .filter(|line| line.selectable)
+            .and_then(|line| line.action_index)
+        else {
+            return;
+        };
+        let Some(model) = self.command_palette_model.as_mut() else {
+            return;
+        };
+        let Some(row) = model.rows.get(action_index) else {
+            return;
+        };
+        let action_id = row.id.clone();
+        if model.selected_row != Some(action_index) {
+            self.command_palette_result = None;
+        }
+        model.selected_row = Some(action_index);
+        self.recompose_command_palette_lines();
+        self.request_redraw();
+        // Pointer and Enter use the same stable id and app-owned activation path.
+        emit_command_palette_action_activated(self.events.as_ref(), &action_id);
+    }
+
+    fn command_palette_owns_pointer_event(&mut self, event: &HostEvent) -> bool {
+        let shown = self.command_palette_shown();
+        match event {
+            HostEvent::CursorMoved { x, y } if shown => {
+                self.cursor_px = (*x as f32, *y as f32);
+                self.reset_cursor_icon();
+                true
+            }
+            HostEvent::MouseWheel { .. } if shown => {
+                self.wheel.reset();
+                true
+            }
+            HostEvent::MouseInput { button, pressed } => {
+                let mask = match button {
+                    HostPointerButton::Left => 1,
+                    HostPointerButton::Middle => 2,
+                    HostPointerButton::Right => 4,
+                    HostPointerButton::Other => 8,
+                };
+                let owns_release = !pressed && self.command_palette_pointer_buttons & mask != 0;
+                if !shown && !owns_release {
+                    return false;
+                }
+                if *pressed {
+                    self.command_palette_pointer_buttons |= mask;
+                    if *button == HostPointerButton::Left {
+                        if let Some(index) = self
+                            .command_palette_layout()
+                            .and_then(|layout| layout.line_at(self.cursor_px))
+                        {
+                            self.activate_command_palette_line(index);
+                        }
+                    }
+                } else {
+                    self.command_palette_pointer_buttons &= !mask;
+                }
+                self.mouse_held = None;
+                self.last_reported_cell = None;
+                self.last_selection_click = None;
+                self.copy_drag_started = false;
+                self.selecting = false;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Dismiss the command-palette overlay locally, clearing all renderer-owned overlay state: the
@@ -14713,9 +14861,44 @@ impl App {
     /// Seed and SHOW the command-palette overlay from an app-supplied model, the same way launch-time
     /// seeding (`with_seeded_command_palette`) does: derive the deterministic initial selection, compose
     /// the filtered overlay lines, store the full model, clear the query, AND drop any held execution
-    /// result so the reopened overlay starts clean (empty query, no `result: …` line). Display-only:
-    /// runs nothing, emits no event, and never touches the session/grid/selection/settings/daemon.
+    /// result so the reopened overlay starts clean (empty query, no `result: …` line). No command is
+    /// activated. An already-reported TUI press is completed before the modal takes pointer ownership.
     fn seed_command_palette_overlay(&mut self, mut model: RendererCommandPaletteModel) {
+        // Complete a TUI gesture already reported before the modal opened. This happens now through
+        // the current exact-viewport write route, never as delayed input after a future focus/rebind.
+        // The later physical mouse-up is palette-owned, even if the palette has since dismissed.
+        if let Some(button) = self.mouse_held.take() {
+            self.command_palette_pointer_buttons |= match button {
+                MouseBtn::Left => 1,
+                MouseBtn::Middle => 2,
+                MouseBtn::Right => 4,
+            };
+            if let Some((id, binding, generation)) = self.mouse_press_owner.take() {
+                if self.viewport_is_bound()
+                    && self.mouse_reporting_active()
+                    && self.focused_session_id() == id
+                    && self.shared.binding_token_for_session(&id).as_ref() == Some(&binding)
+                {
+                    if let Some(sequence) = self.last_reported_cell.and_then(|cell| {
+                        self.mouse_sequence_at_cell(MouseEv::Release(button), cell)
+                    }) {
+                        // Submit with the ORIGINAL press token. A rebind between the equality check
+                        // and admission must reject, not silently resolve a replacement owner.
+                        self.admit_or_retain_owner_batch_with_proof(
+                            binding,
+                            vec![OwnerRequest::Write { id, data: sequence }],
+                            generation,
+                            None,
+                        );
+                    }
+                }
+            }
+        }
+        // An already-started terminal/chrome gesture must not keep running behind the modal.
+        self.clear_chrome_drag_state();
+        self.selecting = false;
+        self.copy_drag_started = false;
+        self.wheel.reset();
         let query = model.query.clone().unwrap_or_default();
         let selected = derive_command_palette_selection(&model, &query, model.selected_row);
         model.selected_row = selected;
@@ -14725,6 +14908,57 @@ impl App {
         self.command_palette_query = query;
         self.command_palette_model = Some(model);
         self.command_palette_result = None;
+    }
+
+    fn refresh_command_palette_rows(
+        &mut self,
+        generation: u64,
+        rows: Vec<RendererCommandPaletteRow>,
+    ) {
+        let Some(model) = self.command_palette_model.as_mut() else {
+            return;
+        };
+        if model.refresh_generation != Some(generation) {
+            return;
+        }
+        let selected_id = model
+            .selected_row
+            .and_then(|index| model.rows.get(index))
+            .map(|row| row.id.clone());
+        model.rows = rows;
+        let selected = selected_id
+            .as_ref()
+            .and_then(|id| model.rows.iter().position(|row| &row.id == id));
+        model.selected_row =
+            derive_command_palette_selection(model, &self.command_palette_query, selected);
+        if model
+            .selected_row
+            .and_then(|index| model.rows.get(index))
+            .map(|row| &row.id)
+            != selected_id.as_ref()
+        {
+            self.command_palette_result = None;
+        }
+        self.recompose_command_palette_lines();
+    }
+
+    fn set_command_palette_action_result(
+        &mut self,
+        generation: u64,
+        action_id: &str,
+        result: RendererCommandPaletteResult,
+    ) {
+        if self
+            .command_palette_model
+            .as_ref()
+            .and_then(|model| model.refresh_generation)
+            != Some(generation)
+            || self.selected_command_palette_action_id().as_deref() != Some(action_id)
+        {
+            return;
+        }
+        self.command_palette_result = Some(result);
+        self.recompose_command_palette_lines();
     }
 
     /// The stable `id` of the command-palette action currently selected in the overlay, or `None` when
@@ -16418,6 +16652,7 @@ impl App {
         // target cannot still consume a click or Enter before (or after) the blank frame presents.
         self.picker_rows = None;
         self.command_palette_lines = None;
+        self.command_palette_pointer_buttons = 0;
         self.command_palette_model = None;
         self.command_palette_query.clear();
         self.command_palette_result = None;
@@ -17146,6 +17381,22 @@ impl App {
                     h.request_redraw();
                 }
             }
+            UserEvent::RefreshCommandPaletteRows { generation, rows } => {
+                self.refresh_command_palette_rows(generation, rows);
+                if let Some(h) = self.host.as_ref() {
+                    h.request_redraw();
+                }
+            }
+            UserEvent::SetCommandPaletteActionResult {
+                generation,
+                action_id,
+                result,
+            } => {
+                self.set_command_palette_action_result(generation, &action_id, result);
+                if let Some(h) = self.host.as_ref() {
+                    h.request_redraw();
+                }
+            }
             UserEvent::DismissCommandPalette => {
                 // Clear the overlay exactly like unmodified Escape: lines, model, query, and any held
                 // result. Display-only — repaint only when there was state to clear.
@@ -17386,6 +17637,10 @@ impl App {
                 }
                 _ => {}
             }
+            return HostControl::Continue;
+        }
+        // Modal pointer routing must precede pane focus, selection, divider drags and TUI reporting.
+        if self.command_palette_owns_pointer_event(&event) {
             return HostControl::Continue;
         }
         match event {
@@ -18292,7 +18547,13 @@ impl App {
                             let split_frame = self.current_split_frame();
                             self.sync_sibling_session(split_frame.as_ref());
                             self.sync_pane_cache();
-                            self.clear_selection();
+                            // A same-pane press is also the next word/line click or a
+                            // Shift extension. Keep its anchor and click chain until the
+                            // gesture below decides whether to replace them. A genuine
+                            // owner change must never carry selection into another PTY.
+                            if self.sel_session_id.as_deref() != Some(pane.session_id.as_str()) {
+                                self.clear_selection();
+                            }
                             self.request_redraw();
                             // Do not return in local-selection mode: this same press must fall
                             // through to selection-start below on every host. Returning here made
@@ -20681,10 +20942,8 @@ impl App {
                 .as_ref()
                 .map(|rows| rows.iter().map(|r| r.text.clone()).collect());
             r.set_picker_overlay(picker_lines);
-            // Foreground command-palette overlay (when launched with one): a static, read-only modal
-            // list of composed lines drawn over the grid. SEPARATE carrier from the picker overlay;
-            // `None` keeps every existing launch path byte-identical. Display-only — the renderer draws
-            // only the line text and never re-sorts, hit-tests, or updates it at runtime.
+            // Palette rows share the scoped terminal origin with native pointer hit testing. React
+            // children remain outside its bounds; the terminal is still drawn by WGPU.
             r.set_command_palette_overlay(self.command_palette_lines.clone());
             // Foreground split-pane shortcut hint overlay (when toggled on): a small, non-modal,
             // read-only list of the current split controls drawn over the grid. SEPARATE carrier from the
@@ -34479,6 +34738,12 @@ mod command_channel_tests {
                     Some(r) => forwarded.push(format!("cp-result:{}", r.text)),
                     None => forwarded.push("cp-result:clear".to_string()),
                 },
+                UserEvent::RefreshCommandPaletteRows { .. } => {
+                    forwarded.push("cp-rows:refresh".into())
+                }
+                UserEvent::SetCommandPaletteActionResult { .. } => {
+                    forwarded.push("cp-action:result".into())
+                }
                 UserEvent::DismissCommandPalette => forwarded.push("cp-dismiss".to_string()),
                 UserEvent::SetCommandPaletteOverlay { command_palette } => match command_palette {
                     Some(_) => forwarded.push("cp-overlay:set".to_string()),
@@ -35046,6 +35311,7 @@ mod picker_tests {
         selected_row: Option<usize>,
     ) -> RendererCommandPaletteModel {
         RendererCommandPaletteModel {
+            refresh_generation: None,
             title: "Command Palette".to_string(),
             query: query.map(str::to_string),
             rows,
@@ -35711,6 +35977,7 @@ mod command_palette_query_tests {
     // query can isolate exactly one row per searchable field.
     fn catalog() -> RendererCommandPaletteModel {
         RendererCommandPaletteModel {
+            refresh_generation: None,
             title: "Command Palette".to_string(),
             query: None,
             rows: vec![
@@ -35953,6 +36220,7 @@ mod command_palette_query_tests {
             })
             .collect();
         let model = RendererCommandPaletteModel {
+            refresh_generation: None,
             title: "Command Palette".to_string(),
             query: None,
             rows,
@@ -35967,6 +36235,7 @@ mod command_palette_query_tests {
         // The retained text-only helper is unchanged: it echoes the model's static `query` and never
         // re-filters. Independent from the new filtered composer.
         let model = RendererCommandPaletteModel {
+            refresh_generation: None,
             title: "Command Palette".to_string(),
             query: Some("settings".to_string()),
             rows: vec![row(
@@ -35987,6 +36256,7 @@ mod command_palette_query_tests {
     #[test]
     fn empty_catalog_composes_no_commands_state() {
         let model = RendererCommandPaletteModel {
+            refresh_generation: None,
             title: "Command Palette".to_string(),
             query: None,
             rows: vec![],
@@ -36016,6 +36286,7 @@ mod command_palette_dismiss_tests {
 
     fn model() -> RendererCommandPaletteModel {
         RendererCommandPaletteModel {
+            refresh_generation: None,
             title: "Command Palette".to_string(),
             query: Some("settings".to_string()),
             rows: vec![RendererCommandPaletteRow {
@@ -36103,6 +36374,7 @@ mod command_palette_activation_tests {
 
     fn model_with_three_rows() -> RendererCommandPaletteModel {
         RendererCommandPaletteModel {
+            refresh_generation: None,
             title: "Command Palette".to_string(),
             query: None,
             rows: vec![row("a.one"), row("b.two"), row("c.three")],
@@ -36296,6 +36568,7 @@ mod command_palette_activation_tests {
 
     fn model_with_two_rows() -> RendererCommandPaletteModel {
         RendererCommandPaletteModel {
+            refresh_generation: None,
             title: "Command Palette".to_string(),
             query: None,
             rows: vec![row("a.one"), row("b.two")],
@@ -37021,6 +37294,130 @@ mod command_palette_activation_tests {
         assert!(app.command_palette_model.is_none());
         assert!(app.command_palette_query.is_empty());
         assert!(app.command_palette_result.is_none());
+    }
+
+    #[test]
+    fn catalog_refresh_preserves_query_and_selected_identity_without_reopening() {
+        let mut app = headless_app_with_command_palette(model_with_three_rows());
+        let model = model_with_three_rows();
+        let selected = model.rows[1].id.clone();
+        app.edit_command_palette_query(model.rows[1].label.clone());
+        let query = app.command_palette_query.clone();
+        app.command_palette_result = Some(RendererCommandPaletteResult {
+            text: "running".into(),
+        });
+        let mut rows = model.rows;
+        rows.reverse();
+        app.command_palette_model
+            .as_mut()
+            .unwrap()
+            .refresh_generation = Some(7);
+        app.refresh_command_palette_rows(7, rows.clone());
+        assert_eq!(app.command_palette_query, query);
+        assert_eq!(
+            app.selected_command_palette_action_id().as_deref(),
+            Some(selected.as_str())
+        );
+        assert_eq!(app.command_palette_result.as_ref().unwrap().text, "running");
+        rows.retain(|row| row.id != selected);
+        app.refresh_command_palette_rows(7, rows.clone());
+        assert!(app.command_palette_result.is_none());
+        app.dismiss_command_palette();
+        app.refresh_command_palette_rows(7, rows);
+        assert!(app.command_palette_model.is_none());
+        assert!(app.command_palette_lines.is_none());
+    }
+
+    #[test]
+    fn catalog_refresh_command_bridges_to_matching_user_event() {
+        let rows = model_with_three_rows().rows;
+        match user_event_for_command(RendererCommand::RefreshCommandPaletteRows {
+            generation: 7,
+            rows: rows.clone(),
+        }) {
+            UserEvent::RefreshCommandPaletteRows {
+                generation: 7,
+                rows: actual,
+            } => assert_eq!(actual, rows),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn late_catalog_refresh_cannot_replace_newer_overlay() {
+        let mut older = model_with_three_rows();
+        older.refresh_generation = Some(1);
+        let mut app = headless_app_with_command_palette(older);
+        app.dismiss_command_palette();
+        let mut newer = model_with_three_rows();
+        newer.refresh_generation = Some(2);
+        app.seed_command_palette_overlay(newer.clone());
+        app.edit_command_palette_query(newer.rows[2].label.clone());
+        let query = app.command_palette_query.clone();
+        let selected = app.selected_command_palette_action_id();
+        app.refresh_command_palette_rows(1, Vec::new());
+        assert_eq!(app.command_palette_model.as_ref().unwrap().rows, newer.rows);
+        assert_eq!(app.command_palette_query, query);
+        assert_eq!(app.selected_command_palette_action_id(), selected);
+        app.seed_command_palette_overlay(model_with_three_rows());
+        app.refresh_command_palette_rows(2, Vec::new());
+        assert!(!app.command_palette_model.as_ref().unwrap().rows.is_empty());
+    }
+
+    #[test]
+    fn late_action_completion_does_not_overwrite_reopened_or_changed_selection() {
+        let mut model = model_with_three_rows();
+        model.refresh_generation = Some(1);
+        let mut app = headless_app_with_command_palette(model.clone());
+        app.edit_command_palette_query(model.rows[0].label.clone());
+        let first = model.rows[0].id.clone();
+        let second = model.rows[1].id.clone();
+        let result = || RendererCommandPaletteResult {
+            text: "finished".into(),
+        };
+        app.set_command_palette_action_result(1, &first, result());
+        assert_eq!(
+            app.command_palette_result.as_ref().unwrap().text,
+            "finished"
+        );
+        app.edit_command_palette_query(model.rows[1].label.clone());
+        app.set_command_palette_action_result(
+            1,
+            &second,
+            RendererCommandPaletteResult {
+                text: "second running".into(),
+            },
+        );
+        app.set_command_palette_action_result(1, &first, result());
+        assert_eq!(
+            app.command_palette_result.as_ref().unwrap().text,
+            "second running"
+        );
+        app.dismiss_command_palette();
+        app.set_command_palette_action_result(1, &first, result());
+        assert!(app.command_palette_result.is_none());
+        model.refresh_generation = Some(2);
+        app.seed_command_palette_overlay(model);
+        app.edit_command_palette_query(first.clone());
+        app.set_command_palette_action_result(1, &first, result());
+        assert!(app.command_palette_result.is_none());
+        app.set_command_palette_action_result(2, &first, result());
+        assert!(app.command_palette_result.is_some());
+    }
+
+    #[test]
+    fn action_result_command_preserves_correlation_through_bridge() {
+        let event = user_event_for_command(RendererCommand::SetCommandPaletteActionResult {
+            generation: 7,
+            action_id: "plugin:test:run".into(),
+            result: RendererCommandPaletteResult {
+                text: "finished".into(),
+            },
+        });
+        assert!(
+            matches!(event, UserEvent::SetCommandPaletteActionResult { generation: 7, action_id, result }
+            if action_id == "plugin:test:run" && result.text == "finished")
+        );
     }
 
     #[test]
@@ -38584,6 +38981,318 @@ mod terminal_selection_ownership_tests {
         (app, shared)
     }
 
+    fn palette_model() -> super::RendererCommandPaletteModel {
+        super::RendererCommandPaletteModel {
+            refresh_generation: Some(1),
+            title: "Commands".into(),
+            query: None,
+            rows: ["first", "second"]
+                .into_iter()
+                .map(|id| super::RendererCommandPaletteRow {
+                    id: id.into(),
+                    label: id.into(),
+                    category: "Plugin".into(),
+                    summary: "test command".into(),
+                    command: id.into(),
+                })
+                .collect(),
+            selected_row: Some(0),
+        }
+    }
+
+    #[test]
+    fn command_palette_pointer_and_wheel_do_not_reach_terminal_or_change_pane() {
+        for mouse_reporting in [false, true] {
+            let (mut app, shared) = app_with_primary_grid();
+            let mut snapshot = grid("primary-gen", 20, 6, "terminal");
+            snapshot.alt_screen = true;
+            snapshot.mouse_report = mouse_reporting;
+            snapshot.mouse_motion = mouse_reporting;
+            snapshot.mouse_sgr = mouse_reporting;
+            *shared.grid.lock().unwrap() = Some(Arc::new(snapshot));
+            app.seed_command_palette_overlay(palette_model());
+            let focus = app.focused_pane_session.clone();
+            shared.drain_test_requests();
+            for event in [
+                HostEvent::CursorMoved { x: 20.0, y: 20.0 },
+                HostEvent::MouseInput {
+                    button: HostPointerButton::Left,
+                    pressed: true,
+                },
+                HostEvent::CursorMoved { x: 40.0, y: 40.0 },
+                HostEvent::MouseInput {
+                    button: HostPointerButton::Left,
+                    pressed: false,
+                },
+                HostEvent::MouseInput {
+                    button: HostPointerButton::Right,
+                    pressed: true,
+                },
+                HostEvent::MouseInput {
+                    button: HostPointerButton::Right,
+                    pressed: false,
+                },
+                HostEvent::MouseInput {
+                    button: HostPointerButton::Middle,
+                    pressed: true,
+                },
+                HostEvent::MouseInput {
+                    button: HostPointerButton::Middle,
+                    pressed: false,
+                },
+                HostEvent::MouseWheel {
+                    delta: super::HostScrollDelta::Lines { x: 0.0, y: 3.0 },
+                },
+                HostEvent::MouseWheel {
+                    delta: super::HostScrollDelta::Pixels { x: 0.0, y: 120.0 },
+                },
+            ] {
+                assert_eq!(app.handle_host_event(event), HostControl::Continue);
+            }
+            assert_eq!(app.focused_pane_session, focus);
+            assert!(!app.selecting);
+            assert!(app.sel_anchor.is_none());
+            assert!(
+                shared.drain_test_requests().is_empty(),
+                "modal pointer input reached PTY"
+            );
+            // Normal alternate-screen wheel handling resumes immediately after dismissal.
+            app.dismiss_command_palette();
+            let wheel = HostEvent::MouseWheel {
+                delta: super::HostScrollDelta::Lines { x: 0.0, y: 1.0 },
+            };
+            assert!(!app.command_palette_owns_pointer_event(&wheel));
+            // The headless fixture has no GPU-backed pointer hit target. Alternate-scroll keys
+            // still prove the real dispatch path is active again without inventing mouse geometry.
+            if !mouse_reporting {
+                app.handle_host_event(wheel);
+                assert!(!shared.drain_test_requests().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn command_palette_owned_release_is_consumed_after_action_dismissal() {
+        let (mut app, shared) = app_with_primary_grid();
+        app.seed_command_palette_overlay(palette_model());
+        assert!(
+            app.command_palette_owns_pointer_event(&HostEvent::MouseInput {
+                button: HostPointerButton::Left,
+                pressed: true,
+            })
+        );
+        app.dismiss_command_palette();
+        assert!(
+            app.command_palette_owns_pointer_event(&HostEvent::MouseInput {
+                button: HostPointerButton::Left,
+                pressed: false,
+            })
+        );
+        assert!(
+            !app.command_palette_owns_pointer_event(&HostEvent::MouseInput {
+                button: HostPointerButton::Left,
+                pressed: false,
+            })
+        );
+        assert_eq!(app.command_palette_pointer_buttons, 0);
+        assert!(shared.drain_test_requests().is_empty());
+    }
+
+    #[test]
+    fn command_palette_entry_completes_preexisting_tui_press_only_once() {
+        let (mut app, shared) = app_with_primary_grid();
+        let mut snapshot = grid("primary-gen", 20, 6, "terminal");
+        snapshot.mouse_report = true;
+        snapshot.mouse_sgr = true;
+        *shared.grid.lock().unwrap() = Some(Arc::new(snapshot));
+        app.mouse_held = Some(super::MouseBtn::Left);
+        // Use the real reporting path with a resolved cell, independent of GPU geometry.
+        app.report_mouse_at_cell(
+            super::MouseEv::Press(super::MouseBtn::Left),
+            CellPos { col: 4, row: 1 },
+        );
+        match shared.drain_test_requests().as_slice() {
+            [ClientRequest::Write { id, data, .. }] => {
+                assert_eq!(id, "primary");
+                assert_eq!(data, "\u{1b}[<0;5;2M");
+            }
+            other => panic!("expected original SGR press, got {other:?}"),
+        }
+        app.seed_command_palette_overlay(palette_model());
+        match shared.drain_test_requests().as_slice() {
+            [ClientRequest::Write { id, data, .. }] => {
+                assert_eq!(id, "primary");
+                assert_eq!(data, "\u{1b}[<0;5;2m");
+            }
+            other => panic!("expected one entry-time SGR release, got {other:?}"),
+        }
+        assert!(app.mouse_held.is_none());
+        assert!(app.last_reported_cell.is_none());
+        app.dismiss_command_palette();
+        app.handle_host_event(HostEvent::MouseInput {
+            button: HostPointerButton::Left,
+            pressed: false,
+        });
+        assert!(
+            shared.drain_test_requests().is_empty(),
+            "physical release must not be replayed"
+        );
+        app.seed_command_palette_overlay(palette_model());
+        for pressed in [true, false] {
+            app.handle_host_event(HostEvent::MouseInput {
+                button: HostPointerButton::Left,
+                pressed,
+            });
+        }
+        app.dismiss_command_palette();
+        assert!(
+            shared.drain_test_requests().is_empty(),
+            "palette-born press has no terminal gesture to complete"
+        );
+    }
+
+    #[test]
+    fn command_palette_entry_cannot_write_to_inactive_or_stale_viewport() {
+        for stale in [false, true] {
+            let (mut app, shared) = app_with_primary_grid();
+            let mut snapshot = grid("primary-gen", 20, 6, "terminal");
+            snapshot.mouse_report = true;
+            snapshot.mouse_sgr = true;
+            *shared.grid.lock().unwrap() = Some(Arc::new(snapshot));
+            app.mouse_held = Some(super::MouseBtn::Left);
+            app.report_mouse_at_cell(
+                super::MouseEv::Press(super::MouseBtn::Left),
+                CellPos { col: 4, row: 1 },
+            );
+            if stale {
+                shared.clear_viewport();
+            } else {
+                app.exact_viewport = None;
+            }
+            shared.drain_test_requests();
+            app.seed_command_palette_overlay(palette_model());
+            assert!(shared.drain_test_requests().is_empty());
+            assert!(app.mouse_held.is_none());
+        }
+    }
+
+    #[test]
+    fn command_palette_entry_does_not_complete_another_zoomed_panes_press() {
+        let (mut app, shared, _) = app_with_right_child();
+        let mut primary = grid("primary-gen", 20, 6, "primary");
+        primary.mouse_report = true;
+        primary.mouse_sgr = true;
+        *shared.grid.lock().unwrap() = Some(Arc::new(primary));
+        let mut child = grid("child-gen", 20, 6, "child");
+        child.mouse_report = true;
+        child.mouse_sgr = true;
+        child.revision = Revision(2);
+        assert!(shared.apply_pane_grid(
+            "child",
+            shared.pane_epoch("child").unwrap(),
+            Arc::new(child)
+        ));
+        app.zoomed_pane_session = Some("child".into());
+        app.mouse_held = Some(super::MouseBtn::Left);
+        app.report_mouse_at_cell(
+            super::MouseEv::Press(super::MouseBtn::Left),
+            CellPos { col: 4, row: 1 },
+        );
+        assert!(matches!(shared.drain_test_requests().as_slice(),
+            [ClientRequest::Write { id, .. }] if id == "child"));
+        assert!(app.cycle_pane_focus(super::PaneCycleDirection::Next));
+        assert_eq!(app.focused_session_id(), "primary");
+        assert_eq!(app.zoomed_pane_session.as_deref(), Some("primary"));
+        assert!(
+            app.mouse_held.is_some(),
+            "reproduces pre-existing focus-change held state"
+        );
+        shared.drain_test_requests();
+        app.seed_command_palette_overlay(palette_model());
+        assert!(
+            shared.drain_test_requests().is_empty(),
+            "old child press must not release into primary"
+        );
+        app.dismiss_command_palette();
+        app.handle_host_event(HostEvent::MouseInput {
+            button: HostPointerButton::Left,
+            pressed: false,
+        });
+        assert!(shared.drain_test_requests().is_empty());
+    }
+
+    #[test]
+    fn command_palette_entry_does_not_complete_a_previous_session_generation() {
+        for rebind in [false, true] {
+            let (mut app, shared) = app_with_primary_grid();
+            let mut original = grid("primary-gen", 20, 6, "original");
+            original.mouse_report = true;
+            original.mouse_sgr = true;
+            *shared.grid.lock().unwrap() = Some(Arc::new(original));
+            app.mouse_held = Some(super::MouseBtn::Left);
+            app.report_mouse_at_cell(
+                super::MouseEv::Press(super::MouseBtn::Left),
+                CellPos { col: 4, row: 1 },
+            );
+            assert!(matches!(
+                shared.drain_test_requests().as_slice(),
+                [ClientRequest::Write { .. }]
+            ));
+            if rebind {
+                shared.set_active_session("primary").unwrap();
+            }
+            let mut replacement = grid("replacement-gen", 20, 6, "replacement");
+            replacement.mouse_report = true;
+            replacement.mouse_sgr = true;
+            *shared.grid.lock().unwrap() = Some(Arc::new(replacement));
+            app.seed_command_palette_overlay(palette_model());
+            assert!(
+                shared.drain_test_requests().is_empty(),
+                "original press cannot authorize replacement PTY input"
+            );
+            assert!(app.pending_owner_requests.is_empty());
+        }
+    }
+
+    #[test]
+    fn command_palette_pointer_row_and_keyboard_enter_emit_same_stable_action() {
+        let (mut app, shared) = app_with_primary_grid();
+        let (tx, rx) = mpsc::channel();
+        app.events = super::AppRendererEvents(super::viewport_gated_renderer_events(
+            Some(tx),
+            Arc::clone(&app.viewport_event_gate),
+        ));
+        app.seed_command_palette_overlay(palette_model());
+        app.activate_command_palette_line(0); // title is not an action
+        assert!(rx.try_recv().is_err());
+        let line = app
+            .command_palette_lines
+            .as_ref()
+            .unwrap()
+            .iter()
+            .position(|line| line.action_index == Some(1))
+            .unwrap();
+        app.activate_command_palette_line(line);
+        app.handle_key(HostKeyEvent {
+            key: super::HostKey::Named(HostNamedKey::Enter),
+            text: None,
+            base_text: None,
+            location: HostKeyLocation::Standard,
+            pressed: true,
+            repeat: false,
+        });
+        for _ in 0..2 {
+            match rx.try_recv().unwrap() {
+                super::RendererEvent::CommandPaletteActionActivated { action_id } => {
+                    assert_eq!(action_id, "second")
+                }
+                event => panic!("unexpected event {event:?}"),
+            }
+        }
+        assert!(rx.try_recv().is_err());
+        assert!(shared.drain_test_requests().is_empty());
+    }
+
     struct RecordingNeutralHost {
         titles: Arc<Mutex<Vec<String>>>,
     }
@@ -39074,6 +39783,7 @@ mod terminal_selection_ownership_tests {
                 action_index: Some(0),
             }]);
             app.command_palette_model = Some(super::RendererCommandPaletteModel {
+                refresh_generation: None,
                 title: "stale".to_string(),
                 query: None,
                 rows: vec![super::RendererCommandPaletteRow {

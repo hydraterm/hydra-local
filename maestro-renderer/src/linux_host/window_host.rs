@@ -36,7 +36,7 @@ use wry::WebViewExtUnix as _;
 use super::clipboard::GtkTerminalClipboardHost;
 use super::event_bridge::{
     cursor_moved_event, host_button, host_modifiers, host_scroll, ime_commit_event,
-    ime_preedit_event, key_host_event, route_terminal_key, HostEvent,
+    ime_preedit_event, is_terminal_button_press, key_host_event, route_terminal_key, HostEvent,
 };
 use super::overlay::LinuxOverlayHost;
 use super::persistent_surface::{
@@ -1048,6 +1048,9 @@ impl LinuxDashboardHost {
             let mods = last_modifiers.clone();
             let clipboard_host = clipboard_host.clone();
             terminal_slot.connect_button_press_event(move |widget, event| {
+                if !is_terminal_button_press(event.event_type()) {
+                    return glib::Propagation::Proceed;
+                }
                 widget.grab_focus();
                 emit_modifiers_if_changed(&sink, &mods, event.state());
                 // A click can arrive without a preceding motion event (touchpad tap, restored

@@ -15,6 +15,9 @@ const INFERABLE_AGENTS: &[&str] = &[
 
 pub fn canonical_launch_for_restart(launch: &LaunchSpec) -> LaunchSpec {
     match launch {
+        // Bound recipes are minted only from the closed prepared grammar. Never sanitize a
+        // malformed binding into executable authority, or replace its exact launcher with PATH.
+        LaunchSpec::BoundProvider { .. } => launch.clone(),
         LaunchSpec::KnownSafe {
             launch_spec_id,
             params,
@@ -46,15 +49,9 @@ pub fn known_safe_provider_has_exact_resume(launch: &LaunchSpec) -> bool {
 pub(crate) fn strict_known_safe_provider_mode(
     launch: &LaunchSpec,
 ) -> Option<PreparedProviderLaunchMode> {
-    let LaunchSpec::KnownSafe {
-        launch_spec_id,
-        params,
-    } = launch
-    else {
-        return None;
-    };
+    let (launch_spec_id, params, _) = launch.provider_recipe()?;
 
-    if !is_agent(launch_spec_id) || canonical_agent_params(launch_spec_id, params) != *params {
+    if !is_agent(launch_spec_id) || canonical_agent_params(launch_spec_id, params) != params {
         return None;
     }
     strict_prepared_provider_params(launch_spec_id, params)

@@ -672,15 +672,11 @@ impl ExistingSessionStart {
         now_ms: u64,
     ) -> Result<Self, SessionServiceError> {
         let session_id = session.session_id.clone();
-        let LaunchSpec::KnownSafe {
-            launch_spec_id,
-            params,
-        } = &session.launch
-        else {
+        let Some((launch_spec_id, params, _)) = session.launch.provider_recipe() else {
             return Err(SessionServiceError::AttachAuthorityLost { session_id });
         };
         let mut provider_argv = Vec::with_capacity(1 + params.len());
-        provider_argv.push(launch_spec_id.clone());
+        provider_argv.push(launch_spec_id.to_owned());
         provider_argv.extend(params.iter().cloned());
         let valid_generation = session
             .last_known_generation

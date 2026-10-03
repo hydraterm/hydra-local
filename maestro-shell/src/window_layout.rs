@@ -1701,6 +1701,11 @@ fn canonical_prepared_unknown_with_agent_task(
                     }
                 )
         }
+        PreparedSessionBinding::ProviderFreshAudit => {
+            params.kind == SessionKind::Agent
+                && publication_launch == &params.launch
+                && publication_launch.fresh_provider_audit().is_some()
+        }
         PreparedSessionBinding::ProviderExact => {
             params.kind == SessionKind::Agent
                 && publication_launch == &params.launch
@@ -1806,6 +1811,11 @@ fn prepared_params_match_unknown(
                             ..
                         }
                     )
+            }
+            PreparedSessionBinding::ProviderFreshAudit => {
+                params.kind == SessionKind::Agent
+                    && publication_launch == &params.launch
+                    && publication_launch.fresh_provider_audit().is_some()
             }
             PreparedSessionBinding::ProviderExact => {
                 params.kind == SessionKind::Agent

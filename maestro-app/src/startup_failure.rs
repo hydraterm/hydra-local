@@ -1,5 +1,7 @@
 //! Pure presentation for a foreground product launch that failed before renderer startup.
-//! This supplies text only: no retry, daemon replacement, or retained-session mutation.
+//! This supplies text only; app composition separately owns confirmed recovery.
+
+pub const RECOVERY_WARNING: &str = "Restart Terminal Service ends all running terminal programs owned by this retained service, including those in other Hydra windows. You may lose unsaved terminal state and scrollback.\n\nSaved projects, files, and provider conversation history are kept. Running programs cannot be restored exactly; safe saved sessions may reopen.\n\nChoose Cancel to leave the retained service and its programs untouched.";
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct StartupFailureDialog {
@@ -22,6 +24,10 @@ pub fn startup_failure_dialog(
             "Hydra could not connect to its retained terminal service.",
             "The retained daemon and its sessions were left untouched. No replacement daemon was started.",
         ),
+        "daemon_recovery_failed" => (
+            "Hydra could not complete the requested terminal-service restart.",
+            "Saved projects, files, and provider conversation history were not deleted. Reopen Hydra after the terminal service has finished stopping.",
+        ),
         "daemon_spawn_failed" | "daemon_unreachable" => (
             "Hydra could not start its terminal service.",
             "No terminal session was opened by this launch.",
@@ -35,6 +41,13 @@ pub fn startup_failure_dialog(
         title: "Hydra could not open",
         message: format!("{summary}\n\n{reason}\n\n{outcome}"),
     })
+}
+
+pub fn recovery_confirmation_dialog(reason: &str) -> StartupFailureDialog {
+    StartupFailureDialog {
+        title: "Restart Hydra's terminal service?",
+        message: format!("{}\n\n{RECOVERY_WARNING}", reason.replace('\0', "\u{fffd}")),
+    }
 }
 
 /// Only the post-probe attach-only branch with no visible persisted target may use this.
@@ -67,6 +80,20 @@ mod tests {
         "daemon_spawn_failed",
         "daemon_unreachable",
     ];
+
+    #[test]
+    fn retained_recovery_explains_live_process_loss_and_saved_data_preservation() {
+        let dialog = recovery_confirmation_dialog("old build");
+        assert!(dialog
+            .message
+            .contains("ends all running terminal programs"));
+        assert!(dialog
+            .message
+            .contains("Saved projects, files, and provider conversation history are kept"));
+        assert!(dialog
+            .message
+            .contains("unsaved terminal state and scrollback"));
+    }
 
     #[test]
     fn only_foreground_product_startup_presents_each_supported_failure() {

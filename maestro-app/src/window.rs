@@ -1027,6 +1027,34 @@ impl<S: RendererCommandSink> TabSwitchController<S> {
             .map_err(|()| TabSwitchError::RendererControlClosed)
     }
 
+    /// Refresh catalog rows without reopening a dismissed overlay or resetting query/selection.
+    pub fn refresh_command_palette_rows(
+        &mut self,
+        generation: u64,
+        rows: Vec<maestro_renderer::RendererCommandPaletteRow>,
+    ) -> Result<(), TabSwitchError> {
+        self.sender
+            .send(maestro_renderer::RendererCommand::RefreshCommandPaletteRows { generation, rows })
+            .map_err(|()| TabSwitchError::RendererControlClosed)
+    }
+
+    pub fn set_command_palette_action_result(
+        &mut self,
+        generation: u64,
+        action_id: String,
+        result: maestro_renderer::RendererCommandPaletteResult,
+    ) -> Result<(), TabSwitchError> {
+        self.sender
+            .send(
+                maestro_renderer::RendererCommand::SetCommandPaletteActionResult {
+                    generation,
+                    action_id,
+                    result,
+                },
+            )
+            .map_err(|()| TabSwitchError::RendererControlClosed)
+    }
+
     /// Replace (`Some`) or clear (`None`) the renderer's read-only top dashboard/settings panel through
     /// the same command channel by sending a
     /// [`maestro_renderer::RendererCommand::SetDashboardPanel`]. Display-only — like `set_tab_strip` it
@@ -1528,6 +1556,25 @@ impl RendererTabRuntime {
         command_palette: Option<maestro_renderer::RendererCommandPaletteModel>,
     ) -> Result<(), TabSwitchError> {
         self.controller.set_command_palette_overlay(command_palette)
+    }
+
+    pub fn refresh_command_palette_rows(
+        &mut self,
+        generation: u64,
+        rows: Vec<maestro_renderer::RendererCommandPaletteRow>,
+    ) -> Result<(), TabSwitchError> {
+        self.controller
+            .refresh_command_palette_rows(generation, rows)
+    }
+
+    pub fn set_command_palette_action_result(
+        &mut self,
+        generation: u64,
+        action_id: String,
+        result: maestro_renderer::RendererCommandPaletteResult,
+    ) -> Result<(), TabSwitchError> {
+        self.controller
+            .set_command_palette_action_result(generation, action_id, result)
     }
 
     /// Replace (`Some`) or clear (`None`) the renderer's read-only top dashboard/settings panel through
@@ -4281,6 +4328,27 @@ mod tests {
             sent[1],
             maestro_renderer::RendererCommand::SetReactChromeOverlayVisible { visible: true }
         ));
+    }
+
+    #[test]
+    fn palette_catalog_refresh_preserves_generation_and_closed_channel_error() {
+        let mut controller = TabSwitchController::new(RecordingSink::default());
+        controller
+            .refresh_command_palette_rows(17, Vec::new())
+            .unwrap();
+        {
+            let sent = controller.sender.sent.borrow();
+            assert_eq!(sent.len(), 1);
+            assert!(matches!(&sent[0],
+                maestro_renderer::RendererCommand::RefreshCommandPaletteRows { generation: 17, rows }
+                    if rows.is_empty()));
+        }
+        controller.sender.closed = true;
+        assert_eq!(
+            controller.refresh_command_palette_rows(18, Vec::new()),
+            Err(TabSwitchError::RendererControlClosed)
+        );
+        assert_eq!(controller.sender.sent.borrow().len(), 1);
     }
 
     #[test]

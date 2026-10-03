@@ -17,7 +17,27 @@ fn optional_extension_production_source() -> &'static str {
 
 #[test]
 fn public_workspace_excludes_the_private_agent_and_cloud_build_binding() {
-    assert!(!ROOT_MANIFEST.contains("\"hydra-agent\""));
+    assert!(ROOT_MANIFEST.contains("exclude = [\"hydra-agent\"]"));
+    let output = std::process::Command::new(env!("CARGO"))
+        .args(["metadata", "--no-deps", "--locked", "--format-version", "1"])
+        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap())
+        .output()
+        .expect("Cargo metadata must describe the public workspace");
+    assert!(output.status.success(), "Cargo metadata must succeed");
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("Cargo metadata is valid JSON");
+    let members = metadata["workspace_members"].as_array().unwrap();
+    for package in metadata["packages"].as_array().unwrap() {
+        if members.contains(&package["id"]) {
+            assert!(
+                !matches!(
+                    package["name"].as_str(),
+                    Some("hydra-agent" | "hydra-cloud")
+                ),
+                "standalone agent and private cloud must not join the desktop workspace"
+            );
+        }
+    }
     assert!(!ROOT_MANIFEST.contains("profile.dev.package.hydra-agent"));
     assert!(!APP_MANIFEST.contains("build = \"build.rs\""));
     assert!(!APP_LIB.contains("desktop_environment"));

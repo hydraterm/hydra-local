@@ -1207,7 +1207,10 @@ describe('lazy native overlay model delivery', () => {
     expect(preview()).toBe('devin --resume synthetic-devin-session --model swe')
   })
 
-  it('keeps a launch modal open and shows a bounded alert when the executable is missing', async () => {
+  it.each([
+    { name: 'missing executable', text: `Executable claude was not found. ${'x'.repeat(500)}`, code: 'agent_executable_missing', fragment: 'Claude' },
+    { name: 'history without launcher', text: "Hydra found Claude's history storage, but its launcher is unavailable. Check the selected executable, installation, or login-shell PATH.", code: 'agent_history_executable_missing', fragment: "Hydra found Claude's history storage" },
+  ])('keeps a launch modal open and shows a bounded alert: $name', async ({ text, code, fragment }) => {
     const initialModel = structuredClone(mockDashboardModel)
     const intents: Array<Record<string, unknown>> = []
     const browserWindow = Object.assign(new EventTarget(), {
@@ -1225,8 +1228,8 @@ describe('lazy native overlay model delivery', () => {
             browserWindow.__HYDRA_DASHBOARD_RESOLVE_LAUNCH_PREFLIGHT__?.(
               String(intent.request_id),
               false,
-              `Executable claude was not found. ${'x'.repeat(500)}`,
-              'agent_executable_missing',
+              text,
+              code,
             )
           }
         },
@@ -1266,12 +1269,16 @@ describe('lazy native overlay model delivery', () => {
     expect(renderer!.root.findByProps({ 'aria-label': 'New project' })).toBeTruthy()
     const alert = renderer!.root.findByProps({ role: 'alert' })
     const message = alert.children.join('')
-    expect(message).toContain('Claude')
-    expect(message).toContain('`claude`')
-    expect(message).toContain('`command -v claude`')
-    expect(message).toContain('choose Terminal')
-    expect(message).not.toContain('Executable claude was not found.')
+    expect(message).toContain(fragment)
     expect(message.length).toBeLessThanOrEqual(320)
+    if (code === 'agent_executable_missing') {
+      expect(message).toContain('`claude`')
+      expect(message).toContain('`command -v claude`')
+      expect(message).toContain('choose Terminal')
+      expect(message).not.toContain('Executable claude was not found.')
+    } else {
+      expect(message).toBe(text)
+    }
     const readyButton = renderer!.root
       .findAllByType('button')
       .find((node) => node.children.join('') === 'Create')!

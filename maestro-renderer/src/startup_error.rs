@@ -1,5 +1,32 @@
 //! Native startup presentation before a renderer/window event loop exists.
 
+/// The cancel/close result is always non-destructive. This function performs no recovery itself.
+pub fn confirm_startup_recovery(title: &str, message: &str) -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let result = rfd::MessageDialog::new()
+            .set_title(title)
+            .set_description(message)
+            .set_level(rfd::MessageLevel::Warning)
+            // Cancel is the default (first) button; Return must not end retained programs.
+            .set_buttons(rfd::MessageButtons::OkCancelCustom(
+                "Cancel".into(),
+                "Restart Terminal Service".into(),
+            ))
+            .show();
+        Ok(result == rfd::MessageDialogResult::Custom("Restart Terminal Service".into()))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux_host::startup_error::confirm_recovery(title, message)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (title, message);
+        Ok(false)
+    }
+}
+
 /// Show one error with a Close action on the process main thread, before renderer startup.
 /// No daemon, session, filesystem, or retry operations are performed. Linux reports display
 /// initialization failure; macOS rfd has no distinct unavailable-display error. The caller

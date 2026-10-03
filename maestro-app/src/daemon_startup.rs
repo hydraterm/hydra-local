@@ -1,4 +1,4 @@
-//! App startup uses one absolute deadline and never replaces an unresponsive retained daemon.
+//! App startup uses one probe deadline. Replacement requires explicit foreground confirmation.
 use super::{
     child_log_stdio, ChildLogKind, DaemonClientError, LaunchFailure, ReusedDaemonProtocol,
     SpawnedDaemon, DAEMON_CONNECT_POLL, DAEMON_CONNECT_TIMEOUT,
@@ -6,6 +6,9 @@ use super::{
 use std::path::Path;
 use std::process::{Command as ProcCommand, Stdio};
 use std::time::{Duration, Instant};
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod recovery;
 
 type StartupResult = Result<
     (
@@ -35,6 +38,30 @@ fn ensure_daemon_before(
     log_dir: Option<&Path>,
     deadline: Instant,
 ) -> StartupResult {
+    ensure_daemon_impl(socket_path, daemon_bin, log_dir, deadline, None)
+}
+
+/// Foreground-only composition supplies the explicit native confirmation. Headless callers retain
+/// ensure_daemon's non-destructive behavior and unchanged structured failures.
+pub(super) fn ensure_daemon_with_confirmation(
+    socket_path: &Path,
+    daemon_bin: &Path,
+    log_dir: Option<&Path>,
+    deadline: Instant,
+    confirm: &mut dyn FnMut(&LaunchFailure) -> bool,
+) -> StartupResult {
+    ensure_daemon_impl(socket_path, daemon_bin, log_dir, deadline, Some(confirm))
+}
+
+fn ensure_daemon_impl(
+    socket_path: &Path,
+    daemon_bin: &Path,
+    log_dir: Option<&Path>,
+    deadline: Instant,
+    confirm: Option<&mut dyn FnMut(&LaunchFailure) -> bool>,
+) -> StartupResult {
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = &confirm;
     let retained = match maestro_shell::DaemonClient::connect_before(socket_path, deadline) {
         Ok(client) => Some(client),
         Err(DaemonClientError::DaemonUnavailable { source, .. })
@@ -53,6 +80,10 @@ fn ensure_daemon_before(
         }
     };
     if let Some(mut client) = retained {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let recovery = confirm
+            .as_ref()
+            .map(|_| recovery::RetainedRecovery::capture(&client, socket_path));
         let (protocol_version, build_version) = match client.daemon_info_before(deadline) {
             Ok(info) => info,
             Err(error) => {
@@ -67,22 +98,46 @@ fn ensure_daemon_before(
                 if matches!(error, DaemonClientError::DaemonError { .. }) {
                     return Ok((None, ReusedDaemonProtocol::Legacy, Some(client)));
                 }
-                return Err(LaunchFailure::new(
+                let failure = LaunchFailure::new(
                     "daemon_probe_failed",
                     format!(
                         "retained daemon did not return an aligned compatibility identity reply: {error}; its sessions were left untouched. Open the original Hydra version to access them"
                     ),
-                ));
+                );
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                if let (Some(recovery), Some(confirm)) = (recovery, confirm) {
+                    return recover_or_refuse(
+                        socket_path,
+                        daemon_bin,
+                        log_dir,
+                        recovery,
+                        failure,
+                        confirm,
+                    );
+                }
+                return Err(failure);
             }
         };
         if protocol_version > maestro_protocol::DAEMON_PROTOCOL_VERSION {
-            return Err(LaunchFailure::new(
+            let failure = LaunchFailure::new(
                 "stale_daemon",
                 format!(
                     "retained daemon protocol {protocol_version} (build {build_version}) is newer than supported protocol {}; its live sessions were left untouched",
                     maestro_protocol::DAEMON_PROTOCOL_VERSION
                 ),
-            ));
+            );
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            if let (Some(recovery), Some(confirm)) = (recovery, confirm) {
+                return recover_or_refuse(
+                    socket_path,
+                    daemon_bin,
+                    log_dir,
+                    recovery,
+                    failure,
+                    confirm,
+                );
+            }
+            return Err(failure);
         }
         // Older retained daemons remain attach-compatible so an app upgrade never strands or kills
         // their PTYs. ShellRuntime separately requires the exact current mutation protocol before
@@ -158,6 +213,65 @@ fn ensure_daemon_before(
             DAEMON_CONNECT_TIMEOUT
         ),
     ))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn recover_or_refuse(
+    socket_path: &Path,
+    daemon_bin: &Path,
+    log_dir: Option<&Path>,
+    recovery: std::io::Result<recovery::RetainedRecovery>,
+    mut failure: LaunchFailure,
+    confirm: &mut dyn FnMut(&LaunchFailure) -> bool,
+) -> StartupResult {
+    let recovery = match recovery {
+        Ok(recovery) => recovery,
+        Err(error) => {
+            failure
+                .message
+                .push_str(&format!("\nSafe restart is unavailable: {error}"));
+            return Err(failure);
+        }
+    };
+    if !confirm(&failure) {
+        return Err(failure);
+    }
+    recovery
+        .stop_confirmed(Instant::now() + DAEMON_CONNECT_TIMEOUT)
+        .map_err(|error| {
+            LaunchFailure::new(
+                "daemon_recovery_failed",
+                format!("Could not safely restart the terminal service: {error}"),
+            )
+        })?;
+    // A concurrent replacement is subject to the normal identity/retention rules, never killed.
+    // Recovery gets no recursive confirmation or automatic retry against a new process.
+    ensure_daemon(socket_path, daemon_bin, log_dir)
+        .map_err(|error| LaunchFailure::new("daemon_recovery_failed", error.message))
+}
+
+pub(super) fn restart_unusable_retained_daemon(
+    client: &maestro_shell::DaemonClient,
+    socket_path: &Path,
+    daemon_bin: &Path,
+    log_dir: Option<&Path>,
+    failure: LaunchFailure,
+    confirm: &mut dyn FnMut(&LaunchFailure) -> bool,
+) -> StartupResult {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    return recover_or_refuse(
+        socket_path,
+        daemon_bin,
+        log_dir,
+        recovery::RetainedRecovery::capture(client, socket_path),
+        failure,
+        confirm,
+    );
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (client, socket_path, daemon_bin, log_dir, confirm);
+        Err(failure)
+    }
 }
 
 #[cfg(test)]

@@ -2655,9 +2655,21 @@ body.is-linux-lazy-overlay .overlay-icon-more {
   font-weight: 750;
 }
 .split-dialog__submit {
-  border-color: color-mix(in srgb, var(--accent) 64%, white 8%);
-  background: color-mix(in srgb, var(--accent) 82%, #ffffff 6%);
+  /* System WebKit versions without color-mix must still paint a readable primary action.
+     Keep the opaque default accent before the optional project-accent enhancement. */
+  border-color: #fbbf24;
+  background: #fbbf24;
   color: #121218;
+}
+@supports (background: color-mix(in srgb, black, white)) {
+  .split-dialog__submit {
+    border-color: color-mix(in srgb, var(--accent) 64%, white 8%);
+    background: color-mix(in srgb, var(--accent) 82%, #ffffff 6%);
+  }
+}
+.split-dialog__submit:focus-visible {
+  outline: 2px solid #f1f3f7;
+  outline-offset: 2px;
 }
 
 /* ---------- Terminal host (native surface slot) ---------- */

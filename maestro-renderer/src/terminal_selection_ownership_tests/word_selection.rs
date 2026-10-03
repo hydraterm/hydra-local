@@ -7,6 +7,76 @@ fn release(app: &mut App) {
     });
 }
 
+#[test]
+fn pointer_shift_click_in_split_keeps_the_original_selection_anchor() {
+    let (mut app, shared, origin) = app_with_right_child();
+    app.host = Some(Box::new(RecordingNeutralHost {
+        titles: Arc::new(Mutex::new(Vec::new())),
+    }));
+    app.test_cell_size_logical = Some((10.0, 20.0));
+    app.sync_pane_cache();
+    shared.drain_test_requests();
+    let pointer = |app: &mut App, col: usize| {
+        app.handle_host_event(HostEvent::CursorMoved {
+            x: (origin.col + col) as f64 * 10.0 + 5.0,
+            y: origin.row as f64 * 20.0 + 5.0,
+        });
+    };
+    pointer(&mut app, 0);
+    app.handle_host_event(HostEvent::MouseInput {
+        button: HostPointerButton::Left,
+        pressed: true,
+    });
+    pointer(&mut app, 2);
+    release(&mut app);
+    assert_eq!(app.selected_text().as_deref(), Some("chi"));
+    app.modifiers.shift = true;
+    pointer(&mut app, 4);
+    app.handle_host_event(HostEvent::MouseInput {
+        button: HostPointerButton::Left,
+        pressed: true,
+    });
+    release(&mut app);
+    assert_eq!(app.sel_anchor, Some(origin));
+    assert_eq!(app.selected_text().as_deref(), Some("child"));
+    assert!(shared.drain_test_requests().is_empty());
+}
+
+#[test]
+fn repeated_pointer_clicks_in_split_keep_word_and_line_gestures() {
+    let (mut app, shared, origin) = app_with_right_child();
+    app.host = Some(Box::new(RecordingNeutralHost {
+        titles: Arc::new(Mutex::new(Vec::new())),
+    }));
+    app.test_cell_size_logical = Some((10.0, 20.0));
+    app.sync_pane_cache();
+    shared.drain_test_requests();
+    app.handle_host_event(HostEvent::CursorMoved {
+        x: (origin.col + 2) as f64 * 10.0 + 5.0,
+        y: origin.row as f64 * 20.0 + 5.0,
+    });
+    for count in 1..=4 {
+        app.handle_host_event(HostEvent::MouseInput {
+            button: HostPointerButton::Left,
+            pressed: true,
+        });
+        release(&mut app);
+        match count {
+            1 | 4 => assert!(app.current_selection().is_none()),
+            2 => assert!(matches!(
+                app.sel_unit_anchor,
+                Some((_, _, crate::SelectionUnit::Word))
+            )),
+            3 => assert!(matches!(
+                app.sel_unit_anchor,
+                Some((_, _, crate::SelectionUnit::LogicalLine))
+            )),
+            _ => unreachable!(),
+        }
+    }
+    assert!(shared.drain_test_requests().is_empty());
+}
+
 fn double_click(app: &mut App, pos: CellPos) {
     // This helper represents an independent two-click gesture, not a prior click's continuation.
     app.last_selection_click = None;

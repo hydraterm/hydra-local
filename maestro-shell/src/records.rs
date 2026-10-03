@@ -165,6 +165,22 @@ pub enum LaunchSpec {
         /// Non-secret parameters only.
         params: Vec<String>,
     },
+    /// A Hydra-selected provider recipe bound to an absolute launcher, rather than PATH.
+    /// Keep the launcher path lexical: a stable symlink may follow normal provider upgrades.
+    /// Older readers refuse this distinct tier instead of silently discarding the binding.
+    BoundProvider {
+        launch_spec_id: String,
+        params: Vec<String>,
+        executable: String,
+    },
+    /// Audit of a selected fresh provider without a bound conversation. Never a restart recipe:
+    /// even explicit Reopen must not invent latest/continue or replay its first-launch command.
+    /// A distinct tier makes older readers refuse it rather than discard its non-replay policy.
+    FreshProvider {
+        launch_spec_id: String,
+        params: Vec<String>,
+        executable: String,
+    },
     /// An ad-hoc command line whose secret-shaped tokens have been conservatively redacted.
     /// `restart_requires_user` is always true for this tier: the shell MUST prompt for the
     /// redacted values before re-spawning — it never silently replays them.
@@ -176,6 +192,57 @@ pub enum LaunchSpec {
     /// The launch was not retained at all, so its prior command is never replayed. An explicit
     /// plain-terminal Reopen may start a separately reviewed default shell instead.
     OptOut,
+}
+
+impl LaunchSpec {
+    /// Read a closed fresh-provider profile for audit/identity/inheritance only, never execution.
+    pub fn fresh_provider_audit(&self) -> Option<(&str, &[String], &str)> {
+        let Self::FreshProvider {
+            launch_spec_id,
+            params,
+            executable,
+        } = self
+        else {
+            return None;
+        };
+        if !std::path::Path::new(executable).is_absolute()
+            || executable.len() > 4096
+            || executable.as_bytes().contains(&0)
+        {
+            return None;
+        }
+        let mut source = vec![launch_spec_id.clone()];
+        source.extend(params.iter().cloned());
+        let (mode, _) =
+            crate::restart_recipe::strict_prepared_provider_launch(launch_spec_id, &source)?;
+        (mode == crate::restart_recipe::PreparedProviderLaunchMode::FreshUnassigned).then_some((
+            launch_spec_id,
+            params,
+            executable,
+        ))
+    }
+
+    /// Provider identity remains separate from its optional, locally bound executable.
+    /// This does not grant restart authority: callers still validate the closed provider grammar.
+    pub fn provider_recipe(&self) -> Option<(&str, &[String], Option<&str>)> {
+        match self {
+            Self::KnownSafe {
+                launch_spec_id,
+                params,
+            } => Some((launch_spec_id, params, None)),
+            Self::BoundProvider {
+                launch_spec_id,
+                params,
+                executable,
+            } if std::path::Path::new(executable).is_absolute()
+                && executable.len() <= 4096
+                && !executable.as_bytes().contains(&0) =>
+            {
+                Some((launch_spec_id, params, Some(executable)))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// The durable, shell-side description of a session — distinct from the daemon's in-memory

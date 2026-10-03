@@ -1,5 +1,6 @@
 //! Platform-neutral, current-attempt provider selection. Resolving and validating an executable
-//! remain platform operations; this carrier never changes a durable provider/conversation recipe.
+//! remain platform operations. The prepared-session boundary may retain its stable launcher in a
+//! replayable provider recipe without changing the selected provider or conversation identity.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -13,6 +14,11 @@ pub trait LaunchEnvLookup {
         None
     }
     fn selected_provider_path(&self, _provider: &str) -> Option<PathBuf> {
+        None
+    }
+    /// Explicit operator mapping for a renamed/wrapped provider executable. Unlike a selected
+    /// launch path this is an input to discovery; invalid configured paths must not fall back.
+    fn configured_provider_path(&self, _provider: &str) -> Option<PathBuf> {
         None
     }
 }
@@ -62,6 +68,10 @@ impl<E: LaunchEnvLookup> LaunchEnvLookup for SelectedProviderLaunchEnv<'_, E> {
         self.selected
             .and_then(|selected| selected.path_for(provider).map(Path::to_path_buf))
             .or_else(|| self.env.selected_provider_path(provider))
+    }
+
+    fn configured_provider_path(&self, provider: &str) -> Option<PathBuf> {
+        self.env.configured_provider_path(provider)
     }
 }
 

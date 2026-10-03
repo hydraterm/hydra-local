@@ -135,7 +135,8 @@ pub use project::{
 };
 #[cfg(unix)]
 pub use provider_executable::{
-    resolve_provider_executable, ProviderLookupError, ProviderResolution,
+    provider_executable_names, provider_executable_override_variable, resolve_provider_executable,
+    ProviderLookupError, ProviderResolution,
 };
 pub use provider_launch_selection::{ProviderExecutable, SelectedProviderLaunchEnv};
 pub use records::{

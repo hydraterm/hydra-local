@@ -178,7 +178,7 @@ impl LaunchPreflightError {
                 agent.display_name()
             ),
             Self::MissingWithHistoryStore(agent) => format!(
-                "Hydra found {}'s history storage, but couldn't find its command on your login-shell PATH. Check the installation or PATH.",
+                "Hydra found {}'s history storage, but its launcher is unavailable. Check the selected executable, installation, or login-shell PATH.",
                 agent.display_name()
             ),
             Self::MissingCommand => {
@@ -595,6 +595,11 @@ impl maestro_shell::LaunchEnvLookup for LoginShellAgentProbe {
     fn path_os(&self) -> Option<std::ffi::OsString> {
         std::env::var_os("PATH")
     }
+    fn configured_provider_path(&self, provider: &str) -> Option<PathBuf> {
+        maestro_shell::provider_executable_override_variable(provider)
+            .and_then(std::env::var_os)
+            .map(PathBuf::from)
+    }
 }
 
 impl LoginShellAgentProbe {
@@ -713,29 +718,42 @@ impl AgentExecutableProbe for LoginShellAgentProbe {
             ProbeTarget::LoginShell(agent) => {
                 let available = self.login_shell_has(*agent, cwd)?;
                 if !available {
-                    use maestro_local_services::agent_history::{
-                        provider_history_store_presence, HistoryStorePresence,
-                    };
-                    let history_agent = match agent {
-                        SupportedAgentExecutable::Antigravity => "antigravity",
-                        SupportedAgentExecutable::Kiro => "kiro",
-                        SupportedAgentExecutable::Cursor => "cursor",
-                        _ => agent.command(),
-                    };
-                    if provider_history_store_presence(history_agent, self.home.as_deref())
-                        == HistoryStorePresence::Present
-                    {
-                        return Err(LaunchPreflightError::MissingWithHistoryStore(*agent));
-                    }
+                    return Err(missing_provider_error(*agent, self.home.as_deref()));
                 }
                 Ok(available)
             }
             ProbeTarget::ProcessPathCommand(command) => {
                 Ok(process_path_executable(command, cwd).is_some())
             }
-            ProbeTarget::DirectPath { path, .. } => Ok(is_executable_file(path)),
+            ProbeTarget::DirectPath { path, agent } => {
+                if is_executable_file(path) {
+                    Ok(true)
+                } else {
+                    Err(missing_provider_error(*agent, self.home.as_deref()))
+                }
+            }
             ProbeTarget::DirectCommandPath(path) => Ok(is_executable_file(path)),
         }
+    }
+}
+
+fn missing_provider_error(
+    agent: SupportedAgentExecutable,
+    home: Option<&Path>,
+) -> LaunchPreflightError {
+    use maestro_local_services::agent_history::{
+        provider_history_store_presence, HistoryStorePresence,
+    };
+    let history_agent = match agent {
+        SupportedAgentExecutable::Antigravity => "antigravity",
+        SupportedAgentExecutable::Kiro => "kiro",
+        SupportedAgentExecutable::Cursor => "cursor",
+        _ => agent.command(),
+    };
+    if provider_history_store_presence(history_agent, home) == HistoryStorePresence::Present {
+        LaunchPreflightError::MissingWithHistoryStore(agent)
+    } else {
+        LaunchPreflightError::Missing(agent)
     }
 }
 
@@ -871,11 +889,27 @@ pub(crate) fn reprobe_selected_provider(
     argv: &[String],
     selected: &maestro_shell::ProviderExecutable,
 ) -> Result<(), LaunchPreflightError> {
+    reprobe_selected_provider_with_home(
+        argv,
+        selected,
+        std::env::var_os("HOME").as_deref().map(Path::new),
+    )
+}
+
+fn reprobe_selected_provider_with_home(
+    argv: &[String],
+    selected: &maestro_shell::ProviderExecutable,
+    home: Option<&Path>,
+) -> Result<(), LaunchPreflightError> {
     let provider = argv.first().ok_or(LaunchPreflightError::MalformedCommand)?;
     if selected.remains_executable_for(provider) {
         Ok(())
     } else {
-        Err(LaunchPreflightError::MissingCommand)
+        let agent = SupportedAgentExecutable::from_canonical_command(provider)
+            .filter(|_| selected.path_for(provider).is_some());
+        Err(agent
+            .map(|agent| missing_provider_error(agent, home))
+            .unwrap_or(LaunchPreflightError::MissingCommand))
     }
 }
 
@@ -963,14 +997,14 @@ mod tests {
         );
         assert_eq!(error.code(), "agent_history_executable_missing");
         let message = error.user_message();
-        assert_eq!(message, "Hydra found Codex's history storage, but couldn't find its command on your login-shell PATH. Check the installation or PATH.");
+        assert_eq!(message, "Hydra found Codex's history storage, but its launcher is unavailable. Check the selected executable, installation, or login-shell PATH.");
         assert!(!message.contains("folder"));
         assert!(error.to_string().len() < 256);
         assert!(!message.contains(root.path().to_str().unwrap()));
     }
 
     #[test]
-    fn history_presence_keeps_custom_direct_cwd_and_probe_errors_unchanged() {
+    fn history_presence_enriches_known_direct_paths_but_not_custom_cwd_or_probe_errors() {
         let root = tempfile::tempdir().unwrap();
         let mut probe = missing_binary_probe(root.path());
         std::fs::create_dir_all(root.path().join(".claude/projects")).unwrap();
@@ -983,7 +1017,9 @@ mod tests {
                 },
                 root.path()
             ),
-            Ok(false)
+            Err(LaunchPreflightError::MissingWithHistoryStore(
+                SupportedAgentExecutable::Claude
+            ))
         );
         assert_eq!(
             preflight_with_home(
@@ -1101,6 +1137,15 @@ mod tests {
         assert!(reprobe_selected_provider(&["codex".into()], &selected).is_err());
         std::fs::remove_file(executable).unwrap();
         assert!(reprobe_selected_provider(&argv, &selected).is_err());
+        std::fs::create_dir_all(root.path().join(".claude/projects")).unwrap();
+        let error =
+            reprobe_selected_provider_with_home(&argv, &selected, Some(root.path())).unwrap_err();
+        assert_eq!(
+            error,
+            LaunchPreflightError::MissingWithHistoryStore(SupportedAgentExecutable::Claude)
+        );
+        assert!(error.user_message().contains("history storage"));
+        assert!(!error.user_message().contains(root.path().to_str().unwrap()));
     }
 
     #[test]

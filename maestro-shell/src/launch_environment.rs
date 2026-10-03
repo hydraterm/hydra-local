@@ -36,6 +36,12 @@ impl LaunchEnvLookup for ProcessLaunchEnv {
     fn path_os(&self) -> Option<OsString> {
         std::env::var_os("PATH")
     }
+
+    fn configured_provider_path(&self, provider: &str) -> Option<PathBuf> {
+        crate::provider_executable_override_variable(provider)
+            .and_then(std::env::var_os)
+            .map(PathBuf::from)
+    }
 }
 
 /// Resolve the user's configured login shell without consulting process-global state directly.
@@ -73,7 +79,8 @@ pub(crate) fn is_executable_file(path: &Path) -> bool {
 /// Build the exact login-shell argv used by both fresh App launches and durable KnownSafe replay.
 /// A current prepared executable is used verbatim. Otherwise the login-shell command remains
 /// authoritative, with conventional per-user installation fallbacks; OpenCode retains its existing
-/// native-install preference. Later replay deliberately resolves again without rewriting its recipe.
+/// native-install preference. Legacy unbound replay resolves again; BoundProvider replay supplies
+/// its stored stable absolute launcher and refuses a missing locator without PATH fallback.
 pub fn login_shell_argv(argv: &[String], env: &impl LaunchEnvLookup) -> Vec<String> {
     login_shell_argv_with(argv, &login_shell_program(env), env, is_executable_file)
 }
@@ -162,21 +169,36 @@ pub fn known_safe_provider_login_shell_argv(
     launch: &LaunchSpec,
     env: &impl LaunchEnvLookup,
 ) -> Option<Vec<String>> {
-    let LaunchSpec::KnownSafe {
-        launch_spec_id,
-        params,
-    } = launch
-    else {
-        return None;
-    };
-    if !LOGIN_SHELL_PROVIDERS.contains(&launch_spec_id.as_str()) {
+    let (launch_spec_id, params, executable) = launch.provider_recipe()?;
+    if !LOGIN_SHELL_PROVIDERS.contains(&launch_spec_id) {
         return None;
     }
     let mut argv = Vec::with_capacity(1 + params.len());
-    argv.push(launch_spec_id.clone());
+    argv.push(launch_spec_id.to_owned());
     argv.extend(params.iter().cloned());
-    Some(login_shell_argv(&argv, env))
+    if let Some(executable) = executable {
+        // Revalidate the same stable locator, not its previous symlink target and not PATH.
+        if crate::restart_recipe::strict_known_safe_provider_mode(launch).is_none()
+            || !is_executable_file(Path::new(executable))
+        {
+            return None;
+        }
+        let selected = crate::ProviderExecutable::new(launch_spec_id.to_owned(), executable.into());
+        Some(login_shell_argv(
+            &argv,
+            &crate::SelectedProviderLaunchEnv {
+                env,
+                selected: Some(&selected),
+            },
+        ))
+    } else {
+        Some(login_shell_argv(&argv, env))
+    }
 }
+
+#[cfg(test)]
+#[path = "bound_provider_tests.rs"]
+mod bound_provider_tests;
 
 #[cfg(test)]
 mod tests {

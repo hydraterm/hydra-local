@@ -15,7 +15,8 @@
     "build": "tsc -b && vite build && node scripts/inline-dist.mjs",
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:submit-paint": "node scripts/check-submit-paint.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",

@@ -12,7 +12,7 @@
 // its complete authority tuple together at the call boundary.
 #![allow(clippy::result_large_err, clippy::too_many_arguments)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize as _;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -1945,13 +1945,15 @@ impl crate::remote_control::PaneSplitter for DaemonPaneSplitter {
             crate::remote_control::SplitPaneDir::Down => maestro_shell::SplitAxis::Down,
         };
         let launch = if is_terminal {
-            crate::session_creator::empty_session_launch(self.tx.headless_server())
+            crate::session_creator::empty_session_launch(self.tx.headless_server()).into()
         } else if let Some(launch) = start_launch {
-            launch
+            RemotePreparedLaunch::from(launch)
         } else {
             match fresh_inherited_remote_session_launch(&source_session) {
                 Ok(Some(launch)) => launch,
-                Ok(None) => crate::session_creator::empty_session_launch(self.tx.headless_server()),
+                Ok(None) => {
+                    crate::session_creator::empty_session_launch(self.tx.headless_server()).into()
+                }
                 Err(()) => return Err(crate::remote_control::SplitPaneCreateError::Internal),
             }
         };
@@ -2186,13 +2188,15 @@ impl crate::remote_control::PaneSplitter for DaemonPaneSplitter {
                 .to_string()
         });
         let launch = if is_terminal {
-            crate::session_creator::empty_session_launch(self.tx.headless_server())
+            crate::session_creator::empty_session_launch(self.tx.headless_server()).into()
         } else if let Some(launch) = start_launch {
-            launch
+            RemotePreparedLaunch::from(launch)
         } else {
             match fresh_inherited_remote_session_launch(&source_session) {
                 Ok(Some(launch)) => launch,
-                Ok(None) => crate::session_creator::empty_session_launch(self.tx.headless_server()),
+                Ok(None) => {
+                    crate::session_creator::empty_session_launch(self.tx.headless_server()).into()
+                }
                 Err(()) => return Err(crate::remote_control::SplitPaneCreateError::Internal),
             }
         };
@@ -2908,6 +2912,41 @@ fn recorded_remote_session_launch(
     }
 }
 
+/// A private same-host launch carrier. Explicit user launches have no inherited locator; a fresh
+/// child of a selected provider retains its stable launcher, never its conversation selector.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RemotePreparedLaunch {
+    command: String,
+    args: Vec<String>,
+    provider_locator: Option<PathBuf>,
+}
+
+impl From<crate::resume_launch::ResumeLaunch> for RemotePreparedLaunch {
+    fn from(launch: crate::resume_launch::ResumeLaunch) -> Self {
+        Self {
+            command: launch.command,
+            args: launch.args,
+            provider_locator: None,
+        }
+    }
+}
+
+// This environment is used only for the resolver's explicit absolute-path validation branch.
+// Actual execution always uses RemoteLaunchEnvironment's current trusted shell/home.
+impl maestro_shell::LaunchEnvLookup for RemotePreparedLaunch {
+    fn shell_utf8(&self) -> Option<String> {
+        None
+    }
+    fn home_os(&self) -> Option<std::ffi::OsString> {
+        None
+    }
+    fn configured_provider_path(&self, provider: &str) -> Option<PathBuf> {
+        (provider == self.command)
+            .then(|| self.provider_locator.clone())
+            .flatten()
+    }
+}
+
 /// Derive an implicit child-pane launch without inheriting the source provider conversation.
 ///
 /// "No agent selected" inherits the provider *profile*, not its session identity. A reviewed
@@ -2917,14 +2956,29 @@ fn recorded_remote_session_launch(
 /// Agent shell wrapper fails closed because it could conceal an exact provider resume command.
 fn fresh_inherited_remote_session_launch(
     session: &maestro_shell::SessionRecord,
-) -> Result<Option<crate::resume_launch::ResumeLaunch>, ()> {
+) -> Result<Option<RemotePreparedLaunch>, ()> {
     use crate::resume_launch::ResumeAgent;
 
     let (provider, params) = match &session.launch {
+        maestro_shell::LaunchSpec::FreshProvider { .. } => {
+            if session.kind != maestro_shell::SessionKind::Agent {
+                return Err(());
+            }
+            let (provider, params, _) = session.launch.fresh_provider_audit().ok_or(())?;
+            (resume_agent_from_command(provider).ok_or(())?, params)
+        }
         maestro_shell::LaunchSpec::KnownSafe {
             launch_spec_id,
             params,
+        }
+        | maestro_shell::LaunchSpec::BoundProvider {
+            launch_spec_id,
+            params,
+            ..
         } => {
+            if session.launch.provider_recipe().is_none() {
+                return Err(());
+            }
             let Some(provider) = resume_agent_from_command(launch_spec_id) else {
                 return if session.kind == maestro_shell::SessionKind::Shell {
                     // `KnownSafe` is not itself provider provenance: an absolute provider path or
@@ -3003,7 +3057,18 @@ fn fresh_inherited_remote_session_launch(
             launch.args.push(flag.to_string());
         }
     }
-    Ok(Some(launch))
+    let provider_locator = match &session.launch {
+        maestro_shell::LaunchSpec::BoundProvider { executable, .. }
+        | maestro_shell::LaunchSpec::FreshProvider { executable, .. } => {
+            Some(PathBuf::from(executable))
+        }
+        _ => None,
+    };
+    Ok(Some(RemotePreparedLaunch {
+        command: launch.command,
+        args: launch.args,
+        provider_locator,
+    }))
 }
 
 fn resume_agent_from_command(command: &str) -> Option<crate::resume_launch::ResumeAgent> {
@@ -3322,9 +3387,9 @@ impl crate::remote_control::WindowOpener for DaemonWindowOpener {
         } else {
             maestro_shell::SessionKind::Agent
         };
-        let launch = start_launch.unwrap_or_else(|| {
+        let launch = RemotePreparedLaunch::from(start_launch.unwrap_or_else(|| {
             crate::session_creator::empty_session_launch(self.tx.headless_server())
-        });
+        }));
         let mut occupied = self
             .known_sessions()
             .into_iter()
@@ -3862,9 +3927,9 @@ impl DaemonProjectEditor {
         } else {
             maestro_shell::SessionKind::Agent
         };
-        let launch = start_launch.unwrap_or_else(|| {
+        let launch = RemotePreparedLaunch::from(start_launch.unwrap_or_else(|| {
             crate::session_creator::empty_session_launch(self.tx.headless_server())
-        });
+        }));
         let (session, launch_environment) = prepared_remote_session_spec(
             &self.tx,
             &workspace,
@@ -4328,7 +4393,7 @@ fn prepared_remote_session_spec(
     session_id: &str,
     cwd: &str,
     kind: maestro_shell::SessionKind,
-    launch: &crate::resume_launch::ResumeLaunch,
+    launch: &RemotePreparedLaunch,
     initial_size: InitialTerminalSize,
     now_ms: u64,
 ) -> Result<
@@ -4336,22 +4401,68 @@ fn prepared_remote_session_spec(
     maestro_shell::DaemonClientError,
 > {
     let launch_environment = remote_launch_environment(tx)?;
+    prepared_remote_session_spec_with_environment(
+        launch_environment,
+        workspace,
+        session_id,
+        cwd,
+        kind,
+        launch,
+        initial_size,
+        now_ms,
+    )
+}
+
+fn prepared_remote_session_spec_with_environment(
+    launch_environment: RemoteLaunchEnvironment,
+    workspace: &maestro_shell::Workspace,
+    session_id: &str,
+    cwd: &str,
+    kind: maestro_shell::SessionKind,
+    launch: &RemotePreparedLaunch,
+    initial_size: InitialTerminalSize,
+    now_ms: u64,
+) -> Result<
+    (maestro_shell::PreparedSessionSpec, RemoteLaunchEnvironment),
+    maestro_shell::DaemonClientError,
+> {
+    let mut argv = Vec::with_capacity(1 + launch.args.len());
+    argv.push(launch.command.clone());
+    argv.extend(launch.args.iter().cloned());
+    let selected_provider = kind == maestro_shell::SessionKind::Agent
+        && maestro_shell::is_strict_prepared_provider_launch(&launch.command, &argv);
+    if launch.provider_locator.is_some() && !selected_provider {
+        return Err(maestro_shell::DaemonClientError::Protocol {
+            detail: "inherited provider profile is outside the sealed launch contract".into(),
+        });
+    }
+    let selected = if launch.provider_locator.is_some() {
+        match maestro_shell::resolve_provider_executable(&launch.command, Path::new(cwd), launch) {
+            Ok(Some(maestro_shell::ProviderResolution::Executable(selected))) => Some(selected),
+            _ => return Err(maestro_shell::DaemonClientError::Protocol {
+                detail:
+                    "the inherited provider launcher is unavailable; restore its original location"
+                        .into(),
+            }),
+        }
+    } else {
+        None
+    };
+    let selected_environment = maestro_shell::SelectedProviderLaunchEnv {
+        env: &launch_environment,
+        selected: selected.as_ref(),
+    };
     let prepared_workspace = maestro_shell::PreparedWorkspace::unsealed(
         workspace.policy,
         workspace.workspace_id.clone(),
         session_id,
         PathBuf::from(cwd),
     );
-    let mut argv = Vec::with_capacity(1 + launch.args.len());
-    argv.push(launch.command.clone());
-    argv.extend(launch.args.iter().cloned());
-    let spec = if kind == maestro_shell::SessionKind::Agent
-        && maestro_shell::is_strict_prepared_provider_launch(&launch.command, &argv)
-    {
+    let spec = if selected_provider {
         prepared_workspace.provider_session_spec(
             &launch.command,
             &argv,
-            &launch_environment,
+            &selected_environment,
             initial_size.cols(),
             initial_size.rows(),
             now_ms,
@@ -4360,7 +4471,7 @@ fn prepared_remote_session_spec(
         prepared_workspace.adhoc_session_spec_with_env(
             kind,
             &argv,
-            &launch_environment,
+            &selected_environment,
             initial_size.cols(),
             initial_size.rows(),
             now_ms,
@@ -6481,6 +6592,306 @@ mod tests {
         let runtime = runtime_remote_session_launch(None, false);
         let expected = crate::session_creator::empty_session_launch(false);
         assert_eq!(runtime, expected);
+    }
+
+    #[test]
+    fn bound_provider_restart_derivation_preserves_remote_environment_and_fresh_child_identity() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let locator = tmp.path().join("stable-codex");
+        std::fs::write(&locator, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&locator, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut session = maestro_shell::SessionRecord {
+            session_id: "bound-provider".into(),
+            workspace_id: "ws".into(),
+            kind: maestro_shell::SessionKind::Agent,
+            launch: maestro_shell::LaunchSpec::BoundProvider {
+                launch_spec_id: "codex".into(),
+                params: vec![
+                    "resume".into(),
+                    "20000000-0000-4000-8000-000000000001".into(),
+                ],
+                executable: locator.to_str().unwrap().into(),
+            },
+            cwd_resolved: tmp.path().to_str().unwrap().into(),
+            agent_task_id: None,
+            created_at_ms: 1,
+            last_attached_at_ms: 1,
+            last_known_generation: None,
+            status: maestro_shell::SessionStatus::Exited,
+        };
+        let workspace = maestro_shell::Workspace {
+            workspace_id: "ws".into(),
+            project_id: "project".into(),
+            root: session.cwd_resolved.clone(),
+            policy: maestro_shell::WorkspacePolicy::ScratchCwd,
+            consent: Default::default(),
+        };
+        // Production resolve_existing_remote_session_exact supplies RemoteLaunchEnvironment
+        // to this constructor, then forwards its child_environment to SessionService. Test
+        // that exact derivation boundary, not the legacy test-only argv helper above.
+        for headless in [false, true] {
+            let shell = if headless {
+                "/fixture/trusted-account-shell"
+            } else {
+                "/fixture/desktop-shell"
+            };
+            let home = if headless {
+                "/fixture/trusted-account-home"
+            } else {
+                "/fixture/desktop-home"
+            };
+            let environment = RemoteLaunchEnvironment {
+                shell: Some(shell.into()),
+                home: Some(home.into()),
+                child_environment: headless.then(|| maestro_protocol::ChildEnvironment {
+                    home: home.into(),
+                    shell: shell.into(),
+                }),
+            };
+            maestro_shell::ExistingSessionStart::known_safe_exact(
+                &session,
+                &workspace,
+                &environment,
+                80,
+                24,
+                2,
+            )
+            .unwrap();
+            let argv =
+                maestro_shell::known_safe_provider_login_shell_argv(&session.launch, &environment)
+                    .unwrap();
+            assert_eq!(argv[0], shell);
+            assert!(argv
+                .iter()
+                .any(|arg| arg.contains(locator.to_str().unwrap())));
+            assert_eq!(
+                environment.home.as_deref(),
+                Some(std::ffi::OsStr::new(home))
+            );
+            assert_eq!(environment.child_environment.is_some(), headless);
+            if let Some(child) = environment.child_environment {
+                assert_eq!(child.home, home);
+                assert_eq!(child.shell, shell);
+            }
+        }
+        let fresh = fresh_inherited_remote_session_launch(&session)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.command, "codex");
+        assert_eq!(fresh.provider_locator.as_deref(), Some(locator.as_path()));
+        assert!(
+            fresh.args.is_empty(),
+            "fresh child must never inherit source conversation"
+        );
+        std::fs::remove_file(&locator).unwrap();
+        let environment = RemoteLaunchEnvironment {
+            shell: Some("/bin/sh".into()),
+            home: None,
+            child_environment: None,
+        };
+        assert!(maestro_shell::ExistingSessionStart::known_safe_exact(
+            &session,
+            &workspace,
+            &environment,
+            80,
+            24,
+            2,
+        )
+        .is_err());
+        session.launch = maestro_shell::LaunchSpec::KnownSafe {
+            launch_spec_id: "codex".into(),
+            params: vec![
+                "resume".into(),
+                "20000000-0000-4000-8000-000000000001".into(),
+            ],
+        };
+        let legacy = fresh_inherited_remote_session_launch(&session)
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.command, fresh.command);
+        assert_eq!(legacy.args, fresh.args);
+        assert!(legacy.provider_locator.is_none());
+    }
+
+    #[test]
+    fn inherited_remote_wrapper_is_sealed_with_current_environment_and_audit_only_child() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = maestro_shell::AppPaths::with_base(tmp.path().join("profile"));
+        let cwd = tmp.path().to_str().unwrap();
+        maestro_shell::ProjectService::new(&paths)
+            .create("project", "Fixture", cwd, Default::default(), 1)
+            .unwrap();
+        let Some(maestro_shell::LoadOutcome::Loaded(project)) =
+            maestro_shell::load_one::<maestro_shell::Project>(
+                &paths,
+                maestro_shell::RecordKind::Project,
+                "project",
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        let workspace = maestro_shell::Workspace {
+            workspace_id: "ws".into(),
+            project_id: "project".into(),
+            root: cwd.into(),
+            policy: maestro_shell::WorkspacePolicy::ScratchCwd,
+            consent: Default::default(),
+        };
+        maestro_shell::write_record(
+            &paths,
+            maestro_shell::RecordKind::Workspace,
+            "ws",
+            1,
+            &workspace,
+        )
+        .unwrap();
+        let locator = tmp.path().join("renamed-stable-wrapper");
+        std::fs::write(&locator, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&locator, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut source = maestro_shell::SessionRecord {
+            session_id: "source".into(),
+            workspace_id: "ws".into(),
+            kind: maestro_shell::SessionKind::Agent,
+            launch: maestro_shell::LaunchSpec::BoundProvider {
+                launch_spec_id: "codex".into(),
+                params: vec![
+                    "resume".into(),
+                    "20000000-0000-4000-8000-000000000001".into(),
+                ],
+                executable: locator.to_str().unwrap().into(),
+            },
+            cwd_resolved: cwd.into(),
+            agent_task_id: None,
+            created_at_ms: 1,
+            last_attached_at_ms: 1,
+            last_known_generation: None,
+            status: maestro_shell::SessionStatus::Live,
+        };
+        for headless in [false, true] {
+            let launch = fresh_inherited_remote_session_launch(&source)
+                .unwrap()
+                .unwrap();
+            let shell = if headless {
+                "/fixture/current-account-shell"
+            } else {
+                "/fixture/current-desktop-shell"
+            };
+            let home = if headless {
+                "/fixture/current-account-home"
+            } else {
+                "/fixture/current-desktop-home"
+            };
+            let environment = RemoteLaunchEnvironment {
+                shell: Some(shell.into()),
+                home: Some(home.into()),
+                child_environment: headless.then(|| maestro_protocol::ChildEnvironment {
+                    home: home.into(),
+                    shell: shell.into(),
+                }),
+            };
+            let id = if headless {
+                "headless-child"
+            } else {
+                "desktop-child"
+            };
+            let (spec, environment) = prepared_remote_session_spec_with_environment(
+                environment,
+                &workspace,
+                id,
+                cwd,
+                source.kind,
+                &launch,
+                InitialTerminalSize::default(),
+                2,
+            )
+            .unwrap();
+            maestro_shell::WindowLayoutService::new(&paths)
+                .prepare_unplaced_session_with_spec(&project, &workspace, spec)
+                .unwrap();
+            let Some(maestro_shell::LoadOutcome::Loaded(child)) =
+                maestro_shell::load_one::<maestro_shell::SessionRecord>(
+                    &paths,
+                    maestro_shell::RecordKind::Session,
+                    id,
+                )
+                .unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(
+                child.launch.fresh_provider_audit(),
+                Some(("codex", [].as_slice(), locator.to_str().unwrap()))
+            );
+            assert!(child.launch.provider_recipe().is_none());
+            assert_eq!(environment.shell.as_deref(), Some(shell));
+            assert_eq!(
+                environment.home.as_deref(),
+                Some(std::ffi::OsStr::new(home))
+            );
+            assert_eq!(environment.child_environment.is_some(), headless);
+            if let Some(child_env) = environment.child_environment {
+                assert_eq!(child_env.home, home);
+                assert_eq!(child_env.shell, shell);
+            }
+            // A child of the fresh audit record inherits the launcher/profile, still no identity.
+            source = child;
+        }
+        let inherited = fresh_inherited_remote_session_launch(&source)
+            .unwrap()
+            .unwrap();
+        let mut malformed = inherited.clone();
+        malformed.args.push("--unreviewed".into());
+        for (kind, launch) in [
+            (maestro_shell::SessionKind::Shell, &inherited),
+            (maestro_shell::SessionKind::Agent, &malformed),
+        ] {
+            assert!(
+                prepared_remote_session_spec_with_environment(
+                    RemoteLaunchEnvironment {
+                        shell: Some("/bin/sh".into()),
+                        home: None,
+                        child_environment: None,
+                    },
+                    &workspace,
+                    "invalid-child",
+                    cwd,
+                    kind,
+                    launch,
+                    InitialTerminalSize::default(),
+                    3,
+                )
+                .is_err(),
+                "an inherited locator cannot downgrade into custom execution"
+            );
+        }
+        std::fs::remove_file(&locator).unwrap();
+        let environment = RemoteLaunchEnvironment {
+            shell: Some("/bin/sh".into()),
+            home: None,
+            child_environment: None,
+        };
+        assert!(prepared_remote_session_spec_with_environment(
+            environment,
+            &workspace,
+            "missing-child",
+            cwd,
+            source.kind,
+            &inherited,
+            InitialTerminalSize::default(),
+            3
+        )
+        .is_err());
+        let explicit = RemotePreparedLaunch::from(crate::resume_launch::ResumeLaunch {
+            command: "claude".into(),
+            args: vec![],
+        });
+        assert!(
+            explicit.provider_locator.is_none(),
+            "an explicit choice must not acquire the parent's locator"
+        );
     }
 
     #[test]

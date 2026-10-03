@@ -86,6 +86,7 @@ allowed_docs = {
     "public-private-boundary.md",
     "third-party-licensing.md",
     "developer/local-control-quickstart.md",
+    "developer/plugins.md",
     "developer/remote-core-quickstart.md",
 }
 unexpected_docs = sorted(
@@ -100,6 +101,9 @@ allowed_examples = {
     "local-control/demo.py",
     "local-control/hydra_client.py",
     "local-control/test_hydra_client.py",
+    "local-control/plugin_demo.py",
+    "plugins/retained-terminal/hydra-plugin.json",
+    "plugins/retained-terminal/new_terminal.py",
 }
 unexpected_examples = sorted(
     str(path.relative_to(root / "examples"))

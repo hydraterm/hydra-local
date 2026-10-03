@@ -27,6 +27,238 @@ use crate::theme;
 use crate::wire::{CursorShape, GridSnapshot, UnderlineStyle};
 use crate::RendererCommandPaletteOverlayLine;
 
+/// One physical-pixel projection shared by palette painting and pointer input. Origins are the
+/// existing scoped terminal origins: macOS reserves React chrome, a Linux terminal slot does not.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CommandPaletteLayout {
+    pub content: [f32; 4],
+    pub row_height: f32,
+    pub first_line: usize,
+    pub visible_lines: usize,
+}
+
+impl CommandPaletteLayout {
+    pub fn new(
+        size: (u32, u32),
+        origin: (f32, f32),
+        row_height: f32,
+        lines: &[RendererCommandPaletteOverlayLine],
+    ) -> Option<Self> {
+        if !origin.0.is_finite()
+            || !origin.1.is_finite()
+            || !row_height.is_finite()
+            || row_height <= 0.0
+            || lines.is_empty()
+        {
+            return None;
+        }
+        let x = origin.0.clamp(0.0, size.0 as f32);
+        let y = origin.1.clamp(0.0, size.1 as f32);
+        let width = size.0 as f32 - x;
+        let height = size.1 as f32 - y;
+        let visible_lines = ((height / row_height).floor() as usize).min(lines.len());
+        if width <= 0.0 || visible_lines == 0 {
+            return None;
+        }
+        let selected = lines.iter().position(|line| line.selected).unwrap_or(0);
+        let first_line = selected.saturating_add(1).saturating_sub(visible_lines);
+        Some(Self {
+            content: [x, y, width, height],
+            row_height,
+            first_line,
+            visible_lines,
+        })
+    }
+
+    pub fn row_rect(self, visible_row: usize) -> [f32; 4] {
+        [
+            self.content[0],
+            self.content[1] + visible_row as f32 * self.row_height,
+            self.content[2],
+            self.row_height,
+        ]
+    }
+
+    fn opaque_bounds(self) -> TextBounds {
+        TextBounds {
+            left: self.content[0].floor() as i32,
+            top: self.content[1].floor() as i32,
+            right: (self.content[0] + self.content[2]).ceil() as i32,
+            bottom: (self.content[1] + self.visible_lines as f32 * self.row_height).ceil() as i32,
+        }
+    }
+
+    pub fn line_at(self, cursor: (f32, f32)) -> Option<usize> {
+        let (x, y) = cursor;
+        if !x.is_finite()
+            || !y.is_finite()
+            || x < self.content[0]
+            || x >= self.content[0] + self.content[2]
+            || y < self.content[1]
+            || y >= self.content[1] + self.visible_lines as f32 * self.row_height
+        {
+            return None;
+        }
+        Some(self.first_line + ((y - self.content[1]) / self.row_height).floor() as usize)
+    }
+}
+
+/// All glyphs are submitted after all quads. Remove the opaque palette band from underlying text
+/// clips rather than assuming its earlier background quad can cover later terminal glyphs.
+fn text_bounds_outside_palette(bounds: TextBounds, palette: TextBounds) -> [Option<TextBounds>; 4] {
+    let intersection = TextBounds {
+        left: bounds.left.max(palette.left),
+        top: bounds.top.max(palette.top),
+        right: bounds.right.min(palette.right),
+        bottom: bounds.bottom.min(palette.bottom),
+    };
+    if intersection.left >= intersection.right || intersection.top >= intersection.bottom {
+        return [Some(bounds), None, None, None];
+    }
+    [
+        TextBounds {
+            bottom: intersection.top,
+            ..bounds
+        },
+        TextBounds {
+            top: intersection.bottom,
+            ..bounds
+        },
+        TextBounds {
+            top: intersection.top,
+            bottom: intersection.bottom,
+            right: intersection.left,
+            ..bounds
+        },
+        TextBounds {
+            top: intersection.top,
+            bottom: intersection.bottom,
+            left: intersection.right,
+            ..bounds
+        },
+    ]
+    .map(|b| (b.left < b.right && b.top < b.bottom).then_some(b))
+}
+
+#[cfg(test)]
+mod command_palette_layout_tests {
+    use super::*;
+
+    fn lines(count: usize, selected: usize) -> Vec<RendererCommandPaletteOverlayLine> {
+        (0..count)
+            .map(|i| RendererCommandPaletteOverlayLine {
+                text: format!("line {i}"),
+                selectable: i != 0,
+                selected: i == selected,
+                action_index: i.checked_sub(1),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn command_palette_rows_and_hits_share_mac_chrome_origin_at_each_scale() {
+        for scale in [1.0, 1.5, 2.0] {
+            let layout = CommandPaletteLayout::new(
+                ((1200.0 * scale) as u32, (800.0 * scale) as u32),
+                (472.0 * scale, 46.0 * scale),
+                20.0 * scale,
+                &lines(4, 2),
+            )
+            .unwrap();
+            assert_eq!(
+                layout.row_rect(0),
+                [472.0 * scale, 46.0 * scale, 728.0 * scale, 20.0 * scale]
+            );
+            for row in 0..4 {
+                let rect = layout.row_rect(row);
+                assert_eq!(layout.line_at((rect[0] + 1.0, rect[1] + 1.0)), Some(row));
+            }
+            assert_eq!(layout.line_at((471.0 * scale, 80.0 * scale)), None);
+            assert_eq!(layout.line_at((500.0 * scale, 45.0 * scale)), None);
+            assert_eq!(layout.line_at((500.0 * scale, 126.0 * scale)), None);
+            assert_eq!(layout.line_at((1200.0 * scale, 50.0 * scale)), None);
+        }
+    }
+
+    #[test]
+    fn command_palette_linux_slot_does_not_reapply_chrome_and_small_view_tracks_selection() {
+        let layout =
+            CommandPaletteLayout::new((600, 65), (12.0, 0.0), 20.0, &lines(12, 9)).unwrap();
+        assert_eq!(layout.content, [12.0, 0.0, 588.0, 65.0]);
+        assert_eq!((layout.first_line, layout.visible_lines), (7, 3));
+        assert_eq!(layout.line_at((13.0, 41.0)), Some(9));
+        assert_eq!(layout.line_at((13.0, 60.0)), None);
+        // A collapsed sidebar simply changes the shared origin; no independent cached geometry.
+        let collapsed =
+            CommandPaletteLayout::new((600, 400), (12.0, 46.0), 20.0, &lines(4, 1)).unwrap();
+        assert_eq!(collapsed.row_rect(0)[0], 12.0);
+    }
+
+    #[test]
+    fn command_palette_degenerate_geometry_has_no_draw_or_hit_target() {
+        for origin in [(600.0, 0.0), (0.0, 400.0), (f32::NAN, 0.0)] {
+            assert!(CommandPaletteLayout::new((600, 400), origin, 20.0, &lines(4, 1)).is_none());
+        }
+        for height in [0.0, -1.0, f32::INFINITY] {
+            assert!(
+                CommandPaletteLayout::new((600, 400), (0.0, 0.0), height, &lines(4, 1)).is_none()
+            );
+        }
+        assert!(CommandPaletteLayout::new((600, 10), (0.0, 0.0), 20.0, &lines(4, 1)).is_none());
+    }
+
+    #[test]
+    fn command_palette_occlusion_removes_only_covered_glyph_pixels() {
+        let palette = TextBounds {
+            left: 40,
+            top: 20,
+            right: 100,
+            bottom: 60,
+        };
+        assert!(text_bounds_outside_palette(palette, palette)
+            .iter()
+            .all(Option::is_none));
+        let crossing = TextBounds {
+            left: 30,
+            top: 10,
+            right: 110,
+            bottom: 70,
+        };
+        let visible = text_bounds_outside_palette(crossing, palette);
+        for x in 30..110 {
+            for y in 10..70 {
+                let covered = (40..100).contains(&x) && (20..60).contains(&y);
+                let copies = visible
+                    .iter()
+                    .flatten()
+                    .filter(|b| x >= b.left && x < b.right && y >= b.top && y < b.bottom)
+                    .count();
+                assert_eq!(copies, usize::from(!covered), "pixel {x},{y}");
+            }
+        }
+        let chrome = TextBounds {
+            left: 0,
+            top: 0,
+            right: 40,
+            bottom: 80,
+        };
+        assert_eq!(
+            text_bounds_outside_palette(chrome, palette),
+            [Some(chrome), None, None, None]
+        );
+        let below = TextBounds {
+            left: 40,
+            top: 60,
+            right: 100,
+            bottom: 80,
+        };
+        assert_eq!(
+            text_bounds_outside_palette(below, palette),
+            [Some(below), None, None, None]
+        );
+    }
+}
+
 /// One background/cursor rectangle instance: position + size in pixels (physical)
 /// and an RGBA color. The vertex shader maps pixel space to clip space.
 #[repr(C)]
@@ -1171,6 +1403,12 @@ impl Renderer {
             self.grid_origin_x,
             self.config.width as f32,
         );
+        let command_palette_layout = CommandPaletteLayout::new(
+            (self.config.width, self.config.height),
+            (ox, oy),
+            ch,
+            &self.command_palette_overlay,
+        );
 
         // Active-pane clip: when a split frame exists, the active PTY grid is painted ONLY inside the
         // active tab's pane (offset by the pane's top-left cell, bounded by its cell extent). `None`
@@ -1967,35 +2205,6 @@ impl Renderer {
             }
         }
 
-        // --- command-palette overlay (opt-in, read-only, foreground modal) ---
-        // Mirrors the picker overlay quad draw but from the SEPARATE `command_palette_overlay`
-        // carrier: a full-window dim backdrop plus one opaque band per composed row. Drawn LAST so it
-        // sits OVER the grid and all other chrome. The parser forbids it alongside the picker overlay,
-        // so the two are never populated at once. Empty draws nothing.
-        if !self.command_palette_overlay.is_empty() {
-            quads.push(QuadInstance {
-                rect: [
-                    0.0,
-                    0.0,
-                    self.config.width as f32,
-                    self.config.height as f32,
-                ],
-                color: rgba(PICKER_OVERLAY_BACKDROP, 0.92),
-            });
-            for (i, line) in self.command_palette_overlay.iter().enumerate() {
-                let y = ch * i as f32;
-                let row_color = if line.selected {
-                    COMMAND_PALETTE_OVERLAY_SELECTED_ROW
-                } else {
-                    PICKER_OVERLAY_ROW
-                };
-                quads.push(QuadInstance {
-                    rect: [0.0, y, self.config.width as f32, ch],
-                    color: rgba(row_color, 1.0),
-                });
-            }
-        }
-
         // --- split-pane shortcut hint overlay (opt-in, read-only, NON-modal) ---
         // One opaque band per composed row from physical y=0, mirroring the picker/command-palette row
         // bands, but with NO full-window dim backdrop: the grid stays visible behind the hint. Drawn
@@ -2047,6 +2256,33 @@ impl Renderer {
                 quads.push(QuadInstance {
                     rect: [0.0, y, self.config.width as f32, ch],
                     color: rgba(PICKER_OVERLAY_ROW, 1.0),
+                });
+            }
+        }
+
+        // The palette is last, entirely inside the terminal surface's chrome-adjusted content area.
+        if let Some(layout) = command_palette_layout {
+            quads.push(QuadInstance {
+                rect: layout.content,
+                color: rgba(PICKER_OVERLAY_BACKDROP, 0.92),
+            });
+            for (i, line) in self
+                .command_palette_overlay
+                .iter()
+                .skip(layout.first_line)
+                .take(layout.visible_lines)
+                .enumerate()
+            {
+                quads.push(QuadInstance {
+                    rect: layout.row_rect(i),
+                    color: rgba(
+                        if line.selected {
+                            COMMAND_PALETTE_OVERLAY_SELECTED_ROW
+                        } else {
+                            PICKER_OVERLAY_ROW
+                        },
+                        1.0,
+                    ),
                 });
             }
         }
@@ -2592,24 +2828,32 @@ impl Renderer {
             picker_line_bufs.push((buf, top));
         }
 
-        // Command-palette overlay row buffers: mirrors the picker overlay buffers but from the
-        // SEPARATE `command_palette_overlay` carrier, so the two never alias. One shaped buffer per
-        // composed row, each (buffer, top_y) from physical y=0. The rows are already composed/fitted
-        // and control-char-free by the App. Built here so the buffers outlive the `text_areas` borrow.
-        let command_palette_w = self.config.width as f32;
+        // Palette buffers use exactly the row layout used by quads and pointer hit testing.
         let mut command_palette_line_bufs: Vec<(Buffer, f32, bool)> = Vec::new();
-        for (i, line) in self.command_palette_overlay.iter().enumerate() {
-            let top = ch * i as f32;
-            let mut buf = Buffer::new(&mut self.font_system, metrics);
-            buf.set_size(&mut self.font_system, Some(command_palette_w), Some(ch));
-            buf.set_text(
-                &mut self.font_system,
-                &line.text,
-                Attrs::new().family(Family::Monospace),
-                Shaping::Advanced,
-            );
-            buf.shape_until_scroll(&mut self.font_system, false);
-            command_palette_line_bufs.push((buf, top, line.selected));
+        if let Some(layout) = command_palette_layout {
+            for (i, line) in self
+                .command_palette_overlay
+                .iter()
+                .skip(layout.first_line)
+                .take(layout.visible_lines)
+                .enumerate()
+            {
+                let top = layout.row_rect(i)[1];
+                let mut buf = Buffer::new(&mut self.font_system, metrics);
+                buf.set_size(
+                    &mut self.font_system,
+                    Some((layout.content[2] - 4.0 * scale).max(0.0)),
+                    Some(ch),
+                );
+                buf.set_text(
+                    &mut self.font_system,
+                    &line.text,
+                    Attrs::new().family(Family::Monospace),
+                    Shaping::Advanced,
+                );
+                buf.shape_until_scroll(&mut self.font_system, false);
+                command_palette_line_bufs.push((buf, top, line.selected));
+            }
         }
 
         // Split-pane shortcut hint overlay row buffers: one shaped buffer per composed row, each
@@ -3134,33 +3378,6 @@ impl Renderer {
             });
         }
 
-        // Command-palette overlay rows: mirrors the picker overlay text draw but from the separate
-        // command-palette buffers, each clipped to its one-row band. Pushed LAST so the modal text
-        // draws over the grid and all other chrome. Since the parser forbids `--command-palette`
-        // alongside `--picker-overlay`, the two overlays are never populated at once.
-        for (buf, top, selected) in command_palette_line_bufs.iter() {
-            let band_bottom = (top + ch).ceil() as i32;
-            let text_color = if *selected {
-                COMMAND_PALETTE_OVERLAY_SELECTED_TEXT
-            } else {
-                PICKER_OVERLAY_TEXT
-            };
-            text_areas.push(TextArea {
-                buffer: buf,
-                left: 4.0 * scale,
-                top: *top,
-                scale: 1.0,
-                bounds: TextBounds {
-                    left: 0,
-                    top: top.floor() as i32,
-                    right: self.config.width as i32,
-                    bottom: band_bottom.min(self.config.height as i32),
-                },
-                default_color: GColor::rgb(text_color[0], text_color[1], text_color[2]),
-                custom_glyphs: &[],
-            });
-        }
-
         // Split-pane shortcut hint overlay rows: mirrors the picker overlay text draw, each clipped to
         // its one-row band so text never bleeds into a neighbor row. Pushed LAST so the hint text draws
         // over the grid and other chrome. Same left inset as the other overlays.
@@ -3237,6 +3454,41 @@ impl Renderer {
             });
         }
 
+        if let Some(layout) = command_palette_layout {
+            let opaque = layout.opaque_bounds();
+            text_areas = text_areas
+                .into_iter()
+                .flat_map(|area| {
+                    text_bounds_outside_palette(area.bounds, opaque)
+                        .into_iter()
+                        .flatten()
+                        .map(move |bounds| TextArea {
+                            bounds,
+                            ..area.clone()
+                        })
+                })
+                .collect();
+            for (buf, top, selected) in &command_palette_line_bufs {
+                let color = if *selected {
+                    COMMAND_PALETTE_OVERLAY_SELECTED_TEXT
+                } else {
+                    PICKER_OVERLAY_TEXT
+                };
+                text_areas.push(TextArea {
+                    buffer: buf,
+                    left: layout.content[0] + 4.0 * scale,
+                    top: *top,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        top: top.floor() as i32,
+                        bottom: ((top + ch).ceil() as i32).min(opaque.bottom),
+                        ..opaque
+                    },
+                    default_color: GColor::rgb(color[0], color[1], color[2]),
+                    custom_glyphs: &[],
+                });
+            }
+        }
         stats.text_areas = text_areas.len() as u32;
         let prepare_start = self.stats_enabled.then(Instant::now);
         let text_prepare = self.text_renderer.prepare(

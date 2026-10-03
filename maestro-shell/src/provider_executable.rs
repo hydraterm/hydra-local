@@ -1,4 +1,19 @@
 //! One provider lookup policy shared by preflight and retained-session launch fallbacks.
+//!
+//! Order: explicit HYDRA_PROVIDER_*_EXECUTABLE absolute locator; OpenCode's established native
+//! ~/.opencode/bin/opencode preference; fixed command spellings in the interactive login shell;
+//! then ~/.local/bin and ~/.nix-profile/bin. Cursor also accepts its documented cursor-agent
+//! spelling. Other renamed/versioned wrappers require the explicit mapping below. No globbing,
+//! candidate execution, provider-history reads, or shell evaluation of configured paths occurs.
+//! For manual installation diagnostics the supported CLIs expose `<absolute launcher> --version`;
+//! discovery itself never runs a version probe or arbitrary wrapper to infer provider identity.
+//! Sources: https://docs.cursor.com/en/cli/installation and
+//! https://nix.dev/manual/nix/2.25/package-management/profiles .
+//!
+//! The selected path is lexical, not canonicalized: stable symlinks may follow normal upgrades.
+//! Replayable prepared recipes persist it as BoundProvider. FreshProvider records only audit a
+//! selected fresh launch without an assigned conversation; they never grant replay authority.
+//! Shell-only aliases without an absolute selection retain the non-replayable AdHoc recipe.
 
 #[cfg(unix)]
 use std::io::Read;
@@ -38,15 +53,53 @@ pub enum ProviderLookupError {
     TimedOut,
 }
 
-/// Conventional installation roots, not version directories or guessed wrapper executable names.
+/// Fixed provider command spellings. A wrapper using one of these names is an ordinary executable;
+/// arbitrary renamed/versioned wrappers require an explicit absolute-path mapping, never a glob.
+pub fn provider_executable_names(provider: &str) -> Option<&'static [&'static str]> {
+    Some(match provider {
+        "claude" => &["claude"],
+        "codex" => &["codex"],
+        "gemini" => &["gemini"],
+        "opencode" => &["opencode"],
+        "copilot" => &["copilot"],
+        "agy" => &["agy"],
+        "kimi" => &["kimi"],
+        "kiro-cli" => &["kiro-cli"],
+        // Cursor documents both the original cursor-agent launcher and current agent command.
+        "agent" => &["agent", "cursor-agent"],
+        "amp" => &["amp"],
+        "devin" => &["devin"],
+        "droid" => &["droid"],
+        _ => return None,
+    })
+}
+
+pub fn provider_executable_override_variable(provider: &str) -> Option<&'static str> {
+    Some(match provider {
+        "claude" => "HYDRA_PROVIDER_CLAUDE_EXECUTABLE",
+        "codex" => "HYDRA_PROVIDER_CODEX_EXECUTABLE",
+        "gemini" => "HYDRA_PROVIDER_GEMINI_EXECUTABLE",
+        "opencode" => "HYDRA_PROVIDER_OPENCODE_EXECUTABLE",
+        "copilot" => "HYDRA_PROVIDER_COPILOT_EXECUTABLE",
+        "agy" => "HYDRA_PROVIDER_ANTIGRAVITY_EXECUTABLE",
+        "kimi" => "HYDRA_PROVIDER_KIMI_EXECUTABLE",
+        "kiro-cli" => "HYDRA_PROVIDER_KIRO_EXECUTABLE",
+        "agent" => "HYDRA_PROVIDER_CURSOR_EXECUTABLE",
+        "amp" => "HYDRA_PROVIDER_AMP_EXECUTABLE",
+        "devin" => "HYDRA_PROVIDER_DEVIN_EXECUTABLE",
+        "droid" => "HYDRA_PROVIDER_FACTORY_EXECUTABLE",
+        _ => return None,
+    })
+}
+
+/// Conventional stable launch roots, not physical version directories. Nix's documented profile
+/// symlink follows upgrades; keep it lexical rather than pinning a /nix/store generation.
 pub(crate) fn provider_fallback(
     provider: &str,
     env: &impl LaunchEnvLookup,
     executable: impl Fn(&Path) -> bool,
 ) -> Option<PathBuf> {
-    if !crate::restart_recipe::is_known_provider_id(provider) {
-        return None;
-    }
+    let names = provider_executable_names(provider)?;
     let mut candidates = Vec::new();
     if let Some(home) = env
         .home_os()
@@ -56,7 +109,11 @@ pub(crate) fn provider_fallback(
         if provider == "opencode" {
             candidates.push(home.join(".opencode/bin/opencode"));
         }
-        candidates.push(home.join(".local/bin").join(provider));
+        for root in [".local/bin", ".nix-profile/bin"] {
+            for name in names {
+                candidates.push(home.join(root).join(name));
+            }
+        }
     }
     candidates
         .into_iter()
@@ -69,8 +126,17 @@ pub fn resolve_provider_executable(
     cwd: &Path,
     env: &impl LaunchEnvLookup,
 ) -> Result<Option<ProviderResolution>, ProviderLookupError> {
-    if !crate::restart_recipe::is_known_provider_id(provider) {
+    let Some(names) = provider_executable_names(provider) else {
         return Ok(None);
+    };
+    if let Some(path) = env.configured_provider_path(provider) {
+        // Operator configuration is data, never shell syntax; missing/invalid overrides do not
+        // silently select a different executable from PATH or a conventional root.
+        return Ok(
+            (path.is_absolute() && path.to_str().is_some() && is_executable_file(&path)).then(
+                || ProviderResolution::Executable(ProviderExecutable::new(provider.into(), path)),
+            ),
+        );
     }
     let cwd = if cwd.is_absolute() {
         cwd.to_path_buf()
@@ -95,9 +161,14 @@ pub fn resolve_provider_executable(
     const MARKER: &[u8] = b"\x1eHYDRA_PROVIDER\x1f";
     const END: &[u8] = b"\x1eHYDRA_PROVIDER_END\x1f";
     let mut command = Command::new(crate::login_shell_program(env));
+    let lookup = names
+        .iter()
+        .map(|name| format!("command -v {name}"))
+        .collect::<Vec<_>>()
+        .join(" || ");
     command.args([
         LOGIN_SHELL_COMMAND_FLAGS,
-        &format!("printf '\\036HYDRA_PROVIDER\\037'; command -v {provider}; hydra_status=$?; printf '\\036HYDRA_PROVIDER_END\\037'; exit \"$hydra_status\""),
+        &format!("printf '\\036HYDRA_PROVIDER\\037'; {lookup}; hydra_status=$?; printf '\\036HYDRA_PROVIDER_END\\037'; exit \"$hydra_status\""),
     ]);
     command
         .current_dir(&cwd)
@@ -227,6 +298,7 @@ mod tests {
         root: tempfile::TempDir,
         shell: PathBuf,
         path: OsString,
+        configured: Option<PathBuf>,
     }
     impl LaunchEnvLookup for Fixture {
         fn shell_utf8(&self) -> Option<String> {
@@ -237,6 +309,11 @@ mod tests {
         }
         fn path_os(&self) -> Option<OsString> {
             Some(self.path.clone())
+        }
+        fn configured_provider_path(&self, provider: &str) -> Option<PathBuf> {
+            (provider == "claude")
+                .then(|| self.configured.clone())
+                .flatten()
         }
     }
     impl Fixture {
@@ -251,6 +328,7 @@ mod tests {
                 root,
                 shell,
                 path: "/usr/bin:/bin".into(),
+                configured: None,
             }
         }
         fn write(path: &Path, contents: &str) {
@@ -282,6 +360,55 @@ mod tests {
             assert!(output.status.success());
             String::from_utf8(output.stdout).unwrap()
         }
+    }
+
+    #[test]
+    fn explicit_versioned_wrapper_is_data_and_missing_override_does_not_fall_back() {
+        let mut fixture = Fixture::new();
+        let marker = fixture.root.path().join("unexpected-discovery-execution");
+        let path = fixture
+            .root
+            .path()
+            .join("wrapper v2 ' $(touch should-not-run)");
+        Fixture::write(
+            &path,
+            &format!(
+                "#!/bin/sh\ntouch '{}'\nprintf 'wrapper-v2'\n",
+                marker.display()
+            ),
+        );
+        fixture.configured = Some(path.clone());
+        let Some(ProviderResolution::Executable(selected)) = fixture.resolve("claude") else {
+            panic!("explicit absolute wrapper was missed")
+        };
+        assert_eq!(selected.path_for("claude"), Some(path.as_path()));
+        assert!(
+            !marker.exists(),
+            "discovery must never execute candidate wrappers"
+        );
+        fixture.provider(".local/bin/claude", "wrong-fallback");
+        for invalid in [
+            PathBuf::from("relative/wrapper"),
+            fixture.root.path().join("absent"),
+        ] {
+            fixture.configured = Some(invalid);
+            assert!(fixture.resolve("claude").is_none());
+        }
+    }
+
+    #[test]
+    fn stable_nix_profile_and_documented_cursor_alias_are_discoverable() {
+        let fixture = Fixture::new();
+        let wrapped = fixture.provider(".nix-profile/bin/claude", "nix-wrapper");
+        let Some(ProviderResolution::Executable(selected)) = fixture.resolve("claude") else {
+            panic!("stable Nix profile launcher was missed")
+        };
+        assert_eq!(selected.path_for("claude"), Some(wrapped.as_path()));
+        let cursor = fixture.provider(".local/bin/cursor-agent", "cursor");
+        let Some(ProviderResolution::Executable(selected)) = fixture.resolve("agent") else {
+            panic!("documented Cursor CLI alias was missed")
+        };
+        assert_eq!(selected.path_for("agent"), Some(cursor.as_path()));
     }
 
     #[test]
