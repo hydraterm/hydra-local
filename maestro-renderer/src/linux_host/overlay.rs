@@ -58,11 +58,12 @@ const CANCEL_OVERLAY_VIEWPORT_OBSERVER_SCRIPT: &str = r#"
   delete window.__HYDRA_LINUX_OVERLAY_VIEWPORT_BARRIER__;
 })();
 "#;
-// Lazy WebKit creation/load is allowed a wider bounded window because it does not own or suppress
-// native input. Expiry retires the product request so a late ready marker can only warm the parked
-// document; the short presentation deadline below starts only after that exact marker.
+// Lazy loading and presentation each have a bounded budget. Native Cancel remains available in
+// either phase; expiry retains a visible Retry/Cancel notice rather than dismissing the request.
 const OVERLAY_COLD_LOAD_TIMEOUT: Duration = Duration::from_secs(10);
-const MODAL_PRESENTATION_TIMEOUT: Duration = Duration::from_secs(3);
+// Cold mapping has been observed completing correctly after four seconds under load. Keep the
+// same bounded budget as cold document load; timeout is recoverable UI, never silent dismissal.
+const MODAL_PRESENTATION_TIMEOUT: Duration = OVERLAY_COLD_LOAD_TIMEOUT;
 const OVERLAY_RECOVERY_GENERATION_PARAM: &str = "__hydra_recovery_generation";
 const CANONICAL_OVERLAY_READY_JSON: &str = r#"{"type":"dashboardOverlayReady"}"#;
 const SUPPRESS_PERSISTENT_DOCUMENTS_SCRIPT: &str = r#"
@@ -1155,6 +1156,25 @@ struct OverlayRuntime {
     pending_product_intents: PendingProductIntents,
     captured_launch: Option<CapturedDialogLaunch>,
     launch_trigger: Option<(PendingProductIntentScope, u32)>,
+    native_notice: Option<(u64, NativeDialogNotice)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeDialogNotice {
+    Loading,
+    Failed(OverlayDeadlinePhase),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OverlayNativeActionKind {
+    Retry,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OverlayNativeAction {
+    token: u64,
+    kind: OverlayNativeActionKind,
 }
 
 impl OverlayRuntime {
@@ -1175,7 +1195,38 @@ impl OverlayRuntime {
             pending_product_intents: PendingProductIntents::default(),
             captured_launch: None,
             launch_trigger: None,
+            native_notice: None,
         }
+    }
+
+    fn native_loading(&mut self) {
+        self.native_notice = Some((self.presentation_token, NativeDialogNotice::Loading));
+    }
+
+    fn native_timeout(&mut self, token: u64) -> bool {
+        let Some(phase) = self.deadline_phase_for_token(token) else {
+            return false;
+        };
+        self.end_deadline();
+        self.clear_pending_product_intents();
+        self.native_notice = Some((self.presentation_token, NativeDialogNotice::Failed(phase)));
+        true
+    }
+
+    fn take_native_action(&mut self, action: OverlayNativeAction) -> Option<NativeDialogNotice> {
+        let (token, notice) = self.native_notice?;
+        if action.token != token
+            || (action.kind == OverlayNativeActionKind::Retry
+                && !matches!(notice, NativeDialogNotice::Failed(_)))
+        {
+            return None;
+        }
+        // Retry retires before widget work. Cancel retires synchronously through the shared hide
+        // authority, which also needs to know that a cold request owns native focus.
+        if action.kind == OverlayNativeActionKind::Retry {
+            self.native_notice = None;
+        }
+        Some(notice)
     }
 
     fn all_persistent_documents_finished(&self) -> bool {
@@ -1313,6 +1364,7 @@ impl OverlayRuntime {
 
     fn accepts_product_intents(&self) -> bool {
         self.visible
+            && self.native_notice.is_none()
             && self.presentation_complete
             && self.delivery.can_present()
             && self.persistent_suppression.is_ready()
@@ -1328,6 +1380,7 @@ impl OverlayRuntime {
             return false;
         }
         self.presentation_complete = true;
+        self.native_notice = None;
         true
     }
 
@@ -1947,7 +2000,7 @@ fn fallback_key_propagation(state: &std::rc::Weak<RefCell<OverlayRuntime>>) -> g
         .upgrade()
         .is_none_or(|state| match state.try_borrow() {
             Ok(state) => native_fallback_consumes_keys(
-                state.visible,
+                state.visible || state.native_notice.is_some(),
                 state.presentation_complete
                     && state.delivery.can_present()
                     && state.persistent_suppression.is_ready(),
@@ -1959,6 +2012,18 @@ fn fallback_key_propagation(state: &std::rc::Weak<RefCell<OverlayRuntime>>) -> g
     } else {
         glib::Propagation::Proceed
     }
+}
+
+fn native_notice_control_key(key: gtk::gdk::keys::Key) -> bool {
+    use gtk::gdk::keys::constants;
+    matches!(
+        key,
+        constants::Tab
+            | constants::ISO_Left_Tab
+            | constants::Return
+            | constants::KP_Enter
+            | constants::space
+    )
 }
 
 fn linux_overlay_input_trace_enabled() -> bool {
@@ -2349,6 +2414,10 @@ pub struct LinuxOverlayHost {
     persistent_input_gate: Rc<PersistentInputGate>,
     presentation_barrier: Rc<RefCell<OverlayPresentationBarrier>>,
     presentation_timeout: Rc<RefCell<OverlayPresentationTimeout>>,
+    native_notice_box: gtk::Box,
+    native_notice_label: gtk::Label,
+    native_retry: gtk::Button,
+    native_cancel: gtk::Button,
     overlay_url: String,
     initialization_script: String,
     input_trace_enabled: bool,
@@ -2431,11 +2500,41 @@ impl LinuxOverlayHost {
         let state = Rc::new(RefCell::new(OverlayRuntime::new(persistent_target_count)));
         {
             let key_state = Rc::downgrade(&state);
-            layer.connect_key_press_event(move |_, _| fallback_key_propagation(&key_state));
+            let proxy = wake_proxy.clone();
+            layer.connect_key_press_event(move |_, event| {
+                let notice = key_state
+                    .upgrade()
+                    .and_then(|state| state.borrow().native_notice);
+                if let Some((token, _)) = notice {
+                    use gtk::gdk::keys::constants as key;
+                    if event.keyval() == key::Escape {
+                        let _ = proxy.send_event(LinuxLoopEvent::OverlayNativeAction(
+                            OverlayNativeAction {
+                                token,
+                                kind: OverlayNativeActionKind::Cancel,
+                            },
+                        ));
+                        return glib::Propagation::Stop;
+                    }
+                    if native_notice_control_key(event.keyval()) {
+                        return glib::Propagation::Proceed;
+                    }
+                }
+                fallback_key_propagation(&key_state)
+            });
         }
         {
             let key_state = Rc::downgrade(&state);
-            layer.connect_key_release_event(move |_, _| fallback_key_propagation(&key_state));
+            layer.connect_key_release_event(move |_, event| {
+                if native_notice_control_key(event.keyval())
+                    && key_state
+                        .upgrade()
+                        .is_some_and(|state| state.borrow().native_notice.is_some())
+                {
+                    return glib::Propagation::Proceed;
+                }
+                fallback_key_propagation(&key_state)
+            });
         }
         layer.set_widget_name("hydra-dashboard-overlay-fallback");
         if let Some(accessible) = layer.accessible() {
@@ -2486,7 +2585,55 @@ impl LinuxOverlayHost {
         parking_page.show();
         page_stack.set_visible_child(&parking_page);
         page_stack.show();
-        layer.add(&page_stack);
+        // One native control surface above the retained document. Never swap out or hide a
+        // mapped WebView merely to show a timeout; doing so can stall its pending cold paint.
+        let native_surface = gtk::Overlay::new();
+        native_surface.add(&page_stack);
+        let native_notice_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        native_notice_box.set_widget_name("hydra-dialog-notice");
+        native_notice_box.set_halign(gtk::Align::Center);
+        native_notice_box.set_valign(gtk::Align::Center);
+        native_notice_box.set_margin_start(24);
+        native_notice_box.set_margin_end(24);
+        native_notice_box.set_no_show_all(true);
+        let native_notice_label = gtk::Label::new(None);
+        native_notice_label.set_line_wrap(true);
+        native_notice_label.set_max_width_chars(52);
+        native_notice_label.set_justify(gtk::Justification::Center);
+        native_notice_box.pack_start(&native_notice_label, false, false, 0);
+        let native_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        native_buttons.set_halign(gtk::Align::Center);
+        let native_retry = gtk::Button::with_label("Retry opening dialog");
+        let native_cancel = gtk::Button::with_label("Cancel opening dialog");
+        for (button, kind) in [
+            (&native_retry, OverlayNativeActionKind::Retry),
+            (&native_cancel, OverlayNativeActionKind::Cancel),
+        ] {
+            let state = Rc::downgrade(&state);
+            let proxy = wake_proxy.clone();
+            button.connect_clicked(move |_| {
+                let notice = state
+                    .upgrade()
+                    .and_then(|state| state.borrow().native_notice);
+                if let Some((token, _)) = notice {
+                    let _ = proxy.send_event(LinuxLoopEvent::OverlayNativeAction(
+                        OverlayNativeAction { token, kind },
+                    ));
+                }
+            });
+            native_buttons.pack_start(button, false, false, 0);
+        }
+        native_notice_box.pack_start(&native_buttons, false, false, 0);
+        let notice_css = gtk::CssProvider::new();
+        let _ = notice_css.load_from_data(
+            b"#hydra-dialog-notice { background-color: #17181d; color: #f1f3f7; padding: 24px; border: 1px solid #737782; border-radius: 8px; }",
+        );
+        native_notice_box
+            .style_context()
+            .add_provider(&notice_css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        native_surface.add_overlay(&native_notice_box);
+        native_surface.show();
+        layer.add(&native_surface);
 
         let top_level_widget: gtk::Widget = top_level.clone().upcast();
         let layer_widget: gtk::Widget = layer.clone().upcast();
@@ -2716,6 +2863,10 @@ impl LinuxOverlayHost {
             persistent_input_gate,
             presentation_barrier,
             presentation_timeout: Rc::new(RefCell::new(OverlayPresentationTimeout::default())),
+            native_notice_box,
+            native_notice_label,
+            native_retry,
+            native_cancel,
             overlay_url,
             initialization_script: overlay_initialization_script(
                 &initialization_script,
@@ -3159,20 +3310,25 @@ impl LinuxOverlayHost {
         }
     }
 
-    /// Begin one bounded lazy-load request without changing native focus or input ownership.
-    /// Duplicate visibility requests do not extend the bound.
+    /// Begin a bounded lazy-load request with native Cancel independent of WebKit readiness.
+    /// Duplicate visibility requests do not extend the bound or replace captured opener focus.
     fn arm_cold_load_timeout(&self) {
         let Some(token) = self.state.borrow_mut().ensure_cold_load_deadline() else {
             return;
         };
+        *self.previous_focus.borrow_mut() = self.top_level.focused_widget();
+        self.state.borrow_mut().native_loading();
+        self.suppress_native_underlay_inputs();
+        self.refresh_native_notice(true);
         self.arm_overlay_timeout_source(token, OVERLAY_COLD_LOAD_TIMEOUT);
     }
 
-    /// One short bounded deadline spans only the modal presentation join: persistent document
-    /// readiness, persistent suppression callbacks, and overlay modal delivery. A hung WebKit
-    /// process therefore degrades back to the retained terminal instead of trapping all input.
+    /// A bounded deadline spans the modal presentation join. A hung WebKit process cannot trap
+    /// native Cancel; expiry offers an explicit retry without granting product-input authority.
     fn arm_presentation_timeout(&self) {
         let token = self.state.borrow_mut().begin_presentation_deadline();
+        self.state.borrow_mut().native_loading();
+        self.refresh_native_notice(true);
         self.arm_overlay_timeout_source(token, MODAL_PRESENTATION_TIMEOUT);
     }
 
@@ -3199,9 +3355,17 @@ impl LinuxOverlayHost {
     }
 
     fn ensure_presentation_timeout(&self) {
+        if matches!(
+            self.state.borrow().native_notice,
+            Some((_, NativeDialogNotice::Failed(_)))
+        ) {
+            return;
+        }
         let Some(token) = self.state.borrow_mut().ensure_presentation_deadline() else {
             return;
         };
+        self.state.borrow_mut().native_loading();
+        self.refresh_native_notice(true);
         self.arm_overlay_timeout_source(token, MODAL_PRESENTATION_TIMEOUT);
     }
 
@@ -3213,6 +3377,13 @@ impl LinuxOverlayHost {
     pub fn set_visible(&self, visible: bool) {
         if !visible {
             self.hide_and_restore_focus();
+            return;
+        }
+        if matches!(
+            self.state.borrow().native_notice,
+            Some((_, NativeDialogNotice::Failed(_)))
+        ) {
+            self.refresh_native_notice(false);
             return;
         }
         self.state
@@ -3242,8 +3413,8 @@ impl LinuxOverlayHost {
             )
         };
         if !already_visible && !ready {
-            // Lazy WebKit load is request state, not modal presentation state. Keep every native
-            // surface interactive until the authenticated document emits its exact ready marker.
+            // Lazy loading is request state, not permission to accept product input. Native Cancel
+            // remains available while the authenticated document becomes ready.
             self.arm_cold_load_timeout();
             if let Err(err) = self.ensure_created() {
                 eprintln!("linux-host dashboard overlay creation failed: {err}");
@@ -3377,12 +3548,14 @@ impl LinuxOverlayHost {
     fn hide_and_restore_focus(&self) {
         let (was_visible, webview) = {
             let mut state = self.state.borrow_mut();
-            let was_visible = state.visible;
+            let was_visible = state.visible || state.native_notice.is_some();
+            state.native_notice = None;
             state.begin_dialog_hide(&self.focus_epoch);
             state.visible = false;
             state.delivery.hide();
             (was_visible, state.webview.clone())
         };
+        self.refresh_native_notice(false);
         // Only synchronous park/restore may retain the launch across paired None/opener signals.
         self.park_webview(webview.as_deref(), false);
         self.present_target.set_overlay_occluded(false);
@@ -3400,12 +3573,14 @@ impl LinuxOverlayHost {
         let (was_visible, webview) = {
             let mut state = self.state.borrow_mut();
             state.reject_dialog_launch(&self.focus_epoch);
-            let was_visible = state.visible;
+            let was_visible = state.visible || state.native_notice.is_some();
+            state.native_notice = None;
             state.visible = false;
             state.delivery.hide();
             state.clear_pending_product_intents();
             (was_visible, state.webview.clone())
         };
+        self.refresh_native_notice(false);
         self.park_webview(webview.as_deref(), false);
         self.present_target.set_overlay_occluded(false);
         self.restore_underlay_inputs(was_visible);
@@ -3471,14 +3646,14 @@ impl LinuxOverlayHost {
         }
     }
 
-    /// Map the transparent/inert GTK container hierarchy first. Only after its exact client
+    /// Map the paintable but inert GTK container hierarchy first. Only after its exact client
     /// allocation returns through the owner loop may the retained WebView map; its own allocation
     /// and a later DOM viewport acknowledgement are separate generation-bound phases.
     fn stage_ready_webview(&self, token: u64, webview: &wry::WebView) -> Result<(), String> {
         let started = Instant::now();
         log_overlay_presentation_step(token, "stage-begin", started);
         self.suppress_underlay_inputs();
-        self.present_target.set_overlay_occluded(false);
+        self.present_target.set_overlay_occluded(true);
         self.top_level.queue_draw();
         let target = OverlayGeometry::target(&self.composition);
         let began = self.presentation_barrier.borrow_mut().begin(token, target);
@@ -3487,11 +3662,12 @@ impl LinuxOverlayHost {
             return Ok(());
         }
 
-        // Opacity does not remove a GTK widget from allocation/mapping. This lets WebKit update its
-        // backing store and input region while the terminal remains visually on top. Native input
-        // was already suppressed by the modal gate, and every staged widget stays insensitive.
-        self.layer.set_opacity(0.0);
-        self.layer.set_sensitive(false);
+        // WebKit must be allowed to paint its first mapped frame before it can reliably return
+        // the viewport acknowledgement. A zero-opacity ancestor can defer that work until the
+        // presentation timeout hides it again. Show the loading/document surface, but keep every
+        // input path inert until the exact native geometry and DOM acknowledgement both pass.
+        self.layer.set_opacity(1.0);
+        self.layer.set_sensitive(true);
         self.layer.set_can_focus(false);
         self.content.set_sensitive(false);
         self.content.show();
@@ -3505,7 +3681,7 @@ impl LinuxOverlayHost {
         self.page_stack.set_sensitive(false);
         self.page_stack.set_visible_child(&self.content);
         // Configure the entire descendant hierarchy while its windowed ancestor is hidden, request
-        // layout, and map the transparent layer last. The first native owner-loop event therefore
+        // layout, and map the inert layer last. The first native owner-loop event therefore
         // certifies the three GTK containers before WebKit itself is allowed to map.
         self.layer.queue_resize();
         self.layer.queue_draw();
@@ -3516,7 +3692,7 @@ impl LinuxOverlayHost {
         Ok(())
     }
 
-    /// Expose a staged document only after the generation-bound native allocation event and exact
+    /// Enable a staged document only after the generation-bound native allocation event and exact
     /// DOM viewport acknowledgement have both been revalidated on later owner-loop turns.
     fn activate_ready_webview(
         &self,
@@ -3548,6 +3724,7 @@ impl LinuxOverlayHost {
         if !self.state.borrow_mut().mark_presented(token) {
             return Err("stale overlay presentation token".to_owned());
         }
+        self.refresh_native_notice(false);
         widget.grab_focus();
         self.layer.queue_draw();
         log_overlay_presentation_step(token, "activated-and-focused", started);
@@ -3560,7 +3737,13 @@ impl LinuxOverlayHost {
     fn try_present_ready_webview(&self) {
         let (can_present, presentation_complete, token, webview) = {
             let state = self.state.borrow();
-            if !state.visible || !state.persistent_suppression.is_ready() {
+            if !state.visible
+                || !state.persistent_suppression.is_ready()
+                || matches!(
+                    state.native_notice,
+                    Some((_, NativeDialogNotice::Failed(_)))
+                )
+            {
                 return;
             }
             (
@@ -3719,6 +3902,10 @@ impl LinuxOverlayHost {
     }
 
     fn show_native_fallback(&self) {
+        if self.state.borrow().native_notice.is_some() {
+            self.refresh_native_notice(false);
+            return;
+        }
         let webview = self.state.borrow().webview.clone();
         self.cancel_viewport_observer(webview.as_deref());
         self.present_target.set_overlay_occluded(true);
@@ -3730,6 +3917,74 @@ impl LinuxOverlayHost {
         self.top_level.queue_draw();
     }
 
+    /// Controls are siblings of the inert WebKit page. Do not hide or reload that page: its
+    /// pending paint/evaluation and any existing form draft must survive a timeout.
+    fn refresh_native_notice(&self, focus: bool) {
+        let notice = self.state.borrow().native_notice;
+        let Some((_, notice)) = notice else {
+            self.native_notice_box.hide();
+            return;
+        };
+        let failed = matches!(notice, NativeDialogNotice::Failed(_));
+        self.native_notice_label.set_text(match notice {
+            NativeDialogNotice::Loading => "Opening dialog… You can cancel while it loads.",
+            NativeDialogNotice::Failed(OverlayDeadlinePhase::ColdLoad) => {
+                "The dialog did not finish loading. Retry opening it or cancel."
+            }
+            NativeDialogNotice::Failed(_) => {
+                "The dialog could not become interactive in time. Retry opening it or cancel."
+            }
+        });
+        for child in self.native_notice_box.children() {
+            child.show_all();
+        }
+        self.native_retry.set_visible(failed);
+        self.native_notice_box.show();
+        self.layer.set_sensitive(true);
+        self.layer.set_can_focus(false);
+        self.layer.set_opacity(1.0);
+        self.layer.show();
+        self.present_target.set_overlay_occluded(true);
+        if focus {
+            if failed {
+                self.native_retry.grab_focus();
+            } else {
+                self.native_cancel.grab_focus();
+            }
+        }
+        self.top_level.queue_draw();
+    }
+
+    pub(crate) fn handle_native_action(&self, action: OverlayNativeAction) {
+        if self.state.borrow_mut().take_native_action(action).is_none() {
+            return;
+        }
+        match action.kind {
+            OverlayNativeActionKind::Cancel => {
+                self.hide_and_restore_focus();
+            }
+            OverlayNativeActionKind::Retry => {
+                let ready = self.state.borrow().delivery.react_ready;
+                if ready {
+                    self.state.borrow_mut().visible = true;
+                    self.arm_presentation_timeout();
+                    self.suppress_underlay_inputs();
+                    self.try_present_ready_webview();
+                } else {
+                    // Retain the same WebView and cached modal; never replay a creation intent or
+                    // reinject a delivered form (which would reset its draft).
+                    let token = self
+                        .state
+                        .borrow_mut()
+                        .begin_deadline(OverlayDeadlinePhase::ColdLoad);
+                    self.state.borrow_mut().native_loading();
+                    self.arm_overlay_timeout_source(token, OVERLAY_COLD_LOAD_TIMEOUT);
+                    self.refresh_native_notice(true);
+                }
+            }
+        }
+    }
+
     /// Select the inert page before hiding WebKit, disconnecting its embedding socket from the
     /// GtkStackAccessible tree without unparenting or unrealizing the retained WebView. Its
     /// document, WebContext, backing store, script cache, and recovery generation stay intact.
@@ -3738,6 +3993,8 @@ impl LinuxOverlayHost {
     fn park_webview(&self, webview: Option<&wry::WebView>, keep_fallback_visible: bool) {
         let started = Instant::now();
         let token = self.state.borrow().presentation_token;
+        let has_native_notice = self.state.borrow().native_notice.is_some();
+        let keep_fallback_visible = keep_fallback_visible || has_native_notice;
         log_overlay_presentation_step(token, "park-begin", started);
         self.cancel_viewport_observer(webview);
         self.parking_page.show();
@@ -3761,11 +4018,14 @@ impl LinuxOverlayHost {
         self.content.hide();
 
         self.layer.set_sensitive(keep_fallback_visible);
-        self.layer.set_can_focus(keep_fallback_visible);
+        self.layer
+            .set_can_focus(keep_fallback_visible && !has_native_notice);
         self.layer.set_opacity(1.0);
         if keep_fallback_visible {
             self.layer.show();
-            self.layer.grab_focus();
+            if !has_native_notice {
+                self.layer.grab_focus();
+            }
         } else {
             // A visible product modal may deliberately keep this native fallback hidden until the
             // persistent documents confirm `inert`. Preserve its Loading/Recovering semantics for
@@ -3778,6 +4038,7 @@ impl LinuxOverlayHost {
         log_overlay_presentation_step(token, "park-layer-updated", started);
         self.layer.queue_resize();
         self.layer.queue_draw();
+        self.refresh_native_notice(false);
     }
 
     fn mark_overlay_react_ready(&self) {
@@ -3818,14 +4079,15 @@ impl LinuxOverlayHost {
             return;
         }
         if let Some(token) = presentation_token {
-            // The exact ready marker is the ownership boundary. Only now capture focus, start the
-            // short presentation join, and suppress the native terminal/sidebar/topbar.
-            *self.previous_focus.borrow_mut() = self.top_level.focused_widget();
+            // The native loading panel already captured opener focus. Preserve that exact owner
+            // while moving to the separately bounded, fully gated presentation join.
+            self.state.borrow_mut().native_loading();
             self.trace_native_focus(
                 "capture-before-native-suppression",
                 self.previous_focus.borrow().as_ref(),
             );
             self.arm_overlay_timeout_source(token, MODAL_PRESENTATION_TIMEOUT);
+            self.refresh_native_notice(false);
             self.set_fallback_accessibility(FallbackAccessibility::Loading);
             self.suppress_underlay_inputs();
             self.park_webview(Some(&webview), false);
@@ -3918,16 +4180,10 @@ impl LinuxOverlayHost {
                 eprintln!("linux-host overlay timeout-state {snapshot}");
             }
         }
-        match phase {
-            Some(OverlayDeadlinePhase::ColdLoad) => {
-                eprintln!("linux-host overlay cold load timed out token={token}");
-                self.fail_closed_to_terminal();
-            }
-            Some(OverlayDeadlinePhase::Presentation) => {
-                eprintln!("linux-host modal presentation timed out token={token}");
-                self.fail_closed_to_terminal();
-            }
-            Some(OverlayDeadlinePhase::Idle) | None => {}
+        if self.state.borrow_mut().native_timeout(token) {
+            eprintln!("linux-host overlay opening timed out token={token} phase={phase:?}");
+            self.presentation_timeout.borrow_mut().cancel();
+            self.refresh_native_notice(true);
         }
     }
 
@@ -3942,7 +4198,7 @@ impl LinuxOverlayHost {
             } => {
                 let (decision, was_visible, webview) = {
                     let mut state = self.state.borrow_mut();
-                    let was_visible = state.visible;
+                    let was_visible = state.visible || state.native_notice.is_some();
                     let decision = state.recovery.on_failure(generation);
                     if matches!(
                         decision,
@@ -3953,6 +4209,7 @@ impl LinuxOverlayHost {
                         state.clear_pending_product_intents();
                     }
                     if decision == RecoveryDecision::Exhausted {
+                        state.native_notice = None;
                         state.visible = false;
                         state.delivery.hide();
                     }
@@ -4010,6 +4267,7 @@ impl LinuxOverlayHost {
                         self.overlay_url.len()
                     ),
                     RecoveryDecision::Exhausted => {
+                        self.refresh_native_notice(false);
                         // The hidden final document must lose IPC/navigation authority before any
                         // later WebKit callback can run. Recovery exhaustion is permanent for this
                         // lazily-created WebView instance.
@@ -6061,6 +6319,122 @@ mod tests {
     }
 
     #[test]
+    fn native_notice_keeps_gtk_button_activation_and_focus_keys() {
+        use gtk::gdk::keys::constants as key;
+        for accepted in [
+            key::Tab,
+            key::ISO_Left_Tab,
+            key::Return,
+            key::KP_Enter,
+            key::space,
+        ] {
+            assert!(native_notice_control_key(accepted));
+        }
+        for blocked in [key::a, key::Escape, key::BackSpace, key::Delete] {
+            assert!(!native_notice_control_key(blocked));
+        }
+    }
+
+    #[test]
+    fn native_timeout_retains_delivered_modal_and_rejects_late_readiness() {
+        let mut runtime = runtime_awaiting_presentation();
+        runtime.persistent_suppression.begin(0);
+        let token = runtime.presentation_token;
+        runtime.native_loading();
+        assert!(runtime.native_timeout(token));
+        assert!(runtime.delivery.has_active_modal());
+        assert!(runtime.delivery.can_present());
+        assert!(!runtime.accepts_product_intents());
+        assert!(!runtime.mark_presented(token));
+        assert_eq!(runtime.deadline_phase_for_token(token), None);
+        assert!(!runtime.native_timeout(token));
+        assert!(matches!(
+            runtime.native_notice,
+            Some((
+                _,
+                NativeDialogNotice::Failed(OverlayDeadlinePhase::Presentation)
+            ))
+        ));
+        assert_eq!(
+            runtime.route_product_intent(r#"{"type":"splitPane"}"#.into()),
+            ProductIntentRoute::RejectedNotPresented
+        );
+    }
+
+    #[test]
+    fn native_retry_is_explicit_token_bound_and_single_use() {
+        let mut runtime = runtime_awaiting_presentation();
+        let loading_token = runtime.presentation_token;
+        runtime.native_loading();
+        assert!(runtime
+            .take_native_action(OverlayNativeAction {
+                token: loading_token,
+                kind: OverlayNativeActionKind::Retry,
+            })
+            .is_none());
+        assert!(runtime.native_timeout(loading_token));
+        assert!(runtime
+            .take_native_action(OverlayNativeAction {
+                token: loading_token,
+                kind: OverlayNativeActionKind::Cancel,
+            })
+            .is_none());
+        let retry = OverlayNativeAction {
+            token: runtime.native_notice.unwrap().0,
+            kind: OverlayNativeActionKind::Retry,
+        };
+        assert!(runtime.take_native_action(retry).is_some());
+        assert!(runtime.take_native_action(retry).is_none());
+        let fresh = runtime.begin_presentation_deadline();
+        runtime.native_loading();
+        assert_ne!(fresh, loading_token);
+        assert!(runtime.take_native_action(retry).is_none());
+        assert!(runtime.delivery.can_present());
+        assert!(!runtime.accepts_product_intents());
+    }
+
+    #[test]
+    fn native_cold_failure_does_not_auto_promote_on_late_ready() {
+        let mut runtime = OverlayRuntime::new(1);
+        runtime.delivery.attach_webview();
+        runtime
+            .delivery
+            .remember(MODAL_ONE, ReactChromeScriptKind::Modal, true);
+        let token = runtime.ensure_cold_load_deadline().unwrap();
+        runtime.native_loading();
+        assert!(runtime.native_timeout(token));
+        assert!(runtime.delivery.react_ready().is_some());
+        assert!(runtime.promote_cold_load_to_presentation().is_none());
+        assert!(!runtime.visible);
+        assert!(!runtime.accepts_product_intents());
+        let cancel = OverlayNativeAction {
+            token: runtime.native_notice.unwrap().0,
+            kind: OverlayNativeActionKind::Cancel,
+        };
+        assert!(runtime.take_native_action(cancel).is_some());
+        // The synchronous host hide path retains notice ownership until it captures opener focus.
+        assert!(runtime.native_notice.is_some());
+        runtime.native_notice = None;
+        runtime.delivery.hide();
+        runtime.end_deadline();
+        assert!(runtime.take_native_action(cancel).is_none());
+        assert!(!runtime.delivery.has_active_modal());
+    }
+
+    #[test]
+    fn native_loading_notice_retires_only_after_all_presentation_gates() {
+        let mut runtime = runtime_awaiting_presentation();
+        let token = runtime.presentation_token;
+        runtime.native_loading();
+        assert!(!runtime.mark_presented(token));
+        assert!(runtime.native_notice.is_some());
+        runtime.persistent_suppression.begin(0);
+        assert!(runtime.mark_presented(token));
+        assert!(runtime.native_notice.is_none());
+        assert!(runtime.accepts_product_intents());
+    }
+
+    #[test]
     fn cold_load_request_stays_hidden_and_duplicate_requests_do_not_extend_it() {
         let mut runtime = OverlayRuntime::new(1);
         runtime
@@ -6068,7 +6442,8 @@ mod tests {
             .remember(MODAL_ONE, ReactChromeScriptKind::Modal, true);
 
         let cold_token = runtime.ensure_cold_load_deadline().unwrap();
-        assert!(OVERLAY_COLD_LOAD_TIMEOUT > MODAL_PRESENTATION_TIMEOUT);
+        assert_eq!(OVERLAY_COLD_LOAD_TIMEOUT, MODAL_PRESENTATION_TIMEOUT);
+        assert!(MODAL_PRESENTATION_TIMEOUT > Duration::from_millis(4463));
         assert!(runtime.cold_load_pending());
         assert!(!runtime.visible);
         assert!(!runtime.accepts_product_intents());

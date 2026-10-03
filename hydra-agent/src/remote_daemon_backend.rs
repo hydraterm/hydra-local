@@ -9807,6 +9807,148 @@ mod tests {
     }
 
     #[test]
+    fn daemon_new_pane_inherited_wrapper_reaches_wire_and_executes_without_path_fallback() {
+        use crate::remote_control::PaneSplitter;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        const SOURCE_ID: &str = "10000000-0000-4000-8000-000000000001";
+        for fresh_parent in [false, true] {
+            let dir = tempfile::Builder::new()
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let paths = seed_split_fixture(dir.path());
+            let locator = dir.path().join("stable renamed 'provider'");
+            let old = dir.path().join("version-one");
+            let upgraded = dir.path().join("version-two");
+            let trap = dir.path().join("codex");
+            let receipt = dir.path().join("wrapper-receipt");
+            for (path, body) in [
+                (&old, "#!/bin/sh\nprintf OLD\n"),
+                (&upgraded, "#!/bin/sh\nprintf 'UPGRADED:%s' \"$#\" > \"$HYDRA_QA_RECEIPT\"\nprintf 'UPGRADED:%s' \"$#\"\n"),
+                (&trap, "#!/bin/sh\nprintf PATH_TRAP\nexit 97\n"),
+            ] {
+                std::fs::write(path, body).unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            symlink(&old, &locator).unwrap();
+            let Some(maestro_shell::LoadOutcome::Loaded(mut source)) =
+                maestro_shell::load_one::<maestro_shell::SessionRecord>(
+                    &paths,
+                    maestro_shell::RecordKind::Session,
+                    "s-a",
+                )
+                .unwrap()
+            else {
+                panic!("source")
+            };
+            source.launch = if fresh_parent {
+                maestro_shell::LaunchSpec::FreshProvider {
+                    launch_spec_id: "codex".into(),
+                    params: vec![],
+                    executable: locator.to_str().unwrap().into(),
+                }
+            } else {
+                maestro_shell::LaunchSpec::BoundProvider {
+                    launch_spec_id: "codex".into(),
+                    params: vec!["resume".into(), SOURCE_ID.into()],
+                    executable: locator.to_str().unwrap().into(),
+                }
+            };
+            maestro_shell::write_record(
+                &paths,
+                maestro_shell::RecordKind::Session,
+                "s-a",
+                3,
+                &source,
+            )
+            .unwrap();
+            let (tx, _rx) =
+                daemon_request_channel(DAEMON_REQUEST_QUEUE_CAP, DAEMON_REQUEST_QUEUE_BYTE_CAP);
+            let daemon = install_conditional_start_test_daemon(&tx);
+            let mut splitter = DaemonPaneSplitter {
+                tx,
+                paths: paths.clone(),
+                sessions: Arc::new(Mutex::new(SessionCache::mutation_ready_for_test())),
+            };
+            let request = || crate::remote_control::SplitPaneRequest {
+                window_id: "win-main".into(),
+                from_pane_id: "pane-a".into(),
+                dir: crate::remote_control::SplitPaneDir::Right,
+                agent: None,
+                launch_flags: None,
+                cwd: None,
+                pane_name: None,
+                now_ms: 5,
+            };
+            let created = splitter.new_pane(request()).unwrap();
+            let start = only_conditional_start(&daemon);
+            let Some(maestro_shell::LoadOutcome::Loaded(child)) =
+                maestro_shell::load_one::<maestro_shell::SessionRecord>(
+                    &paths,
+                    maestro_shell::RecordKind::Session,
+                    &created.session_id,
+                )
+                .unwrap()
+            else {
+                panic!("child")
+            };
+            assert_eq!(
+                child.launch.fresh_provider_audit(),
+                Some(("codex", [].as_slice(), locator.to_str().unwrap()))
+            );
+            assert!(child.launch.provider_recipe().is_none());
+            assert!(!start["args"].to_string().contains(SOURCE_ID));
+            assert_eq!(start["command"], login_shell_program());
+            // Execute the actual production caller's captured StartSession wire, not a rebuilt
+            // test-only launch helper. An updater may retarget the stable link after preparation.
+            std::fs::remove_file(&locator).unwrap();
+            symlink(&upgraded, &locator).unwrap();
+            let output = std::process::Command::new(start["command"].as_str().unwrap())
+                .args(
+                    start["args"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|arg| arg.as_str().unwrap()),
+                )
+                .env_clear()
+                .env("HOME", dir.path())
+                .env("HYDRA_QA_RECEIPT", &receipt)
+                .env(
+                    "PATH",
+                    std::env::join_paths([dir.path(), Path::new("/usr/bin"), Path::new("/bin")])
+                        .unwrap(),
+                )
+                .current_dir(start["cwd"].as_str().unwrap())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // Real login shells may print a distribution welcome banner before executing argv.
+            assert_eq!(std::fs::read(&receipt).unwrap(), b"UPGRADED:0");
+            assert!(output.stdout.ends_with(b"UPGRADED:0"));
+            std::fs::remove_file(&locator).unwrap();
+            assert!(splitter.new_pane(request()).is_err());
+            assert_eq!(
+                daemon.start_requests().len(),
+                1,
+                "missing locator cannot fall back to PATH"
+            );
+            let mut explicit = request();
+            explicit.agent = Some("claude".into());
+            splitter.new_pane(explicit).unwrap();
+            let starts = daemon.start_requests();
+            assert_eq!(starts.len(), 2);
+            assert!(!starts[1]["args"].to_string().contains("stable renamed"));
+            assert!(starts[1]["args"].to_string().contains("--session-id"));
+            // The explicit provider's wire is inspected only: no installed provider is executed.
+        }
+    }
+
+    #[test]
     fn daemon_new_pane_does_not_evict_live_panes_when_window_is_full() {
         use crate::remote_control::PaneSplitter;
         let dir =

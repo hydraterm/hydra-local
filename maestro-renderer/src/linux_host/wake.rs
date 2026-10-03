@@ -41,8 +41,8 @@
 
 use super::event_bridge::HostEvent;
 use super::overlay::{
-    OverlayEvaluationResult, OverlayNativeAllocationReady, OverlayViewportReady,
-    PersistentFocusReady, PersistentSuppressionResult,
+    OverlayEvaluationResult, OverlayNativeAction, OverlayNativeAllocationReady,
+    OverlayViewportReady, PersistentFocusReady, PersistentSuppressionResult,
 };
 use super::recovery::WebKitRecoveryEvent;
 use crate::{UserEvent, UserEventSender};
@@ -75,6 +75,8 @@ pub enum LinuxLoopEvent {
     OverlayViewportReady(OverlayViewportReady),
     /// Bounded owner-loop failure when the complete modal-presentation join never finishes.
     OverlayPresentationTimeout { token: u64 },
+    /// Native loading/failure controls, scoped to the exact displayed notice token.
+    OverlayNativeAction(OverlayNativeAction),
     /// The GTK parent completed an after-paint phase for the current Wayland terminal reveal.
     /// WGPU remains gated until the owner loop accepts this exact generation.
     TerminalRevealReady { generation: u64 },
@@ -175,6 +177,9 @@ where
             unreachable!("renderer event transport only submits LinuxLoopEvent::Renderer")
         }
         LinuxLoopEvent::OverlayPresentationTimeout { .. } => {
+            unreachable!("renderer event transport only submits LinuxLoopEvent::Renderer")
+        }
+        LinuxLoopEvent::OverlayNativeAction(_) => {
             unreachable!("renderer event transport only submits LinuxLoopEvent::Renderer")
         }
         LinuxLoopEvent::TerminalRevealReady { .. } => {
@@ -425,6 +430,9 @@ mod tests {
                 }
                 LinuxLoopEvent::OverlayPresentationTimeout { .. } => {
                     panic!("GTK delivery must never submit OverlayPresentationTimeout")
+                }
+                LinuxLoopEvent::OverlayNativeAction(_) => {
+                    panic!("GTK delivery must never submit OverlayNativeAction")
                 }
                 LinuxLoopEvent::TerminalRevealReady { .. } => {
                     panic!("GTK delivery must never submit TerminalRevealReady")

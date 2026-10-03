@@ -1339,6 +1339,11 @@ impl LinuxDashboardHost {
                         overlay.handle_presentation_timeout(token);
                     }
                 }
+                Event::UserEvent(LinuxLoopEvent::OverlayNativeAction(action)) => {
+                    if let Some(overlay) = self.overlay_host.as_ref() {
+                        overlay.handle_native_action(action);
+                    }
+                }
                 Event::UserEvent(LinuxLoopEvent::TerminalRevealReady { generation }) => {
                     if let Some(resume) = self.present_target.complete_reveal(generation) {
                         if app.resume_linux_terminal_presentation(resume)
