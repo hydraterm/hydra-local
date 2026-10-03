@@ -81,6 +81,7 @@ if unexpected_root:
 
 allowed_docs = {
     "architecture.md",
+    "architecture/windows-desktop.md",
     "assets/hydra-local-demo.gif",
     "assets/hydra-sidebar-82e88d7ec829.gif",
     "public-private-boundary.md",
