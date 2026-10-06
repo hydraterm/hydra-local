@@ -5,11 +5,11 @@ listed below. This inventory covers the locked Rust and dashboard graphs plus th
 Remote browser/broker tool locks and the separate WebRTC agent source graph. It does not
 change or replace any upstream licence.
 
-- `Cargo.lock` SHA-256: `26d6dd5cfd23c9af278ebe66eeb3dd882aef87a20572ccbc9351fbf8f7c7fce1`
+- `Cargo.lock` SHA-256: `41dd12bb69aaf7bb8b76599a00e75c11e938eab458bc37e18ce8035ebd56ac27`
 - `dashboard-ui/package-lock.json` SHA-256: `8c5ef57bf3d91150fcaa94440629882bdb21c5ec608e0fd4a4466c02100557dd`
 - Rust dependency versions: 543
-- `hydra-agent/Cargo.lock` SHA-256: `7975a2d18916737df32457a372eedfb1f60c19217841999ec8671b022beb88d4`
-- Standalone WebRTC agent dependency versions: 343
+- `hydra-agent/Cargo.lock` SHA-256: `a4b46be4a19da396312c00caa831cdaa4d74e001ed92102525df0fff2cb4b40b`
+- Standalone WebRTC agent dependency versions: 355
 - npm dependency versions: 188
 - `web-client/package-lock.json` SHA-256: `8bf5ac450cac220bb16df6e2be38307a1990fab9221c228d398b8fdcd4a2a7d4`
 - Browser-core development dependency versions: 95
@@ -788,6 +788,7 @@ binary policies and their locked graph are unchanged by this source-only invento
 | `reqwest` | `0.12.28` | `MIT OR Apache-2.0` | [source](https://github.com/seanmonstar/reqwest) |
 | `rfc6979` | `0.4.0` | `Apache-2.0 OR MIT` | [source](https://github.com/RustCrypto/signatures/tree/master/rfc6979) |
 | `ring` | `0.17.14` | `Apache-2.0 AND ISC` | [source](https://github.com/briansmith/ring) |
+| `roxmltree` | `0.20.0` | `MIT OR Apache-2.0` | [source](https://github.com/RazrFalcon/roxmltree) |
 | `rtcp` | `0.11.0` | `MIT OR Apache-2.0` | [source](https://github.com/webrtc-rs/rtcp) |
 | `rtp` | `0.11.0` | `MIT OR Apache-2.0` | [source](https://github.com/webrtc-rs/rtp) |
 | `rusqlite` | `0.32.1` | `MIT` | [source](https://github.com/rusqlite/rusqlite) |
@@ -897,13 +898,24 @@ binary policies and their locked graph are unchanged by this source-only invento
 | `winapi` | `0.3.9` | `MIT/Apache-2.0` | [source](https://github.com/retep998/winapi-rs) |
 | `winapi-i686-pc-windows-gnu` | `0.4.0` | `MIT/Apache-2.0` | [source](https://github.com/retep998/winapi-rs) |
 | `winapi-x86_64-pc-windows-gnu` | `0.4.0` | `MIT/Apache-2.0` | [source](https://github.com/retep998/winapi-rs) |
+| `windows` | `0.61.3` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
+| `windows-collections` | `0.2.0` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
+| `windows-core` | `0.61.2` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
+| `windows-future` | `0.2.1` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
+| `windows-implement` | `0.60.2` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
+| `windows-interface` | `0.59.3` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
+| `windows-link` | `0.1.3` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
 | `windows-link` | `0.2.1` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
+| `windows-numerics` | `0.2.0` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
+| `windows-result` | `0.3.4` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
+| `windows-strings` | `0.4.2` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
 | `windows-sys` | `0.48.0` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
 | `windows-sys` | `0.52.0` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
 | `windows-sys` | `0.59.0` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
 | `windows-sys` | `0.61.2` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
 | `windows-targets` | `0.48.5` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
 | `windows-targets` | `0.52.6` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
+| `windows-threading` | `0.1.0` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
 | `windows_aarch64_gnullvm` | `0.48.5` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
 | `windows_aarch64_gnullvm` | `0.52.6` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
 | `windows_aarch64_msvc` | `0.48.5` | `MIT OR Apache-2.0` | [source](https://github.com/microsoft/windows-rs) |
