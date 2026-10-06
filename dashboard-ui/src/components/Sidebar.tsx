@@ -162,6 +162,10 @@ export function Sidebar({
   const [openProjectMenuId, setOpenProjectMenuId] = useState<string | null>(null)
   const [renameDraft, setRenameDraft] = useState<{ project_id: string; name: string } | null>(null)
   const [deleteDraft, setDeleteDraft] = useState<DeleteDraft | null>(null)
+  const [deletePending, setDeletePending] = useState(false)
+  const [deleteMessage, setDeleteMessage] = useState<string | null>(null)
+  const deleteRequestRef = useRef<AbortController | null>(null)
+  useEffect(() => () => deleteRequestRef.current?.abort(), [])
   const [openWindowMenuKey, setOpenWindowMenuKey] = useState<string | null>(null)
   const [windowRenameDraft, setWindowRenameDraft] = useState<WindowRenameDraft | null>(null)
   const [openPaneMenuKey, setOpenPaneMenuKey] = useState<string | null>(null)
@@ -476,6 +480,8 @@ export function Sidebar({
   }
 
   const startDeleteProject = (project: ProjectCardView, detail: ProjectDetail | undefined): void => {
+    if (deleteRequestRef.current) return
+    setDeleteMessage(null)
     setDeleteDraft({
       project_id: project.project_id,
       name: project.name,
@@ -622,12 +628,36 @@ export function Sidebar({
     commitPaneRename,
   )
 
-  const submitDeleteProject = (): void => {
-    if (!deleteDraft) return
-    bridge.deleteProject(deleteDraft)
+  const cancelDeleteProject = (): void => {
+    deleteRequestRef.current?.abort()
+    deleteRequestRef.current = null
+    setDeletePending(false)
+    setDeleteMessage(null)
+    setDeleteDraft(null)
+  }
+
+  const submitDeleteProject = async (): Promise<void> => {
+    if (!deleteDraft || deleteRequestRef.current) return
+    const draft = deleteDraft
+    const controller = new AbortController()
+    deleteRequestRef.current = controller
+    setDeletePending(true)
+    setDeleteMessage(null)
+    const result = await bridge.awaitLaunchMutation(
+      (request_id) => bridge.deleteProject({ ...draft, request_id }),
+      () => setDeleteMessage('Still waiting for Hydra to confirm deletion. The request has not been sent again.'),
+      controller.signal,
+    )
+    if (deleteRequestRef.current !== controller || controller.signal.aborted) return
+    deleteRequestRef.current = null
+    setDeletePending(false)
+    if (!result.ok) {
+      setDeleteMessage(result.message ?? 'Project deletion was not completed.')
+      return
+    }
     setExpandedProjects((prev) => {
       const next = { ...prev }
-      delete next[deleteDraft.project_id]
+      delete next[draft.project_id]
       return next
     })
     setDeleteDraft(null)
@@ -1652,7 +1682,7 @@ export function Sidebar({
               type="button"
               className="sidebar-create__close"
               aria-label="Cancel"
-              onClick={() => setDeleteDraft(null)}
+              onClick={cancelDeleteProject}
             >
               ×
             </button>
@@ -1661,32 +1691,17 @@ export function Sidebar({
 	            This removes <strong>{deleteDraft.name}</strong> from the shelf and stops its live panes.
 	            The working folder, project files, and provider session history remain on disk.
 	          </div>
-	          <label className="delete-option">
-	            <input type="checkbox" checked={deleteDraft.close_open_windows} disabled readOnly />
-	            <span>
-	              <strong>Stop live panes</strong>
-	              <span className="delete-option__hint">
-	                <code>{deleteDraft.runtime_label}</code> — required
-	              </span>
-	            </span>
-	          </label>
-	          <label className="delete-option">
-	            <input type="checkbox" checked={deleteDraft.remove_record} disabled readOnly />
-	            <span>
-	              <strong>Remove from shelf</strong>
-	              <span className="delete-option__hint">project entry will be deleted</span>
-	            </span>
-	          </label>
+              {deleteMessage && <p className="project-delete-copy" role="alert">{deleteMessage}</p>}
 	          <div className="sidebar-create__actions">
-	            <button type="button" className="sidebar-create__danger" onClick={submitDeleteProject}>
-	              Delete project
+	            <button type="button" className="sidebar-create__danger" disabled={deletePending} onClick={() => void submitDeleteProject()}>
+	              {deletePending ? 'Deleting…' : 'Delete project'}
 	            </button>
             <button
               type="button"
               className="sidebar-create__secondary"
-              onClick={() => setDeleteDraft(null)}
+              onClick={cancelDeleteProject}
             >
-              Cancel
+              {deletePending ? 'Close' : 'Cancel'}
             </button>
           </div>
         </div>

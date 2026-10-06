@@ -1,9 +1,10 @@
-//! Correlated replies report launch admission, not renderer publication or provider success.
+//! Correlated replies report launch admission or project deletion commit, not provider success.
 use super::*;
 
 pub(super) fn request_id(intent: &ReactChromeIntent) -> Option<&str> {
     match intent {
         ReactChromeIntent::CreateWindow { request_id, .. }
+        | ReactChromeIntent::DeleteProject { request_id, .. }
         | ReactChromeIntent::SplitPane { request_id, .. } => request_id.as_deref(),
         _ => None,
     }
@@ -64,12 +65,17 @@ mod tests {
 
     #[test]
     fn typed_mutation_ids_remain_optional_and_closed() {
-        for kind in ["createWindow", "splitPane"] {
+        for kind in ["createWindow", "splitPane", "deleteProject"] {
             let mut input = serde_json::json!({"type":kind, "project_id":"p"});
             if kind == "splitPane" {
                 input["window_id"] = "w".into();
                 input["tab_id"] = "t".into();
                 input["dir"] = "h".into();
+            }
+            if kind == "deleteProject" {
+                input["remove_record"] = true.into();
+                input["keep_working_directory"] = true.into();
+                input["close_open_windows"] = true.into();
             }
             assert!(request_id(&parse_react_chrome_intent(&input.to_string()).unwrap()).is_none());
             input["request_id"] = "exact-request".into();

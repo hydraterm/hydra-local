@@ -104,6 +104,7 @@ export type Intent =
     }
   | {
       type: 'deleteProject'
+      request_id?: string
       project_id: string
       remove_record: boolean
       keep_working_directory: boolean
@@ -778,6 +779,7 @@ export const bridge = {
   },
 
   deleteProject(input: {
+    request_id?: string
     project_id: string
     remove_record: boolean
     keep_working_directory: boolean
@@ -790,6 +792,7 @@ export const bridge = {
     // reject the intent for unknown fields.
     postIntent({
       type: 'deleteProject',
+      ...(input.request_id ? { request_id: input.request_id } : {}),
       project_id: input.project_id,
       remove_record: input.remove_record,
       keep_working_directory: input.keep_working_directory,

@@ -16,7 +16,8 @@
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit",
     "test": "vitest run",
-    "test:submit-paint": "node scripts/check-submit-paint.mjs"
+    "test:submit-paint": "node scripts/check-submit-paint.mjs",
+    "test:topbar-geometry": "node scripts/check-topbar-geometry.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",

@@ -1037,6 +1037,40 @@ pub const MIN_FONT_SIZE_PX: u32 = 10;
 /// (see [`MIN_FONT_SIZE_PX`]).
 pub const MAX_FONT_SIZE_PX: u32 = 32;
 
+/// A native terminal shortcut requests an app-owned, persisted font-size change. It carries no
+/// setting path or absolute value; the app resolves its current settings and enforces their bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FontSizeAdjustment {
+    Increase,
+    Decrease,
+    Reset,
+}
+
+/// Cmd +/−/0 on macOS, Ctrl +/−/0 elsewhere. Accept both the unshifted equals key and the produced
+/// plus character (including numpad plus); Alt/AltGr and the other platform modifier remain PTY input.
+pub fn font_size_shortcut(
+    logical_key: &HostKey,
+    mods: &HostModifiers,
+) -> Option<FontSizeAdjustment> {
+    let primary = if cfg!(target_os = "macos") {
+        mods.super_key && !mods.control
+    } else {
+        mods.control && !mods.super_key
+    };
+    if !primary || mods.alt {
+        return None;
+    }
+    match logical_key {
+        HostKey::Character(key) => match key.as_str() {
+            "+" | "=" => Some(FontSizeAdjustment::Increase),
+            "-" | "_" => Some(FontSizeAdjustment::Decrease),
+            "0" if !mods.shift => Some(FontSizeAdjustment::Reset),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Parsed bare-renderer invocation: the daemon socket, the session to attach, and the optional
 /// launch-time font size. Produced by [`parse_renderer_cli`]; consumed by `main.rs` to build a
 /// [`RendererLaunch`].
@@ -4541,10 +4575,12 @@ pub fn compose_shortcut_hint_overlay_lines() -> Vec<RendererCommandPaletteOverla
         ("Keyboard resize", "Cmd+Opt / Ctrl+Alt + Shift + Arrow"),
         ("Reset divider ratio", "Cmd+Opt / Ctrl+Alt + 0"),
         ("Toggle zoom", "Cmd+Opt / Ctrl+Alt + Enter"),
+        ("Terminal font size", "Cmd/Ctrl + Plus or Minus"),
+        ("Reset terminal font size", "Cmd/Ctrl+0"),
     ];
     let mut lines: Vec<RendererCommandPaletteOverlayLine> = Vec::new();
     lines.push(RendererCommandPaletteOverlayLine {
-        text: "Split-pane shortcuts".to_string(),
+        text: "Terminal shortcuts".to_string(),
         selectable: false,
         selected: false,
         action_index: None,
@@ -10157,6 +10193,9 @@ pub enum RendererEvent {
     /// shortcut so it never reaches the PTY; while a modal overlay is active the shortcut is NOT handled
     /// here (modal handling is preserved and no settings event is emitted).
     SettingsPanelOpenRequested,
+    /// A terminal font-size shortcut fired outside a modal. The app owns persistence and applies
+    /// the new metrics through `SetFontSize`; the renderer sends no PTY bytes for this chord.
+    FontSizeAdjustmentRequested { adjustment: FontSizeAdjustment },
     /// The foreground settings-panel shortcut (`Ctrl+,`, or platform command/super `,`) was pressed
     /// while the CURRENT top panel is the settings panel and NO modal overlay was shown. This is the
     /// toggle-close half of the shortcut: INTENT ONLY, carries NO payload. The renderer reports that the
@@ -18750,6 +18789,7 @@ impl App {
                 // rounding each event to zero and never moving.
                 let lines = match delta {
                     HostScrollDelta::Lines { y, .. } => self.wheel.add_lines(y as f64),
+                    #[cfg(any(not(target_os = "linux"), test))]
                     HostScrollDelta::Pixels { y, .. } => self.wheel.add_pixels(y),
                 };
                 if lines == 0 {
@@ -19190,6 +19230,15 @@ impl App {
                 emit_picker_dismissed(self.events.as_ref());
             }
             return;
+        }
+
+        if !self.command_palette_shown() {
+            if let Some(adjustment) = font_size_shortcut(&event.key, &self.modifiers) {
+                if let Some(events) = self.events.as_ref() {
+                    let _ = events.send(RendererEvent::FontSizeAdjustmentRequested { adjustment });
+                }
+                return;
+            }
         }
 
         // File-path-input prompt is input-CAPTURING while open (but not a full modal: it does not block
@@ -27875,7 +27924,7 @@ mod split_frame_tests {
         assert!(!lines.is_empty());
         assert!(lines.len() <= SHORTCUT_HINT_OVERLAY_MAX_ROWS);
         // The first line is the non-selectable title; every line is non-selectable (display-only).
-        assert_eq!(lines[0].text, "Split-pane shortcuts");
+        assert_eq!(lines[0].text, "Terminal shortcuts");
         assert!(lines.iter().all(|l| !l.selectable && !l.selected));
         // The expected split controls are each named somewhere in the overlay (case-insensitive).
         let blob = lines
@@ -27893,6 +27942,8 @@ mod split_frame_tests {
             "keyboard resize",
             "reset divider ratio",
             "zoom",
+            "terminal font size",
+            "reset terminal font size",
         ] {
             assert!(
                 blob.contains(needle),
@@ -35392,6 +35443,7 @@ mod command_channel_tests {
             | RendererEvent::CommandPaletteActionActivated { .. }
             | RendererEvent::CommandPaletteOpenRequested
             | RendererEvent::SettingsPanelOpenRequested
+            | RendererEvent::FontSizeAdjustmentRequested { .. }
             | RendererEvent::SettingsPanelCloseRequested
             | RendererEvent::SettingsPanelRowSelected { .. }
             | RendererEvent::SettingsPanelRowActivated { .. }
@@ -35440,6 +35492,7 @@ mod command_channel_tests {
             | RendererEvent::CommandPaletteActionActivated { .. }
             | RendererEvent::CommandPaletteOpenRequested
             | RendererEvent::SettingsPanelOpenRequested
+            | RendererEvent::FontSizeAdjustmentRequested { .. }
             | RendererEvent::SettingsPanelCloseRequested
             | RendererEvent::SettingsPanelRowSelected { .. }
             | RendererEvent::SettingsPanelRowActivated { .. }
@@ -39127,11 +39180,11 @@ mod terminal_selection_ownership_tests {
     use super::Clipboard;
     use super::{
         apply_set_tab_strip, attach_selection_to_owner, file_drop_target_session_at_cell,
-        focusable_split_pane_at_cell, pane_content_region, App, CellPos, HostControl,
-        PaneFocusDirection, PendingFileDrop, RendererEvent, RendererExactSessionTarget,
-        RendererExactViewport, RendererExactViewportOutcome, RendererExactViewportRequest,
-        RendererExactViewportRole, RendererTab, RendererTabSplitAxis, RendererTabStrip, Shared,
-        UserEvent, UserEventSender, DEFAULT_WINDOW_TITLE,
+        focusable_split_pane_at_cell, font_size_shortcut, pane_content_region, App, CellPos,
+        FontSizeAdjustment, HostControl, PaneFocusDirection, PendingFileDrop, RendererEvent,
+        RendererExactSessionTarget, RendererExactViewport, RendererExactViewportOutcome,
+        RendererExactViewportRequest, RendererExactViewportRole, RendererTab, RendererTabSplitAxis,
+        RendererTabStrip, Shared, UserEvent, UserEventSender, DEFAULT_WINDOW_TITLE,
     };
     use super::{HostEvent, HostKey, HostKeyEvent, HostModifiers};
     use crate::host_event::{HostIme, HostKeyLocation, HostNamedKey, HostPointerButton};
@@ -39875,7 +39928,6 @@ mod terminal_selection_ownership_tests {
         assert!(app.pending_file_drop.is_none());
     }
 
-    #[cfg(target_os = "macos")]
     fn key_event(character: &str) -> HostKeyEvent {
         HostKeyEvent {
             key: HostKey::Character(character.to_string()),
@@ -40397,6 +40449,123 @@ mod terminal_selection_ownership_tests {
             !app.mouse_reporting_active(),
             "Option/Alt is the second local-selection override",
         );
+    }
+
+    fn font_shortcut_modifiers() -> HostModifiers {
+        HostModifiers {
+            control: !cfg!(target_os = "macos"),
+            super_key: cfg!(target_os = "macos"),
+            ..HostModifiers::default()
+        }
+    }
+
+    #[test]
+    fn terminal_font_shortcuts_match_platform_primary_and_shifted_plus() {
+        let mods = font_shortcut_modifiers();
+        for (key, expected) in [
+            ("=", FontSizeAdjustment::Increase),
+            ("+", FontSizeAdjustment::Increase),
+            ("-", FontSizeAdjustment::Decrease),
+            ("_", FontSizeAdjustment::Decrease),
+            ("0", FontSizeAdjustment::Reset),
+        ] {
+            assert_eq!(
+                font_size_shortcut(&key_event(key).key, &mods),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            font_size_shortcut(
+                &key_event("+").key,
+                &HostModifiers {
+                    shift: true,
+                    ..mods
+                }
+            ),
+            Some(FontSizeAdjustment::Increase)
+        );
+        for excluded in [
+            HostModifiers::default(),
+            HostModifiers { alt: true, ..mods },
+            HostModifiers {
+                control: true,
+                super_key: true,
+                ..mods
+            },
+            HostModifiers {
+                control: cfg!(target_os = "macos"),
+                super_key: !cfg!(target_os = "macos"),
+                ..HostModifiers::default()
+            },
+        ] {
+            assert_eq!(font_size_shortcut(&key_event("+").key, &excluded), None);
+        }
+        assert_eq!(
+            font_size_shortcut(
+                &key_event("0").key,
+                &HostModifiers {
+                    shift: true,
+                    ..mods
+                }
+            ),
+            None
+        );
+        assert_eq!(font_size_shortcut(&key_event("x").key, &mods), None);
+    }
+
+    #[test]
+    fn terminal_font_shortcut_emits_intent_without_pty_input_or_local_metric_change() {
+        let (mut app, shared) = app_with_primary_grid();
+        let (events_tx, events_rx) = mpsc::channel();
+        app.events = super::AppRendererEvents(super::viewport_gated_renderer_events(
+            Some(events_tx),
+            Arc::clone(&app.viewport_event_gate),
+        ));
+        app.modifiers = font_shortcut_modifiers();
+        let previous_metric = app.font_size_px;
+        let mut event = key_event("=");
+        app.handle_key(event.clone());
+        event.repeat = true;
+        app.handle_key(event.clone());
+        event.pressed = false;
+        app.handle_key(event);
+        assert_eq!(
+            events_rx.try_iter().collect::<Vec<_>>(),
+            vec![
+                RendererEvent::FontSizeAdjustmentRequested {
+                    adjustment: FontSizeAdjustment::Increase
+                },
+                RendererEvent::FontSizeAdjustmentRequested {
+                    adjustment: FontSizeAdjustment::Increase
+                },
+            ]
+        );
+        assert_eq!(app.font_size_px, previous_metric);
+        assert!(shared.drain_test_requests().is_empty());
+        app.events = super::AppRendererEvents(None);
+        app.handle_key(key_event("-"));
+        assert!(
+            shared.drain_test_requests().is_empty(),
+            "a disconnected shortcut never leaks to PTY"
+        );
+    }
+
+    #[test]
+    fn terminal_font_shortcuts_respect_modal_ownership() {
+        let (mut app, shared) = app_with_primary_grid();
+        let (events_tx, events_rx) = mpsc::channel();
+        app.events = super::AppRendererEvents(super::viewport_gated_renderer_events(
+            Some(events_tx),
+            Arc::clone(&app.viewport_event_gate),
+        ));
+        app.modifiers = font_shortcut_modifiers();
+        app.picker_rows = Some(Vec::new());
+        app.handle_key(key_event("+"));
+        app.picker_rows = None;
+        app.command_palette_lines = Some(Vec::new());
+        app.handle_key(key_event("-"));
+        assert!(events_rx.try_recv().is_err());
+        assert!(shared.drain_test_requests().is_empty());
     }
 
     #[cfg(target_os = "macos")]

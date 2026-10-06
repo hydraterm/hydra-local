@@ -656,11 +656,22 @@ impl TerminalPresentTarget {
                 );
             },
             Backend::X11(c) => unsafe {
-                gdk_x11_move_resize_child(c, slot_x, slot_y, width, height);
+                // GTK/Wayland origins are logical, but raw Xlib positions are physical. Width
+                // and height already came from the scaled allocation; scale only the origin.
+                let (x, y) = x11_child_origin(slot_x, slot_y, buffer_scale);
+                gdk_x11_move_resize_child(c, x, y, width, height);
             },
         }
         Ok(())
     }
+}
+
+fn x11_child_origin(logical_x: i32, logical_y: i32, buffer_scale: i32) -> (i32, i32) {
+    let scale = buffer_scale.max(1);
+    (
+        logical_x.saturating_mul(scale),
+        logical_y.saturating_mul(scale),
+    )
 }
 
 /// Queue a Wayland child stacking change relative to its parent. This is double-buffered parent
@@ -837,6 +848,24 @@ unsafe fn gdk_x11_move_resize_child(c: &X11Child, x: i32, y: i32, width: u32, he
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn x11_child_origin_scales_gtk_logical_position_once() {
+        assert_eq!(super::x11_child_origin(460, 46, 1), (460, 46));
+        assert_eq!(super::x11_child_origin(460, 46, 2), (920, 92));
+        assert_eq!(super::x11_child_origin(24, 46, 2), (48, 92));
+        assert_eq!(super::x11_child_origin(460, 46, 3), (1380, 138));
+    }
+
+    #[test]
+    fn x11_child_origin_handles_minimum_scale_and_signed_positions() {
+        assert_eq!(super::x11_child_origin(-3, -2, 2), (-6, -4));
+        assert_eq!(super::x11_child_origin(460, 46, 0), (460, 46));
+        assert_eq!(
+            super::x11_child_origin(i32::MAX, i32::MIN, 2),
+            (i32::MAX, i32::MIN)
+        );
+    }
+
     use super::{
         Backend, OverlayOcclusionState, ProxyCleanup, RegistryListenerGuard, TerminalPresentTarget,
         TerminalPresentationGate, TerminalPresentationPhase, TerminalStackOrder, WaylandChild,

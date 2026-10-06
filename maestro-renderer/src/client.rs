@@ -174,7 +174,7 @@ fn reviewed_server_pid(stream: &UnixStream) -> io::Result<Option<u32>> {
                 "Unix daemon peer identity was unavailable or did not match the effective uid",
             ));
         }
-        return Ok(Some(credentials.pid as u32));
+        Ok(Some(credentials.pid as u32))
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1187,6 +1187,7 @@ pub fn next_view_offset(
 /// converting each one independently and rounding loses every sub-threshold event,
 /// so a gentle scroll never moves at all. We instead accumulate pixels and emit whole
 /// line steps as the total crosses each multiple, retaining the remainder.
+#[cfg(any(not(target_os = "linux"), test))]
 pub const WHEEL_PIXELS_PER_LINE: f64 = 16.0;
 
 /// Accumulates fractional wheel/trackpad scroll into whole line steps without losing
@@ -1219,6 +1220,7 @@ impl WheelAccumulator {
 
     /// Feed a `PixelDelta` y (in pixels). Returns the whole line steps to apply now,
     /// carrying the sub-line remainder forward so consecutive small events accumulate.
+    #[cfg(any(not(target_os = "linux"), test))]
     pub fn add_pixels(&mut self, pixels: f64) -> i64 {
         self.residue += pixels / WHEEL_PIXELS_PER_LINE;
         self.take_whole()

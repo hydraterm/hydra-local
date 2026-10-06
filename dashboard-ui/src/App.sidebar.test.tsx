@@ -1666,6 +1666,7 @@ describe('native sidebar geometry and focus', () => {
     const deleteIntent = intents.find((intent) => intent.type === 'deleteProject')
     expect(deleteIntent).toEqual({
       type: 'deleteProject',
+      request_id: expect.any(String),
       project_id: 'sample_workspace',
       remove_record: true,
       keep_working_directory: true,
@@ -1675,5 +1676,65 @@ describe('native sidebar geometry and focus', () => {
     expect(deleteIntent).not.toHaveProperty('root')
     expect(deleteIntent).not.toHaveProperty('runtime_label')
     expect(deleteIntent).not.toHaveProperty('open_count')
+  })
+
+  it('shows a native delete refusal, keeps the dialog, and permits an explicit retry', async () => {
+    const intents: Array<Record<string, unknown>> = []
+    const host = installWindow('?chrome=sidebar', intents)
+    await mount()
+    act(() => renderer!.root.findAllByProps({ title: 'Project actions' })[0].props.onClick())
+    act(() => renderer!.root.find(node => node.props.role === 'menuitem' && node.children.join('') === 'Delete project…').props.onClick())
+    const dialog = () => renderer!.root.findByProps({ role: 'dialog' })
+    const submit = () => dialog().findByProps({ className: 'sidebar-create__danger' })
+    expect(dialog().findAllByProps({ type: 'checkbox' })).toHaveLength(0)
+    act(() => { submit().props.onClick(); submit().props.onClick() })
+    expect(submit().props.disabled).toBe(true)
+    const requests = () => intents.filter(intent => intent.type === 'deleteProject')
+    expect(requests()).toHaveLength(1)
+    const message = 'Keep one window open globally before deleting this project.'
+    await act(async () => {
+      host.__HYDRA_DASHBOARD_RESOLVE_LAUNCH_MUTATION__?.(String(requests()[0].request_id), false, message)
+      await Promise.resolve()
+    })
+    expect(dialog().findByProps({ role: 'alert' }).children.join('')).toBe(message)
+    expect(submit().props.disabled).toBe(false)
+    act(() => submit().props.onClick())
+    expect(requests()).toHaveLength(2)
+    await act(async () => {
+      host.__HYDRA_DASHBOARD_RESOLVE_LAUNCH_MUTATION__?.(String(requests()[0].request_id), true, null)
+      await Promise.resolve()
+    })
+    expect(submit().props.disabled).toBe(true)
+    await act(async () => {
+      host.__HYDRA_DASHBOARD_RESOLVE_LAUNCH_MUTATION__?.(String(requests()[1].request_id), true, null)
+      await Promise.resolve()
+    })
+    expect(renderer!.root.findAllByProps({ role: 'dialog' })).toHaveLength(0)
+  })
+
+  it('keeps an unconfirmed delete pending without resending and ignores a reply after closing', async () => {
+    vi.useFakeTimers()
+    const intents: Array<Record<string, unknown>> = []
+    const host = installWindow('?chrome=sidebar', intents)
+    await mount()
+    act(() => renderer!.root.findAllByProps({ title: 'Project actions' })[0].props.onClick())
+    const open = () => renderer!.root.find(node => node.props.role === 'menuitem' && node.children.join('') === 'Delete project…').props.onClick()
+    act(open)
+    const submit = () => renderer!.root.findByProps({ className: 'sidebar-create__danger' })
+    act(() => submit().props.onClick())
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_001) })
+    expect(submit().props.disabled).toBe(true)
+    expect(renderer!.root.findByProps({ role: 'alert' }).children.join('')).toContain('not been sent again')
+    const request = intents.find(intent => intent.type === 'deleteProject')!
+    expect(intents.filter(intent => intent.type === 'deleteProject')).toHaveLength(1)
+    act(() => renderer!.root.findByProps({ role: 'dialog' }).findByProps({ 'aria-label': 'Cancel' }).props.onClick())
+    act(() => renderer!.root.findAllByProps({ title: 'Project actions' })[0].props.onClick())
+    act(open)
+    await act(async () => {
+      host.__HYDRA_DASHBOARD_RESOLVE_LAUNCH_MUTATION__?.(String(request.request_id), true, null)
+      await Promise.resolve()
+    })
+    expect(submit().props.disabled).toBe(false)
+    expect(renderer!.root.findAllByProps({ role: 'alert' })).toHaveLength(0)
   })
 })

@@ -1478,7 +1478,7 @@ impl OverlayRuntime {
             (self.accepts_product_intents()
                 && scope.presentation_token == self.presentation_token
                 && scope.recovery_generation == self.recovery.generation())
-            .then(|| CapturedDialogLaunch {
+            .then_some(CapturedDialogLaunch {
                 ticket,
                 scope,
                 request_id,

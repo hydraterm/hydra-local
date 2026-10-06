@@ -91,11 +91,12 @@ pub trait HostServices {
 /// no executable is resolved through `PATH`, and terminal-controlled URL content
 /// is neither logged nor inherited as process stdio. Linux uses GIO directly in
 /// its GTK host adapter instead of the shell-dispatching `xdg-open` program.
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn start_native_http_open(url: &str) -> bool {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = url;
-        return false;
+        false
     }
     #[cfg(target_os = "macos")]
     {

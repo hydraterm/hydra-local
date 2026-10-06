@@ -72,6 +72,9 @@ export async function installDevHost(): Promise<void> {
           ),
         }
         publish()
+        if (intent.request_id) {
+          window.__HYDRA_DASHBOARD_RESOLVE_LAUNCH_MUTATION__?.(intent.request_id, true, null)
+        }
       }
     },
 

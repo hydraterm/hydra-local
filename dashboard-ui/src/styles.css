@@ -1730,20 +1730,13 @@ body.is-resizing-sidebar .sidebar-resizer::before {
   isolation: isolate;
   display: inline-flex;
   align-items: center;
+  /* Hover, focus and activation must not move this or neighboring close targets.
+     Compressed names remain available through the button's title and aria-label. */
   flex: 1 1 0;
   min-width: 52px;
   max-width: 220px;
   overflow: hidden;
   border-radius: 8px 8px 0 0;
-  transition:
-    flex-grow 0.14s ease,
-    min-width 0.14s ease,
-    max-width 0.14s ease;
-}
-.window-tab-group.is-active {
-  flex-grow: 1.45;
-  min-width: 72px;
-  max-width: 250px;
 }
 .window-tab-group.drop-before::after,
 .window-tab-group.drop-after::after {
@@ -1768,12 +1761,6 @@ body.is-resizing-sidebar .sidebar-resizer::before {
   color: #f6c778;
   font-size: 12px;
   overflow-wrap: anywhere;
-}
-.window-tab-group:hover,
-.window-tab-group:focus-within {
-  flex-grow: 2.5;
-  min-width: min(140px, 100%);
-  max-width: min(280px, 100%);
 }
 .window-tab {
   display: inline-flex;

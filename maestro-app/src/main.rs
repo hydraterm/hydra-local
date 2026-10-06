@@ -575,6 +575,28 @@ fn plan_workspace_consent(key: WorkspaceConsentKey, trimmed: &str) -> SettingsPa
     }
 }
 
+/// Apply a typed native shortcut through the same persisted settings boundary as the settings panel.
+fn apply_font_size_adjustment(
+    base: &Path,
+    adjustment: maestro_renderer::FontSizeAdjustment,
+) -> Result<u32, maestro_app::SettingsFailure> {
+    use maestro_renderer::FontSizeAdjustment;
+    let current = effective_settings(base).appearance.font_size_px;
+    let next = match adjustment {
+        FontSizeAdjustment::Increase => {
+            current.saturating_add(1).min(maestro_app::MAX_FONT_SIZE_PX)
+        }
+        FontSizeAdjustment::Decrease => {
+            current.saturating_sub(1).max(maestro_app::MIN_FONT_SIZE_PX)
+        }
+        FontSizeAdjustment::Reset => maestro_app::DEFAULT_FONT_SIZE_PX,
+    };
+    if next != current {
+        set_font_size_px(base, next)?;
+    }
+    Ok(next)
+}
+
 /// Bounded status label shown after a settings-panel submit attempt. Pure and unit-testable. The
 /// key fragment is sanitized; reasons are short fixed literals so nothing unbounded leaks.
 fn settings_panel_submit_status_label(
@@ -713,6 +735,7 @@ fn react_chrome_allowed_fields(intent_type: &str) -> Option<&'static [&'static s
         ],
         "updateProject" => &["project_id", "name", "root", "icon", "accent_color"],
         "deleteProject" => &[
+            "request_id",
             "project_id",
             "remove_record",
             "keep_working_directory",
@@ -947,6 +970,8 @@ enum ReactChromeIntent {
     },
     #[serde(rename = "deleteProject")]
     DeleteProject {
+        #[serde(default)]
+        request_id: Option<String>,
         project_id: String,
         remove_record: bool,
         keep_working_directory: bool,
@@ -3303,7 +3328,7 @@ fn dashboard_react_project_detail(
         "default_workspace_policy": project.default_workspace_policy,
         "last_active_at_ms": project.last_active_at_ms,
         // The built-in "Terminal" project (system) + user-hidden flag — the React chrome uses these to simplify its
-        // dialogs (Terminal: rename/color/icon only, no agent/folder) + refuse delete.
+        // dialogs (Terminal: rename/color/icon only, no agent/folder).
         "system": project.system,
         "hidden": project.hidden,
         "windows": windows,
@@ -5459,7 +5484,7 @@ fn visible_stable_product_startup_target(
 }
 
 /// On a fresh install (ZERO projects on disk), seed the built-in "Terminal" project: a `system: true` project (rename-
-/// able + hideable but never deletable) holding one PLAIN-BASH window (SessionKind::Shell, LaunchSpec::OptOut). This
+/// able + hideable) holding one PLAIN-BASH window (SessionKind::Shell, LaunchSpec::OptOut). This
 /// replaces the old bare/unassigned startup window with a real project-OWNED window, so the disk↔app mirror always
 /// holds and the window reaches the remote. Idempotent: no-op when any project exists OR the system project already
 /// exists. Best-effort — every step logs + proceeds so a fresh start never hard-fails on bootstrap.
@@ -8855,8 +8880,7 @@ fn fallback_window_after_deletion(
         wid != PRODUCT_RECOVERY_WINDOW_ID
             && windows.iter().any(|(id, visible)| id == wid && *visible)
     };
-    // 1. The system "Terminal" project's first surviving window (it is never deletable, so after a
-    //    cascade delete of any user project this is the guaranteed safe harbor).
+    // 1. Prefer a surviving system "Terminal" window, if that project still exists.
     let first_owned_candidate = |projects: Vec<&DeletionFallbackProject>| {
         projects.into_iter().find_map(|project| {
             project
@@ -11788,10 +11812,12 @@ fn validated_product_shell_target(
     let tab_valid = if is_recovery {
         recovery_layout_shape_valid(&layout)
     } else {
+        // Stash is user presentation, not loss of ownership. Revive seals the complete stashed
+        // graph before its layout CAS; requiring visibility here makes that ordering impossible.
         layout
             .tabs
             .iter()
-            .filter(|tab| tab.tab_id == tab_id && tab.session_id == session_id && !tab.stashed)
+            .filter(|tab| tab.tab_id == tab_id && tab.session_id == session_id)
             .count()
             == 1
     };
@@ -17428,14 +17454,17 @@ fn spawn_window_event_listener(
                             }
                         }
                         ReactChromeIntent::DeleteProject {
+                            request_id,
                             project_id,
                             remove_record,
                             keep_working_directory,
                             close_open_windows,
                         } => {
-                            if !remove_record {
-                                eprintln!(
-                                    "attach-tab: React deleteProject ignored project={project_id:?}; remove_record=false"
+                            if !remove_record || !keep_working_directory || !close_open_windows {
+                                launch_mutation::reject(
+                                    &mut tab_runtime,
+                                    request_id.as_deref(),
+                                    "Delete project removes its entry and panes, but always keeps your working folder and provider history.".into(),
                                 );
                                 continue;
                             }
@@ -17444,8 +17473,12 @@ fn spawn_window_event_listener(
                             {
                                 Ok(plan) => plan,
                                 Err(error) => {
-                                    eprintln!(
-                                        "attach-tab: React deleteProject could not prepare complete ownership for {project_id:?}; nothing changed: {error}"
+                                    launch_mutation::reject(
+                                        &mut tab_runtime,
+                                        request_id.as_deref(),
+                                        format!(
+                                            "Could not delete project; nothing changed: {error}"
+                                        ),
                                     );
                                     continue;
                                 }
@@ -17456,8 +17489,10 @@ fn spawn_window_event_listener(
                             ) {
                                 Ok(layouts) => layouts,
                                 Err(error) => {
-                                    eprintln!(
-                                        "attach-tab: React deleteProject could not load every owned window for {project_id:?}; nothing changed: {error}"
+                                    launch_mutation::reject(
+                                        &mut tab_runtime,
+                                        request_id.as_deref(),
+                                        format!("Could not load project windows; nothing changed: {error}"),
                                     );
                                     continue;
                                 }
@@ -17470,7 +17505,7 @@ fn spawn_window_event_listener(
                             let active_window_removed =
                                 removed_window_ids.contains(&listener_window_id);
                             // Same decision as the remote-delete guard in the idle tick: prefer the
-                            // SYSTEM Terminal project's window (undeletable → always a safe harbor),
+                            // surviving SYSTEM Terminal project's window,
                             // then any other surviving window. Computed BEFORE the rows are deleted,
                             // so the to-be-removed windows are passed as exclusions.
                             let fallback_window = if active_window_removed {
@@ -17488,6 +17523,11 @@ fn spawn_window_event_listener(
                                 &plan,
                             ) {
                                 Ok(mut result) => {
+                                    launch_mutation::respond(
+                                        &mut tab_runtime,
+                                        request_id.as_deref(),
+                                        Ok(()),
+                                    );
                                     let renderer_ready_for_release = if active_window_removed {
                                         let lost_window_id = listener_window_id.clone();
                                         let viewport_cleared =
@@ -17600,8 +17640,10 @@ fn spawn_window_event_listener(
                                     );
                                 }
                                 Err(error) => {
-                                    eprintln!(
-                                        "attach-tab: React deleteProject failed closed for {project_id:?}; project records were preserved: {error}"
+                                    launch_mutation::reject(
+                                        &mut tab_runtime,
+                                        request_id.as_deref(),
+                                        format!("Could not delete project; project records were preserved: {error}"),
                                     );
                                 }
                             }
@@ -21623,6 +21665,21 @@ fn spawn_window_event_listener(
                             "attach-tab: settings-panel shortcut could not reach the renderer \
                                      (non-fatal; panel not shown): {e}"
                         );
+                    }
+                }
+                maestro_renderer::RendererEvent::FontSizeAdjustmentRequested { adjustment } => {
+                    // Resolve each repeat against fresh persisted settings, not the renderer's
+                    // asynchronously applied metric. Reuse the normal writer and live resize path;
+                    // other windows observe the same setting through their appearance watcher.
+                    match apply_font_size_adjustment(&listener_base, adjustment) {
+                        Ok(px) => {
+                            let _ = tab_runtime.font_size_runtime().set_font_size(px);
+                        }
+                        Err(_) => {
+                            let _ = tab_runtime.set_status_label(Some(format!(
+                                "{listener_base_status_label} · Terminal font size was not saved"
+                            )));
+                        }
                     }
                 }
                 // Settings-panel close/toggle intent. The renderer reports this ONLY when the
@@ -28455,6 +28512,7 @@ mod foreground_react_chrome_listener_invariant {
             intent,
             ReactChromeIntent::DeleteProject {
                 project_id,
+                request_id: None,
                 remove_record: true,
                 keep_working_directory: true,
                 close_open_windows: true,
@@ -28655,6 +28713,54 @@ mod renderer_control_channel_reachability {
     };
 
     #[test]
+    fn terminal_font_adjustment_persists_each_repeat_and_reset_preserving_other_settings() {
+        use maestro_renderer::FontSizeAdjustment::*;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        set_theme(base, "high_contrast_dark").unwrap();
+        for (adjustment, expected) in [(Decrease, 15), (Decrease, 14), (Increase, 15), (Reset, 16)]
+        {
+            assert_eq!(
+                super::apply_font_size_adjustment(base, adjustment).unwrap(),
+                expected
+            );
+            let settings = effective_settings(base);
+            assert_eq!(settings.appearance.font_size_px, expected);
+            assert_eq!(settings.appearance.theme, "high_contrast_dark");
+        }
+    }
+
+    #[test]
+    fn terminal_font_adjustment_clamps_both_bounds() {
+        use maestro_renderer::FontSizeAdjustment::*;
+        let dir = tempfile::tempdir().unwrap();
+        for (px, adjustment) in [
+            (maestro_app::MIN_FONT_SIZE_PX, Decrease),
+            (maestro_app::MAX_FONT_SIZE_PX, Increase),
+        ] {
+            set_font_size_px(dir.path(), px).unwrap();
+            assert_eq!(
+                super::apply_font_size_adjustment(dir.path(), adjustment).unwrap(),
+                px
+            );
+            assert_eq!(effective_settings(dir.path()).appearance.font_size_px, px);
+        }
+    }
+
+    #[test]
+    fn terminal_font_adjustment_reports_write_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("not-a-directory");
+        std::fs::write(&blocked, b"fixture").unwrap();
+        assert!(super::apply_font_size_adjustment(
+            &blocked,
+            maestro_renderer::FontSizeAdjustment::Increase
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&blocked).unwrap(), b"fixture");
+    }
+
+    #[test]
     fn app_can_construct_a_renderer_command_and_reference_the_entrypoint() {
         let command = maestro_renderer::RendererCommand::AttachSession {
             session_id: "s-1".to_string(),
@@ -28819,6 +28925,7 @@ mod renderer_control_channel_reachability {
             | maestro_renderer::RendererEvent::CommandPaletteActionActivated { .. }
             | maestro_renderer::RendererEvent::CommandPaletteOpenRequested
             | maestro_renderer::RendererEvent::SettingsPanelOpenRequested
+            | maestro_renderer::RendererEvent::FontSizeAdjustmentRequested { .. }
             | maestro_renderer::RendererEvent::SettingsPanelCloseRequested
             | maestro_renderer::RendererEvent::SettingsPanelRowSelected { .. }
             | maestro_renderer::RendererEvent::SettingsPanelRowActivated { .. }
@@ -28880,6 +28987,7 @@ mod renderer_control_channel_reachability {
             | maestro_renderer::RendererEvent::CommandPaletteActionActivated { .. }
             | maestro_renderer::RendererEvent::CommandPaletteOpenRequested
             | maestro_renderer::RendererEvent::SettingsPanelOpenRequested
+            | maestro_renderer::RendererEvent::FontSizeAdjustmentRequested { .. }
             | maestro_renderer::RendererEvent::SettingsPanelCloseRequested
             | maestro_renderer::RendererEvent::SettingsPanelRowSelected { .. }
             | maestro_renderer::RendererEvent::SettingsPanelRowActivated { .. }
@@ -32823,6 +32931,54 @@ mod product_startup_target_tests {
     }
 
     #[test]
+    fn deleted_built_in_terminal_is_not_recreated_while_a_user_project_survives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::with_base(tmp.path().join("base"));
+        ensure_product_startup_target(&paths, 1).unwrap();
+        let projects = ProjectService::new(&paths);
+        projects
+            .create(
+                "user-project",
+                "User",
+                tmp.path().to_string_lossy(),
+                NewProject::default(),
+                2,
+            )
+            .unwrap();
+        super::seed_default_project_window(
+            &paths,
+            "user-project",
+            tmp.path().to_string_lossy().as_ref(),
+            maestro_shell::records::SessionKind::Shell,
+            maestro_shell::records::LaunchSpec::OptOut,
+            3,
+        )
+        .unwrap();
+        let plan = projects.plan_delete(SYSTEM_TERMINAL_PROJECT_ID).unwrap();
+        let resolved = plan
+            .kill_session_ids
+            .iter()
+            .map(|id| {
+                (
+                    id.clone(),
+                    maestro_shell::PreResolvedSessionState::ConfirmedAbsent,
+                )
+            })
+            .collect();
+        projects
+            .commit_delete_preserving_global_last(&plan, &resolved, 4)
+            .unwrap();
+        super::bootstrap_system_terminal_if_empty(&paths);
+        let target = ensure_product_startup_target(&paths, 5).unwrap();
+        assert_eq!(target.project_id, "user-project");
+        assert!(projects.load(SYSTEM_TERMINAL_PROJECT_ID).unwrap().is_none());
+        assert!(projects
+            .load(PRODUCT_RECOVERY_PROJECT_ID)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn hidden_system_project_is_skipped_without_being_unhidden() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = AppPaths::with_base(tmp.path().join("base"));
@@ -34280,9 +34436,25 @@ mod product_startup_target_tests {
 
     #[test]
     fn all_stashed_recovery_can_revive_retained_real_pane_before_mutating_layout() {
+        assert_stashed_retained_pane_revives_without_restart(false);
+    }
+
+    #[test]
+    fn stashed_builtin_terminal_revive_preserves_generation_and_seals_before_layout_commit() {
+        assert_stashed_retained_pane_revives_without_restart(true);
+    }
+
+    fn assert_stashed_retained_pane_revives_without_restart(builtin: bool) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = AppPaths::with_base(tmp.path().join("base"));
-        let mut target = seed_user_target(&paths, tmp.path());
+        let mut target = if builtin {
+            ensure_product_startup_target(&paths, 1).expect("normal product bootstrap")
+        } else {
+            seed_user_target(&paths, tmp.path())
+        };
+        if builtin {
+            target.session.status = SessionStatus::Live;
+        }
         target.session.last_known_generation = Some("retained".into());
         store::write_record(
             &paths,
@@ -34337,17 +34509,47 @@ mod product_startup_target_tests {
             assert!(!remainder.contains("start_session"));
         });
 
-        revive_recorded_pane_after_preflight(
-            &paths,
-            &socket,
-            &target.layout.window_id,
-            &target.tab_id,
-            &target.session.session_id,
-            &["sh".to_string()],
-            RecordedPaneOpenPolicy::Product,
-            21,
-        )
-        .expect("retained real pane exact-attaches before revive");
+        if builtin {
+            let prepared = super::preflight_recorded_pane_revive(
+                &paths,
+                &socket,
+                &target.layout.window_id,
+                &target.tab_id,
+                &target.session.session_id,
+                &["sh".to_string()],
+                RecordedPaneOpenPolicy::Product,
+                21,
+            )
+            .expect("retained built-in exact-attaches before revive");
+            assert!(
+                windows
+                    .load(&target.layout.window_id)
+                    .unwrap()
+                    .unwrap()
+                    .tabs[0]
+                    .stashed
+            );
+            windows
+                .commit_prepared_pane_revive(prepared.layout, 21)
+                .unwrap();
+            drop(prepared.attachment_handoff);
+        } else {
+            revive_recorded_pane_after_preflight(
+                &paths,
+                &socket,
+                &target.layout.window_id,
+                &target.tab_id,
+                &target.session.session_id,
+                &["sh".to_string()],
+                RecordedPaneOpenPolicy::Product,
+                21,
+            )
+            .expect("retained real pane exact-attaches before revive");
+        }
+        let attached: SessionRecord =
+            loaded(&paths, RecordKind::Session, &target.session.session_id);
+        assert_eq!(attached.last_known_generation.as_deref(), Some("retained"));
+        assert_eq!(attached.status, SessionStatus::Live);
         server.join().unwrap();
 
         let revived = windows.load(&target.layout.window_id).unwrap().unwrap();
@@ -34367,6 +34569,52 @@ mod product_startup_target_tests {
             },
             PRODUCT_RECOVERY_WINDOW_ID,
         ));
+    }
+
+    #[test]
+    fn stashed_builtin_terminal_revive_refuses_changed_owner_without_layout_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::with_base(tmp.path().join("base"));
+        let target = ensure_product_startup_target(&paths, 1).unwrap();
+        let windows = WindowLayoutService::new(&paths);
+        windows
+            .set_tab_stashed(&target.layout.window_id, &target.tab_id, true, 2)
+            .unwrap();
+        let expected = windows.load(&target.layout.window_id).unwrap().unwrap();
+        let mut other_project: maestro_shell::Project =
+            loaded(&paths, RecordKind::Project, SYSTEM_TERMINAL_PROJECT_ID);
+        other_project.project_id = "unrelated-owner".into();
+        other_project.window_order.clear();
+        store::write_record(
+            &paths,
+            RecordKind::Project,
+            &other_project.project_id,
+            2,
+            &other_project,
+        )
+        .unwrap();
+        store::set_window_project(&paths, &target.layout.window_id, "unrelated-owner").unwrap();
+        let error = match super::preflight_recorded_pane_revive(
+            &paths,
+            &tmp.path().join("must-not-connect.sock"),
+            &target.layout.window_id,
+            &target.tab_id,
+            &target.session.session_id,
+            &["sh".into()],
+            RecordedPaneOpenPolicy::Product,
+            3,
+        ) {
+            Ok(_) => panic!("changed owner must not grant reserved authority"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("no coherent sealed authority"));
+        assert_eq!(
+            windows.load(&target.layout.window_id).unwrap().unwrap(),
+            expected
+        );
+        let session: SessionRecord =
+            loaded(&paths, RecordKind::Session, &target.session.session_id);
+        assert_eq!(session, target.session);
     }
 
     #[test]

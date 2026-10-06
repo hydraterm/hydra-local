@@ -199,6 +199,14 @@ describe('native topbar semantics and intents', () => {
       expect(intents[intents.length - 1]).toEqual({
         type: 'focusWindow', project_id: 'sample', window_id: 'w-sample',
       })
+      expect(intents.some((intent) => intent.type === 'reorderWindowPresentation')).toBe(false)
+      expect(toolbar.findAll((node) =>
+        typeof node.props['aria-label'] === 'string' && node.props['aria-label'].startsWith('Focus '),
+      ).map((button) => button.props['aria-label'])).toEqual([
+        'Focus Release checks in Sample Workspace',
+        'Focus Analytics report in Sample Analytics',
+        'Focus Dashboard build in Sample Workspace',
+      ])
       expect(model.global_window_order).toEqual(['missing', 'w-2', 'w-sample', 'w-main'])
     },
   )

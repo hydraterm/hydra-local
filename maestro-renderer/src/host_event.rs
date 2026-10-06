@@ -114,8 +114,16 @@ pub enum HostPointerButton {
 /// Neutral scroll delta (winit `MouseScrollDelta`): line-based or pixel-based.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum HostScrollDelta {
-    Lines { x: f32, y: f32 },
-    Pixels { x: f64, y: f64 },
+    Lines {
+        x: f32,
+        y: f32,
+    },
+    // GTK3 scroll events use line units; only the winit adapter produces pixel deltas.
+    #[cfg(any(not(target_os = "linux"), test))]
+    Pixels {
+        x: f64,
+        y: f64,
+    },
 }
 
 /// Neutral IME event. The renderer only acts on `Commit`; preedit/enable/disable are display-only no-ops today

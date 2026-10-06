@@ -420,7 +420,9 @@ fn project_deletion_plan(
             retained_shared_session_ids: Vec::new(),
         });
     };
-    if system {
+    // The visible built-in Terminal is a user project too. Only the internal recovery
+    // target is reserved; ordinary user deletion still preserves the global last window.
+    if system && project_id == crate::reserved_product_shell::PRODUCT_RECOVERY_PROJECT_ID {
         return Err(ProjectServiceError::SystemProjectCannotBeDeleted {
             project_id: project_id.to_string(),
         });
@@ -634,8 +636,8 @@ pub enum ProjectServiceError {
     /// `reorder` was given an order that is not an exact permutation of the existing project ids
     /// (missing id, unknown id, or a duplicate). Nothing was rewritten.
     InvalidOrder { reason: String },
-    /// `delete` was called on a SYSTEM project (the built-in "Terminal"). System projects can be renamed + hidden
-    /// but never deleted. Nothing was removed.
+    /// A reserved recovery project or an internal system-project rollback was refused.
+    /// Nothing was removed.
     SystemProjectCannotBeDeleted { project_id: String },
     /// The database ownership graph changed after the daemon cleanup plan was prepared. Nothing
     /// was deleted; the caller must prepare and execute a fresh plan.
@@ -764,7 +766,7 @@ pub struct NewProject {
     pub launch_defaults: Option<super::records::ProjectLaunchDefaults>,
     /// Extra named folders pinned for window creation. Empty when none.
     pub directories: Vec<super::records::ProjectDirectory>,
-    /// Mark this a SYSTEM project (the built-in "Terminal"): renameable + hideable but never deletable. Ordinary
+    /// Mark this a SYSTEM project (for example the built-in "Terminal"). Ordinary
     /// user projects leave this false.
     pub system: bool,
 }
@@ -2583,13 +2585,13 @@ mod tests {
     }
 
     #[test]
-    fn delete_refuses_a_system_project_but_allows_ordinary_ones() {
+    fn delete_refuses_internal_recovery_but_allows_ordinary_projects() {
         let (_t, paths) = temp_paths();
-        // system "Terminal" — must NOT be deletable
+        // The internal recovery target is not an ordinary dashboard project.
         svc(&paths)
             .create(
-                "system-terminal",
-                "Terminal",
+                crate::reserved_product_shell::PRODUCT_RECOVERY_PROJECT_ID,
+                "Recovery",
                 "/",
                 NewProject {
                     system: true,
@@ -2603,7 +2605,9 @@ mod tests {
             .create("u1", "User", "/u", NewProject::default(), 1)
             .unwrap();
 
-        let err = svc(&paths).plan_delete("system-terminal").unwrap_err();
+        let err = svc(&paths)
+            .plan_delete(crate::reserved_product_shell::PRODUCT_RECOVERY_PROJECT_ID)
+            .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -2612,10 +2616,58 @@ mod tests {
             "system project delete must be refused, got {err:?}"
         );
         // the record is still there
-        assert!(svc(&paths).load("system-terminal").unwrap().is_some());
+        assert!(svc(&paths)
+            .load(crate::reserved_product_shell::PRODUCT_RECOVERY_PROJECT_ID)
+            .unwrap()
+            .is_some());
         // ordinary delete still works
         assert!(commit_delete(&paths, "u1").removed);
         assert!(svc(&paths).load("u1").unwrap().is_none());
+    }
+
+    #[test]
+    fn built_in_terminal_deletes_only_when_another_visible_window_survives() {
+        let (_t, paths) = temp_paths();
+        let service = svc(&paths);
+        service
+            .create(
+                "system-terminal",
+                "Terminal",
+                "/",
+                NewProject {
+                    system: true,
+                    ..Default::default()
+                },
+                1,
+            )
+            .unwrap();
+        create_visible_assigned_window(
+            &paths,
+            "terminal-window",
+            "system-terminal",
+            "terminal-tab",
+        );
+        let plan = service.plan_delete("system-terminal").unwrap();
+        let resolved = confirmed_absent_resolutions(&plan);
+        assert!(matches!(
+            service.commit_delete_preserving_global_last(&plan, &resolved, 2),
+            Err(ProjectServiceError::GloballyLastVisibleWindow { .. })
+        ));
+        assert!(service.load("system-terminal").unwrap().is_some());
+        service
+            .create("other", "Other", "/other", NewProject::default(), 3)
+            .unwrap();
+        create_visible_assigned_window(&paths, "other-window", "other", "other-tab");
+        let plan = service.plan_delete("system-terminal").unwrap();
+        let result = service
+            .commit_delete_preserving_global_last(&plan, &confirmed_absent_resolutions(&plan), 4)
+            .unwrap();
+        assert!(result.removed);
+        assert!(service.load("system-terminal").unwrap().is_none());
+        assert!(crate::WindowLayoutService::new(&paths)
+            .load("other-window")
+            .unwrap()
+            .is_some());
     }
 
     #[test]

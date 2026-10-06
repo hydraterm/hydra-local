@@ -258,7 +258,9 @@ fn graph_base_shape(kind: ReservedProductShellKind, graph: &ReservedProductShell
                     .tabs
                     .iter()
                     .filter(|tab| {
-                        tab.tab_id == ids.tab_id && tab.session_id == ids.session_id && !tab.stashed
+                        // A user-stashed built-in remains owned. Its exact stash state and the
+                        // mutation epoch are still sealed and rechecked before publication.
+                        tab.tab_id == ids.tab_id && tab.session_id == ids.session_id
                     })
                     .count()
                     == 1
@@ -824,6 +826,66 @@ mod tests {
             9,
         )
         .expect("legitimate System sibling topology remains authorized");
+    }
+
+    #[test]
+    fn stashed_system_authority_seals_the_exact_stash_state_and_epoch() {
+        let temp = TempDir::new().unwrap();
+        let (paths, graph) = seed_reserved(&temp, ReservedProductShellKind::SystemTerminal);
+        let windows = crate::WindowLayoutService::new(&paths);
+        windows
+            .set_tab_stashed(SYSTEM_TERMINAL_WINDOW_ID, SYSTEM_TERMINAL_TAB_ID, true, 5)
+            .unwrap();
+        let authority = ReservedProductShellStart::load(
+            &paths,
+            ReservedProductShellKind::SystemTerminal,
+            &graph.session,
+            &graph.workspace,
+            vec!["/bin/sh".into()],
+            80,
+            24,
+            6,
+        )
+        .expect("normal stash remains an owned built-in shell");
+        assert!(authority.graph.layout.tabs[0].stashed);
+        assert!(authority.graph_matches_in_snapshot(&paths).unwrap());
+        windows
+            .set_tab_stashed(SYSTEM_TERMINAL_WINDOW_ID, SYSTEM_TERMINAL_TAB_ID, false, 7)
+            .unwrap();
+        assert!(
+            !authority.graph_matches_in_snapshot(&paths).unwrap(),
+            "visibility change invalidates the old sealed graph"
+        );
+        windows
+            .set_tab_stashed(SYSTEM_TERMINAL_WINDOW_ID, SYSTEM_TERMINAL_TAB_ID, true, 8)
+            .unwrap();
+        assert!(
+            !authority.graph_matches_in_snapshot(&paths).unwrap(),
+            "ABA stash change cannot reuse the old epoch"
+        );
+    }
+
+    #[test]
+    fn stashed_recovery_remains_invalid_reserved_topology() {
+        let temp = TempDir::new().unwrap();
+        let (paths, graph) = seed_reserved(&temp, ReservedProductShellKind::ProductRecovery);
+        crate::WindowLayoutService::new(&paths)
+            .set_tab_stashed(PRODUCT_RECOVERY_WINDOW_ID, PRODUCT_RECOVERY_TAB_ID, true, 5)
+            .unwrap();
+        assert!(
+            ReservedProductShellStart::load(
+                &paths,
+                ReservedProductShellKind::ProductRecovery,
+                &graph.session,
+                &graph.workspace,
+                vec!["/bin/sh".into()],
+                80,
+                24,
+                6,
+            )
+            .is_err(),
+            "hidden recovery has no user stash/revive action"
+        );
     }
 
     #[test]
