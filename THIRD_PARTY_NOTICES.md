@@ -11,9 +11,9 @@ change or replace any upstream licence.
 - `hydra-agent/Cargo.lock` SHA-256: `7975a2d18916737df32457a372eedfb1f60c19217841999ec8671b022beb88d4`
 - Standalone WebRTC agent dependency versions: 343
 - npm dependency versions: 188
-- `web-client/package-lock.json` SHA-256: `82a5509d84c09e94c73944ef5c757d892fff2bb5c3435dca1d96207330908168`
+- `web-client/package-lock.json` SHA-256: `8bf5ac450cac220bb16df6e2be38307a1990fab9221c228d398b8fdcd4a2a7d4`
 - Browser-core development dependency versions: 95
-- `hydra-cloud/package-lock.json` SHA-256: `7f5ddebc65344d243e81b92debe52a231e7c5111a1d7abd007ebbffc81eea1ba`
+- `hydra-cloud/package-lock.json` SHA-256: `3c158e0d7471a62118fb7b156c9b5dc462da702732059076bd3c988ffb98fd57`
 - Broker-core development dependency versions: 94
 
 The source repository does not vendor these dependencies. Package managers retrieve each
@@ -1234,7 +1234,7 @@ than bundled tool notices. Tool redistributors must review the actual material t
 | `postcss` | `8.5.26` | `MIT` | [source](https://www.npmjs.com/package/postcss) |
 | `rollup` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/rollup) |
 | `siginfo` | `2.0.0` | `ISC` | [source](https://www.npmjs.com/package/siginfo) |
-| `source-map-js` | `1.2.1` | `BSD-3-Clause` | [source](https://www.npmjs.com/package/source-map-js) |
+| `source-map-js` | `1.2.2` | `BSD-3-Clause` | [source](https://www.npmjs.com/package/source-map-js) |
 | `stackback` | `0.0.2` | `MIT` | [source](https://www.npmjs.com/package/stackback) |
 | `std-env` | `4.2.0` | `MIT` | [source](https://www.npmjs.com/package/std-env) |
 | `tinybench` | `2.9.0` | `MIT` | [source](https://www.npmjs.com/package/tinybench) |
@@ -1333,7 +1333,7 @@ than bundled tool notices. Tool redistributors must review the actual material t
 | `postcss` | `8.5.26` | `MIT` | [source](https://www.npmjs.com/package/postcss) |
 | `rollup` | `4.62.2` | `MIT` | [source](https://www.npmjs.com/package/rollup) |
 | `siginfo` | `2.0.0` | `ISC` | [source](https://www.npmjs.com/package/siginfo) |
-| `source-map-js` | `1.2.1` | `BSD-3-Clause` | [source](https://www.npmjs.com/package/source-map-js) |
+| `source-map-js` | `1.2.2` | `BSD-3-Clause` | [source](https://www.npmjs.com/package/source-map-js) |
 | `stackback` | `0.0.2` | `MIT` | [source](https://www.npmjs.com/package/stackback) |
 | `std-env` | `4.2.0` | `MIT` | [source](https://www.npmjs.com/package/std-env) |
 | `tinybench` | `2.9.0` | `MIT` | [source](https://www.npmjs.com/package/tinybench) |
