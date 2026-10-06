@@ -6,7 +6,7 @@ Remote browser/broker tool locks and the separate WebRTC agent source graph. It 
 change or replace any upstream licence.
 
 - `Cargo.lock` SHA-256: `26d6dd5cfd23c9af278ebe66eeb3dd882aef87a20572ccbc9351fbf8f7c7fce1`
-- `dashboard-ui/package-lock.json` SHA-256: `1b24584cf696a0a1993ec68a943b0a361116b7e765e9c2cd464a19e4da140401`
+- `dashboard-ui/package-lock.json` SHA-256: `8c5ef57bf3d91150fcaa94440629882bdb21c5ec608e0fd4a4466c02100557dd`
 - Rust dependency versions: 543
 - `hydra-agent/Cargo.lock` SHA-256: `7975a2d18916737df32457a372eedfb1f60c19217841999ec8671b022beb88d4`
 - Standalone WebRTC agent dependency versions: 343
@@ -1109,7 +1109,7 @@ binary policies and their locked graph are unchanged by this source-only invento
 | `scheduler` | `0.23.2` | `MIT` | [source](https://www.npmjs.com/package/scheduler) |
 | `semver` | `6.3.1` | `ISC` | [source](https://www.npmjs.com/package/semver) |
 | `siginfo` | `2.0.0` | `ISC` | [source](https://www.npmjs.com/package/siginfo) |
-| `source-map-js` | `1.2.1` | `BSD-3-Clause` | [source](https://www.npmjs.com/package/source-map-js) |
+| `source-map-js` | `1.2.2` | `BSD-3-Clause` | [source](https://www.npmjs.com/package/source-map-js) |
 | `stackback` | `0.0.2` | `MIT` | [source](https://www.npmjs.com/package/stackback) |
 | `std-env` | `4.2.0` | `MIT` | [source](https://www.npmjs.com/package/std-env) |
 | `symbol-tree` | `3.2.4` | `MIT` | [source](https://www.npmjs.com/package/symbol-tree) |
