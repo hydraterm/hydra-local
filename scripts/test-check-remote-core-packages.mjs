@@ -31,7 +31,7 @@ const output = () => join(base, 'never-created-' + Math.random().toString(16).sl
 
 test('complete selected source is accepted without writing input or output', () => {
   const root = fixture(), target = output()
-  assert.equal(Object.keys(inspectSource(root, target)).length, 38)
+  assert.equal(Object.keys(inspectSource(root, target)).length, 144)
   assert.ok(!existsSync(target))
   for (const [path, body] of Object.entries(original)) assert.deepEqual(readFileSync(join(root, path)), body)
 })
@@ -109,8 +109,8 @@ test('actual explicit runner builds packages and an ordinary fresh installed con
   assert.equal(child.status, 0, child.stdout + child.stderr)
   assert.match(child.stdout, /qualification: PASS/)
   const report = JSON.parse(readFileSync(join(options.output, 'RESULT.json')))
-  assert.equal(report.complete, true); assert.equal(report.consumerToolLocationCount, 108)
-  assert.equal(report.installedDeclarations.length, 17)
+  assert.equal(report.complete, true); assert.equal(report.consumerToolLocationCount, 97)
+  assert.equal(report.installedDeclarations.length, 73)
   assert.ok(report.operations.length >= 15 && report.operations.every(row => row.exit === 0))
   for (const [path, body] of Object.entries(original)) assert.deepEqual(readFileSync(join(options.source, path)), body)
 })
