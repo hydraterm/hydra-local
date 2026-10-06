@@ -21,6 +21,7 @@ export type Intent =
       request_id: string
       agent?: string
       resolved_launch_command?: string
+      custom_command?: string
       cwd?: string
     }
   | { type: 'pickProjectFolder'; request_id: string }
@@ -196,6 +197,7 @@ export type DashboardHost = {
 
 declare global {
   interface Window {
+    __HYDRA_DASHBOARD_SHOW_ERROR__?: (message: string) => void
     hydraDashboard?: DashboardHost
     ipc?: {
       postMessage?: (message: string) => void
@@ -642,6 +644,19 @@ export const bridge = {
     return () => sidebarStateListeners.delete(listener)
   },
 
+  subscribeDashboardError(listener: (message: string) => void): () => void {
+    const target = window
+    const receive = (message: string): void => {
+      if (typeof message === 'string' && message.trim()) listener(message.slice(0, 320))
+    }
+    target.__HYDRA_DASHBOARD_SHOW_ERROR__ = receive
+    return () => {
+      if (target.__HYDRA_DASHBOARD_SHOW_ERROR__ === receive) {
+        delete target.__HYDRA_DASHBOARD_SHOW_ERROR__
+      }
+    }
+  },
+
   dashboardOverlayReady(): void {
     postIntent({ type: 'dashboardOverlayReady' })
   },
@@ -657,13 +672,14 @@ export const bridge = {
   async preflightLaunch(input: {
     agent?: string
     resolved_launch_command?: string
+    custom_command?: string
     cwd?: string
   }): Promise<LaunchPreflightResult> {
     const resolved_launch_command = input.resolved_launch_command?.trim()
     const selectedAgent = input.agent?.trim().toLowerCase()
-    // Project creation without an initial session has no launch to validate.
+    // Without an initial session, explicit custom text still needs native syntax validation.
     // Terminal launches still go native so the working directory is checked.
-    if (!resolved_launch_command && !selectedAgent) {
+    if (!resolved_launch_command && !input.custom_command?.trim() && !selectedAgent) {
       return { ok: true, message: null, code: null }
     }
 
@@ -676,6 +692,7 @@ export const bridge = {
         request_id: 'mock',
         agent: input.agent,
         resolved_launch_command,
+        custom_command: input.custom_command?.trim() || undefined,
         cwd: input.cwd?.trim() || undefined,
       })
       return { ok: true, message: null, code: null }
@@ -702,6 +719,7 @@ export const bridge = {
         request_id,
         agent: input.agent,
         resolved_launch_command,
+        custom_command: input.custom_command?.trim() || undefined,
         cwd: input.cwd?.trim() || undefined,
       })
     })

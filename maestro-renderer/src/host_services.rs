@@ -93,7 +93,19 @@ pub trait HostServices {
 /// its GTK host adapter instead of the shell-dispatching `xdg-open` program.
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn start_native_http_open(url: &str) -> bool {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        let Some(action) = crate::windows_http::HttpOpen::prepare(url) else {
+            return false;
+        };
+        return std::thread::Builder::new()
+            .name("hydra-open-http".to_owned())
+            .spawn(move || {
+                action.open();
+            })
+            .is_ok();
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = url;
         false

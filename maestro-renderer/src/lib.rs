@@ -45,18 +45,26 @@
 mod client;
 pub mod provider_observation;
 mod selection_span;
+#[cfg(test)]
+mod test_transport;
 // Private bundled-dashboard asset origin shared by the macOS WKWebView and Linux WebKitGTK hosts.
 // Both WRY IPC backends require the current document to parse as an HTTP-style URI, which a
 // `file:///...` bundle URL does not. Keep the serving/path policy in one cross-platform boundary.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod dashboard_protocol;
 mod file_drop;
+#[cfg(any(windows, test))]
+mod windows_chrome_geometry;
+#[cfg(windows)]
+mod windows_chrome_host;
 // Platform-neutral windowing event model the App consumes. Both platforms translate native events into it via
 // a small adapter (winit on macOS, Tao/GTK on Linux) so no toolkit type reaches App. See host_event.rs.
 mod host_event;
 // Platform-neutral window-service boundary (redraw/size/scale/cursor/title/attention/IME). App routes its
 // outbound window-service calls through the `HostServices` trait so no toolkit type reaches those call sites.
 mod host_services;
+#[cfg(windows)]
+pub mod windows_http;
 // The full-window macOS Metal sublayer can trail AppKit's content allocation by one compositor
 // frame during a live resize. Keep the native backing beneath it opaque and theme-dark so that
 // interval cannot expose NSWindow's default light background.
@@ -1009,6 +1017,9 @@ fn claim_for_handoff(handoff: &RendererAttachmentHandoff) -> client::AttachmentH
 /// Optional app-owned React chrome hosted as a native child WebView.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RendererReactChrome {
+    /// Exact app-owned bundled entrypoint. Windows must not roundtrip verbatim paths through URLs.
+    #[cfg(windows)]
+    pub index_html: std::path::PathBuf,
     /// URL loaded by the child WebView, usually the bundled dashboard-ui/index.html.
     pub url: String,
     /// URL loaded by the top-band child WebView.
@@ -1022,6 +1033,37 @@ pub struct RendererReactChrome {
     pub width_logical_px: u32,
     /// Reserved top-band height in logical pixels.
     pub top_height_logical_px: u32,
+}
+
+impl RendererReactChrome {
+    /// Compose Windows-host assets with private-origin URLs, not Unix file-URL descriptors.
+    /// Kept callable across platforms for qualification tests. No filesystem access,
+    /// canonicalization, namespace-prefix stripping or WebView navigation occurs here.
+    pub fn from_native_asset(
+        index_html: &std::path::Path,
+        initialization_script: String,
+        width_logical_px: u32,
+        top_height_logical_px: u32,
+    ) -> Result<Self, String> {
+        let surface_url = |surface| {
+            dashboard_protocol::DashboardAssetServing::native_surface(index_html, surface)
+                .map(|serving| serving.url)
+                .ok_or_else(|| {
+                    "dashboard entrypoint must be an absolute path with a Unicode filename"
+                        .to_string()
+                })
+        };
+        Ok(Self {
+            #[cfg(windows)]
+            index_html: index_html.to_path_buf(),
+            url: surface_url("chrome=sidebar")?,
+            top_url: surface_url("chrome=topbar")?,
+            overlay_url: surface_url("chrome=overlay")?,
+            initialization_script,
+            width_logical_px,
+            top_height_logical_px,
+        })
+    }
 }
 
 /// The historical default glyph point size the bare renderer and demo/stress paths use when no
@@ -7848,17 +7890,37 @@ fn pane_has_header(region: RendererPaneRegion) -> bool {
     region.cols >= PANE_CLOSE_MIN_COLS && region.rows >= PANE_CLOSE_MIN_ROWS
 }
 
-/// The CONTENT sub-region of a pane: the pane region minus the reserved header row at the top (when the
-/// pane hosts a header). This is the SINGLE SOURCE OF TRUTH for where terminal content lives — the PTY
+/// The CONTENT sub-region of a pane: the pane region minus the header and a trailing gutter (when the
+/// pane hosts a header). Rect-driven dividers occupy the last column/row of the preceding pane:
+/// reserve those cells in PTY sizing too, rather than painting a separator over live terminal text.
+/// This is the SINGLE SOURCE OF TRUTH for where terminal content lives — the PTY
 /// is sized to it, the painted grid is clipped/offset to it, and absolute↔pane-local mouse coordinates
 /// subtract its origin. A pane too small for a header returns its region unchanged.
 fn pane_content_region(region: RendererPaneRegion) -> RendererPaneRegion {
-    if pane_has_header(region) {
+    pane_content_region_with_header(
+        region,
+        if pane_has_header(region) {
+            PANE_HEADER_ROWS
+        } else {
+            0
+        },
+    )
+}
+
+fn pane_content_region_with_header(
+    region: RendererPaneRegion,
+    header_rows: u16,
+) -> RendererPaneRegion {
+    if header_rows > 0 {
         RendererPaneRegion {
             col: region.col,
-            row: region.row + PANE_HEADER_ROWS,
-            cols: region.cols,
-            rows: region.rows.saturating_sub(PANE_HEADER_ROWS),
+            row: region.row + header_rows,
+            cols: region.cols.saturating_sub(1).max(1),
+            rows: region
+                .rows
+                .saturating_sub(header_rows)
+                .saturating_sub(1)
+                .max(1),
         }
     } else {
         region
@@ -9153,6 +9215,8 @@ pub enum RendererRunError {
     /// The Linux Tao/GTK DashboardHost failed to build or run (Linux only). Carries the host error text.
     #[cfg(target_os = "linux")]
     LinuxHost(String),
+    #[cfg(windows)]
+    WindowsHost(String),
 }
 
 impl std::fmt::Display for RendererRunError {
@@ -9167,6 +9231,8 @@ impl std::fmt::Display for RendererRunError {
             }
             #[cfg(target_os = "linux")]
             RendererRunError::LinuxHost(e) => write!(f, "linux dashboard host error: {e}"),
+            #[cfg(windows)]
+            RendererRunError::WindowsHost(e) => write!(f, "Windows dashboard host error: {e}"),
         }
     }
 }
@@ -9179,6 +9245,8 @@ impl std::error::Error for RendererRunError {
             RendererRunError::ViewportAuthorityUnavailable => None,
             #[cfg(target_os = "linux")]
             RendererRunError::LinuxHost(_) => None,
+            #[cfg(windows)]
+            RendererRunError::WindowsHost(_) => None,
         }
     }
 }
@@ -10458,11 +10526,19 @@ pub enum RendererEvent {
         /// Native Linux dialog ownership captured at receipt, never supplied by JavaScript.
         dialog_focus_ticket: Option<u64>,
     },
+    /// Dashboard intent received without a published terminal viewport. This is native receipt
+    /// provenance, not terminal authority: App must parse and admit only independent dashboard or
+    /// explicit recovery operations. Publishing another viewport never upgrades this event.
+    NeutralReactChromeIntent {
+        json: String,
+        dialog_focus_ticket: Option<u64>,
+        terminal_connection_closed: bool,
+    },
 }
 
 /// Durable lifecycle/disposition observations remain deliverable while the terminal viewport is
-/// neutral. Every app/chrome intent requires an all-baseline published viewport, so a WebView or
-/// retained native hit target cannot mutate App state during an exact rebind.
+/// neutral. Native pane intents still require an all-baseline published viewport. Dashboard IPC
+/// instead retains neutral provenance for App's typed recovery/global-intent admission.
 fn renderer_event_is_allowed_while_viewport_neutral(event: &RendererEvent) -> bool {
     matches!(
         event,
@@ -10497,6 +10573,8 @@ struct ViewportEventGateState {
 #[derive(Debug)]
 struct ViewportEventGate {
     state: Mutex<ViewportEventGateState>,
+    // Observe the existing reader/writer close latch even before the owner handles ConnectionClosed.
+    connection: std::sync::Weak<Shared>,
 }
 
 impl ViewportEventGate {
@@ -10507,6 +10585,14 @@ impl ViewportEventGate {
                 published,
                 exhausted: false,
             }),
+            connection: std::sync::Weak::new(),
+        }
+    }
+
+    fn for_connection(shared: &Arc<Shared>) -> Self {
+        Self {
+            connection: Arc::downgrade(shared),
+            ..Self::new(true)
         }
     }
 
@@ -10579,9 +10665,9 @@ impl ViewportEventGate {
 }
 
 /// Cloneable producer-time publication gate. The gate mutex is held through the downstream
-/// unbounded-channel enqueue, so Clear is ordered either wholly before an intent (which is dropped)
-/// or wholly after it (the intent belongs to the prior published viewport). There is no asynchronous
-/// untagged queue in which a neutral-era intent could be resurrected by a later publish.
+/// unbounded-channel enqueue, so Clear is ordered wholly before or after an intent. Neutral native
+/// pane events are dropped; chrome receives immutable neutral provenance for typed App admission.
+/// A later publish cannot upgrade that provenance to terminal authority.
 #[derive(Clone, Debug)]
 pub(crate) struct ViewportEventSink {
     events: std::sync::mpsc::Sender<RendererEvent>,
@@ -10596,9 +10682,30 @@ impl RendererEventOutput for ViewportEventSink {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !state.published && !renderer_event_is_allowed_while_viewport_neutral(&event) {
-            return Ok(());
-        }
+        let terminal_connection_closed = self
+            .gate
+            .connection
+            .upgrade()
+            .is_some_and(|shared| shared.connection_is_closed());
+        let event = if !state.published || terminal_connection_closed {
+            match event {
+                RendererEvent::ReactChromeIntent {
+                    json,
+                    dialog_focus_ticket,
+                } => {
+                    eprintln!("hydra-dashboard: routing chrome intent from neutral viewport");
+                    RendererEvent::NeutralReactChromeIntent {
+                        json,
+                        dialog_focus_ticket,
+                        terminal_connection_closed,
+                    }
+                }
+                event if renderer_event_is_allowed_while_viewport_neutral(&event) => event,
+                _ => return Ok(()),
+            }
+        } else {
+            event
+        };
         self.events.send(event)
     }
 }
@@ -10642,7 +10749,7 @@ mod viewport_event_gate_tests {
     use std::time::Duration;
 
     #[test]
-    fn producer_gate_drops_neutral_and_aba_intents_but_keeps_lifecycle_observations() {
+    fn producer_gate_preserves_neutral_chrome_provenance_and_lifecycle_across_aba() {
         let gate = Arc::new(ViewportEventGate::new(true));
         let (external, received) = mpsc::channel();
         let gated = viewport_gated_renderer_events(Some(external), Arc::clone(&gate))
@@ -10663,6 +10770,13 @@ mod viewport_event_gate_tests {
                 observed_generation: Some("gen-A".to_string()),
             })
             .unwrap();
+        assert!(matches!(
+            received.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RendererEvent::NeutralReactChromeIntent {
+                terminal_connection_closed: false,
+                ..
+            }
+        ));
         assert!(matches!(
             received.recv_timeout(Duration::from_secs(1)).unwrap(),
             RendererEvent::SessionExited { .. }
@@ -10689,6 +10803,13 @@ mod viewport_event_gate_tests {
             })
             .unwrap();
         assert!(gate.publish(next_epoch));
+        assert!(
+            matches!(
+                received.try_recv().unwrap(),
+                RendererEvent::NeutralReactChromeIntent { .. }
+            ),
+            "publication never upgrades the provenance of already-queued chrome"
+        );
         assert!(received.try_recv().is_err());
 
         let final_epoch = gate.neutralize();
@@ -10727,7 +10848,58 @@ mod viewport_event_gate_tests {
         gate.neutralize();
         send_after_close.send(()).unwrap();
         producer.join().unwrap();
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            RendererEvent::NeutralReactChromeIntent { .. }
+        ));
         assert!(received.try_recv().is_err());
+    }
+
+    #[test]
+    fn neutral_chrome_keeps_global_recovery_delivery_but_drops_native_pane_events() {
+        let shared = Arc::new(super::Shared::default());
+        let gate = Arc::new(ViewportEventGate::for_connection(&shared));
+        let (external, received) = mpsc::channel();
+        let gated = viewport_gated_renderer_events(Some(external), Arc::clone(&gate)).unwrap();
+        gate.neutralize();
+        gated
+            .send(RendererEvent::TabStripActivated {
+                window_id: "old".into(),
+                tab_id: "old".into(),
+            })
+            .unwrap();
+        gated
+            .send(RendererEvent::ReactChromeIntent {
+                json: r#"{"type":"openWindowDialog","project_id":"p"}"#.into(),
+                dialog_focus_ticket: Some(7),
+            })
+            .unwrap();
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            RendererEvent::NeutralReactChromeIntent {
+                dialog_focus_ticket: Some(7),
+                terminal_connection_closed: false,
+                ..
+            }
+        ));
+        assert!(received.try_recv().is_err());
+
+        assert!(gate.publish(gate.epoch()));
+        shared.abort_connection();
+        // The reader/writer close latch must win even before the owner processes ConnectionClosed.
+        gated
+            .send(RendererEvent::ReactChromeIntent {
+                json: r#"{"type":"reviveWindow","window_id":"w"}"#.into(),
+                dialog_focus_ticket: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            RendererEvent::NeutralReactChromeIntent {
+                terminal_connection_closed: true,
+                ..
+            }
+        ));
     }
 }
 
@@ -12031,6 +12203,10 @@ struct App {
     // no-op'ing. macOS keeps its own `react_webview` path below (this stays None there).
     #[cfg(any(not(target_os = "macos"), test))]
     chrome_host: Option<std::rc::Rc<dyn crate::host_services::ChromeHostServices>>,
+    #[cfg(windows)]
+    windows_chrome: Option<std::rc::Rc<windows_chrome_host::WindowsChromeHost>>,
+    #[cfg(windows)]
+    windows_chrome_error: Option<String>,
     #[cfg(target_os = "macos")]
     react_webview: Option<wry::WebView>,
     #[cfg(target_os = "macos")]
@@ -12124,7 +12300,7 @@ struct App {
     viewport_event_gate: Arc<ViewportEventGate>,
     /// Optional wake path back into the winit app from platform callbacks owned by child surfaces such
     /// as the embedded WebView. Tests and command-only fixtures can leave it absent.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     event_proxy: Option<EventLoopProxy<UserEvent>>,
     #[cfg(not(target_os = "linux"))]
     window: Option<Arc<Window>>,
@@ -12276,7 +12452,7 @@ impl App {
                 }
             })
             .unwrap_or(460);
-        let viewport_event_gate = Arc::new(ViewportEventGate::new(true));
+        let viewport_event_gate = Arc::new(ViewportEventGate::for_connection(&shared));
         let events = viewport_gated_renderer_events(events, Arc::clone(&viewport_event_gate));
         App {
             shared,
@@ -12324,6 +12500,10 @@ impl App {
             latest_react_chrome_model_json: None,
             #[cfg(any(not(target_os = "macos"), test))]
             chrome_host: None,
+            #[cfg(windows)]
+            windows_chrome: None,
+            #[cfg(windows)]
+            windows_chrome_error: None,
             #[cfg(target_os = "macos")]
             react_webview: None,
             #[cfg(target_os = "macos")]
@@ -12346,7 +12526,7 @@ impl App {
             picker_click_in_progress: false,
             events: AppRendererEvents(events),
             viewport_event_gate,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             event_proxy: _event_proxy,
             #[cfg(not(target_os = "linux"))]
             window: None,
@@ -12633,7 +12813,30 @@ impl App {
         }
     }
 
-    #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
+    #[cfg(windows)]
+    fn mount_react_chrome_webview(&mut self) {
+        if self.windows_chrome.is_some() {
+            return;
+        }
+        let (Some(window), Some(chrome)) = (self.window.as_ref(), self.react_chrome.as_ref())
+        else {
+            return;
+        };
+        match windows_chrome_host::WindowsChromeHost::mount(
+            window.clone(),
+            chrome,
+            self.events.clone_sink(),
+            self.event_proxy.clone(),
+        ) {
+            Ok(host) => {
+                self.chrome_host = Some(host.clone());
+                self.windows_chrome = Some(host);
+            }
+            Err(error) => self.windows_chrome_error = Some(error),
+        }
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "linux"), not(windows)))]
     fn mount_react_chrome_webview(&mut self) {}
 
     #[cfg(target_os = "macos")]
@@ -12676,7 +12879,23 @@ impl App {
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    fn resize_react_chrome_webview(&mut self) {
+        if let (Some(host), Some(chrome), Some(size)) = (
+            self.windows_chrome.as_ref(),
+            self.react_chrome.as_ref(),
+            self.windows_surface_extent(),
+        ) {
+            if let Err(error) = host.resize_to(size, chrome.width_logical_px) {
+                eprintln!("hydra-dashboard Windows resize failed: {error}");
+            }
+        }
+        // Reflect only the current allocation into React. The saved width remains intact,
+        // so a temporarily collapsed narrow window re-expands to the user's preference.
+        self.publish_react_chrome_sidebar_state();
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
     fn resize_react_chrome_webview(&mut self) {}
 
     /// Read the FOCUSED pane's latest accepted LIVE snapshot's input modes (None until its first grid).
@@ -14283,7 +14502,10 @@ impl App {
                 .map(|h| h.scale_factor() as f32)
                 .unwrap_or(1.0);
             let surface_w = self.renderer.as_ref().map(|r| r.surface_size_physical().0);
-            return surface_owned_react_inset_px(scope, chrome.width_logical_px, scale, surface_w);
+            let width = chrome.width_logical_px;
+            #[cfg(windows)]
+            let width = self.effective_react_chrome_width_logical_px(width);
+            return surface_owned_react_inset_px(scope, width, scale, surface_w);
         }
         let Some(dock) = self.dock.as_ref() else {
             return 0.0;
@@ -15118,7 +15340,10 @@ impl App {
     /// overlay. The product App hides that legacy overlay, so it consumes no PTY row.
     fn window_dims(&self) -> Option<(u16, u16)> {
         let (w, r) = (self.host.as_ref()?, self.renderer.as_ref()?);
+        #[cfg(not(windows))]
         let size = w.inner_size();
+        #[cfg(windows)]
+        let size = r.surface_size_physical();
         let scale = w.scale_factor() as f32;
         let (cw, ch) = r.cell_size_logical();
         let native_top_bar = native_top_bar_enabled(self.top_tab_bar, self.react_chrome.is_some());
@@ -17089,6 +17314,17 @@ impl ApplicationHandler<UserEvent> for App {
                 (DEFAULT_COLS * 9) as f64,
                 (DEFAULT_ROWS * 20) as f64,
             ));
+        #[cfg(windows)]
+        let attrs = {
+            use winit::platform::windows::{IconExtWindows, WindowAttributesExtWindows};
+            let icon = winit::window::Icon::from_resource(1, None).ok();
+            // Keep the opaque WGPU parent painted beneath WebView2 children. Clipping
+            // them out would let transparent browser backing reveal the desktop instead.
+            attrs
+                .with_clip_children(false)
+                .with_window_icon(icon.clone())
+                .with_taskbar_icon(icon)
+        };
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         #[cfg(target_os = "macos")]
         if let Err(error) = macos_window_backing::apply(window.as_ref(), self.theme) {
@@ -17106,6 +17342,10 @@ impl ApplicationHandler<UserEvent> for App {
         self.host = Some(host);
         self.renderer = Some(renderer);
         self.mount_react_chrome_webview();
+        #[cfg(windows)]
+        if self.windows_chrome_error.is_some() {
+            event_loop.exit();
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -17123,6 +17363,18 @@ impl ApplicationHandler<UserEvent> for App {
     // ApplicationHandler still requires the method to exist, so the signature stays.
     #[cfg(not(target_os = "linux"))]
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        #[cfg(windows)]
+        if matches!(
+            &event,
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                ..
+            }
+        ) {
+            if let Some(chrome) = self.windows_chrome.as_ref() {
+                chrome.native_pointer_pressed();
+            }
+        }
         if let Some(host_event) = crate::winit_host_adapter::host_event_from_winit(&event) {
             if self.handle_host_event(host_event) == HostControl::Exit {
                 event_loop.exit();
@@ -17734,6 +17986,34 @@ impl App {
         match event {
             HostEvent::CloseRequested => return HostControl::Exit,
             HostEvent::Resized { width, height } => {
+                // Recursive WM_SIZE events are buffered by winit. Sample the current
+                // client once, then keep child bounds and native geometry on the
+                // allocation accepted below, even if Windows advances again.
+                #[cfg(windows)]
+                let (width, height) = windows_chrome_geometry::resize_extent(
+                    (width, height),
+                    self.host.as_ref().map(|host| host.inner_size()),
+                );
+                // Start the out-of-process browser's layout before the blocking
+                // GPU surface reallocation. Previously its first resize request
+                // came only after that wait, immediately before the native frame
+                // was presented, leaving the collapsed browser rail visible in
+                // the newly expanded native sidebar reservation.
+                #[cfg(windows)]
+                if self
+                    .renderer
+                    .as_ref()
+                    .is_some_and(|r| r.accepts_surface_extent(width, height))
+                {
+                    if let (Some(host), Some(chrome)) =
+                        (self.windows_chrome.as_ref(), self.react_chrome.as_ref())
+                    {
+                        if let Err(error) = host.resize_to((width, height), chrome.width_logical_px)
+                        {
+                            eprintln!("hydra-dashboard Windows preallocation failed: {error}");
+                        }
+                    }
+                }
                 #[cfg(target_os = "linux")]
                 let surface_resize_allowed = self
                     .host
@@ -17752,7 +18032,18 @@ impl App {
                 } else {
                     false
                 };
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(windows)]
+                let surface_was_reconfigured = if let Some(r) = self.renderer.as_mut() {
+                    let previous = r.surface_size_physical();
+                    if windows_chrome_geometry::allocation_changed(previous, (width, height)) {
+                        r.resize(width, height);
+                    }
+                    // Rejected allocations must not trigger a presentation either.
+                    r.surface_size_physical() != previous
+                } else {
+                    false
+                };
+                #[cfg(not(any(target_os = "linux", windows)))]
                 if let Some(r) = self.renderer.as_mut() {
                     // Local re-layout (GPU surface). Geometry to the daemon is a
                     // separate, coalesced one-way path (window px -> daemon dims).
@@ -17766,6 +18057,14 @@ impl App {
                 self.resize_react_chrome_webview();
                 self.schedule_resize();
                 self.schedule_resize_refit();
+                // WebView child bounds above have already moved. Commit the matching
+                // native allocation now instead of leaving the last presented texture
+                // visible until a later WM_PAINT. As on Linux, keep PTY/pane geometry
+                // synchronization on the existing coalescer and trailing refit path.
+                #[cfg(windows)]
+                if surface_was_reconfigured && self.draw_frame(false) == HostControl::Exit {
+                    return HostControl::Exit;
+                }
                 // Linux presents into a Wayland subsurface / X11 child rather than the Tao
                 // top-level. A GTK allocation configures WGPU above, but Tao does not reliably
                 // emit RedrawRequested for that child across resize bursts. Present the newly
@@ -18830,6 +19129,8 @@ impl App {
                     let s = w.inner_size();
                     r.resize(s.0, s.1);
                 }
+                #[cfg(windows)]
+                self.resize_react_chrome_webview();
                 // A DPI/scale change alters cell metrics and the daemon geometry, exactly
                 // like a resize, so the scrollback policy resets the view to live in both.
                 self.force_live_view();
@@ -18933,6 +19234,12 @@ impl App {
             return;
         };
         if chrome.width_logical_px == width_logical_px {
+            // React may have optimistically expanded a temporarily collapsed narrow rail.
+            // Reassert the effective allocation even when the saved preference is unchanged.
+            #[cfg(windows)]
+            if self.effective_react_chrome_width_logical_px(width_logical_px) != width_logical_px {
+                self.publish_react_chrome_sidebar_state();
+            }
             return;
         }
         chrome.width_logical_px = width_logical_px;
@@ -18944,20 +19251,23 @@ impl App {
         // terminal slot actually grows/shrinks into the freed/consumed space (collapse/expand). Fed from the
         // SAME width state as the grid reservation so the two never diverge. On macOS the sidebar is a WebView
         // overlay resized by `resize_react_chrome_webview` above, so this is a no-op there.
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         if let Some(chrome_host) = self.chrome_host.as_ref() {
             chrome_host.set_sidebar_width(width_logical_px);
         }
+        // Native gutter drags bypass React intents. Publish the authoritative width after
+        // every change so the next DOM drag or collapse/expand cannot start from stale state.
+        self.publish_react_chrome_sidebar_state();
         self.resize.invalidate_last_sent();
         // On Linux the GTK terminal-slot allocation is the geometry authority. The sidebar
         // size request above is asynchronous, so scheduling here would sample the PRE-layout
         // (often collapsed/wide) slot and race the authoritative size_allocate event. Let that
-        // HostEvent::Resized drive the coalesced PTY resize. macOS owns one full-window surface,
-        // so its historical immediate scheduling remains byte-identical.
-        #[cfg(target_os = "macos")]
+        // HostEvent::Resized drive the coalesced PTY resize. macOS and Windows own one
+        // full-window surface: child chrome changes do not resize that parent, so schedule now.
+        #[cfg(any(target_os = "macos", windows))]
         self.schedule_resize();
         self.schedule_resize_refit();
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         if let Some(h) = self.host.as_ref() {
             h.request_redraw();
         }
@@ -18968,17 +19278,55 @@ impl App {
         let Some(chrome) = self.react_chrome.as_ref() else {
             return;
         };
+        #[cfg(not(windows))]
         let width = chrome.width_logical_px.clamp(24, 720);
-        let last_expanded = self
-            .last_expanded_react_chrome_width_logical_px
-            .clamp(180, 720);
-
+        #[cfg(windows)]
+        let _ = chrome;
         // GTK allocation is the physical authority on Linux. Reassert it after a WebKit process
         // reload, then replay the same native state into the new JS realm. The pending slot makes
         // this safe even if the React subscription has not committed yet.
+        #[cfg(not(windows))]
         if let Some(chrome_host) = self.chrome_host.as_ref() {
             chrome_host.set_sidebar_width(width);
         }
+        #[cfg(windows)]
+        self.resize_react_chrome_webview();
+        #[cfg(not(windows))]
+        self.publish_react_chrome_sidebar_state();
+    }
+
+    #[cfg(windows)]
+    fn windows_surface_extent(&self) -> Option<(u32, u32)> {
+        windows_chrome_geometry::frame_extent(
+            self.renderer.as_ref().map(|r| r.surface_size_physical()),
+            || self.host.as_ref().map(|host| host.inner_size()),
+        )
+    }
+
+    #[cfg(windows)]
+    fn effective_react_chrome_width_logical_px(&self, requested: u32) -> u32 {
+        self.host
+            .as_ref()
+            .zip(self.windows_surface_extent())
+            .map_or(requested, |(host, size)| {
+                windows_chrome_geometry::sidebar_width_logical(
+                    requested,
+                    size.0,
+                    host.scale_factor(),
+                )
+            })
+    }
+
+    fn publish_react_chrome_sidebar_state(&mut self) {
+        let Some(chrome) = self.react_chrome.as_ref() else {
+            return;
+        };
+        let width = chrome.width_logical_px.clamp(24, 720);
+        #[cfg(windows)]
+        let width = self.effective_react_chrome_width_logical_px(width);
+        let last_expanded = self
+            .last_expanded_react_chrome_width_logical_px
+            .clamp(180, 720);
         let script = format!(
             r#"(function () {{
   var state = {{ width_logical_px: {width}, last_expanded_width_logical_px: {last_expanded} }};
@@ -20954,7 +21302,7 @@ impl App {
         renderer.set_dashboard_panel(None, 0.0, None);
         renderer.set_dock_width_x(0.0);
         renderer.set_grid_origin_x(0.0);
-        renderer.set_dock_rows(Vec::new(), false);
+        renderer.set_dock_rows(Vec::new(), false, false);
         renderer.set_picker_overlay(None);
         renderer.set_command_palette_overlay(None);
         renderer.set_shortcut_hint_overlay(refusal);
@@ -20982,7 +21330,7 @@ impl App {
     }
 
     /// Compose and present one frame. Normal redraws synchronize every visible PTY/pane geometry
-    /// before painting. A Linux GTK allocation uses `sync_session_geometry = false`: its purpose is
+    /// before painting. A Linux/Windows allocation uses `sync_session_geometry = false`: its purpose is
     /// to commit a correctly sized WGPU buffer immediately, while the existing ResizeCoalescer and
     /// settled refit remain the sole bounded path for daemon winsize changes during resize bursts.
     fn draw_frame(&mut self, sync_session_geometry: bool) -> HostControl {
@@ -21347,7 +21695,7 @@ impl App {
                 (None, Some(d)) => (d.rows.clone(), d.collapsed),
                 _ => (Vec::new(), false),
             };
-            r.set_dock_rows(dock_rows, dock_collapsed);
+            r.set_dock_rows(dock_rows, dock_collapsed, self.react_chrome.is_none());
             // Foreground picker overlay (when shown): a modal list of rows drawn from physical y=0
             // OVER the grid. `None` keeps every existing launch path byte-identical. The renderer
             // draws only the row text; row order is the deterministic composition order — the renderer
@@ -21658,7 +22006,7 @@ fn run_renderer_impl(
     // All native/App/WebView producers write through one publication gate. Startup reaches this
     // point only after every exact baseline; runtime Clear/rebind closes the same Arc before local
     // projection teardown and aggregate commit reopens it afterward.
-    let viewport_event_gate = Arc::new(ViewportEventGate::new(true));
+    let viewport_event_gate = Arc::new(ViewportEventGate::for_connection(&shared));
     let renderer_events = viewport_gated_renderer_events(events, Arc::clone(&viewport_event_gate));
 
     // Only a complete aggregate baseline may create the native owner and any embedded chrome.
@@ -21795,6 +22143,10 @@ fn run_renderer_impl(
     #[cfg(not(target_os = "linux"))]
     {
         event_loop.run_app(&mut app)?;
+        #[cfg(windows)]
+        if let Some(error) = app.windows_chrome_error.take() {
+            return Err(RendererRunError::WindowsHost(error));
+        }
         Ok(())
     }
 
@@ -21847,12 +22199,12 @@ fn run_renderer_impl(
 #[cfg(test)]
 mod retained_v2_startup_admission_tests {
     use super::{client, wait_for_startup_legacy_binding, StartupEventSender};
+    use crate::test_transport::Listener as UnixListener;
     use crate::wire::{
         Cell, Color, CursorShape, DaemonEvent, GridSnapshot, NamedColor, Revision,
         SessionGeneration,
     };
     use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixListener;
     use std::sync::mpsc;
 
     fn retained_grid() -> GridSnapshot {
@@ -21899,14 +22251,17 @@ mod retained_v2_startup_admission_tests {
 
     #[test]
     fn retained_v2_no_handoff_transport_reaches_grid_without_exact_viewport() {
-        let socket = std::path::PathBuf::from("/tmp").join(format!(
-            "mr-v2-{}-{}.sock",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        let socket = crate::test_transport::endpoint(
+            std::path::Path::new("/tmp"),
+            &format!(
+                "mr-v2-{}-{}.sock",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .subsec_nanos()
+            ),
+        );
         let listener = UnixListener::bind(&socket).unwrap();
         let (release_tx, release_rx) = mpsc::channel();
         let server = std::thread::spawn(move || {
@@ -23554,12 +23909,12 @@ mod split_frame_tests {
         RESIZE_RATIO_STEP, SHORTCUT_HINT_OVERLAY_MAX_ROWS,
     };
     use crate::client::ScrollAction;
+    use crate::test_transport::Listener as UnixListener;
     use crate::wire::{
         Cell, ClientRequest, Color, CursorShape, GridSnapshot, NamedColor, Revision,
         SessionGeneration, UnderlineStyle,
     };
     use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixListener;
     use std::sync::{mpsc, Arc, Mutex};
 
     #[derive(Clone)]
@@ -23621,7 +23976,7 @@ mod split_frame_tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&base).unwrap();
-        let socket = base.join("daemon.sock");
+        let socket = crate::test_transport::endpoint(&base, "daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let instance = instance.to_string();
         let cancel_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -23650,7 +24005,7 @@ mod split_frame_tests {
                     Some("daemon_info") => {
                         writeln!(
                             stream,
-                            "{{\"ev\":\"daemon_info\",\"protocol_version\":3,\"build_version\":\"test-v3\",\"daemon_instance_id\":\"{instance}\",\"output_generation_echo\":true,\"child_environment\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"generation_conditional_attach\":true}}"
+                            "{{\"ev\":\"daemon_info\",\"protocol_version\":3,\"build_version\":\"test-v3\",\"daemon_instance_id\":\"{instance}\",\"output_generation_echo\":true,\"child_environment\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"windows_start_operation_retirement_barrier\":true,\"generation_conditional_attach\":true}}"
                         )
                         .unwrap();
                     }
@@ -23852,7 +24207,7 @@ mod split_frame_tests {
         fixture: &OwnedHandoffFixture,
         name: &str,
     ) -> OperationalClaimPeer {
-        let socket = fixture.base.join(format!("{name}.sock"));
+        let socket = crate::test_transport::endpoint(&fixture.base, &format!("{name}.sock"));
         let listener = UnixListener::bind(&socket).unwrap();
         let instance = fixture
             .authority
@@ -23880,7 +24235,7 @@ mod split_frame_tests {
             assert!(matches!(read_request(), ClientRequest::DaemonInfo));
             writeln!(
                 stream,
-                "{{\"ev\":\"daemon_info\",\"protocol_version\":3,\"build_version\":\"test-v3\",\"daemon_instance_id\":\"{instance}\",\"output_generation_echo\":true,\"child_environment\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"generation_conditional_attach\":true}}"
+                "{{\"ev\":\"daemon_info\",\"protocol_version\":3,\"build_version\":\"test-v3\",\"daemon_instance_id\":\"{instance}\",\"output_generation_echo\":true,\"child_environment\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"windows_start_operation_retirement_barrier\":true,\"generation_conditional_attach\":true}}"
             )
             .unwrap();
             stream.flush().unwrap();
@@ -24592,8 +24947,11 @@ mod split_frame_tests {
             })
             .unwrap();
         assert!(
-            app_events.try_recv().is_err(),
-            "the App-level producer gate closes at exact-rebind receipt"
+            matches!(
+                app_events.try_recv().unwrap(),
+                RendererEvent::NeutralReactChromeIntent { .. }
+            ),
+            "chrome carries neutral provenance while the terminal producer gate is closed"
         );
 
         assert!(shared.prove_test_exact_viewport_grid("sid-B", "gen-C"));
@@ -24829,8 +25187,11 @@ mod split_frame_tests {
                 })
                 .unwrap();
             assert!(
-                app_events.try_recv().is_err(),
-                "the intent gate is neutral before Unavailable reaches App"
+                matches!(
+                    app_events.try_recv().unwrap(),
+                    RendererEvent::NeutralReactChromeIntent { .. }
+                ),
+                "Unavailable does not suppress independent dashboard recovery intents"
             );
             app.handle_user_event(UserEvent::ClearViewport);
             app.handle_user_event(UserEvent::Redraw);
@@ -25084,7 +25445,7 @@ mod split_frame_tests {
         let fixture = owned_handoff_fixture("22222222222242228222222222222222");
         let authority = fixture.authority();
         let handoff = RendererAttachmentHandoff::new(authority.clone());
-        let operational_socket = fixture.base.join("operational.sock");
+        let operational_socket = crate::test_transport::endpoint(&fixture.base, "operational.sock");
         let listener = UnixListener::bind(&operational_socket).unwrap();
         let instance = authority.expected_daemon_instance().as_str().to_string();
         let token = authority.token().clone();
@@ -25104,7 +25465,7 @@ mod split_frame_tests {
             ));
             writeln!(
                 stream,
-                "{{\"ev\":\"daemon_info\",\"protocol_version\":3,\"build_version\":\"test-v3\",\"daemon_instance_id\":\"{instance}\",\"output_generation_echo\":true,\"child_environment\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"generation_conditional_attach\":true}}"
+                "{{\"ev\":\"daemon_info\",\"protocol_version\":3,\"build_version\":\"test-v3\",\"daemon_instance_id\":\"{instance}\",\"output_generation_echo\":true,\"child_environment\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"windows_start_operation_retirement_barrier\":true,\"generation_conditional_attach\":true}}"
             )
             .unwrap();
             stream.flush().unwrap();
@@ -30091,10 +30452,8 @@ mod split_frame_tests {
     }
 
     #[test]
-    fn pane_content_region_reserves_the_header_row_when_the_pane_can_host_one() {
-        // A pane big enough for the header bar gives up its TOP rows to chrome: content starts below
-        // the reserved header and is shorter by the same amount, but keeps the same column span. This is the single source of
-        // truth the PTY size, draw offset, clip height, and mouse/selection coords all read from.
+    fn pane_content_region_reserves_header_and_trailing_divider_gutters() {
+        // PTY sizing, paint and pointer routing all exclude the same separator cells.
         let region = RendererPaneRegion {
             col: 4,
             row: 2,
@@ -30106,8 +30465,8 @@ mod split_frame_tests {
             RendererPaneRegion {
                 col: 4,
                 row: 4,
-                cols: 10,
-                rows: 4,
+                cols: 9,
+                rows: 3,
             }
         );
     }
@@ -30150,10 +30509,10 @@ mod split_frame_tests {
             RendererPaneRegion {
                 col: 0,
                 row: PANE_HEADER_ROWS,
-                cols: 80,
-                rows: 30 - PANE_HEADER_ROWS,
+                cols: 79,
+                rows: 30 - PANE_HEADER_ROWS - 1,
             },
-            "real split panes still reserve their visible header"
+            "real split panes reserve their visible header and divider gutters"
         );
     }
 
@@ -34641,6 +35000,43 @@ mod tab_bar_tests {
     }
 
     #[test]
+    fn rect_pane_terminal_content_never_occupies_a_divider_cell() {
+        let strip = RendererTabStrip {
+            window_id: "gutter".into(),
+            tabs: vec![
+                rect_tab("a", None, true, [0, 0, 500, 1000]),
+                rect_tab("b", Some("a"), false, [500, 0, 500, 500]),
+                rect_tab("c", Some("a"), false, [500, 500, 500, 500]),
+            ],
+        };
+        for (cols, rows) in [(80, 24), (41, 17), (120, 40)] {
+            let layout = compute_split_layout(&strip, cols, rows).unwrap();
+            for pane in &layout.panes {
+                let content =
+                    crate::pane_content_region_for_layout(pane.region, layout.panes.len());
+                for divider in &layout.dividers {
+                    for offset in 0..divider.length {
+                        let (col, row) = if divider.glyph == '|' {
+                            (divider.col, divider.row + offset)
+                        } else {
+                            (divider.col + offset, divider.row)
+                        };
+                        let inside = col >= content.col
+                            && col < content.col + content.cols
+                            && row >= content.row
+                            && row < content.row + content.rows;
+                        assert!(
+                            !inside,
+                            "{cols}x{rows}: divider overlaps {} terminal",
+                            pane.tab_id
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn rect_divider_targets_two_pane_vertical_split() {
         // Left half | right half over an 80x24 grid: one vertical seam at col 40 spanning all rows,
         // bordering `a` on the left and `b` on the right.
@@ -35465,6 +35861,7 @@ mod command_channel_tests {
             | RendererEvent::PaneSwallowRequested { .. }
             | RendererEvent::CloseFocusedPaneRequested { .. }
             | RendererEvent::ReactChromeIntent { .. }
+            | RendererEvent::NeutralReactChromeIntent { .. }
             | RendererEvent::DividerRatioPersisted { .. }
             | RendererEvent::RemoteAccessToggleRequested { .. }
             | RendererEvent::WinsizeOwnerToggleRequested { .. }
@@ -35514,6 +35911,7 @@ mod command_channel_tests {
             | RendererEvent::PaneSwallowRequested { .. }
             | RendererEvent::CloseFocusedPaneRequested { .. }
             | RendererEvent::ReactChromeIntent { .. }
+            | RendererEvent::NeutralReactChromeIntent { .. }
             | RendererEvent::DividerRatioPersisted { .. }
             | RendererEvent::RemoteAccessToggleRequested { .. }
             | RendererEvent::WinsizeOwnerToggleRequested { .. }
@@ -39757,6 +40155,10 @@ mod terminal_selection_ownership_tests {
     }
 
     fn app_with_right_child() -> (App, Arc<Shared>, CellPos) {
+        app_with_right_child_rows(6)
+    }
+
+    fn app_with_right_child_rows(rows: usize) -> (App, Arc<Shared>, CellPos) {
         let shared = Shared::with_test_handoff_peer_facts(None, None);
         let mut app = selection_fixture_app(shared.clone());
         let tab_strip = RendererTabStrip {
@@ -39777,8 +40179,8 @@ mod terminal_selection_ownership_tests {
             &shared,
             tab_strip,
             vec![
-                ("primary", grid("primary-gen", 20, 6, "hello-primary")),
-                ("child", grid("child-gen", 20, 6, "child-copy")),
+                ("primary", grid("primary-gen", 20, rows, "hello-primary")),
+                ("child", grid("child-gen", 20, rows, "child-copy")),
             ],
         );
         let layout = app.current_split_layout().expect("two-pane layout");
@@ -41252,6 +41654,56 @@ mod idle_wake_delivery_tests {
         }
     }
 
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn full_window_sidebar_change_schedules_resize_and_redraw_before_refit() {
+        let mut app = bound_headless_app();
+        app.react_chrome = Some(super::RendererReactChrome {
+            #[cfg(windows)]
+            index_html: std::path::PathBuf::new(),
+            url: String::new(),
+            top_url: String::new(),
+            overlay_url: String::new(),
+            initialization_script: String::new(),
+            width_logical_px: 460,
+            top_height_logical_px: 46,
+        });
+        let redraws = Arc::new(AtomicUsize::new(0));
+        app.host = Some(Box::new(RedrawHost(redraws.clone())));
+        // A read-only viewport still needs a repaint. Seed queued geometry to prove the
+        // immediate scheduler runs its real read-only guard rather than leaving it to refit.
+        app.mutation_read_only = true;
+        let now = Instant::now();
+        assert_eq!(
+            app.resize.record((80, 24), now, RESIZE_MIN_INTERVAL),
+            Some((80, 24))
+        );
+        assert_eq!(app.resize.record((90, 24), now, RESIZE_MIN_INTERVAL), None);
+        assert!(app.resize.has_pending());
+
+        app.handle_user_event(UserEvent::SetReactChromeWidth {
+            width_logical_px: 377,
+        });
+
+        assert_eq!(redraws.load(Ordering::SeqCst), 1);
+        assert!(
+            !app.resize.has_pending(),
+            "immediate resize must run the mutation guard"
+        );
+        assert!(app.shared.drain_test_requests().is_empty());
+        assert!(app
+            .pending_resize_refit_at
+            .is_some_and(|deadline| deadline > now));
+        app.handle_user_event(UserEvent::SetReactChromeWidth {
+            width_logical_px: 377,
+        });
+        assert_eq!(
+            redraws.load(Ordering::SeqCst),
+            1,
+            "unchanged width stays idle"
+        );
+    }
+
     #[test]
     fn handle_user_event_applies_state_without_an_event_loop() {
         // The Linux owner loop calls `handle_user_event` directly (no ActiveEventLoop, no
@@ -41558,5 +42010,24 @@ mod linux_chrome_state_tests {
                 && script.contains("last_expanded_width_logical_px: 377")
                 && script.contains("__HYDRA_PENDING_SIDEBAR_STATE__")
         }));
+    }
+
+    #[test]
+    fn native_sidebar_resize_publishes_width_without_waiting_for_page_recovery() {
+        let mut app = headless_app(460);
+        let host = Rc::new(RecordingChromeHost::default());
+        app.chrome_host = Some(host.clone());
+
+        app.set_react_chrome_width(623);
+
+        assert_eq!(&*host.widths.borrow(), &[623]);
+        assert!(host.scripts.borrow().iter().any(|script| {
+            script.contains("width_logical_px: 623")
+                && script.contains("last_expanded_width_logical_px: 623")
+                && script.contains("__HYDRA_DASHBOARD_APPLY_SIDEBAR_STATE__")
+        }));
+        let script_count = host.scripts.borrow().len();
+        app.set_react_chrome_width(623);
+        assert_eq!(host.scripts.borrow().len(), script_count);
     }
 }

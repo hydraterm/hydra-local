@@ -133,6 +133,8 @@ export function Topbar({
   const [dragWindow, setDragWindow] = useState<string | null>(null)
   const [dropTarget, setDropTarget] = useState<{ id: string; edge: 'before' | 'after' } | null>(null)
   const restoreFocusRef = useRef<string | null>(null)
+  const windowListRef = useRef<HTMLDivElement | null>(null)
+  const activeWindowRef = useRef<HTMLSpanElement | null>(null)
   useEffect(() => {
     if (
       renaming && !windows.some(({ project: owner, window }) =>
@@ -140,6 +142,41 @@ export function Topbar({
     ) setRenaming(null)
   }, [renaming, windows])
   useEffect(() => setRequestedTabStop(defaultTabStop), [defaultTabStop])
+  useEffect(() => {
+    const list = windowListRef.current
+    if (!list) return
+    // Sidebar/shortcut activation need not focus a toolbar button. Reveal only the
+    // active group inside its strip; do not move keyboard focus or scroll the host.
+    const revealActive = (): void => {
+      const active = activeWindowRef.current
+      if (!active) return
+      const viewport = list.getBoundingClientRect()
+      if (viewport.right <= viewport.left) return
+      const bounds = active.getBoundingClientRect()
+      if (bounds.left < viewport.left) list.scrollLeft += bounds.left - viewport.left
+      else if (bounds.right > viewport.right) list.scrollLeft += bounds.right - viewport.right
+    }
+    revealActive()
+    if (typeof ResizeObserver === 'undefined') return
+    const initial = list.getBoundingClientRect()
+    let lastWidth = initial.right - initial.left
+    let disposed = false
+    const observer = new ResizeObserver(() => {
+      if (disposed) return
+      const viewport = list.getBoundingClientRect()
+      const width = viewport.right - viewport.left
+      // Ignore the initial delivery and unchanged-size notifications. In particular, do not
+      // undo manual scrolling or create a resize/scroll feedback loop.
+      if (width === lastWidth) return
+      lastWidth = width
+      revealActive()
+    })
+    observer.observe(list)
+    return () => {
+      disposed = true
+      observer.disconnect()
+    }
+  }, [defaultTabStop])
   const availableControls = windows.flatMap(({ project: owner, window }) => [
     focusWindowControl(owner.project_id, window.window_id),
     ...(globalVisibleWindowCount > 1
@@ -227,7 +264,7 @@ export function Topbar({
           {windowOrderWarning}
         </span>
       )}
-      <div className="window-tabs__left">
+      <div className="window-tabs__left" ref={windowListRef}>
         {windows.map(({ project: owner, window: w }) => {
           const controlId = focusWindowControl(owner.project_id, w.window_id)
           const isRenaming = renaming === controlId
@@ -246,6 +283,7 @@ export function Topbar({
           return (
             <span
               key={`${owner.project_id}:${w.window_id}`}
+              ref={isActive ? activeWindowRef : undefined}
               className={`window-tab-group ${isActive ? 'is-active' : ''} ${isRenaming ? 'is-renaming' : ''} ${dropTarget?.id === w.window_id ? `drop-${dropTarget.edge}` : ''}`}
               onDragEnter={acceptLocalDrag}
               onDragOver={acceptLocalDrag}
@@ -362,7 +400,8 @@ export function Topbar({
         tabIndex={tabIndexFor(NEW_WINDOW_CONTROL)}
         onClick={() => bridge.openWindowDialog(project.project_id)}
       >
-        + window
+        <span aria-hidden="true">+</span>
+        <span className="window-tab__action-label">window</span>
       </button>
 
       <div className="window-tabs__spacer" />
@@ -377,7 +416,11 @@ export function Topbar({
         tabIndex={tabIndexFor(SPLIT_RIGHT_CONTROL)}
         onClick={() => openSplit('h')}
       >
-        ⊟ split right
+        <svg aria-hidden="true" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor">
+          <rect x="1" y="1" width="14" height="14" rx="1" />
+          <path d="M8 1v14" />
+        </svg>
+        <span className="window-tab__action-label">split right</span>
       </button>
       <button
         type="button"
@@ -389,7 +432,11 @@ export function Topbar({
         tabIndex={tabIndexFor(SPLIT_DOWN_CONTROL)}
         onClick={() => openSplit('v')}
       >
-        ⊟ split down
+        <svg aria-hidden="true" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor">
+          <rect x="1" y="1" width="14" height="14" rx="1" />
+          <path d="M1 8h14" />
+        </svg>
+        <span className="window-tab__action-label">split down</span>
       </button>
       <button
         type="button"
@@ -400,7 +447,8 @@ export function Topbar({
         tabIndex={tabIndexFor(OPEN_WORKSPACE_CONTROL)}
         onClick={() => void openWorkspaceFolder()}
       >
-        ⊡ open workspace
+        <span aria-hidden="true">⊡</span>
+        <span className="window-tab__action-label">open workspace</span>
       </button>
     </header>
   )

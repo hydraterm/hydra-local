@@ -13,6 +13,11 @@ pub trait LaunchEnvLookup {
     fn path_os(&self) -> Option<OsString> {
         None
     }
+    /// Windows roaming data may be redirected outside USERPROFILE.
+    #[cfg(windows)]
+    fn roaming_app_data_os(&self) -> Option<OsString> {
+        None
+    }
     fn selected_provider_path(&self, _provider: &str) -> Option<PathBuf> {
         None
     }
@@ -63,6 +68,10 @@ impl<E: LaunchEnvLookup> LaunchEnvLookup for SelectedProviderLaunchEnv<'_, E> {
     }
     fn path_os(&self) -> Option<OsString> {
         self.env.path_os()
+    }
+    #[cfg(windows)]
+    fn roaming_app_data_os(&self) -> Option<OsString> {
+        self.env.roaming_app_data_os()
     }
     fn selected_provider_path(&self, provider: &str) -> Option<PathBuf> {
         self.selected

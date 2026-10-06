@@ -21,7 +21,7 @@ use crate::envelope::Envelope;
 use crate::paths::{AppPaths, RecordKind};
 
 const MIGRATION_LOCK: &str = ".legacy-json-import.lock";
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) const MIGRATION_LOCK_FOR_SECURITY_TESTS: &str = MIGRATION_LOCK;
 // Version 1 markers were introduced after the best-effort importer had already shipped. That
 // implementation could move records it skipped into `legacy-json*`, while the v1 marker path only
@@ -1774,7 +1774,46 @@ fn regular_file_identity(path: &Path) -> Result<(u64, u64), String> {
     Ok((metadata.dev(), metadata.ino()))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn regular_file_identity(path: &Path) -> Result<(u64, u64), String> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, GetFileType, BY_HANDLE_FILE_INFORMATION,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_TYPE_DISK,
+    };
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| format!("open regular file identity {}: {error}", path.display()))?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // The owned no-follow handle remains live throughout both native observations.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(format!(
+            "inspect regular file identity {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    if unsafe { GetFileType(file.as_raw_handle()) } != FILE_TYPE_DISK
+        || info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        || info.nNumberOfLinks == 0
+    {
+        return Err(format!(
+            "path is not an ordinary regular file: {}",
+            path.display()
+        ));
+    }
+    // Migration intentionally retains two hard links during its crash-safe archive phase.
+    // Unlike credential authority, an exact archive witness must permit that live link count.
+    Ok((
+        u64::from(info.dwVolumeSerialNumber),
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn regular_file_identity(_path: &Path) -> Result<(u64, u64), String> {
     Err("legacy archival identity checks are unsupported on this platform".to_string())
 }
@@ -2013,6 +2052,11 @@ fn read_regular_file_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
     let mut file = options.open(path)?;
     if !file.metadata()?.file_type().is_file() {
         return Err(std::io::Error::new(
@@ -2032,6 +2076,11 @@ fn read_regular_file_no_follow_bounded(path: &Path, max_bytes: u64) -> std::io::
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let file = options.open(path)?;
     let metadata = file.metadata()?;
@@ -2178,6 +2227,8 @@ fn sync_parent(path: &Path) -> Result<(), String> {
 }
 
 fn sync_dir(path: &Path) -> Result<(), String> {
+    #[cfg(not(unix))]
+    let _ = path;
     #[cfg(unix)]
     {
         let mut options = OpenOptions::new();
@@ -2364,6 +2415,34 @@ fn ensure_owner_only_notice(path: &Path) -> Result<(), String> {
     let file = secured
         .open_existing_owner_file(name)
         .map_err(|error| format!("open independent reconciliation notice: {error}"))?;
+    #[cfg(windows)]
+    let file = {
+        // FlushFileBuffers requires writable access. Reopen the already-validated exact object,
+        // not its pathname; do not recreate a vanished notice or truncate its existing bytes.
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+        use windows_sys::Win32::{
+            Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE},
+            Storage::FileSystem::{
+                ReOpenFile, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+                FILE_SHARE_WRITE,
+            },
+        };
+        let handle = unsafe {
+            ReOpenFile(
+                file.as_raw_handle(),
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(format!(
+                "open writable independent reconciliation notice: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        unsafe { File::from_raw_handle(handle) }
+    };
     file.sync_all()
         .map_err(|error| format!("sync independent reconciliation notice: {error}"))?;
     sync_parent(path)
@@ -4050,18 +4129,17 @@ mod tests {
         let initial = project("p1", vec![]);
         write_legacy(&paths, RecordKind::Project, "p1", &initial);
 
-        let success_waiting = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let release_success = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let failure_at_lock = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let allow_failure_lock = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let timeout = std::time::Duration::from_secs(10);
+        let (success_waiting_tx, success_waiting) = std::sync::mpsc::channel();
+        let (release_success, release_success_rx) = std::sync::mpsc::channel();
+        let release_success_rx = std::sync::Mutex::new(release_success_rx);
+        let (failure_at_lock_tx, failure_at_lock) = std::sync::mpsc::channel();
+        let (allow_failure_lock, allow_failure_lock_rx) = std::sync::mpsc::channel();
+        let allow_failure_lock_rx = std::sync::Mutex::new(allow_failure_lock_rx);
         let success_hook_fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let failure_hook_fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let _hook = MigrationTestHookGuard::install({
             let expected_base = base.clone();
-            let success_waiting = std::sync::Arc::clone(&success_waiting);
-            let release_success = std::sync::Arc::clone(&release_success);
-            let failure_at_lock = std::sync::Arc::clone(&failure_at_lock);
-            let allow_failure_lock = std::sync::Arc::clone(&allow_failure_lock);
             let success_hook_fired = std::sync::Arc::clone(&success_hook_fired);
             let failure_hook_fired = std::sync::Arc::clone(&failure_hook_fired);
             std::sync::Arc::new(move |stage, observed_base| {
@@ -4069,22 +4147,39 @@ mod tests {
                     && observed_base == expected_base
                     && !success_hook_fired.swap(true, Ordering::SeqCst)
                 {
-                    success_waiting.wait();
-                    release_success.wait();
+                    success_waiting_tx.send(()).unwrap();
+                    release_success_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(timeout)
+                        .expect("successful migration was not released");
                 } else if stage == "before-migration-lock"
                     && observed_base == expected_base
                     && success_hook_fired.load(Ordering::SeqCst)
                     && !failure_hook_fired.swap(true, Ordering::SeqCst)
                 {
-                    failure_at_lock.wait();
-                    allow_failure_lock.wait();
+                    failure_at_lock_tx.send(()).unwrap();
+                    allow_failure_lock_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(timeout)
+                        .expect("failing migration was not released");
                 }
             })
         });
 
         let success_base = base.clone();
-        let success = std::thread::spawn(move || crate::db::conn_for(&success_base));
-        success_waiting.wait();
+        let success = std::thread::spawn(move || {
+            let result = crate::db::conn_for(&success_base);
+            assert!(
+                result.is_ok(),
+                "initial migration failed before publication: {result:?}"
+            );
+            result
+        });
+        success_waiting
+            .recv_timeout(timeout)
+            .expect("initial migration never reached authority publication");
 
         let mut divergent = initial.clone();
         divergent.name = "late stale writer".into();
@@ -4092,9 +4187,11 @@ mod tests {
 
         let failure_base = base.clone();
         let failure = std::thread::spawn(move || crate::db::conn_for(&failure_base));
-        failure_at_lock.wait();
-        allow_failure_lock.wait();
-        release_success.wait();
+        failure_at_lock
+            .recv_timeout(timeout)
+            .expect("second migration never reached lock acquisition");
+        allow_failure_lock.send(()).unwrap();
+        release_success.send(()).unwrap();
 
         assert!(success.join().unwrap().is_ok());
         let error = failure.join().unwrap().unwrap_err();
@@ -4105,6 +4202,25 @@ mod tests {
         // and silently bypass the divergent active source.
         let error = crate::db::conn_for(paths.base()).unwrap_err();
         assert!(error.to_string().contains("diverges from SQLite"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_archive_identity_accepts_exact_hardlinks_not_identical_copies_or_directories() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source.json");
+        let linked = temp.path().join("linked.json");
+        let copied = temp.path().join("copied.json");
+        fs::write(&source, b"identical fixture bytes").unwrap();
+        fs::hard_link(&source, &linked).unwrap();
+        fs::copy(&source, &copied).unwrap();
+        let source_identity = regular_file_identity(&source).unwrap();
+        assert_eq!(regular_file_identity(&linked).unwrap(), source_identity);
+        assert_ne!(regular_file_identity(&copied).unwrap(), source_identity);
+        assert!(regular_file_identity(temp.path()).is_err());
+        fs::remove_file(&source).unwrap();
+        assert_eq!(regular_file_identity(&linked).unwrap(), source_identity);
+        assert_eq!(fs::read(&linked).unwrap(), b"identical fixture bytes");
     }
 
     #[test]

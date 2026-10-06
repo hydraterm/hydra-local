@@ -20,12 +20,12 @@ use crate::{UserEvent, UserEventSender};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::net::UnixStream;
+mod transport;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::TryLockError;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use transport::{connect_until, reviewed_server_pid, Stream};
 
 const OUTBOUND_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -60,139 +60,10 @@ struct DaemonPeerProof {
 }
 
 struct DaemonTransport {
-    stream: UnixStream,
+    stream: Stream,
     mutation_capable: bool,
     legacy_attach_compatible: bool,
     peer: DaemonPeerProof,
-}
-
-#[cfg(target_os = "linux")]
-#[repr(C)]
-struct LinuxPeerCredentials {
-    pid: i32,
-    uid: u32,
-    gid: u32,
-}
-
-#[cfg(target_os = "linux")]
-unsafe extern "C" {
-    fn geteuid() -> u32;
-    fn getsockopt(
-        socket: i32,
-        level: i32,
-        option_name: i32,
-        option_value: *mut std::ffi::c_void,
-        option_len: *mut u32,
-    ) -> i32;
-}
-
-#[cfg(not(target_os = "linux"))]
-unsafe extern "C" {
-    fn geteuid() -> u32;
-    fn getpeereid(socket: i32, effective_uid: *mut u32, effective_gid: *mut u32) -> i32;
-    fn getsockopt(
-        socket: i32,
-        level: i32,
-        option_name: i32,
-        option_value: *mut std::ffi::c_void,
-        option_len: *mut u32,
-    ) -> i32;
-}
-
-#[repr(C)]
-struct PollFd {
-    fd: i32,
-    events: i16,
-    revents: i16,
-}
-
-#[cfg(target_os = "linux")]
-type PollCount = usize;
-#[cfg(not(target_os = "linux"))]
-type PollCount = u32;
-
-#[cfg(target_os = "linux")]
-#[repr(C)]
-struct UnixSocketAddress {
-    family: u16,
-    path: [i8; 108],
-}
-
-#[cfg(not(target_os = "linux"))]
-#[repr(C)]
-struct UnixSocketAddress {
-    length: u8,
-    family: u8,
-    path: [i8; 104],
-}
-
-unsafe extern "C" {
-    fn socket(domain: i32, socket_type: i32, protocol: i32) -> i32;
-    fn connect(socket: i32, address: *const std::ffi::c_void, address_len: u32) -> i32;
-    fn poll(fds: *mut PollFd, count: PollCount, timeout_ms: i32) -> i32;
-    fn fcntl(fd: i32, command: i32, ...) -> i32;
-}
-
-fn effective_uid() -> u32 {
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    unsafe { geteuid() }
-}
-
-/// Verify the kernel-authenticated server owner before any protocol bytes cross the socket and
-/// return the Linux peer PID used for exact handoff comparison.
-fn reviewed_server_pid(stream: &UnixStream) -> io::Result<Option<u32>> {
-    #[cfg(target_os = "linux")]
-    {
-        const SOL_SOCKET: i32 = 1;
-        const SO_PEERCRED: i32 = 17;
-        let mut credentials = LinuxPeerCredentials {
-            pid: 0,
-            uid: 0,
-            gid: 0,
-        };
-        let mut length = std::mem::size_of::<LinuxPeerCredentials>() as u32;
-        // SAFETY: the stream owns a connected AF_UNIX fd and both output pointers reference
-        // correctly sized live storage for Linux SO_PEERCRED.
-        let status = unsafe {
-            getsockopt(
-                stream.as_raw_fd(),
-                SOL_SOCKET,
-                SO_PEERCRED,
-                (&mut credentials as *mut LinuxPeerCredentials).cast(),
-                &mut length,
-            )
-        };
-        if status != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if length as usize != std::mem::size_of::<LinuxPeerCredentials>()
-            || credentials.pid <= 0
-            || credentials.uid != effective_uid()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "Unix daemon peer identity was unavailable or did not match the effective uid",
-            ));
-        }
-        Ok(Some(credentials.pid as u32))
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        let mut uid = 0u32;
-        let mut gid = 0u32;
-        // SAFETY: the stream owns a connected AF_UNIX fd and both pointers reference writable ids.
-        if unsafe { getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if uid != effective_uid() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "Unix daemon peer uid did not match the effective uid",
-            ));
-        }
-        Ok(None)
-    }
 }
 
 /// Terminal teardown must complete even if another thread panicked while holding authority/cache
@@ -213,7 +84,7 @@ fn teardown_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// normally restarted after every partial `write`, which lets a trickling peer hold the connection
 /// forever; recomputing the remaining budget gives the whole JSON line one bounded lifetime.
 fn write_frame_before_deadline(
-    stream: &mut UnixStream,
+    stream: &mut Stream,
     frame: &[u8],
     timeout: Duration,
 ) -> io::Result<()> {
@@ -223,11 +94,7 @@ fn write_frame_before_deadline(
     write_frame_until(stream, frame, deadline)
 }
 
-fn write_frame_until(
-    stream: &mut UnixStream,
-    mut frame: &[u8],
-    deadline: Instant,
-) -> io::Result<()> {
+fn write_frame_until(stream: &mut Stream, mut frame: &[u8], deadline: Instant) -> io::Result<()> {
     while !frame.is_empty() {
         let now = Instant::now();
         if now >= deadline {
@@ -253,154 +120,7 @@ fn write_frame_until(
     Ok(())
 }
 
-fn connect_unix_until(socket_path: &str, deadline: Instant) -> io::Result<UnixStream> {
-    const AF_UNIX: i32 = 1;
-    const SOCK_STREAM: i32 = 1;
-    const F_GETFD: i32 = 1;
-    const F_SETFD: i32 = 2;
-    const FD_CLOEXEC: i32 = 1;
-    const POLLOUT: i16 = 0x0004;
-    #[cfg(target_os = "linux")]
-    const SOL_SOCKET: i32 = 1;
-    #[cfg(not(target_os = "linux"))]
-    const SOL_SOCKET: i32 = 0xffff;
-    #[cfg(target_os = "linux")]
-    const SO_ERROR: i32 = 4;
-    #[cfg(not(target_os = "linux"))]
-    const SO_ERROR: i32 = 0x1007;
-
-    let path = socket_path.as_bytes();
-    let max_path = unsafe { std::mem::zeroed::<UnixSocketAddress>() }
-        .path
-        .len();
-    if path.is_empty() || path.len() >= max_path || path.contains(&0) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Unix daemon socket path is empty or too long",
-        ));
-    }
-    // SAFETY: socket returns a new fd. Wrapping it immediately transfers cleanup to UnixStream on
-    // every subsequent return path.
-    let fd = unsafe { socket(AF_UNIX, SOCK_STREAM, 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let stream = unsafe { UnixStream::from_raw_fd(fd) };
-    // SAFETY: fcntl reads/sets descriptor flags on this owned live fd.
-    let descriptor_flags = unsafe { fcntl(fd, F_GETFD) };
-    if descriptor_flags < 0 || unsafe { fcntl(fd, F_SETFD, descriptor_flags | FD_CLOEXEC) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    stream.set_nonblocking(true)?;
-
-    let mut address = unsafe { std::mem::zeroed::<UnixSocketAddress>() };
-    #[cfg(target_os = "linux")]
-    {
-        address.family = AF_UNIX as u16;
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        address.family = AF_UNIX as u8;
-    }
-    for (destination, source) in address.path.iter_mut().zip(path.iter().copied()) {
-        *destination = source as i8;
-    }
-    let address_len = std::mem::offset_of!(UnixSocketAddress, path)
-        .checked_add(path.len() + 1)
-        .and_then(|length| u32::try_from(length).ok())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "socket path overflow"))?;
-    #[cfg(not(target_os = "linux"))]
-    {
-        address.length = u8::try_from(address_len)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket address overflow"))?;
-    }
-    // SAFETY: address points to a correctly initialized platform sockaddr_un prefix for address_len.
-    if Instant::now() >= deadline {
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "daemon connect deadline elapsed",
-        ));
-    }
-    let status = unsafe {
-        connect(
-            fd,
-            (&address as *const UnixSocketAddress).cast(),
-            address_len,
-        )
-    };
-    if status != 0 {
-        let error = io::Error::last_os_error();
-        #[cfg(target_os = "linux")]
-        let in_progress = error.raw_os_error() == Some(115);
-        #[cfg(not(target_os = "linux"))]
-        let in_progress = error.raw_os_error() == Some(36);
-        if !in_progress {
-            return Err(error);
-        }
-        loop {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::TimedOut, "daemon connect deadline elapsed")
-                })?;
-            let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
-            let mut descriptor = PollFd {
-                fd,
-                events: POLLOUT,
-                revents: 0,
-            };
-            // SAFETY: descriptor points to one live pollfd for the duration of this call.
-            let polled = unsafe { poll(&mut descriptor, 1 as PollCount, timeout_ms) };
-            if polled > 0 {
-                if Instant::now() >= deadline {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "daemon connect deadline elapsed",
-                    ));
-                }
-                break;
-            }
-            if polled == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "daemon connect deadline elapsed",
-                ));
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        }
-        let mut socket_error = 0i32;
-        let mut socket_error_len = std::mem::size_of::<i32>() as u32;
-        // SAFETY: socket_error and length are correctly sized outputs for SO_ERROR.
-        if unsafe {
-            getsockopt(
-                fd,
-                SOL_SOCKET,
-                SO_ERROR,
-                (&mut socket_error as *mut i32).cast(),
-                &mut socket_error_len,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        if socket_error != 0 {
-            return Err(io::Error::from_raw_os_error(socket_error));
-        }
-    }
-    if Instant::now() >= deadline {
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "daemon connect deadline elapsed",
-        ));
-    }
-    stream.set_nonblocking(false)?;
-    Ok(stream)
-}
-
-fn read_frame_until(stream: &UnixStream, deadline: Instant) -> io::Result<Vec<u8>> {
+fn read_frame_until(stream: &Stream, deadline: Instant) -> io::Result<Vec<u8>> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = Vec::new();
     loop {
@@ -453,7 +173,7 @@ fn connect_daemon_transport(
     let deadline = Instant::now()
         .checked_add(DAEMON_PROBE_TIMEOUT)
         .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "daemon probe deadline overflow"))?;
-    let mut candidate = connect_unix_until(socket_path, deadline)?;
+    let mut candidate = connect_until(socket_path, deadline)?;
     let server_pid = reviewed_server_pid(&candidate)?;
 
     let probe = (|| -> io::Result<Option<DaemonPeerProof>> {
@@ -499,10 +219,17 @@ fn connect_daemon_transport(
     if let Some(peer) = probe {
         if peer.attachment_handoff_capable {
             if let Some(expected) = handoff {
-                if peer.daemon_instance_id.as_ref() != Some(&expected.expected_daemon_instance)
-                    || peer.server_pid != expected.expected_server_pid
-                    || cfg!(target_os = "linux") && peer.server_pid.is_none()
-                {
+                let peer_matches = peer.daemon_instance_id.as_ref()
+                    == Some(&expected.expected_daemon_instance)
+                    && peer.server_pid == expected.expected_server_pid
+                    && (!cfg!(target_os = "linux") || peer.server_pid.is_some());
+                #[cfg(windows)]
+                let peer_matches = peer_matches
+                    && transport::process_witness_matches(
+                        &candidate,
+                        &expected.authority.daemon_process_witness(),
+                    );
+                if !peer_matches {
                     let _ = candidate.shutdown(Shutdown::Both);
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
@@ -1883,7 +1610,10 @@ pub struct Shared {
     /// A shutdown-only clone of the connected socket. No reads or writes use this handle; it exists
     /// solely so either owner, reader, or writer failure can interrupt a peer-stalled writer and
     /// force the daemon to tear down every forwarder for this client.
-    shutdown_stream: OnceLock<UnixStream>,
+    shutdown_stream: OnceLock<Stream>,
+    /// Keep the real same-process named-pipe peer alive for queue-only owner-loop tests.
+    #[cfg(all(test, windows))]
+    test_handoff_peer: OnceLock<crate::test_transport::Stream>,
     /// Phase A UNIFIED per-session store. ONE map holding a [`PaneStore`] for every non-active
     /// session id: the single rendered split sibling (`kind == Sibling`) AND every extra
     /// non-active pane of a three-or-more-pane layout (`kind == Pane`). Replaces the two
@@ -2097,14 +1827,23 @@ impl Shared {
     }
 
     pub(crate) fn operational_handoff_peer_matches(&self, claim: &AttachmentHandoffClaim) -> bool {
-        self.attachment_handoff_capable.load(Ordering::Acquire)
+        let peer_matches = self.attachment_handoff_capable.load(Ordering::Acquire)
             && self
                 .operational_daemon_instance
                 .get()
                 .and_then(Option::as_ref)
                 == Some(&claim.expected_daemon_instance)
             && self.operational_server_pid.get().copied().flatten() == claim.expected_server_pid
-            && (!cfg!(target_os = "linux") || claim.expected_server_pid.is_some())
+            && (!cfg!(target_os = "linux") || claim.expected_server_pid.is_some());
+        #[cfg(windows)]
+        let peer_matches = peer_matches
+            && self.shutdown_stream.get().is_some_and(|stream| {
+                transport::process_witness_matches(
+                    stream,
+                    &claim.authority.daemon_process_witness(),
+                )
+            });
+        peer_matches
     }
 
     pub(crate) fn operational_daemon_instance(&self) -> Option<maestro_shell::DaemonInstanceId> {
@@ -2459,7 +2198,8 @@ impl Shared {
         if self.connection_is_closed() {
             return Some(Self::closed_admission());
         }
-        if reqs.iter().any(Self::request_is_terminal_mutation)
+        let contains_mutation = reqs.iter().any(Self::request_is_terminal_mutation);
+        if contains_mutation
             && !self
                 .generation_conditional_mutations
                 .load(Ordering::Acquire)
@@ -2517,6 +2257,12 @@ impl Shared {
                     || active.id.as_deref() != Some(token.session_id.as_str())
                     || active.output_generation != Some(token.output_generation)
                 {
+                    return None;
+                }
+                // Exit retains the final Grid for paint/history, not permission to resize/write
+                // the ended PTY. The active guard serializes this check and queue admission with
+                // commit_active_exit, including owner batches retried after backpressure.
+                if contains_mutation && self.exited.lock().unwrap().is_some() {
                     return None;
                 }
                 let grid = self.grid.lock().unwrap();
@@ -2607,6 +2353,11 @@ impl Shared {
                     && entry.epoch == *pane_epoch
                     && entry.output_generation == Some(*output_generation))
                 {
+                    return None;
+                }
+                // The same exit/admission boundary applies to sibling and additional panes.
+                // Read-only Snapshot/Scrollback remain valid against the retained final Grid.
+                if contains_mutation && entry.exited.is_some() {
                     return None;
                 }
                 if entry.grid.as_ref().map(|grid| &grid.generation) != Some(expected_generation) {
@@ -4260,10 +4011,25 @@ impl Shared {
     pub(crate) fn with_test_handoff_peer(
         authority: &maestro_shell::AttachmentHandoffAuthority,
     ) -> Arc<Shared> {
-        Self::with_test_handoff_peer_facts(
+        let shared = Self::with_test_handoff_peer_facts(
             Some(authority.expected_daemon_instance().clone()),
             authority.expected_server_pid(),
-        )
+        );
+        #[cfg(windows)]
+        {
+            let (client, server) = crate::test_transport::authenticated_pair()
+                .expect("authenticated Windows owner-loop peer");
+            assert!(
+                client
+                    .daemon_process_witness()
+                    .matches_live(&authority.daemon_process_witness())
+                    .unwrap(),
+                "test operational peer must be the actual Offer process, not a fabricated PID"
+            );
+            assert!(shared.shutdown_stream.set(client).is_ok());
+            assert!(shared.test_handoff_peer.set(server).is_ok());
+        }
+        shared
     }
 
     #[cfg(test)]
@@ -10431,8 +10197,8 @@ mod decode_error_tests {
 #[cfg(test)]
 mod reader_terminal_failure_tests {
     use super::*;
+    use crate::test_transport::{Listener as UnixListener, Stream};
     use std::fs;
-    use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
@@ -10456,11 +10222,14 @@ mod reader_terminal_failure_tests {
     fn socket_path(_label: &str) -> PathBuf {
         // macOS limits AF_UNIX paths to 104 bytes, while the per-user TMPDIR can already be quite
         // long. Keep this test fixture in the system's short, process-unique `/tmp` namespace.
-        PathBuf::from("/tmp").join(format!(
-            "mr-{}-{}.sock",
-            std::process::id(),
-            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
-        ))
+        crate::test_transport::endpoint(
+            std::path::Path::new("/tmp"),
+            &format!(
+                "mr-{}-{}.sock",
+                std::process::id(),
+                NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+            ),
+        )
     }
 
     fn spawn_exact_test_client(
@@ -10566,7 +10335,7 @@ mod reader_terminal_failure_tests {
         }
     }
 
-    fn write_event(stream: &mut UnixStream, event: DaemonEvent, output_generation: Option<u64>) {
+    fn write_event(stream: &mut Stream, event: DaemonEvent, output_generation: Option<u64>) {
         let mut value = serde_json::to_value(event).expect("event serializes");
         if let Some(generation) = output_generation {
             value["output_generation"] = serde_json::json!(generation);
@@ -10575,7 +10344,7 @@ mod reader_terminal_failure_tests {
         stream.write_all(b"\n").expect("event delimiter writes");
     }
 
-    fn write_live_event(stream: &mut UnixStream, event: DaemonEvent, live_output_generation: u64) {
+    fn write_live_event(stream: &mut Stream, event: DaemonEvent, live_output_generation: u64) {
         let mut value = serde_json::to_value(event).expect("event serializes");
         value["live_output_generation"] = serde_json::json!(live_output_generation);
         serde_json::to_writer(&mut *stream, &value).expect("event writes");
@@ -10595,7 +10364,7 @@ mod reader_terminal_failure_tests {
         line
     }
 
-    fn assert_no_request_before_timeout(reader: &mut BufReader<UnixStream>) {
+    fn assert_no_request_before_timeout(reader: &mut BufReader<Stream>) {
         let mut line = String::new();
         match reader.read_line(&mut line) {
             Err(error)
@@ -10609,14 +10378,14 @@ mod reader_terminal_failure_tests {
         }
     }
 
-    fn read_request(reader: &mut BufReader<UnixStream>) -> ClientRequest {
+    fn read_request(reader: &mut BufReader<Stream>) -> ClientRequest {
         let mut line = String::new();
         reader.read_line(&mut line).expect("request line reads");
         assert!(!line.is_empty(), "client closed before expected request");
         serde_json::from_str(&line).expect("request decodes")
     }
 
-    fn read_initial_plan(reader: &mut BufReader<UnixStream>, stream: &mut UnixStream) -> u64 {
+    fn read_initial_plan(reader: &mut BufReader<Stream>, stream: &mut Stream) -> u64 {
         assert!(matches!(read_request(reader), ClientRequest::DaemonInfo));
         write_event(
             stream,
@@ -10652,6 +10421,131 @@ mod reader_terminal_failure_tests {
     }
 
     #[test]
+    fn exited_binding_reader_keeps_connection_after_final_grid_exit_and_snapshot() {
+        let path = socket_path("exited-binding");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let output_generation = read_initial_plan(&mut reader, &mut stream);
+            write_event(
+                &mut stream,
+                DaemonEvent::Grid {
+                    id: "s".into(),
+                    grid: grid("final-gen", 1),
+                },
+                Some(output_generation),
+            );
+            write_live_event(
+                &mut stream,
+                DaemonEvent::SessionExited {
+                    id: "s".into(),
+                    code: Some(0),
+                },
+                output_generation,
+            );
+            // The initial Attach and queued Snapshot can legitimately bracket SessionExited.
+            write_event(
+                &mut stream,
+                DaemonEvent::Grid {
+                    id: "s".into(),
+                    grid: grid("final-gen", 1),
+                },
+                None,
+            );
+            write_live_event(
+                &mut stream,
+                DaemonEvent::TerminalTitle {
+                    id: "s".into(),
+                    title: Some("after-final-snapshot".into()),
+                },
+                output_generation,
+            );
+            // This explicit read-only request must be next: no post-exit Resize/Write on the wire.
+            assert!(
+                matches!(read_request(&mut reader), ClientRequest::Snapshot { id } if id == "s")
+            );
+            write_live_event(
+                &mut stream,
+                DaemonEvent::TerminalTitle {
+                    id: "s".into(),
+                    title: Some("snapshot-request-received".into()),
+                },
+                output_generation,
+            );
+            finish_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        });
+        let (tx, rx) = mpsc::channel();
+        let shared = spawn_exact_test_client(
+            path.to_string_lossy().into_owned(),
+            "s",
+            "final-gen",
+            Box::new(ChannelSender(tx)),
+        );
+        let seen = recv_until(
+            &rx,
+            |event| matches!(event, UserEvent::TerminalTitle { title: Some(title), .. } if title == "after-final-snapshot"),
+        );
+        assert!(seen
+            .iter()
+            .any(|event| matches!(event, UserEvent::SessionExited { .. })));
+        assert!(seen
+            .iter()
+            .all(|event| !matches!(event, UserEvent::ConnectionClosed)));
+        let binding = shared.binding_token_for_session("s").unwrap();
+        let generation = shared.live_generation_for_binding(&binding).unwrap();
+        assert!(shared
+            .send_request_batch_for_binding(
+                &binding,
+                &[
+                    ClientRequest::Resize {
+                        id: "s".into(),
+                        expected_generation: generation.clone(),
+                        cols: 80,
+                        rows: 24
+                    },
+                    ClientRequest::Write {
+                        id: "s".into(),
+                        expected_generation: generation.clone(),
+                        data: "post-exit".into()
+                    },
+                ],
+                &generation,
+                None
+            )
+            .is_none());
+        assert!(shared
+            .send_request_batch_for_binding(
+                &binding,
+                &[ClientRequest::Snapshot { id: "s".into() }],
+                &generation,
+                None
+            )
+            .unwrap()
+            .is_admitted());
+        let seen = recv_until(
+            &rx,
+            |event| matches!(event, UserEvent::TerminalTitle { title: Some(title), .. } if title == "snapshot-request-received"),
+        );
+        assert!(seen
+            .iter()
+            .all(|event| !matches!(event, UserEvent::ConnectionClosed)));
+        assert!(!shared.connection_is_closed());
+        assert_eq!(*shared.exited.lock().unwrap(), Some(Some(0)));
+        assert_eq!(
+            shared.grid.lock().unwrap().as_ref().unwrap().generation.0,
+            "final-gen"
+        );
+        finish_tx.send(()).unwrap();
+        server.join().unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn legacy_v2_probe_and_attach_share_socket_across_path_replacement_and_stay_read_only() {
         let path = socket_path("legacy-v2-read-only");
         let listener = UnixListener::bind(&path).expect("bind test socket");
@@ -10684,8 +10578,7 @@ mod reader_terminal_failure_tests {
                 },
                 None,
             );
-            fs::remove_file(&replacement_path).expect("unlink probed socket path");
-            let replacement = UnixListener::bind(&replacement_path)
+            let replacement = crate::test_transport::replace_listener(&replacement_path)
                 .expect("bind current-v3 replacement between probe and attach");
             replacement.set_nonblocking(true).unwrap();
 
@@ -11254,6 +11147,7 @@ mod reader_terminal_failure_tests {
             Close,
         }
         enum ServerStatus {
+            OversizeTransferred(usize, Duration),
             ExactRecovered(u64),
             Rebound(u64),
             StaleInert,
@@ -11279,8 +11173,15 @@ mod reader_terminal_failure_tests {
                 Some(generation_a),
             );
 
-            stream
-                .write_all(&oversized_damage_line("s", generation_a))
+            let oversized = oversized_damage_line("s", generation_a);
+            assert!(oversized.len() > crate::wire::MAX_DAMAGE_BYTES);
+            let transfer_started = Instant::now();
+            stream.write_all(&oversized).unwrap();
+            status_tx
+                .send(ServerStatus::OversizeTransferred(
+                    oversized.len(),
+                    transfer_started.elapsed(),
+                ))
                 .unwrap();
             assert!(matches!(
                 read_request(&mut reader),
@@ -11334,8 +11235,13 @@ mod reader_terminal_failure_tests {
                 server_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
                 ServerCommand::SendStaleOversize
             ));
-            stream
-                .write_all(&oversized_damage_line("s", generation_a))
+            let transfer_started = Instant::now();
+            stream.write_all(&oversized).unwrap();
+            status_tx
+                .send(ServerStatus::OversizeTransferred(
+                    oversized.len(),
+                    transfer_started.elapsed(),
+                ))
                 .unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(1)))
@@ -11356,6 +11262,21 @@ mod reader_terminal_failure_tests {
             Box::new(ChannelSender(event_tx)),
         );
         let _ = recv_until(&event_rx, |event| matches!(event, UserEvent::Redraw));
+        let await_transfer = || {
+            // This is a >9 MiB physical-pipe fixture, not a three-second throughput benchmark.
+            // Start the unchanged semantic recovery budget only after the full line is written.
+            match status_rx
+                .recv_timeout(Duration::from_secs(15))
+                .expect("bounded oversized fixture transfer")
+            {
+                ServerStatus::OversizeTransferred(bytes, elapsed) => eprintln!(
+                    "oversized fixture transfer completed: {bytes} bytes in {} ms",
+                    elapsed.as_millis()
+                ),
+                _ => panic!("transfer completion must precede recovery disposition"),
+            }
+        };
+        await_transfer();
         let generation_a = match status_rx.recv_timeout(Duration::from_secs(3)).unwrap() {
             ServerStatus::ExactRecovered(generation) => generation,
             _ => unreachable!(),
@@ -11393,6 +11314,7 @@ mod reader_terminal_failure_tests {
         );
 
         server_tx.send(ServerCommand::SendStaleOversize).unwrap();
+        await_transfer();
         assert!(matches!(
             status_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
             ServerStatus::StaleInert
@@ -14420,6 +14342,261 @@ mod user_event_sender_tests {
         drop(scrollback);
         assert!(app.pending_owner_requests.is_empty());
         assert!(queue.drain_requests().is_empty());
+    }
+
+    #[test]
+    fn exited_bindings_reject_mutations_but_keep_final_grid_and_history() {
+        for role in [Some(PaneKind::Sibling), Some(PaneKind::Pane), None] {
+            let (shared, queue) = Shared::with_test_queue();
+            let primary = shared.init_active_session("primary").unwrap();
+            assert!(shared.commit_active_grid(
+                &primary,
+                Revision(1),
+                Arc::new(grid("primary-gen", 1))
+            ));
+            let id = if role.is_none() { "primary" } else { "other" };
+            match role {
+                Some(PaneKind::Sibling) => {
+                    shared.set_sibling_session(id).unwrap();
+                }
+                Some(PaneKind::Pane) => {
+                    shared.set_pane_sessions(&[id]).unwrap();
+                }
+                None => {}
+            }
+            let binding = shared.binding_token_for_session(id).unwrap();
+            let mut sync = SyncState::new(id);
+            let sender = RecordingSender(Arc::new(Mutex::new(Vec::new())));
+            let mut deliver = |event| match &binding {
+                ViewportBindingToken::Active(token) => {
+                    handle_event_for_binding(&shared, &mut sync, &sender, token, event)
+                }
+                ViewportBindingToken::Pane {
+                    pane_epoch,
+                    pane_kind: PaneKind::Sibling,
+                    viewport_epoch,
+                    output_generation,
+                    ..
+                } => handle_sibling_event_for_binding(
+                    &shared,
+                    &mut sync,
+                    &sender,
+                    id,
+                    *pane_epoch,
+                    *viewport_epoch,
+                    *output_generation,
+                    event,
+                ),
+                ViewportBindingToken::Pane {
+                    pane_epoch,
+                    viewport_epoch,
+                    output_generation,
+                    ..
+                } => handle_pane_event_for_binding(
+                    &shared,
+                    &mut sync,
+                    &sender,
+                    id,
+                    *pane_epoch,
+                    *viewport_epoch,
+                    *output_generation,
+                    event,
+                ),
+            };
+            deliver(DaemonEvent::Grid {
+                id: id.into(),
+                grid: grid("final-gen", 1),
+            });
+            deliver(DaemonEvent::SessionExited {
+                id: id.into(),
+                code: Some(0),
+            });
+            let final_grid = shared.pane_paint(id, "primary").paint_grid().unwrap();
+            assert_eq!(final_grid.generation.0, "final-gen");
+            let generation = shared.live_generation_for_binding(&binding).unwrap();
+            let write = ClientRequest::Write {
+                id: id.into(),
+                expected_generation: generation.clone(),
+                data: "must not reach exited PTY".into(),
+            };
+            let resize = ClientRequest::Resize {
+                id: id.into(),
+                expected_generation: generation.clone(),
+                cols: 80,
+                rows: 24,
+            };
+            for requests in [
+                vec![write.clone()],
+                vec![resize.clone()],
+                vec![ClientRequest::Snapshot { id: id.into() }, write, resize],
+            ] {
+                assert!(
+                    shared
+                        .send_request_batch_for_binding(&binding, &requests, &generation, None)
+                        .is_none(),
+                    "exited {role:?} must reject the entire mutation batch"
+                );
+                assert!(queue.drain_requests().is_empty());
+            }
+            let snapshot = ClientRequest::Snapshot { id: id.into() };
+            assert!(shared
+                .send_request_batch_for_binding(
+                    &binding,
+                    std::slice::from_ref(&snapshot),
+                    &generation,
+                    None
+                )
+                .unwrap()
+                .is_admitted());
+            assert_eq!(queue.drain_requests(), vec![snapshot]);
+            let PreparedScrollAction::Moved {
+                binding: history_binding,
+                request,
+                count,
+            } = shared.prepare_scroll_action(id, "primary", ScrollAction::Lines(1))
+            else {
+                panic!("final history remains readable")
+            };
+            let history = ClientRequest::Scrollback {
+                id: id.into(),
+                offset_from_top: request.requested_offset,
+                count,
+            };
+            assert!(shared
+                .send_request_batch_for_binding(
+                    &history_binding,
+                    std::slice::from_ref(&history),
+                    &generation,
+                    Some(&request)
+                )
+                .unwrap()
+                .is_admitted());
+            assert_eq!(queue.drain_requests(), vec![history]);
+            assert!(Arc::ptr_eq(
+                &final_grid,
+                &shared.pane_paint(id, "primary").paint_grid().unwrap()
+            ));
+            assert!(!shared.connection_is_closed());
+
+            // Rebinding the same textual id creates a fresh lifetime; a stale exit must not veto it.
+            match role {
+                None => {
+                    shared.set_active_session(id).unwrap();
+                }
+                Some(PaneKind::Sibling) => {
+                    shared.set_sibling_session("intermediate").unwrap();
+                    shared.set_sibling_session(id).unwrap();
+                }
+                Some(PaneKind::Pane) => {
+                    shared.clear_pane_sessions();
+                    shared.set_pane_sessions(&[id]).unwrap();
+                }
+            }
+            let fresh = shared.binding_token_for_session(id).unwrap();
+            let fresh_grid = Arc::new(grid("fresh-gen", 1));
+            match &fresh {
+                ViewportBindingToken::Active(token) => {
+                    assert!(shared.commit_active_grid(token, Revision(1), fresh_grid));
+                }
+                ViewportBindingToken::Pane {
+                    pane_kind: PaneKind::Sibling,
+                    ..
+                } => {
+                    assert!(shared.commit_sibling_grid(&fresh, fresh_grid));
+                }
+                ViewportBindingToken::Pane { .. } => {
+                    assert!(shared.commit_pane_grid(&fresh, fresh_grid));
+                }
+            }
+            assert!(!match &binding {
+                ViewportBindingToken::Active(token) => shared.commit_active_exit(token, Some(1)),
+                ViewportBindingToken::Pane {
+                    pane_kind: PaneKind::Sibling,
+                    ..
+                } => shared.commit_sibling_exit(&binding, Some(1)),
+                ViewportBindingToken::Pane { .. } => shared.commit_pane_exit(&binding, Some(1)),
+            });
+            let generation = shared.live_generation_for_binding(&fresh).unwrap();
+            let requests = [
+                ClientRequest::Write {
+                    id: id.into(),
+                    expected_generation: generation.clone(),
+                    data: "fresh".into(),
+                },
+                ClientRequest::Resize {
+                    id: id.into(),
+                    expected_generation: generation.clone(),
+                    cols: 81,
+                    rows: 25,
+                },
+            ];
+            assert!(shared
+                .send_request_batch_for_binding(&fresh, &requests, &generation, None)
+                .unwrap()
+                .is_admitted());
+            assert_eq!(queue.drain_requests(), requests);
+        }
+    }
+
+    #[test]
+    fn exited_binding_drops_owner_resize_write_and_backpressure_retry() {
+        let (shared, queue) = Shared::with_test_queue();
+        shared.init_active_session("s-a").unwrap();
+        let mut sync = SyncState::new("s-a");
+        let sender = RecordingSender(Arc::new(Mutex::new(Vec::new())));
+        handle_event(
+            &shared,
+            &mut sync,
+            &sender,
+            "s-a",
+            DaemonEvent::Grid {
+                id: "s-a".into(),
+                grid: grid("gen-a", 1),
+            },
+        );
+        let binding = shared.binding_token_for_session("s-a").unwrap();
+        let mut app = app_for_shared(shared.clone(), "s-a");
+        queue.saturate_raw();
+        let requests = vec![
+            crate::OwnerRequest::Resize {
+                id: "s-a".into(),
+                cols: 80,
+                rows: 24,
+            },
+            crate::OwnerRequest::Write {
+                id: "s-a".into(),
+                data: "pending".into(),
+            },
+        ];
+        assert_eq!(
+            app.admit_or_retain_owner_batch(binding.clone(), requests.clone()),
+            crate::OwnerBatchAdmission::Retained
+        );
+        assert_eq!(app.pending_owner_requests.len(), 1);
+        handle_event(
+            &shared,
+            &mut sync,
+            &sender,
+            "s-a",
+            DaemonEvent::SessionExited {
+                id: "s-a".into(),
+                code: None,
+            },
+        );
+        queue.discard_all();
+        app.retry_pending_owner_requests();
+        assert!(app.pending_owner_requests.is_empty());
+        assert!(
+            queue.drain_requests().is_empty(),
+            "exit must discard retained owner mutations before writer admission"
+        );
+        assert_eq!(
+            app.admit_or_retain_owner_batch(binding, requests),
+            crate::OwnerBatchAdmission::Rejected
+        );
+        assert!(queue.drain_requests().is_empty());
+        assert!(shared.pane_paint("s-a", "s-a").paint_grid().is_some());
+        assert!(!shared.connection_is_closed());
     }
 
     #[test]

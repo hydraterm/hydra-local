@@ -82,6 +82,7 @@ fn unadmitted_lifecycle_does_not_start_worker_and_metadata_completion_never_laun
 
 #[test]
 fn unchanged_windows_skip_settings_lock_even_after_unrelated_sql_writes() {
+    #[cfg(unix)]
     use std::os::fd::AsRawFd;
     let temp = tempfile::tempdir().unwrap();
     let paths = AppPaths::with_base(temp.path().join("profile"));
@@ -90,27 +91,50 @@ fn unchanged_windows_skip_settings_lock_even_after_unrelated_sql_writes() {
     let mut discovery = Discovery::default();
     assert!(discovery.check(&paths).unwrap());
     assert!(!discovery.check(&paths).unwrap()); // Confirm our own atomic settings save.
+    let reconciled = discovery.reconcile_calls;
+    assert!(
+        reconciled > 0,
+        "the fixture must have reached the real writer"
+    );
+    #[cfg(unix)]
     let lock =
         std::fs::File::open(maestro_app::settings_dir(paths.base()).join(".settings-writer.lock"))
             .unwrap();
     // SAFETY: this test owns the open descriptor until drop releases its advisory lock.
+    #[cfg(unix)]
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    #[cfg(windows)]
+    let lock = maestro_shell::WindowsFileLock::open_owner_exclusive(
+        &maestro_app::settings_dir(paths.base()),
+        std::ffi::OsStr::new(".settings-writer.lock"),
+    )
+    .unwrap();
     let worker_paths = paths.clone();
     let (send, recv) = sync_channel(1);
     let check = std::thread::spawn(move || {
         assert!(!discovery.check(&worker_paths).unwrap());
+        assert_eq!(discovery.reconcile_calls, reconciled);
         WindowLayoutService::new(&worker_paths)
             .rename_window("first", "renamed", 2)
             .unwrap();
         assert!(!discovery.check(&worker_paths).unwrap());
+        // The unchanged-window fast path must not reach the writer while its actual platform
+        // lock is held. The counter also proves no attempted reconciliation was hidden.
+        assert_eq!(discovery.reconcile_calls, reconciled);
         send.send(discovery).unwrap();
     });
     let completed = recv.recv_timeout(Duration::from_secs(2));
+    #[cfg(any(unix, windows))]
     drop(lock); // Release even if the test catches an unintended JSON lock wait.
     check.join().unwrap();
     let mut discovery = completed.expect("unchanged windows must not acquire settings lock");
     windows.create_empty("next", 3).unwrap();
     assert!(discovery.check(&paths).unwrap());
+    assert_eq!(
+        discovery.reconcile_calls,
+        reconciled + 1,
+        "a changed window must reach the real writer"
+    );
     let settings = maestro_app::settings_file_path(paths.base());
     let bytes = std::fs::read(&settings).unwrap();
     std::fs::write(&settings, "broken json").unwrap();

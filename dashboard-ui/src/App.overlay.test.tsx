@@ -40,6 +40,138 @@ afterEach(() => {
 })
 
 describe('lazy native overlay model delivery', () => {
+  it('snapshots a window agent selection before React applies a queued draft update', async () => {
+    vi.spyOn(bridge, 'listFolderSessions').mockResolvedValue([])
+    const browserWindow = Object.assign(new EventTarget(), {
+      location: { href: 'hydra://localhost/index.html?chrome=overlay', search: '?chrome=overlay' },
+      setTimeout: globalThis.setTimeout.bind(globalThis),
+      clearTimeout: globalThis.clearTimeout.bind(globalThis),
+      hydraDashboard: {
+        getDashboardModel: () => structuredClone(mockDashboardModel),
+        postIntent: vi.fn(), onDashboardModel: () => () => undefined,
+      },
+    }) as unknown as OverlayTestWindow
+    vi.stubGlobal('window', browserWindow)
+    vi.stubGlobal('document', {
+      body: { classList: { add: () => undefined, remove: () => undefined } },
+    })
+    await act(async () => { renderer = create(<App />) })
+    await act(async () => {
+      browserWindow.__HYDRA_SHOW_OVERLAY_MODAL__?.({ kind: 'newWindow', project_id: 'sample_workspace' })
+    })
+    const select = renderer!.root.findByProps({ 'aria-label': 'Window agent' })
+    // The event's DOM node is mutable. A native select can reset it while React has a pending
+    // draft update; the requested provider must not be read back from that later DOM state.
+    const target = { value: 'terminal' }
+    await act(async () => {
+      select.props.onChange({ target, currentTarget: target })
+      target.value = 'codex'
+      select.props.onChange({ target, currentTarget: target })
+      target.value = ''
+    })
+    expect(renderer!.root.findByProps({ 'aria-label': 'Window agent' }).props.value).toBe('codex')
+    expect(renderer!.root.findByProps({ 'aria-label': 'Window model' }).props.value).toBe('default')
+  })
+
+  it.each([
+    ['newWindow', 'Window agent', 'Window model'],
+    ['newProject', 'Default agent', 'Default model'],
+    ['split', 'Split agent', 'Split model'],
+  ] as const)('keeps %s usable across input-only, repeated and empty native agent events', async (kind, label, modelLabel) => {
+    vi.spyOn(bridge, 'listFolderSessions').mockResolvedValue([])
+    const browserWindow = Object.assign(new EventTarget(), {
+      location: { href: 'hydra://localhost/index.html?chrome=overlay', search: '?chrome=overlay' },
+      setTimeout: globalThis.setTimeout.bind(globalThis),
+      clearTimeout: globalThis.clearTimeout.bind(globalThis),
+      hydraDashboard: {
+        getDashboardModel: () => structuredClone(mockDashboardModel),
+        postIntent: vi.fn(), onDashboardModel: () => () => undefined,
+      },
+    }) as unknown as OverlayTestWindow
+    vi.stubGlobal('window', browserWindow)
+    vi.stubGlobal('document', {
+      body: { classList: { add: () => undefined, remove: () => undefined } },
+    })
+    await act(async () => { renderer = create(<App />) })
+    await act(async () => {
+      browserWindow.__HYDRA_SHOW_OVERLAY_MODAL__?.(kind === 'newProject' ? { kind } : kind === 'newWindow'
+        ? { kind, project_id: 'sample_workspace' }
+        : { kind, project_id: 'sample_workspace', window_id: 'w-main', tab_id: 'tab-claude', dir: 'h' })
+    })
+    for (const value of ['terminal', 'codex', 'claude', 'claude', '', 'not-a-provider', '__proto__']) {
+      const select = renderer!.root.findByProps({ 'aria-label': label })
+      const previous = select.props.value
+      await act(async () => { select.props.onInput({ currentTarget: { value } }) })
+      const expected = ['terminal', 'codex', 'claude'].includes(value) ? value : previous
+      expect(renderer!.root.findByProps({ 'aria-label': label }).props.value).toBe(expected)
+      await act(async () => {
+        renderer!.root.findByProps({ 'aria-label': label }).props.onChange({ target: { value } })
+      })
+      expect(renderer!.root.findByProps({ 'aria-label': label }).props.value).toBe(expected)
+    }
+    expect(renderer!.root.findByProps({ 'aria-label': modelLabel }).props.value).toBe('default')
+    expect(renderer!.root.findAllByProps({ role: 'dialog' })).toHaveLength(1)
+  })
+
+  it('shows a native recovery error above an open project modal without a correlated request id', async () => {
+    vi.spyOn(bridge, 'pickProjectFolder').mockResolvedValue(null)
+    vi.spyOn(bridge, 'listFolderSessions').mockResolvedValue([])
+    const browserWindow = Object.assign(new EventTarget(), {
+      location: { href: 'hydra://localhost/index.html?chrome=overlay', search: '?chrome=overlay' },
+      setTimeout: globalThis.setTimeout.bind(globalThis),
+      clearTimeout: globalThis.clearTimeout.bind(globalThis),
+      hydraDashboard: {
+        getDashboardModel: () => structuredClone(mockDashboardModel),
+        postIntent: vi.fn(), onDashboardModel: () => () => undefined,
+      },
+    }) as unknown as OverlayTestWindow
+    vi.stubGlobal('window', browserWindow)
+    vi.stubGlobal('document', {
+      body: { classList: { add: () => undefined, remove: () => undefined } },
+    })
+    await act(async () => { renderer = create(<App />) })
+    await act(async () => { browserWindow.__HYDRA_SHOW_OVERLAY_MODAL__?.({ kind: 'newProject' }) })
+    const message = 'Terminal connection was lost. Close and reopen this Hydra window, then retry.'
+    act(() => browserWindow.__HYDRA_DASHBOARD_SHOW_ERROR__?.(message))
+    expect(renderer!.root.findAllByProps({ role: 'dialog' })).toHaveLength(1)
+    const alert = renderer!.root.findByProps({ role: 'alert' })
+    expect(alert.findByType('span').children).toEqual([message])
+    expect(alert.props.style.zIndex).toBeGreaterThan(120)
+  })
+
+  it.each([
+    ['C:\\Fixture\\QA\\my-project', 'my-project'],
+    ['C:/Fixture/QA/my-project/', 'my-project'],
+    ['\\\\server\\share\\my-project\\', 'my-project'],
+    ['/home/test/my-project/', 'my-project'],
+    ['/home/test/literal\\name', 'literal\\name'],
+  ])('uses the native folder basename for project %s', async (path, expectedName) => {
+    vi.spyOn(bridge, 'pickProjectFolder').mockResolvedValue(path)
+    vi.spyOn(bridge, 'listFolderSessions').mockResolvedValue([])
+    const browserWindow = Object.assign(new EventTarget(), {
+      location: { href: 'hydra://localhost/index.html?chrome=overlay', search: '?chrome=overlay' },
+      setTimeout: globalThis.setTimeout.bind(globalThis),
+      clearTimeout: globalThis.clearTimeout.bind(globalThis),
+      hydraDashboard: {
+        getDashboardModel: () => structuredClone(mockDashboardModel),
+        postIntent: () => undefined,
+        onDashboardModel: () => () => undefined,
+      },
+    }) as unknown as OverlayTestWindow
+    vi.stubGlobal('window', browserWindow)
+    vi.stubGlobal('document', {
+      body: { classList: { add: () => undefined, remove: () => undefined } },
+    })
+    await act(async () => { renderer = create(<App />) })
+    await act(async () => { browserWindow.__HYDRA_SHOW_OVERLAY_MODAL__?.({ kind: 'newProject' }) })
+    const choose = renderer!.root.findAllByType('button')
+      .find((button) => button.children.join('') === 'Choose...')!
+    await act(async () => { choose.props.onClick() })
+    const inputs = renderer!.root.findAllByType('input')
+    expect(inputs.some((input) => input.props.value === expectedName)).toBe(true)
+    expect(inputs.some((input) => input.props.value === path)).toBe(true)
+  })
+
   it('wraps only the boundary of a dialog Tab sequence', () => {
     expect(dialogFocusWrapIndex(0, -1, false)).toBeNull()
     expect(dialogFocusWrapIndex(3, -1, false)).toBe(0)

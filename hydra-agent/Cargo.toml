@@ -15,6 +15,12 @@ path = "src/lib.rs"
 name = "hydra-agent"
 path = "src/main.rs"
 
+[[bin]]
+name = "hydra-agent-service"
+path = "src/windows_service_main.rs"
+test = false
+bench = false
+
 [dependencies]
 maestro-protocol = { path = "../maestro-protocol" }
 maestro-local-services = { path = "../maestro-local-services" }
@@ -57,10 +63,15 @@ tracing-subscriber = { workspace = true }
 # enroll: a one-shot HTTPS POST to the cloud /v1/link/redeem. rustls (no openssl); not a hot path.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
 dirs = "5"
+roxmltree = "0.20"
 # Per-event gzip for the negotiated terminal hot path. Compression is performed on the blocking pool;
 # the default/legacy wire remains byte-identical when the capability is not selected.
 flate2 = "1"
 zeroize = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant", "Win32_System_TaskScheduler", "Win32_System_Threading", "Win32_System_Kernel", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Diagnostics_Debug", "Win32_System_JobObjects", "Win32_UI_Shell", "Wdk_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 [features]
 default = []

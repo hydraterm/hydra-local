@@ -1,13 +1,18 @@
-//! S4 — LIVE local PTY smoke (last step). Spawns the REAL pty-daemon, starts a real bash session, and
-//! drives the S4 `TerminalBridge` against it via a real `SessionBackend` over the daemon's Unix socket:
+//! S4 — LIVE local PTY smoke (last step). Spawns the REAL pty-daemon and a native shell session, and
+//! drives the S4 `TerminalBridge` through a real Unix socket or authenticated Windows named pipe:
 //! attach → send `ls` as terminal_input → confirm real daemon OUTPUT frames come back as binary
 //! `terminal_output` → resize → detach. Local loopback only, no network. Proves the bridge's translation
 //! to the existing daemon protocol end-to-end with a real PTY.
 //!
 //! Run: `cargo test -p hydra-agent --test s4_live_pty_smoke`
+//! Windows packaged qualification: set `HYDRA_TEST_PTY_DAEMON` to the absolute packaged daemon path
+//! beside its ConPTY runtime. Without an override the built sibling daemon is used.
 
+#[cfg(windows)]
+use maestro_shell::WindowsPipeStream as DaemonStream;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream as DaemonStream;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,19 +32,45 @@ fn socket_path() -> PathBuf {
     static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
     let pid = std::process::id();
     let sequence = NEXT_SOCKET.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("hydra-s4-smoke-{pid}-{sequence}.sock"))
+    #[cfg(unix)]
+    {
+        std::env::temp_dir().join(format!("hydra-s4-smoke-{pid}-{sequence}.sock"))
+    }
+    #[cfg(windows)]
+    {
+        PathBuf::from(format!(r"\\.\pipe\Hydra.Maestro.s4-smoke-{pid}-{sequence}"))
+    }
+}
+
+fn connect_daemon(sock: &std::path::Path) -> std::io::Result<DaemonStream> {
+    #[cfg(unix)]
+    {
+        DaemonStream::connect(sock)
+    }
+    #[cfg(windows)]
+    {
+        DaemonStream::connect_until(sock, Instant::now() + Duration::from_millis(250))
+    }
 }
 
 /// Locate the built pty-daemon binary. `CARGO_BIN_EXE_pty-daemon` isn't exported to a sibling crate's
 /// tests, so derive it from this test binary's own location: target/<profile>/deps/<thisbin> →
 /// target/<profile>/pty-daemon.
 fn daemon_binary() -> PathBuf {
+    if let Some(binary) = std::env::var_os("HYDRA_TEST_PTY_DAEMON") {
+        let binary = PathBuf::from(binary);
+        assert!(
+            binary.is_absolute() && binary.is_file(),
+            "test daemon override must be an existing absolute file"
+        );
+        return binary;
+    }
     let mut dir = std::env::current_exe().expect("test exe path");
     dir.pop(); // drop the test binary name
     if dir.ends_with("deps") {
         dir.pop();
     }
-    let bin = dir.join("pty-daemon");
+    let bin = dir.join(format!("pty-daemon{}", std::env::consts::EXE_SUFFIX));
     assert!(
         bin.exists(),
         "pty-daemon not built at {bin:?} (run the daemon build first)"
@@ -47,38 +78,55 @@ fn daemon_binary() -> PathBuf {
     bin
 }
 
-fn start_daemon(sock: &PathBuf) -> Child {
-    let child = Command::new(daemon_binary())
-        .arg(sock)
-        .spawn()
-        .expect("spawn daemon");
+fn start_daemon(sock: &PathBuf) -> Killer {
+    let mut command = Command::new(daemon_binary());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x08000000);
+    }
+    let child = command.arg(sock).spawn().expect("spawn daemon");
+    // Own cleanup before polling so a startup assertion cannot strand this daemon.
+    let mut daemon = Killer {
+        child,
+        #[cfg(unix)]
+        socket: sock.clone(),
+    };
     let deadline = Instant::now() + Duration::from_secs(5);
-    while UnixStream::connect(sock).is_err() {
+    while connect_daemon(sock).is_err() {
+        assert!(
+            daemon.child.try_wait().unwrap().is_none(),
+            "daemon exited before accepting"
+        );
         assert!(Instant::now() < deadline, "daemon never accepted");
         std::thread::sleep(Duration::from_millis(20));
     }
-    child
+    daemon
 }
 
 struct Killer {
     child: Child,
+    #[cfg(unix)]
     socket: PathBuf,
 }
 impl Drop for Killer {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        #[cfg(unix)]
         let _ = std::fs::remove_file(&self.socket);
     }
 }
 
 /// A blocking control connection to the daemon: sends ClientRequest JSON lines.
 struct DaemonConn {
-    write: UnixStream,
+    write: DaemonStream,
 }
 impl DaemonConn {
-    fn connect(sock: &PathBuf) -> (Self, BufReader<UnixStream>) {
-        let s = UnixStream::connect(sock).expect("connect daemon");
+    fn connect(sock: &std::path::Path) -> (Self, BufReader<DaemonStream>) {
+        let s = connect_daemon(sock).expect("connect daemon");
+        #[cfg(windows)]
+        s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
         let read_half = s.try_clone().unwrap();
         // The read timeout must be on the CLONE we actually read from, else read_line blocks forever and
         // the wall-clock deadline never fires.
@@ -91,6 +139,58 @@ impl DaemonConn {
         self.write.write_all(line.as_bytes()).unwrap();
         self.write.write_all(b"\n").unwrap();
         self.write.flush().unwrap();
+    }
+}
+
+fn start_session_json(id: &str, cols: u16, rows: u16, echo_only: bool) -> String {
+    #[cfg(unix)]
+    let (command, args, cwd) = if echo_only {
+        ("cat".to_owned(), vec![], PathBuf::from("/tmp"))
+    } else {
+        (
+            "bash".to_owned(),
+            vec!["--norc", "-i"],
+            PathBuf::from("/tmp"),
+        )
+    };
+    #[cfg(windows)]
+    let (command, args, cwd) = {
+        let _ = echo_only;
+        let command = PathBuf::from(std::env::var_os("SystemRoot").expect("Windows system root"))
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        assert!(command.is_file(), "native PowerShell fixture is missing");
+        (
+            command.to_string_lossy().into_owned(),
+            vec!["-NoLogo", "-NoProfile", "-NoExit"],
+            std::env::temp_dir(),
+        )
+    };
+    serde_json::json!({"op":"start_session", "id":id, "cwd":cwd, "command":command,
+        "args":args, "cols":cols, "rows":rows})
+    .to_string()
+}
+
+fn marker_input(marker: &str, echo_only: bool) -> String {
+    #[cfg(unix)]
+    {
+        if echo_only {
+            format!("{marker}\n")
+        } else {
+            format!("echo {marker}\n")
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = echo_only;
+        assert!(marker
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_'));
+        let (first, second) = marker.split_at(marker.len() / 2);
+        // The complete marker never appears in the echoed input: PowerShell must execute it.
+        format!("Write-Output ('{first}' + '{second}')\r")
     }
 }
 
@@ -193,7 +293,10 @@ fn read_until(reader: &mut impl BufRead, needle: &str, within: Duration) -> Opti
     let deadline = Instant::now() + within;
     let mut line = String::new();
     while Instant::now() < deadline {
-        line.clear();
+        // A deadline tick may follow a partial pipe read; retain that prefix until newline.
+        if line.ends_with('\n') {
+            line.clear();
+        }
         match reader.read_line(&mut line) {
             Ok(0) => return None,
             Ok(_) => {
@@ -216,7 +319,9 @@ fn read_output_until_marker(
     let mut decoded = Vec::new();
     let mut line = String::new();
     while Instant::now() < deadline {
-        line.clear();
+        if line.ends_with('\n') {
+            line.clear();
+        }
         match reader.read_line(&mut line) {
             Ok(0) => return None,
             Ok(_) => {
@@ -268,15 +373,12 @@ fn claims() -> TokenClaims {
 #[test]
 fn live_pty_attach_input_output_resize_detach() {
     let sock = socket_path();
-    let _killer = Killer {
-        child: start_daemon(&sock),
-        socket: sock.clone(),
-    };
+    let _killer = start_daemon(&sock);
 
     // The bridge's backend connection both STARTS the session and drives it (the daemon scopes a session
     // to its connection; a remote client over the real bridge would likewise hold one connection).
     let (mut conn, mut daemon_rx) = DaemonConn::connect(&sock);
-    conn.send(r#"{"op":"start_session","id":"s1","cwd":"/tmp","command":"bash","args":["--norc","-i"],"cols":220,"rows":70}"#);
+    conn.send(&start_session_json("s1", 220, 70, false));
     std::thread::sleep(Duration::from_millis(300)); // let the PTY spawn
     let generations = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
     let pending_resize = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -402,7 +504,7 @@ fn live_pty_attach_input_output_resize_detach() {
         .insert("s1".into(), raw_generation);
 
     // send `echo HELLO_S4` as terminal_input over the bridge → reaches the real PTY
-    let inp = bridge.handle_input(channel, b"echo HELLO_S4\n");
+    let inp = bridge.handle_input(channel, marker_input("HELLO_S4", false).as_bytes());
     assert!(inp.is_empty(), "input accepted");
 
     // the daemon streams output frames back; find one carrying our echoed marker, then frame it as a
@@ -418,7 +520,9 @@ fn live_pty_attach_input_output_resize_detach() {
         let mut all = String::new();
         let mut line = String::new();
         while Instant::now() < deadline && found.is_none() {
-            line.clear();
+            if line.ends_with('\n') {
+                line.clear();
+            }
             match daemon_rx.read_line(&mut line) {
                 Ok(0) => break,
                 Ok(_) => {
@@ -493,20 +597,14 @@ async fn peer_bridge_teardown_releases_fds_and_retains_the_daemon_pty() {
     const MARKER: &[u8] = b"HYDRA_RETAINED_AFTER_REMOTE_TEARDOWN";
 
     let sock = socket_path();
-    let daemon = start_daemon(&sock);
+    let _killer = start_daemon(&sock);
     #[cfg(target_os = "linux")]
-    let daemon_pid = daemon.id();
-    let _killer = Killer {
-        child: daemon,
-        socket: sock.clone(),
-    };
+    let daemon_pid = _killer.child.id();
 
     // A witness connection creates and observes the daemon-owned PTY independently of every
     // short-lived remote bridge below.
     let (mut witness, mut witness_rx) = DaemonConn::connect(&sock);
-    witness.send(&format!(
-        r#"{{"op":"start_session","id":"{SESSION}","cwd":"/tmp","command":"cat","args":[],"cols":80,"rows":24}}"#
-    ));
+    witness.send(&start_session_json(SESSION, 80, 24, true));
     std::thread::sleep(Duration::from_millis(250));
     witness.send(&format!(
         r#"{{"op":"attach","id":"{SESSION}","want_raw_output":true}}"#
@@ -582,8 +680,8 @@ async fn peer_bridge_teardown_releases_fds_and_retains_the_daemon_pty() {
     // If remote teardown accidentally killed the retained PTY, this write cannot be echoed by the
     // still-attached witness. Seeing the marker proves process + terminal lifetime survived all cycles.
     witness.send(&format!(
-        r#"{{"op":"write","id":"{SESSION}","data":"{}\n","expected_generation":{}}}"#,
-        String::from_utf8_lossy(MARKER),
+        r#"{{"op":"write","id":"{SESSION}","data":{},"expected_generation":{}}}"#,
+        json_str(&marker_input(std::str::from_utf8(MARKER).unwrap(), true)),
         json_str(&witness_generation)
     ));
     read_output_until_marker(&mut witness_rx, MARKER, Duration::from_secs(5))

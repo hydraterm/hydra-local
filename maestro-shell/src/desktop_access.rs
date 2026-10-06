@@ -436,14 +436,24 @@ mod tests {
     #[test]
     fn current_status_is_not_applicable_off_macos() {
         assert_eq!(current_status(), DesktopAccessStatus::NotApplicable);
+        for path in [
+            r"C:\Fixture\fixture\Desktop\project",
+            r"C:\Fixture\fixture\Documents\project",
+            r"\\server\share\project",
+            "/Users/test/Desktop/project",
+        ] {
+            assert!(!path_requires_full_disk_access(Path::new(path)), "{path}");
+        }
     }
 
+    #[cfg(unix)]
     struct FakePathProbe {
         home: Option<PathBuf>,
         current: Option<PathBuf>,
         components: HashMap<PathBuf, PathComponentProbeResult>,
     }
 
+    #[cfg(unix)]
     impl FakePathProbe {
         fn ordinary() -> Self {
             Self {
@@ -454,6 +464,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl DesktopAccessPathProbe for FakePathProbe {
         fn home_dir(&self) -> Option<PathBuf> {
             self.home.clone()
@@ -472,6 +483,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn lexical_classifier_covers_all_protected_roots_without_prefix_confusion() {
         let probe = FakePathProbe::ordinary();
         for path in [
@@ -515,6 +527,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn data_volume_home_environment_also_protects_the_root_alias() {
         let mut probe = FakePathProbe::ordinary();
         probe.home = Some(PathBuf::from("/System/Volumes/Data/Users/test"));
@@ -531,6 +544,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn lexical_normalization_cannot_escape_or_hide_a_protected_root() {
         let probe = FakePathProbe::ordinary();
         assert!(path_requires_full_disk_access_with_probe(
@@ -544,6 +558,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn symlink_and_component_uncertainty_fail_closed_without_canonicalizing() {
         let mut symlink = FakePathProbe::ordinary();
         symlink.components.insert(
@@ -577,6 +592,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn parent_traversal_cannot_hide_a_symlink_component() {
         let mut probe = FakePathProbe::ordinary();
         probe.components.insert(
@@ -590,6 +606,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn missing_environment_context_fails_closed() {
         let mut probe = FakePathProbe::ordinary();
         probe.home = None;

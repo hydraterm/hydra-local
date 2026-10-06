@@ -1,3 +1,6 @@
+// This wire fixture uses Unix domain sockets and POSIX child commands.
+#![cfg(unix)]
+
 //! Grid-authority smoke test. Proves the daemon parses PTY output through its
 //! VT engine and holds the canonical screen: we write known text, ask for a
 //! grid snapshot, and assert the rendered cells contain it. Then we resize and

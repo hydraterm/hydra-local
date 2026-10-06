@@ -220,13 +220,19 @@ fn regex_escape(s: &str) -> String {
 
 fn daemon_responds(socket_path: &std::path::Path) -> bool {
     use std::io::{Read, Write};
-    use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
-    let Ok(mut stream) = UnixStream::connect(socket_path) else {
+    let Ok(mut stream) = crate::daemon_transport::connect_sync(socket_path) else {
         return false;
     };
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    #[cfg(windows)]
+    if stream
+        .set_write_timeout(Some(Duration::from_millis(500)))
+        .is_err()
+    {
+        return false;
+    }
     if stream.write_all(b"{\"op\":\"list_sessions\"}\n").is_err() {
         return false;
     }

@@ -1,6 +1,6 @@
 //! pty-daemon entrypoint: a long-lived process that owns PTYs (sessions) and a
-//! channel bus, and serves a newline-delimited JSON protocol over a Unix
-//! domain socket. The UI attaches/detaches; the daemon and its agent processes
+//! channel bus, and serves a newline-delimited JSON protocol over an authenticated
+//! local Unix socket or Windows named pipe. The UI attaches/detaches; the daemon and its agent processes
 //! live on, giving tier-(a) session survival across UI restarts.
 
 mod channel;
@@ -8,27 +8,43 @@ mod daemon;
 mod grid;
 mod ids;
 mod outbound;
+#[cfg(unix)]
 mod peercred;
 mod protocol;
 mod revision;
 mod session;
+#[cfg(unix)]
 mod socket;
+#[cfg(test)]
+mod test_child;
+#[cfg(windows)]
+mod windows_child_path;
 #[cfg(windows)]
 mod windows_command;
 #[cfg(windows)]
 mod windows_conpty;
 #[cfg(windows)]
+mod windows_conpty_runtime;
+#[cfg(windows)]
+mod windows_dll_search;
+#[cfg(windows)]
 mod windows_job;
 #[cfg(windows)]
 mod windows_overlapped_io;
+#[cfg(windows)]
+mod windows_pipe;
 #[cfg(windows)]
 mod windows_pipe_security;
 #[cfg(windows)]
 mod windows_private_pipe;
 #[cfg(windows)]
 mod windows_process_encoding;
+#[cfg(windows)]
+mod windows_session_retirement;
 
-use crate::daemon::{ConditionalSessionTake, Daemon, SessionAttachmentAcquireError, SharedDaemon};
+#[cfg(not(windows))]
+use crate::daemon::ConditionalSessionTake;
+use crate::daemon::{Daemon, SessionAttachmentAcquireError, SharedDaemon};
 use crate::ids::SessionId;
 use crate::protocol::{
     AttachmentHandoff, AttachmentHandoffToken, ClientRequest, DaemonEvent, SessionAttachRefusal,
@@ -39,10 +55,13 @@ use anyhow::Result;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::ffi::OsString;
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::task::AbortHandle;
 
@@ -56,6 +75,7 @@ const OUT_QUEUE_BYTES: usize = 32 * 1024 * 1024;
 const _: () = assert!(OUT_QUEUE_BYTES >= MAX_LINE_BYTES);
 
 /// Default socket path. The UI passes the same path; one daemon per user.
+#[cfg(unix)]
 fn default_socket_path() -> PathBuf {
     // SAFETY: geteuid has no preconditions and does not dereference memory.
     default_socket_path_for_uid(|key| std::env::var_os(key), unsafe { libc::geteuid() })
@@ -63,6 +83,7 @@ fn default_socket_path() -> PathBuf {
 
 /// Testable form of [`default_socket_path`]. Empty environment values are absent, matching the
 /// installed launcher and `maestro-shell` endpoint resolver rather than producing a relative path.
+#[cfg(unix)]
 fn default_socket_path_for_uid(
     get_env: impl Fn(&str) -> Option<OsString>,
     effective_uid: u32,
@@ -74,15 +95,29 @@ fn default_socket_path_for_uid(
     PathBuf::from(base).join(maestro_protocol::daemon_socket_filename(effective_uid))
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "pty_daemon=info".into()),
-        )
-        .init();
+fn main() -> Result<()> {
+    #[cfg(windows)]
+    windows_dll_search::restrict_dll_search_to_system32()?;
+    #[cfg(windows)]
+    windows_child_path::initialize();
 
+    async_main()
+}
+
+#[tokio::main]
+async fn async_main() -> Result<()> {
+    let log_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "pty_daemon=info".into())
+        // The locked Windows PTY backend emits registry-derived environment values at TRACE.
+        // Those can contain credentials, so this target stays disabled even for diagnostic runs.
+        .add_directive("portable_pty::cmdbuilder=off".parse()?);
+    tracing_subscriber::fmt().with_env_filter(log_filter).init();
+
+    run_platform().await
+}
+
+#[cfg(unix)]
+async fn run_platform() -> Result<()> {
     let socket_path = std::env::args()
         .nth(1)
         .map(PathBuf::from)
@@ -105,11 +140,11 @@ async fn main() -> Result<()> {
     let shared = Daemon::shared();
 
     // Race the accept loop against a termination signal. On SIGINT/SIGTERM we stop
-    // accepting and run graceful shutdown: kill + reap every owned child so the
-    // daemon does not leave orphans/zombies behind. The accept loop only returns
+    // accepting and run graceful shutdown: terminate + confirm every owned child (including Unix
+    // reaping) so the daemon does not leave orphans/zombies behind. The accept loop only returns
     // on a hard error, which we surface; the normal exit path is the signal.
     tokio::select! {
-        accept_result = accept_loop(&listener, &shared) => {
+        accept_result = accept_loop_unix(&listener, &shared) => {
             // accept_loop loops forever unless `accept()` errors; reaching here
             // means a fatal listener error. Still run shutdown so children aren't
             // orphaned, then propagate the error.
@@ -126,9 +161,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Graceful shutdown: terminate and reap owned children, then report whether
-    // every one confirmed reaped before we exit.
-    let report = shared.lock().await.shutdown();
+    // Graceful shutdown: terminate owned children, then report whether every one confirmed complete
+    // (and, on Unix, reaped) before we exit.
+    let report = shutdown_daemon(&shared).await;
     log_shutdown_report(&report);
     // Best-effort: remove our own socket so a restart sees a clean path rather
     // than a stale one it must probe.
@@ -137,19 +172,118 @@ async fn main() -> Result<()> {
     if report.all_reaped() {
         Ok(())
     } else {
-        // A degraded shutdown (a child didn't confirm reaped) exits non-zero so a
+        // A degraded shutdown (a child did not confirm completion) exits non-zero so a
         // supervisor can notice, rather than silently claiming a clean exit.
         Err(anyhow::anyhow!(
-            "shutdown could not confirm {} of {} child(ren) reaped within the timeout",
+            "shutdown could not confirm completion of {} of {} child(ren) within the timeout",
             report.unconfirmed.len(),
             report.total
         ))
     }
 }
 
+#[cfg(windows)]
+async fn run_platform() -> Result<()> {
+    let pipe_name = match std::env::args_os().nth(1) {
+        Some(name) => windows_pipe::validate_local_pipe_name(name)?,
+        None => windows_pipe::default_pipe_name()?,
+    };
+    let mut listener = windows_pipe::Listener::bind(pipe_name.clone())?;
+    tracing::info!(pipe = %pipe_name.to_string_lossy(), "pty-daemon listening");
+
+    let shared = Daemon::shared();
+    let mut handlers = tokio::task::JoinSet::new();
+    let shutdown_signal = wait_for_shutdown_signal();
+    tokio::pin!(shutdown_signal);
+    let accept_error = loop {
+        // Drain every already-completed task before admitting another connection. The select arm
+        // below also reaps completions while accept is idle; together they keep churn from building
+        // a completed-result backlog even when the pipe is continuously connectable.
+        while let Some(completed) = handlers.try_join_next() {
+            if let Err(error) = completed {
+                tracing::warn!(error = %error, "named-pipe client task failed");
+            }
+        }
+        tokio::select! {
+            accepted = listener.accept() => {
+                let stream = match accepted {
+                    Ok(stream) => stream,
+                    Err(error) => break Some(error),
+                };
+                let shared = shared.clone();
+                handlers.spawn(async move {
+                    let (stream, first_byte) = match windows_pipe::authenticate_client(stream).await {
+                        Ok(authenticated) => authenticated,
+                        Err(error) => {
+                            tracing::warn!(error = %error, "rejecting named-pipe client: identity check failed");
+                            return;
+                        }
+                    };
+                    // Authentication consumed exactly one byte without parsing it; replay that byte
+                    // before the remaining pipe stream so the protocol sees the original bytes.
+                    let (read_half, write_half) = tokio::io::split(stream);
+                    let read_half = std::io::Cursor::new(first_byte).chain(read_half);
+                    if let Err(error) = handle_client(read_half, write_half, shared).await {
+                        tracing::warn!(error = %error, "client connection ended");
+                    }
+                });
+            }
+            signal = &mut shutdown_signal => {
+                match signal {
+                    Some(name) => tracing::info!(signal = name, "received termination signal; shutting down"),
+                    None => tracing::warn!("signal handler unavailable; shutting down"),
+                }
+                break None;
+            }
+            completed = handlers.join_next(), if !handlers.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    tracing::warn!(error = %error, "named-pipe client task failed");
+                }
+            }
+        }
+    };
+
+    // Stop every admitted handler and wait for cancellation before cleaning the Session map. A
+    // handler can therefore never publish a child after the shutdown pass has already completed.
+    handlers.abort_all();
+    while let Some(result) = handlers.join_next().await {
+        if let Err(error) = result {
+            if !error.is_cancelled() {
+                tracing::warn!(error = %error, "named-pipe client task failed during shutdown");
+            }
+        }
+    }
+
+    let shutdown_result = finish_shutdown(&shared).await;
+    if let Some(error) = accept_error {
+        // A listener failure remains the primary error, but child cleanup above is never skipped.
+        return Err(error.into());
+    }
+    shutdown_result
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn run_platform() -> Result<()> {
+    Err(anyhow::anyhow!(
+        "pty-daemon has no authenticated local transport for this platform"
+    ))
+}
+
+async fn shutdown_daemon(shared: &SharedDaemon) -> crate::daemon::ShutdownReport {
+    #[cfg(not(windows))]
+    {
+        shared.lock().await.shutdown()
+    }
+    #[cfg(windows)]
+    {
+        windows_session_retirement::shutdown(shared).await
+    }
+}
+
 /// The connection accept loop. Loops forever, spawning a handler per accepted
 /// connection; returns only if `accept()` itself errors (a fatal listener fault).
-async fn accept_loop(listener: &UnixListener, shared: &SharedDaemon) -> Result<()> {
+#[cfg(unix)]
+async fn accept_loop_unix(listener: &UnixListener, shared: &SharedDaemon) -> Result<()> {
     loop {
         let (stream, _addr) = listener.accept().await?;
         // Peer-credential check (defense-in-depth over the 0600 socket perms): only
@@ -177,8 +311,8 @@ async fn accept_loop(listener: &UnixListener, shared: &SharedDaemon) -> Result<(
 
 /// Await the first of SIGINT or SIGTERM. Resolves to the signal name, or `None`
 /// if the signal handlers could not be installed (we then shut down anyway,
-/// rather than hang ignoring termination). On non-unix this never resolves;
-/// the daemon is unix-only, so that branch is unreachable in practice.
+/// rather than hang ignoring termination).
+#[cfg(unix)]
 async fn wait_for_shutdown_signal() -> Option<&'static str> {
     use tokio::signal::unix::{signal, SignalKind};
     let mut sigint = match signal(SignalKind::interrupt()) {
@@ -198,6 +332,34 @@ async fn wait_for_shutdown_signal() -> Option<&'static str> {
     tokio::select! {
         _ = sigint.recv() => Some("SIGINT"),
         _ = sigterm.recv() => Some("SIGTERM"),
+    }
+}
+
+/// Windows console-control shutdown. A production service/control-channel stop contract is a
+/// later launcher milestone; closing the GUI must never send this signal to the retained daemon.
+#[cfg(windows)]
+async fn wait_for_shutdown_signal() -> Option<&'static str> {
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => Some("CTRL_C"),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to install Ctrl-C handler");
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn finish_shutdown(shared: &SharedDaemon) -> Result<()> {
+    let report = shutdown_daemon(shared).await;
+    log_shutdown_report(&report);
+    if report.all_reaped() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "shutdown could not confirm completion of {} of {} child(ren) within the timeout",
+            report.unconfirmed.len(),
+            report.total
+        ))
     }
 }
 
@@ -516,7 +678,7 @@ async fn handle_request(
                     start_operation_ledger: true,
                     generation_conditional_attach: true,
                     #[cfg(windows)]
-                    windows_start_operation_retirement_barrier: false,
+                    windows_start_operation_retirement_barrier: true,
                 })
                 .await;
         }
@@ -1234,23 +1396,35 @@ async fn handle_request(
             // observing. Release only this connection's guard while retaining its forwarder for
             // the terminal event. A different client's guard is untouched and still blocks take.
             state.release_guard_for_own_kill(&id);
-            let taken = {
-                let mut d = shared.lock().await;
-                d.take_session_if_generation(&id, &expected_generation)
-            };
-            match taken {
-                ConditionalSessionTake::Absent => {}
-                ConditionalSessionTake::GenerationMismatch
-                | ConditionalSessionTake::AttachmentInUse => {
-                    // Close without a best-effort Error. In particular, an attached exited A is
-                    // omitted from live Sessions; allowing this release connection to continue to
-                    // ListSessions could misclassify A as confirmed absent after Kill was refused.
+            #[cfg(windows)]
+            {
+                if let Err(error) =
+                    windows_session_retirement::kill(shared, &id, &expected_generation).await
+                {
+                    tracing::error!(session = %id, %error, "exact Windows session retirement failed");
                     return RequestDisposition::CloseClient;
                 }
-                ConditionalSessionTake::Taken(session) => {
-                    // The exact A Session was removed while the map lock was held. Kill only that
-                    // detached handle after unlock; a concurrently inserted B cannot be touched.
-                    session.kill_child();
+            }
+            #[cfg(not(windows))]
+            {
+                let taken = {
+                    let mut d = shared.lock().await;
+                    d.take_session_if_generation(&id, &expected_generation)
+                };
+                match taken {
+                    ConditionalSessionTake::Absent => {}
+                    ConditionalSessionTake::GenerationMismatch
+                    | ConditionalSessionTake::AttachmentInUse => {
+                        // Close without a best-effort Error. In particular, an attached exited A is
+                        // omitted from live Sessions; allowing this release connection to continue to
+                        // ListSessions could misclassify A as confirmed absent after Kill was refused.
+                        return RequestDisposition::CloseClient;
+                    }
+                    ConditionalSessionTake::Taken(session) => {
+                        // The exact A Session was removed while the map lock was held. Kill only that
+                        // detached handle after unlock; a concurrently inserted B cannot be touched.
+                        session.kill_child();
+                    }
                 }
             }
         }
@@ -1308,6 +1482,7 @@ async fn handle_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_child::{echo, exits, idle, KillOutcome};
     use std::sync::{Arc, Barrier};
     use std::time::Duration;
 
@@ -1335,7 +1510,7 @@ mod tests {
         let daemon_instance_id = {
             let mut daemon = shared.lock().await;
             daemon
-                .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+                .start_session(id.clone(), ".", idle().program(), idle().args(), 80, 24)
                 .unwrap();
             daemon.instance_id().clone()
         };
@@ -1405,7 +1580,7 @@ mod tests {
         let mut daemon = Daemon::default();
         let id = sid("same-client-repeat");
         daemon
-            .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+            .start_session(id.clone(), ".", idle().program(), idle().args(), 80, 24)
             .unwrap();
         let mut state = ClientState::new().unwrap();
         let first_token = handoff_token("10000000000000000000000000000001");
@@ -1478,7 +1653,7 @@ mod tests {
         let mut daemon = Daemon::default();
         let id = sid("ordinary-does-not-consume-handoff");
         daemon
-            .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+            .start_session(id.clone(), ".", idle().program(), idle().args(), 80, 24)
             .unwrap();
         let value = handoff_token("20000000000000000000000000000001");
         let offer = AttachmentHandoff::Offer {
@@ -1532,7 +1707,7 @@ mod tests {
         let generation = {
             let mut daemon = shared.lock().await;
             daemon
-                .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+                .start_session(id.clone(), ".", idle().program(), idle().args(), 80, 24)
                 .unwrap();
             daemon.session(&id).unwrap().generation()
         };
@@ -1583,7 +1758,14 @@ mod tests {
         let killed_generation = {
             let mut daemon = shared.lock().await;
             daemon
-                .start_session(killed_id.clone(), ".", "sleep", &["30".into()], 80, 24)
+                .start_session(
+                    killed_id.clone(),
+                    ".",
+                    idle().program(),
+                    idle().args(),
+                    80,
+                    24,
+                )
                 .unwrap();
             daemon.session(&killed_id).unwrap().generation()
         };
@@ -1637,12 +1819,12 @@ mod tests {
         let id = sid(id);
         let mut daemon = shared.lock().await;
         daemon
-            .start_session(id.clone(), ".", "cat", &[], 80, 24)
+            .start_session(id.clone(), ".", echo().program(), echo().args(), 80, 24)
             .expect("spawn generation A");
         let generation_a = daemon.session(&id).unwrap().generation();
         daemon.kill_session(&id);
         daemon
-            .start_session(id.clone(), ".", "cat", &[], 80, 24)
+            .start_session(id.clone(), ".", echo().program(), echo().args(), 80, 24)
             .expect("spawn generation B");
         let generation_b = daemon.session(&id).unwrap().generation();
         assert_ne!(
@@ -1765,7 +1947,7 @@ mod tests {
         {
             let mut daemon = shared.lock().await;
             daemon
-                .start_session(id.clone(), ".", "true", &[], 80, 24)
+                .start_session(id.clone(), ".", exits().program(), exits().args(), 80, 24)
                 .unwrap();
         }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -1874,14 +2056,10 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let removed = shared
-            .lock()
-            .await
-            .take_session_if_generation(&id, &generation);
-        let ConditionalSessionTake::Taken(session) = removed else {
+        let removed = crate::test_child::conditional_kill_shared(&shared, &id, &generation).await;
+        let KillOutcome::Retired = removed else {
             panic!("EOF must release the last attachment guard");
         };
-        session.kill_child();
     }
 
     #[tokio::test]
@@ -1894,7 +2072,7 @@ mod tests {
         {
             let mut daemon = shared.lock().await;
             daemon
-                .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+                .start_session(id.clone(), ".", idle().program(), idle().args(), 80, 24)
                 .unwrap();
             let pending_offer = AttachmentHandoff::Offer {
                 token: exact_pending.clone(),
@@ -2046,7 +2224,14 @@ mod tests {
         let generation = {
             let mut daemon = shared.lock().await;
             daemon
-                .start_session(sid("generation-match"), ".", "cat", &[], 80, 24)
+                .start_session(
+                    sid("generation-match"),
+                    ".",
+                    echo().program(),
+                    echo().args(),
+                    80,
+                    24,
+                )
                 .expect("spawn matching lifetime");
             daemon
                 .session(&sid("generation-match"))
@@ -2198,6 +2383,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn env_of<'a>(entries: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
         move |key| {
             entries
@@ -2206,6 +2392,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn default_socket_path_uses_first_non_empty_runtime_directory() {
         assert_eq!(
@@ -2237,10 +2424,10 @@ mod tests {
         {
             let mut daemon = shared.lock().await;
             daemon
-                .start_session(sid("list-a"), ".", "sleep", &["30".to_string()], 80, 24)
+                .start_session(sid("list-a"), ".", idle().program(), idle().args(), 80, 24)
                 .expect("spawn list-a");
             daemon
-                .start_session(sid("list-b"), ".", "sleep", &["30".to_string()], 80, 24)
+                .start_session(sid("list-b"), ".", idle().program(), idle().args(), 80, 24)
                 .expect("spawn list-b");
         }
 
@@ -2322,8 +2509,8 @@ mod tests {
                 .start_session(
                     sid("writer-failure"),
                     ".",
-                    "sleep",
-                    &["30".to_string()],
+                    idle().program(),
+                    idle().args(),
                     80,
                     24,
                 )
@@ -2459,7 +2646,7 @@ mod tests {
 
         let (handle, generation) = rt.block_on(async {
             let mut d = shared.lock().await;
-            d.start_session(sid("w"), ".", "sleep", &["30".to_string()], 80, 24)
+            d.start_session(sid("w"), ".", idle().program(), idle().args(), 80, 24)
                 .expect("spawn session");
             let session = d.session(&sid("w")).unwrap();
             (session.pty_handle(), session.generation())

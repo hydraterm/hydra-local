@@ -157,24 +157,33 @@ fn ensure_daemon_impl(
     // server with no console role here, so by default null is the right sink; with `--log-dir` its
     // stdout/stderr are captured to deterministic files there instead. stdin is always null.
     let (stdout, stderr) = child_log_stdio(log_dir, ChildLogKind::Daemon)?;
-    let child = ProcCommand::new(daemon_bin)
+    let mut command = ProcCommand::new(daemon_bin);
+    command
         .arg(socket_path)
         .stdin(Stdio::null())
         .stdout(stdout)
-        .stderr(stderr)
-        .spawn()
-        .map_err(|e| {
-            LaunchFailure::new(
-                "daemon_spawn_failed",
-                format!("failed to spawn pty-daemon: {e}"),
-            )
-        })?;
+        .stderr(stderr);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Detached daemon owns retained ConPTY sessions independently of the GUI's console.
+        command.creation_flags(0x0000_0008 | 0x0000_0200);
+    }
+    let child = command.spawn().map_err(|e| {
+        LaunchFailure::new(
+            "daemon_spawn_failed",
+            format!("failed to spawn pty-daemon: {e}"),
+        )
+    })?;
     let mut spawned = SpawnedDaemon {
         child,
-        socket_path: socket_path.to_path_buf(),
         conditional_start_peer: None,
-        keep: false,
     };
+
+    // Only debug test builds expose this rendezvous. It deliberately fails before the creator's
+    // readiness proof, after a second authenticated client can adopt the public daemon.
+    #[cfg(debug_assertions)]
+    fail_after_spawn_barrier_for_test(spawned.child.id())?;
 
     while Instant::now() < deadline {
         // If the daemon process died before binding, fail fast instead of waiting out the timeout.
@@ -189,7 +198,7 @@ fn ensure_daemon_impl(
             maestro_shell::DaemonClient::connect_before(socket_path, probe_deadline)
         {
             if let Ok(identity) = client.conditional_start_peer_identity_before(probe_deadline) {
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", windows))]
                 if identity.server_pid() != Some(spawned.child.id()) {
                     return Err(LaunchFailure::new(
                         "daemon_spawn_failed",
@@ -212,6 +221,30 @@ fn ensure_daemon_impl(
             socket_path.display(),
             DAEMON_CONNECT_TIMEOUT
         ),
+    ))
+}
+
+#[cfg(debug_assertions)]
+fn fail_after_spawn_barrier_for_test(pid: u32) -> Result<(), LaunchFailure> {
+    let Some(directory) = std::env::var_os("HYDRA_TEST_DAEMON_SPAWN_BARRIER") else {
+        return Ok(());
+    };
+    let directory = std::path::PathBuf::from(directory);
+    if !directory.is_absolute() || !directory.is_dir() {
+        return Err(LaunchFailure::new(
+            "test_barrier_invalid",
+            "invalid fixture barrier",
+        ));
+    }
+    std::fs::write(directory.join("spawned.pid"), pid.to_string())
+        .map_err(|_| LaunchFailure::new("test_barrier_invalid", "fixture barrier write failed"))?;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !directory.join("fail-now").is_file() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Err(LaunchFailure::new(
+        "test_pre_readiness_failure",
+        "injected failure before creator readiness proof",
     ))
 }
 

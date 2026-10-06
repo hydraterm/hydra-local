@@ -14,8 +14,11 @@ use base64::Engine as _;
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
+#[cfg(unix)]
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use zeroize::Zeroizing;
 
@@ -35,6 +38,7 @@ const SUPPORTED_ENROLLMENT_AUTHORIZATION_VERSIONS: [&str; 1] = ["passkey-uv-v1"]
 // the server omits Content-Length or streams with chunked transfer encoding.
 const MAX_REDEEM_RESPONSE_BYTES: usize = 64 * 1024;
 const ENROLLMENT_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(unix)]
 const MAX_OWNER_FILE_BYTES: usize = 64 * 1024;
 const MAX_DEVICE_ID_BYTES: usize = 128;
 const MAX_ACCOUNT_ID_BYTES: usize = 256;
@@ -44,6 +48,7 @@ const MAX_PASSKEY_RP_ID_BYTES: usize = 253;
 const MAX_PASSKEY_CREDENTIAL_ID_BYTES: usize = 2_048;
 const MAX_ERROR_CODE_BYTES: usize = 128;
 const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+#[cfg(unix)]
 static RECORD_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -335,6 +340,7 @@ pub fn load_key(dir: &Path) -> Result<Option<SigningKey>> {
 }
 
 /// Load the device signing key, or generate + persist one (mode 0600). The seed is the only secret here.
+#[cfg(unix)]
 pub fn load_or_create_key(dir: &Path) -> Result<SigningKey> {
     crate::agent_dir::ensure_owned_safe_authority_directory(dir)
         .with_context(|| format!("create or validate agent dir {dir:?}"))?;
@@ -370,6 +376,132 @@ pub fn load_or_create_key(dir: &Path) -> Result<SigningKey> {
             signing_key_from_bytes(&bytes)
         }
         Err(error) => Err(error).context("create device-key"),
+    }
+}
+
+#[cfg(windows)]
+pub fn load_or_create_key(dir: &Path) -> Result<SigningKey> {
+    let _directory = maestro_shell::WindowsPrivateDirectory::ensure(dir)?;
+    if let Some(key) = load_key(dir)? {
+        return Ok(key);
+    }
+    let key = SigningKey::generate(&mut rand::rngs::OsRng);
+    let encoded = zeroize::Zeroizing::new(B64.encode(key.to_bytes()));
+    match crate::windows_private_authority::publish(&dir.join(KEY_FILE), encoded.as_bytes(), false)
+    {
+        Ok(()) => {
+            let readback = load_key(dir)?
+                .ok_or_else(|| anyhow::anyhow!("device key vanished after publication"))?;
+            if readback.to_bytes() != key.to_bytes() {
+                anyhow::bail!("device key changed after publication");
+            }
+            Ok(key)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            load_key(dir)?.ok_or_else(|| anyhow::anyhow!("device key disappeared during creation"))
+        }
+        Err(error) => Err(error).context("publish private device key"),
+    }
+}
+
+#[cfg(windows)]
+fn open_existing_private(path: &Path, label: &str) -> Result<Option<fs::File>> {
+    match crate::windows_private_authority::open(path, false) {
+        Ok(file) => {
+            validate_private_file(&file, label)?;
+            Ok(Some(file))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("open private {label}")),
+    }
+}
+
+#[cfg(windows)]
+fn write_private_json<T: Serialize>(
+    dir: &Path,
+    file_name: &str,
+    _temporary_prefix: &str,
+    value: &T,
+) -> Result<()> {
+    let _directory = maestro_shell::WindowsPrivateDirectory::ensure(dir)?;
+    let expected = serde_json::to_vec_pretty(value)?;
+    let path = dir.join(file_name);
+    crate::windows_private_authority::publish(&path, &expected, true)
+        .context("publish private identity record")?;
+    let (readback, _) = crate::windows_private_authority::read(&path, expected.len())?;
+    if readback != expected {
+        anyhow::bail!("private identity readback changed after publication");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_enrollment_diagnostics(dir: &Path, value: &EnrollmentDiagnostics) -> Result<()> {
+    let expected = serde_json::to_vec_pretty(value)?;
+    if expected.len() > MAX_ENROLLMENT_DIAGNOSTICS_BYTES {
+        anyhow::bail!("enrollment diagnostics exceed the byte bound");
+    }
+    let _directory = maestro_shell::WindowsPrivateDirectory::ensure(dir)?;
+    let temporary = enrollment_diagnostics_temporary_path(dir);
+    match crate::windows_private_authority::remove(&temporary, None) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("remove exact stale diagnostic temporary"),
+    }
+    write_private_json(dir, ENROLLMENT_DIAGNOSTICS_FILE, "diagnostic", value)
+}
+
+#[cfg(windows)]
+fn publish_owner_no_replace(dir: &Path, owner: &DeviceOwner) -> Result<()> {
+    let _directory = maestro_shell::WindowsPrivateDirectory::ensure(dir)?;
+    let expected = serde_json::to_vec_pretty(owner)?;
+    match crate::windows_private_authority::publish(&owner_path(dir), &expected, false) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let actual = read_private_file(&owner_path(dir), OWNER_FILE)?
+                .ok_or_else(|| anyhow::anyhow!("device owner disappeared"))?;
+            if parse_owner(&actual)? != *owner {
+                anyhow::bail!("device owner changed during owner claim");
+            }
+            Ok(())
+        }
+        Err(error) => Err(error).context("publish private device owner"),
+    }
+}
+
+#[cfg(windows)]
+fn release_retired_owner_for_reenrollment(
+    dir: &Path,
+    locks: &crate::service::LifecycleLockSet,
+) -> Result<()> {
+    locks.require_agent_dir(dir)?;
+    if load_record(dir)?.is_some() {
+        return Ok(());
+    }
+    let path = owner_path(dir);
+    let Some(file) = open_existing_private(&path, OWNER_FILE)? else {
+        return Ok(());
+    };
+    let identity = maestro_shell::WindowsPrivateDirectory::validate_file(&file)?;
+    drop(file);
+    if load_record(dir)?.is_some() {
+        anyhow::bail!("active enrollment appeared before retired owner release");
+    }
+    crate::windows_private_authority::remove(&path, Some(identity))
+        .context("release exact retired device owner")?;
+    if open_existing_private(&path, OWNER_FILE)?.is_some() {
+        anyhow::bail!("device owner reappeared after release");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn remove_record(dir: &Path) -> Result<()> {
+    preserve_owner_marker(dir)?;
+    match crate::windows_private_authority::remove(&record_path(dir), None) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("remove exact private enrollment record"),
     }
 }
 
@@ -426,6 +558,7 @@ fn owner_path(dir: &Path) -> PathBuf {
     dir.join(OWNER_FILE)
 }
 
+#[cfg(unix)]
 fn private_open_options() -> fs::OpenOptions {
     let mut options = fs::OpenOptions::new();
     #[cfg(unix)]
@@ -436,6 +569,7 @@ fn private_open_options() -> fs::OpenOptions {
     options
 }
 
+#[cfg(unix)]
 fn create_private_file(path: &Path, label: &str) -> std::io::Result<fs::File> {
     let mut options = private_open_options();
     options.write(true).create_new(true);
@@ -449,6 +583,7 @@ fn create_private_file(path: &Path, label: &str) -> std::io::Result<fs::File> {
         .map_err(|error| std::io::Error::new(error.kind(), format!("{label}: {error}")))
 }
 
+#[cfg(unix)]
 fn open_existing_private(path: &Path, label: &str) -> Result<Option<fs::File>> {
     let mut options = private_open_options();
     options.read(true);
@@ -518,15 +653,11 @@ fn validate_private_file(file: &fs::File, label: &str) -> Result<()> {
     {
         validate_private_file_for_uid(file, label, unsafe { libc::geteuid() })
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let metadata = file
-            .metadata()
-            .with_context(|| format!("inspect {label}"))?;
-        if !metadata.file_type().is_file() {
-            anyhow::bail!("refusing {label}: path is not a regular file");
-        }
-        Ok(())
+        maestro_shell::WindowsPrivateDirectory::validate_file(file)
+            .map(|_| ())
+            .with_context(|| format!("inspect private {label}"))
     }
 }
 
@@ -605,6 +736,7 @@ fn read_bounded_diagnostic_file(
     Ok(Some((bytes, oversized)))
 }
 
+#[cfg(unix)]
 fn write_private_json<T: Serialize>(
     dir: &Path,
     file_name: &str,
@@ -658,6 +790,7 @@ fn write_private_json<T: Serialize>(
     Ok(())
 }
 
+#[cfg(unix)]
 fn remove_safe_stale_diagnostic_temporary(dir: &Path) -> Result<()> {
     let path = enrollment_diagnostics_temporary_path(dir);
     let Some(file) = open_existing_diagnostic(&path, ENROLLMENT_DIAGNOSTICS_TEMP_FILE)? else {
@@ -675,6 +808,7 @@ fn remove_safe_stale_diagnostic_temporary(dir: &Path) -> Result<()> {
     }
 }
 
+#[cfg(unix)]
 fn write_enrollment_diagnostics(dir: &Path, value: &EnrollmentDiagnostics) -> Result<()> {
     crate::agent_dir::ensure_owned_safe_authority_directory(dir)
         .context("create or validate enrollment diagnostic directory")?;
@@ -1067,6 +1201,7 @@ fn load_owner(dir: &Path) -> Result<Option<DeviceOwner>> {
 /// PTYs or deleting local projects. Production callers hold the lifecycle lock
 /// across this function and the subsequent one-shot redeem. The repeated record
 /// check keeps the standalone test/helper entry point fail-closed as well.
+#[cfg(unix)]
 fn release_retired_owner_for_reenrollment(
     dir: &Path,
     locks: &crate::service::LifecycleLockSet,
@@ -1279,6 +1414,7 @@ fn recover_completed_owner_publication(dir: &Path) -> Result<()> {
     }
 }
 
+#[cfg(unix)]
 fn is_exact_owner_temporary_name(name: &str) -> bool {
     let Some(rest) = name.strip_prefix(".device-owner.json.tmp.") else {
         return false;
@@ -1303,6 +1439,7 @@ fn owner_for_record(rec: &DeviceRecord) -> DeviceOwner {
 /// Publish the first durable owner without replacing a marker another lifecycle
 /// process won the race to create. The temporary and final names share a
 /// directory, so the hard-link publication is atomic and no-clobber.
+#[cfg(unix)]
 fn publish_owner_no_replace(dir: &Path, owner: &DeviceOwner) -> Result<()> {
     crate::agent_dir::ensure_owned_safe_authority_directory(dir)
         .context("create or validate enrollment directory")?;
@@ -1357,6 +1494,7 @@ fn publish_owner_no_replace(dir: &Path, owner: &DeviceOwner) -> Result<()> {
     result
 }
 
+#[cfg(unix)]
 fn sync_directory(path: &Path) -> std::io::Result<()> {
     fs::File::open(path)?.sync_all()
 }
@@ -1461,6 +1599,7 @@ pub fn enrollment_binding_is_revoked(
 /// Delete the replaceable enrollment record (device.json). Idempotent — a missing file is Ok. The stable device
 /// key and consistency marker may remain for cleanup recovery, but the next explicit fresh-code enrollment
 /// releases the retired marker and may bind any account. Daemon-owned PTYs and local projects are untouched.
+#[cfg(unix)]
 pub fn remove_record(dir: &Path) -> Result<()> {
     preserve_owner_marker(dir)?;
     let path = record_path(dir);

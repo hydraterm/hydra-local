@@ -241,8 +241,17 @@ pub fn create_session_with_initial_size(
 /// Resolve the runtime recipe for an empty browser-created terminal. Linux
 /// headless services do not inherit an attended launcher's `SHELL`/`PATH`, so
 /// use the effective account's passwd shell as a login shell. Other platforms
-/// retain the existing remote-desktop recipe byte for byte.
+/// retain the existing remote-desktop recipe byte for byte; Windows uses the
+/// shared native desktop shell without POSIX flags.
 pub(crate) fn empty_session_launch(headless_server: bool) -> ResumeLaunch {
+    #[cfg(windows)]
+    {
+        let _ = headless_server;
+        return ResumeLaunch {
+            command: maestro_shell::login_shell_program(&maestro_shell::ProcessLaunchEnv),
+            args: vec![],
+        };
+    }
     #[cfg(target_os = "linux")]
     {
         if headless_server {
@@ -257,10 +266,13 @@ pub(crate) fn empty_session_launch(headless_server: bool) -> ResumeLaunch {
         }
     }
 
-    let _ = headless_server;
-    ResumeLaunch {
-        command: "bash".to_string(),
-        args: vec!["--norc".to_string(), "-i".to_string()],
+    #[cfg(not(windows))]
+    {
+        let _ = headless_server;
+        ResumeLaunch {
+            command: "bash".to_string(),
+            args: vec!["--norc".to_string(), "-i".to_string()],
+        }
     }
 }
 
@@ -886,8 +898,22 @@ mod tests {
     #[test]
     fn desktop_empty_session_launch_preserves_the_legacy_shell_policy() {
         let launch = empty_session_launch(false);
-        assert_eq!(launch.command, "bash");
-        assert_eq!(launch.args, vec!["--norc", "-i"]);
+        #[cfg(not(windows))]
+        {
+            assert_eq!(launch.command, "bash");
+            assert_eq!(launch.args, vec!["--norc", "-i"]);
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                launch.command,
+                maestro_shell::login_shell_program(&maestro_shell::ProcessLaunchEnv)
+            );
+            assert!(
+                launch.args.is_empty(),
+                "native terminal cannot receive POSIX shell flags"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

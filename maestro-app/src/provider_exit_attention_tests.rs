@@ -310,16 +310,20 @@ fn retained_nonzero_without_ack_is_visible_but_never_task_failure() {
 
 #[test]
 fn stable_bound_and_fresh_launchers_are_provider_identity_not_wrapper_basenames() {
+    #[cfg(windows)]
+    let executable = r"C:\synthetic\stable-wrapper.exe";
+    #[cfg(not(windows))]
+    let executable = "/synthetic/stable-wrapper";
     for launch in [
         LaunchSpec::BoundProvider {
             launch_spec_id: "opencode".into(),
             params: vec!["--session".into(), "fixture-session".into()],
-            executable: "/synthetic/stable-wrapper".into(),
+            executable: executable.into(),
         },
         LaunchSpec::FreshProvider {
             launch_spec_id: "opencode".into(),
             params: vec![],
-            executable: "/synthetic/stable-wrapper".into(),
+            executable: executable.into(),
         },
     ] {
         let (_temp, paths) = fixture();

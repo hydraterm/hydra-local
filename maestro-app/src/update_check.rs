@@ -338,27 +338,22 @@ fn fetch(url: &str) -> Option<String> {
 }
 
 fn fetch_command(url: &str) -> Option<Command> {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        let mut command = Command::new("/usr/bin/curl");
-        command.args([
-            "-q",
-            "-fsS",
-            "--proto",
-            "=https",
-            "--max-time",
-            "5",
-            "--connect-timeout",
-            "3",
-            "--max-filesize",
-            &MAX_MANIFEST_BYTES.to_string(),
-            "--",
-            url,
-        ]);
-        return Some(command);
-    }
-    #[allow(unreachable_code)]
-    None
+    let mut command = crate::system_http::curl_command()?;
+    command.args([
+        "-q",
+        "-fsS",
+        "--proto",
+        "=https",
+        "--max-time",
+        "5",
+        "--connect-timeout",
+        "3",
+        "--max-filesize",
+        &MAX_MANIFEST_BYTES.to_string(),
+        "--",
+        url,
+    ]);
+    Some(command)
 }
 
 fn evaluate_manifest(
@@ -557,8 +552,14 @@ pub fn open_available_update() -> Result<(), &'static str> {
             .name("hydra-update-open".to_string())
             .spawn(move || {
                 let _permit = permit;
-                let status = open_url_command(&url).and_then(|mut command| command.status().ok());
-                if !status.is_some_and(|status| status.success()) {
+                #[cfg(windows)]
+                let opened = maestro_renderer::windows_http::HttpOpen::prepare(&url)
+                    .is_some_and(|action| action.open());
+                #[cfg(not(windows))]
+                let opened = open_url_command(&url)
+                    .and_then(|mut command| command.status().ok())
+                    .is_some_and(|status| status.success());
+                if !opened {
                     eprintln!(
                         "hydra update: could not open the validated download in the system browser"
                     );
@@ -569,6 +570,7 @@ pub fn open_available_update() -> Result<(), &'static str> {
     })
 }
 
+#[cfg(not(windows))]
 fn open_url_command(url: &str) -> Option<Command> {
     #[cfg(target_os = "macos")]
     {
@@ -588,6 +590,9 @@ fn open_url_command(url: &str) -> Option<Command> {
 
 /// Best-effort desktop notification; failures are ignored because the dashboard state remains.
 fn notify(remote: &str, download_page: &str) {
+    #[cfg(windows)]
+    let _ = (remote, download_page); // Dashboard carries the notification on Windows.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let message = format!("Hydra v{remote} is available. Download at {download_page}");
     #[cfg(target_os = "macos")]
     {
@@ -838,6 +843,16 @@ mod tests {
     #[test]
     fn system_opener_is_fixed_and_never_uses_a_shell() {
         let url = "https://app.hydraterms.com/downloads/releases/0.2.7/Hydra-macOS.dmg";
+        #[cfg(windows)]
+        {
+            // Windows invokes ShellExecuteW with a literal document, not a subprocess command.
+            assert!(maestro_renderer::windows_http::HttpOpen::prepare(url).is_some());
+            assert!(
+                maestro_renderer::windows_http::HttpOpen::prepare("file:///C:/untrusted.exe")
+                    .is_none()
+            );
+        }
+        #[cfg(not(windows))]
         let command = open_url_command(url).expect("shipping desktop has a system opener");
         #[cfg(target_os = "macos")]
         {

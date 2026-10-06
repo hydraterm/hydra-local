@@ -134,24 +134,130 @@ fn emit(
     append_jsonl(base, &ev);
 }
 
+const PERSISTENT_TRACE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
 fn append_jsonl(base: &std::path::Path, ev: &WriteTrace) {
-    use std::io::Write;
     let path = base.join("db-write.jsonl");
-    // Bounded: truncate once the file passes a cap so the forensic log can't grow unbounded in production.
-    if let Ok(meta) = std::fs::metadata(&path) {
-        if meta.len() > 4 * 1024 * 1024 {
-            let _ = std::fs::write(&path, b"");
-        }
+    let Ok(mut file) = open_persistent_trace(&path, true) else {
+        return;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return;
+    };
+    if metadata.len() > PERSISTENT_TRACE_MAX_BYTES && file.set_len(0).is_err() {
+        return;
     }
     if let Ok(line) = serde_json::to_string(ev) {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            let _ = writeln!(f, "{line}");
-        }
+        use std::io::Write as _;
+        let _ = writeln!(file, "{line}");
     }
+}
+
+#[cfg(unix)]
+fn open_persistent_trace(path: &std::path::Path, create: bool) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(create)
+        .append(create)
+        .create(create)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    // SAFETY: geteuid has no preconditions and does not dereference memory.
+    let effective_uid = unsafe { libc::geteuid() };
+    if !metadata.is_file()
+        || metadata.uid() != effective_uid
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "unsafe persistent write-trace metadata",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_persistent_trace(path: &std::path::Path, create: bool) -> std::io::Result<std::fs::File> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Win32::{
+        Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{
+            ReOpenFile, FILE_APPEND_DATA, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        },
+    };
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "write trace has no parent",
+        )
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "write trace has no filename",
+        )
+    })?;
+    let directory = crate::WindowsPrivateDirectory::open(parent)?;
+    let file = match directory.open_file(name, false) {
+        Ok(file) => file,
+        Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
+            match directory.open_file(name, true) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    directory.open_file(name, false)?
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    if !create {
+        return Ok(file);
+    }
+    if file.metadata()?.len() > PERSISTENT_TRACE_MAX_BYTES {
+        let writable = unsafe {
+            ReOpenFile(
+                file.as_raw_handle(),
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+        };
+        if writable == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        let writable = unsafe { std::fs::File::from_raw_handle(writable) };
+        writable.set_len(0)?;
+    }
+    // ReOpenFile retains the already-validated object, not a second path lookup. Omitting
+    // FILE_WRITE_DATA makes every write append atomically even across diagnostic writers.
+    let handle = unsafe {
+        ReOpenFile(
+            file.as_raw_handle(),
+            FILE_GENERIC_READ | FILE_APPEND_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_persistent_trace(_path: &std::path::Path, _create: bool) -> std::io::Result<std::fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "persistent write tracing is supported only on Unix",
+    ))
 }
 
 /// The in-memory ring (oldest → newest) — for tests + a live dump. Content-blind.
@@ -164,7 +270,29 @@ pub fn recent() -> Vec<WriteTrace> {
 /// Returns up to `max` most-recent parsed lines, oldest → newest. Unparseable lines (truncation
 /// boundary) are skipped. Content-blind by construction — the file only ever holds trace events.
 pub fn tail_jsonl(base: &std::path::Path, max: usize) -> Vec<serde_json::Value> {
-    let Ok(text) = std::fs::read_to_string(base.join("db-write.jsonl")) else {
+    if max == 0 {
+        return Vec::new();
+    }
+    let Ok(file) = open_persistent_trace(&base.join("db-write.jsonl"), false) else {
+        return Vec::new();
+    };
+    let Ok(metadata) = file.metadata() else {
+        return Vec::new();
+    };
+    if metadata.len() > PERSISTENT_TRACE_MAX_BYTES {
+        return Vec::new();
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    use std::io::Read as _;
+    if file
+        .take(PERSISTENT_TRACE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 > PERSISTENT_TRACE_MAX_BYTES
+    {
+        return Vec::new();
+    }
+    let Ok(text) = String::from_utf8(bytes) else {
         return Vec::new();
     };
     let parsed: Vec<serde_json::Value> = text
@@ -261,7 +389,10 @@ mod tests {
     fn tail_jsonl_returns_most_recent_parsed_lines_in_order() {
         let base = std::env::temp_dir().join(format!("hydra-wt-tail-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
+        #[cfg(not(windows))]
         let _ = std::fs::create_dir_all(&base);
+        #[cfg(windows)]
+        let _root = crate::WindowsPrivateDirectory::ensure(&base).unwrap();
         for i in 0..5 {
             trace_write(&base, "Project", &format!("tail-{i}"), &[], 100 + i);
         }
@@ -287,5 +418,72 @@ mod tests {
         );
         assert!(tail_jsonl(std::path::Path::new("/nonexistent-xyz"), 3).is_empty());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_append_rotates_existing_oversize_file_before_opening_append_only_handle() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("private-trace");
+        let root = crate::WindowsPrivateDirectory::ensure(&base).unwrap();
+        let name = std::ffi::OsStr::new("db-write.jsonl");
+        root.open_file(name, true)
+            .unwrap()
+            .set_len(PERSISTENT_TRACE_MAX_BYTES + 1)
+            .unwrap();
+        let path = base.join(name);
+        let mut append = open_persistent_trace(&path, true).unwrap();
+        assert_eq!(append.metadata().unwrap().len(), 0);
+        append.write_all(b"rotated\n").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"rotated\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_append_handles_preserve_prior_writes_and_refuse_hardlinked_trace() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("private-trace");
+        let _root = crate::WindowsPrivateDirectory::ensure(&base).unwrap();
+        let path = base.join("db-write.jsonl");
+        let mut first = open_persistent_trace(&path, true).unwrap();
+        let mut second = open_persistent_trace(&path, true).unwrap();
+        first.write_all(b"first\n").unwrap();
+        second.write_all(b"second\n").unwrap();
+        first.write_all(b"third\n").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first\nsecond\nthird\n");
+        drop((first, second));
+        std::fs::hard_link(&path, base.join("trace-alias")).unwrap();
+        assert!(open_persistent_trace(&path, true).is_err());
+        assert!(open_persistent_trace(&path, false).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"first\nsecond\nthird\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_sink_rejects_symlink_fifo_and_loose_existing_file() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path();
+        let path = base.join("db-write.jsonl");
+        let target = base.join("target");
+        std::fs::write(&target, b"untouched").unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(open_persistent_trace(&path, true).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"existing").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(open_persistent_trace(&path, true).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing");
+
+        std::fs::remove_file(&path).unwrap();
+        let path_c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: path_c is a valid NUL-terminated path and mode is a valid permission mask.
+        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+        assert!(open_persistent_trace(&path, true).is_err());
     }
 }

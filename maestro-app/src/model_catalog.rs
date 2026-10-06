@@ -136,31 +136,26 @@ fn refresh(cache_path: &Path, catalog_url: &str) {
 /// execution during ordinary app startup. The shipping macOS and Linux packages both provide the
 /// fixed system executable reserved for bounded native HTTPS metadata fetches.
 fn refresh_command(url: &str, max_bytes: &str) -> Option<Command> {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        let mut command = Command::new("/usr/bin/curl");
-        command.args([
-            // Must be curl's first argument: ignore ~/.curlrc so a local tracing/output setting
-            // cannot silently change this bounded, content-only request.
-            "-q",
-            "-fsSL",
-            "--proto",
-            "=https",
-            "--proto-redir",
-            "=https",
-            "--max-time",
-            "5",
-            "--connect-timeout",
-            "3",
-            "--max-filesize",
-            max_bytes,
-            "--",
-            url,
-        ]);
-        return Some(command);
-    }
-    #[allow(unreachable_code)]
-    None
+    let mut command = crate::system_http::curl_command()?;
+    command.args([
+        // Must be curl's first argument: ignore ~/.curlrc so a local tracing/output setting
+        // cannot silently change this bounded, content-only request.
+        "-q",
+        "-fsSL",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "--max-time",
+        "5",
+        "--connect-timeout",
+        "3",
+        "--max-filesize",
+        max_bytes,
+        "--",
+        url,
+    ]);
+    Some(command)
 }
 
 /// The cached catalog as a JSON value, or `None` when absent/invalid (callers fall back to

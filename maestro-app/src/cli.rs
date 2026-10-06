@@ -528,8 +528,7 @@ pub struct AttachTabArgs {
     /// `--detach-renderer`: spawn a `maestro-renderer <socket> <session-id>` child (same policy as
     /// `launch`). Invalid together with `--no-run-renderer`.
     pub detach_renderer: bool,
-    /// `--keep-daemon`: when this process spawned the daemon, leave it running after the app finishes
-    /// (same lifecycle policy as `launch`).
+    /// `--keep-daemon`: retained for compatibility; every launch already leaves the daemon running.
     pub keep_daemon: bool,
     /// `--title <text>`: an explicit foreground window title override. Validated by
     /// [`validate_window_title`]; rejected with `--detach-renderer` (same as `launch`).
@@ -744,8 +743,7 @@ pub struct LaunchArgs {
     /// daemon this process spawned running. Invalid together with `--no-run-renderer` (nothing to
     /// detach).
     pub detach_renderer: bool,
-    /// `--keep-daemon`: when this process spawned the daemon, leave it running after the app
-    /// finishes — in BOTH foreground/renderer mode and `--no-run-renderer` smoke mode.
+    /// `--keep-daemon`: retained for compatibility; every launch already leaves the daemon running.
     pub keep_daemon: bool,
     /// `--log-dir <dir>`: an opt-in local directory for child-process logs. When `None`, child
     /// stdin/stdout/stderr go to null (the existing behavior; the app's own stdout/stderr stays a
@@ -996,8 +994,8 @@ pub fn usage() -> &'static str {
      The 'agent-start' command creates a durable agent task and starts its live PTY session\n\
      (composing maestro-shell's AgentTaskRuntime over a fresh post-'--' argv), then prints one\n\
      structured JSON value. 'agent-resume' attaches a NEW live session to an existing agent task.\n\
-     Both ensure a connectable daemon (reuse or spawn) exactly like 'launch'; on success a daemon\n\
-     this command spawned is left running so the task PTY survives, even without --keep-daemon.\n\
+     Both ensure a connectable daemon (reuse or spawn) exactly like 'launch'. Every mode leaves\n\
+     the daemon independently retained, on success or failure, even without --keep-daemon.\n\
      \n\
      The 'window' commands are headless window/tab layout operations over the local WindowLayout\n\
      store. They connect to no daemon, spawn nothing, and touch no sockets. 'create' makes a new\n\
@@ -1034,7 +1032,7 @@ pub fn usage() -> &'static str {
      \x20\x20--log-dir <dir>      capture spawned daemon/detached renderer stdout/stderr under <dir>\n\
      \x20\x20--no-run-renderer    resolve/load/reconcile/report without opening a GUI window\n\
      \x20\x20--detach-renderer    spawn the renderer fire-and-forget (invalid with --no-run-renderer)\n\
-     \x20\x20--keep-daemon        if this process spawned the daemon, leave it running afterward\n\
+     \x20\x20--keep-daemon        compatibility flag; daemons always remain independently retained\n\
      \x20\x20--title <text>       foreground window title override (rejected with --detach-renderer)\n\
      \x20\x20--top-tab-bar        draw app tabs as a native top chrome row (foreground default ON; explicit enable; rejected with --detach-renderer)\n\
      \x20\x20--no-top-tab-bar     opt OUT of the foreground top tab bar (mutually exclusive with --top-tab-bar)\n\
@@ -1069,8 +1067,8 @@ pub fn usage() -> &'static str {
      \x20\x20--daemon <path>      explicit pty-daemon binary path\n\
      \x20\x20--cols <n>           initial PTY columns (default: 80)\n\
      \x20\x20--rows <n>           initial PTY rows (default: 24)\n\
-     \x20\x20--keep-daemon        accepted for symmetry with launch; agent commands always keep\n\
-     \x20\x20                     a spawned daemon on success, and failures clean up owned daemons\n\
+     \x20\x20--keep-daemon        compatibility flag; daemons remain independently retained\n\
+     \x20\x20                     on success and failure, including before readiness proof\n\
      \x20\x20--log-dir <dir>      capture a spawned daemon's stdout/stderr under <dir> (else null)\n\
      \x20\x20--record-window      record the agent task into the app-owned window/tab layout\n\
      \x20\x20                     (opt-in; default agent-start behavior is unchanged without it)\n\
@@ -1131,9 +1129,8 @@ pub fn usage() -> &'static str {
      \x20\x20--detach-renderer    launch the renderer fire-and-forget: do not wait for it, and\n\
      \x20\x20                     leave any daemon this process spawned running (invalid with\n\
      \x20\x20                     --no-run-renderer). Default foreground mode waits for the\n\
-     \x20\x20                     renderer to exit, then stops only a daemon it spawned.\n\
-     \x20\x20--keep-daemon        if this process spawned the daemon, leave it running after the\n\
-     \x20\x20                     app finishes (applies in GUI and --no-run-renderer modes)\n\
+     \x20\x20                     renderer to exit without stopping the retained daemon.\n\
+     \x20\x20--keep-daemon        compatibility flag; daemons always remain independently retained\n\
      \x20\x20--product-startup    installed-app startup: ensure/reuse the stable built-in Terminal\n\
      \x20\x20                     project/window/tab/session and bind dashboard window actions;\n\
      \x20\x20                     incompatible with session/cwd/record/detach overrides\n\
@@ -8406,9 +8403,8 @@ mod tests {
         assert!(u.contains("maestro-app agent-resume"));
         assert!(u.contains("FLAGS (agent-start)"));
         assert!(u.contains("FLAGS (agent-resume)"));
-        // The agent commands never keep a daemon on failure-after-spawn; the help must not
-        // claim otherwise (it always keeps on success and cleans up owned daemons on failure).
-        assert!(!u.contains("failure-after-spawn"));
+        assert!(u.contains("on success and failure, including before readiness proof"));
+        assert!(!u.contains("failures clean up owned daemons"));
     }
 
     // ---- agent-mark parser / DTO ----

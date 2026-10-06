@@ -109,7 +109,7 @@ impl AppPaths {
 
     /// Non-macOS (Linux) default: `$XDG_DATA_HOME/maestro`, or `~/.local/share/maestro` when
     /// `XDG_DATA_HOME` is unset/empty — the XDG base-directory convention.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
     fn platform_default_base() -> io::Result<PathBuf> {
         if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
             if !dir.is_empty() {
@@ -123,6 +123,21 @@ impl AppPaths {
         Ok(home.join(".local").join("share").join("maestro"))
     }
 
+    #[cfg(windows)]
+    fn platform_default_base() -> io::Result<PathBuf> {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .filter(|base| base.is_absolute())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "LOCALAPPDATA is not an absolute path; cannot resolve app-support",
+                )
+            })?;
+        Ok(base.join("Hydra"))
+    }
+
+    #[cfg(unix)]
     fn home_dir() -> io::Result<PathBuf> {
         let home = std::env::var_os("HOME").ok_or_else(|| {
             io::Error::new(

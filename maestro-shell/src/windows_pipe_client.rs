@@ -252,6 +252,30 @@ impl ConnectionState {
     }
 }
 
+/// Exact authenticated server lifetime, without retaining a pipe or attachment guard.
+#[derive(Clone)]
+pub struct WindowsDaemonProcessWitness {
+    process: Arc<OwnedHandle>,
+    pid: u32,
+}
+
+impl std::fmt::Debug for WindowsDaemonProcessWitness {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("WindowsDaemonProcessWitness(<redacted>)")
+    }
+}
+
+impl WindowsDaemonProcessWitness {
+    /// Both handles remain owned throughout comparison. A PID cannot identify two live process
+    /// objects at once; independently authenticated connections need not share the same Arc.
+    /// An exited process or a failed native query never authorizes a replacement daemon.
+    pub fn matches_live(&self, other: &Self) -> io::Result<bool> {
+        Ok(self.pid == other.pid
+            && process_is_alive(&self.process)?
+            && process_is_alive(&other.process)?)
+    }
+}
+
 /// One cloneable byte-stream handle for a single authenticated named-pipe connection.
 pub struct WindowsPipeStream {
     state: Arc<ConnectionState>,
@@ -267,6 +291,7 @@ impl WindowsPipeStream {
     pub fn connect_until(endpoint: &Path, deadline: Instant) -> io::Result<Self> {
         let name = validate_local_pipe_name(endpoint.as_os_str())?;
         let wide: Vec<u16> = name.encode_wide().chain(std::iter::once(0)).collect();
+        let mut observed_busy = false;
         let pipe = loop {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
@@ -291,6 +316,7 @@ impl WindowsPipeStream {
             let error = io::Error::last_os_error();
             match error.raw_os_error().map(|value| value as u32) {
                 Some(ERROR_PIPE_BUSY) => {
+                    observed_busy = true;
                     let wait = duration_millis(remaining.min(CONNECT_RETRY_INTERVAL), false);
                     if unsafe { WaitNamedPipeW(wide.as_ptr(), wait) } == 0 {
                         let wait_error = io::Error::last_os_error();
@@ -301,6 +327,13 @@ impl WindowsPipeStream {
                     }
                 }
                 Some(ERROR_FILE_NOT_FOUND) => {
+                    // A fresh absent endpoint authorizes the shared startup coordinator to
+                    // launch a daemon. Do not erase that evidence by retrying until TimedOut.
+                    // Once an owner was observed, however, disappearance is ambiguous: keep
+                    // the original bounded retry without granting replacement authority.
+                    if !observed_busy {
+                        return Err(error);
+                    }
                     std::thread::sleep(remaining.min(CONNECT_RETRY_INTERVAL));
                 }
                 _ => return Err(error),
@@ -486,6 +519,13 @@ impl WindowsPipeStream {
 
     pub fn server_pid(&self) -> u32 {
         self.state.server_pid
+    }
+
+    pub fn daemon_process_witness(&self) -> WindowsDaemonProcessWitness {
+        WindowsDaemonProcessWitness {
+            process: Arc::clone(&self.state.server_process),
+            pid: self.state.server_pid,
+        }
     }
 
     fn wait_for_io(

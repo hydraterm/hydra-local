@@ -4,7 +4,11 @@ const ROOT_MANIFEST: &str = include_str!("../../Cargo.toml");
 const APP_MANIFEST: &str = include_str!("../Cargo.toml");
 const APP_LIB: &str = include_str!("../src/lib.rs");
 const APP_MAIN: &str = include_str!("../src/main.rs");
+const APP_LIFECYCLE: &str = include_str!("../src/lifecycle.rs");
+const WINDOWS_LAUNCH_ADAPTERS: &str = include_str!("windows_launch_adapters.rs");
 const MODEL_CATALOG: &str = include_str!("../src/model_catalog.rs");
+const APP_BUILD: &str = include_str!("../build.rs");
+const ICON_BUILD: &str = include_str!("../../packaging/windows/build_icon.rs");
 const OPTIONAL_EXTENSION: &str = include_str!("../src/optional_extension.rs");
 const UPDATE_CHECK: &str = include_str!("../src/update_check.rs");
 
@@ -42,24 +46,44 @@ fn public_workspace_excludes_the_private_agent_and_cloud_build_binding() {
     assert!(!APP_MANIFEST.contains("build = \"build.rs\""));
     assert!(!APP_LIB.contains("desktop_environment"));
     assert!(!APP_LIB.contains("pub mod remote_access"));
+    assert!(!APP_LIFECYCLE.contains("BinaryKind::HydraAgent"));
+    assert!(!WINDOWS_LAUNCH_ADAPTERS.contains("BinaryKind::HydraAgent"));
 
     let app_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    for removed in [
-        "build.rs",
-        "src/desktop_environment.rs",
-        "src/remote_access.rs",
-    ] {
+    for removed in ["src/desktop_environment.rs", "src/remote_access.rs"] {
         assert!(
             !app_dir.join(removed).exists(),
             "private boundary file returned to the public app: {removed}"
         );
+    }
+    // A public Windows icon resource is not the retired private trust-binding build hook.
+    // Keep the entrypoint exact so it cannot acquire a second, unaudited build action.
+    assert_eq!(
+        APP_BUILD.trim(),
+        concat!(
+            "#[path = \"../packaging/windows/build_icon.rs\"]\n",
+            "mod windows_icon;\n\n",
+            "fn main() {\n",
+            "    windows_icon::compile(\"maestro-app\").expect(\"build Windows application icon resource\");\n",
+            "}"
+        )
+    );
+    for forbidden in [
+        "deploy/environments",
+        "desktop_remote",
+        "token_verification",
+        "HYDRA_AGENT",
+        "reqwest",
+        "https://",
+    ] {
+        assert!(!ICON_BUILD.contains(forbidden));
     }
 }
 
 #[test]
 fn public_app_contains_no_private_trust_tuple_or_agent_lifecycle_path() {
     // The public test proves the shape it owns without publishing the private verifier's exact
-    // trust-marker denylist. There is no build hook, caller-selected executable, argument list,
+    // trust-marker denylist. There is no trust-binding build hook, caller-selected executable, argument list,
     // environment injection, or generic command surface through which the public app could choose
     // a trust tuple. The private composition separately scans this whole tree for its exact values.
     assert!(!APP_MANIFEST.contains("build ="));

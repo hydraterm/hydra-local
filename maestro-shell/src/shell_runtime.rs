@@ -1176,9 +1176,11 @@ mod tests {
     use crate::paths::RecordKind;
     use crate::records::{LaunchSpec, SessionKind, SessionStatus};
     use crate::store::{self, LoadOutcome};
+    use crate::test_daemon_transport::{
+        endpoint, Listener as UnixListener, Stream as StdUnixStream,
+    };
     use std::collections::HashMap;
     use std::io::{BufRead, BufReader, Read, Write};
-    use std::os::unix::net::{UnixListener, UnixStream as StdUnixStream};
     use std::sync::mpsc;
     use std::thread::JoinHandle;
     use tempfile::TempDir;
@@ -1277,7 +1279,7 @@ mod tests {
         assert_eq!(request, r#"{"op":"daemon_info"}"#);
         writeln!(
             stream,
-            "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"daemon_instance_id\":\"22222222222242228222222222222222\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"generation_conditional_attach\":true}}",
+            "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"daemon_instance_id\":\"22222222222242228222222222222222\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"windows_start_operation_retirement_barrier\":true,\"generation_conditional_attach\":true}}",
             maestro_protocol::DAEMON_PROTOCOL_VERSION
         )
         .unwrap();
@@ -1513,7 +1515,7 @@ mod tests {
 
     fn stub_socket_path() -> (TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("stub.sock");
+        let path = endpoint(dir.path(), "stub.sock");
         (dir, path)
     }
 
@@ -1577,7 +1579,7 @@ mod tests {
 
         let error = ShellRuntime::new(&paths)
             .restart_exited_session(
-                Some(tmp.path().join("must-not-connect.sock")),
+                Some(endpoint(tmp.path(), "must-not-connect.sock")),
                 &MapEnv::new(&[]),
                 &old,
             )
@@ -1806,7 +1808,7 @@ mod tests {
                 );
                 writeln!(
                     stream,
-                    "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"daemon_instance_id\":\"{}\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"generation_conditional_attach\":true}}",
+                    "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"daemon_instance_id\":\"{}\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"windows_start_operation_retirement_barrier\":true,\"generation_conditional_attach\":true}}",
                     maestro_protocol::DAEMON_PROTOCOL_VERSION,
                     STUB_DAEMON_INSTANCE,
                 )
@@ -1897,6 +1899,7 @@ mod tests {
     /// With neither explicit nor stored, the DEFAULT path is used. We point the default (via TMPDIR)
     /// at a directory holding the stub socket filename.
     #[test]
+    #[cfg(unix)]
     fn default_endpoint_socket_is_used_when_no_explicit_or_stored() {
         let tmp = TempDir::new().unwrap();
         let paths = paths_in(&tmp);
@@ -1918,6 +1921,31 @@ mod tests {
         drop(stub);
     }
 
+    #[test]
+    #[cfg(windows)]
+    fn default_endpoint_ignores_temp_override_and_isolated_explicit_endpoint_starts() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+        let cwd = TempDir::new().unwrap();
+        let cwd_path = cwd.path().to_string_lossy().to_string();
+        let (runtime_dir, socket) = stub_socket_path();
+        let env = MapEnv::new(&[("TMPDIR", &runtime_dir.path().to_string_lossy())]);
+        let default = daemon_endpoint::resolve_socket_path(&paths, None, &env).unwrap();
+        assert_eq!(default, crate::windows_default_pipe_name().unwrap());
+        assert_ne!(
+            default, socket,
+            "never bind or connect the user's real daemon in a fixture"
+        );
+
+        let stub = StubDaemon::spawn_at(socket.clone(), serve_grid("s1", "gen-3"));
+        let out = ShellRuntime::new(&paths)
+            .start_session(Some(socket.clone()), &env, &params("s1", &cwd_path))
+            .unwrap();
+        assert_eq!(out.socket_path, socket);
+        assert_eq!(out.record.status, SessionStatus::Live);
+        drop(stub);
+    }
+
     /// A connect failure (no daemon at the resolved path) returns a typed daemon error and writes NO
     /// session record AND NO endpoint record (we never advertise an unreachable socket).
     #[test]
@@ -1928,7 +1956,7 @@ mod tests {
         let cwd_path = cwd.path().to_string_lossy().to_string();
 
         // Explicit path to a socket that does not exist.
-        let missing = tmp.path().join("nope.sock");
+        let missing = endpoint(tmp.path(), "nope.sock");
         let env = MapEnv::new(&[]);
         let rt = ShellRuntime::new(&paths);
         let err = rt
@@ -2395,6 +2423,7 @@ mod tests {
                     "generation_conditional_start": true,
                     "start_operation_ledger": true,
                     "generation_conditional_attach": true,
+                "windows_start_operation_retirement_barrier": true,
                 })
             )
             .unwrap();
@@ -2477,6 +2506,7 @@ mod tests {
                     "generation_conditional_start": true,
                     "start_operation_ledger": true,
                     "generation_conditional_attach": true,
+                "windows_start_operation_retirement_barrier": true,
                 })
             )
             .unwrap();

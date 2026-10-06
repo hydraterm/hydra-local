@@ -10,9 +10,11 @@ use crate::ids::{ChannelId, SessionId};
 use crate::revision::{Revision, SessionGeneration};
 use anyhow::{anyhow, Result};
 use maestro_protocol::request::{AttachmentHandoff, AttachmentHandoffToken};
+#[cfg(any(not(windows), test))]
+use portable_pty::ChildKiller;
 #[cfg(not(windows))]
 use portable_pty::{native_pty_system, CommandBuilder};
-use portable_pty::{Child, ChildKiller, MasterPty, PtySize};
+use portable_pty::{Child, MasterPty, PtySize};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::{Arc, Condvar, Mutex};
@@ -357,9 +359,12 @@ pub struct Session {
     /// pid are serialized with the final `try_wait` + latch publication. Retained exited Sessions
     /// can live in the daemon map for a long time; without this seam a late Kill/Shutdown could
     /// signal a recycled pid in the tiny window after waitpid reaped it but before the latch set.
+    #[cfg(any(not(windows), test))]
     killer: Arc<Mutex<ChildKillerState>>,
     #[cfg(windows)]
     native_lifetime: crate::windows_conpty::SessionLifetime,
+    #[cfg(windows)]
+    pub(crate) retirement: Option<Arc<crate::windows_session_retirement::Retirement>>,
     /// Session-object-local attachment ownership. The Arc is held by non-cloneable guards, so a
     /// guard can retire itself after the daemon map lock and even the Session mapping are gone; it
     /// can never affect a same-id replacement's fresh fence.
@@ -367,6 +372,7 @@ pub struct Session {
 }
 
 struct ChildKillerState {
+    #[cfg(any(not(windows), test))]
     killer: Box<dyn ChildKiller + Send + Sync>,
     /// False once waitpid has reaped the child or the wait backend returned an ambiguous hard
     /// error. In either case a cloned numeric-pid killer is no longer safe to invoke.
@@ -383,6 +389,7 @@ enum PumpWorkerStart {
 }
 
 impl ChildKillerState {
+    #[cfg(any(not(windows), test))]
     fn kill_if_safe(&mut self, already_exited: bool) -> bool {
         if !self.signal_safe || already_exited {
             return false;
@@ -456,8 +463,8 @@ fn terminal_env_overrides<G>(_get: G) -> Vec<(&'static str, &'static str)>
 where
     G: Fn(&str) -> Option<String>,
 {
-    // Do not inject a Unix PATH into a Windows child. Native command preparation retains the
-    // exact captured PATH and its system-directory lookup fallback does not mutate the environment.
+    // Do not inject a Unix PATH into a Windows child. Native command preparation preserves custom
+    // inherited PATH; its separately captured OS-baseline policy may refresh PATH for new children.
     vec![("TERM", "xterm-256color"), ("COLORTERM", "truecolor")]
 }
 
@@ -774,6 +781,7 @@ impl Session {
             }
         };
         let killer = Arc::new(Mutex::new(ChildKillerState {
+            #[cfg(any(not(windows), test))]
             killer: child.clone_killer(),
             signal_safe: true,
         }));
@@ -800,9 +808,12 @@ impl Session {
             output_tx,
             exit_tx,
             exited,
+            #[cfg(any(not(windows), test))]
             killer,
             #[cfg(windows)]
             native_lifetime,
+            #[cfg(windows)]
+            retirement: None,
             attachment_fence: Arc::new(Mutex::new(AttachmentFence::default())),
         })
     }
@@ -816,6 +827,10 @@ impl Session {
         handoff: Option<&AttachmentHandoff>,
         owner_nonce: u64,
     ) -> Result<AttachmentGuard> {
+        #[cfg(windows)]
+        if self.retirement.is_some() {
+            return Err(anyhow!("session retirement is in progress"));
+        }
         let mut fence = self
             .attachment_fence
             .lock()
@@ -999,10 +1014,24 @@ impl Session {
 
     /// Terminate the child process. The reader thread will then hit EOF, reap
     /// the exit code, and fire the exit signal.
+    #[cfg(any(not(windows), test))]
     pub fn kill_child(&self) {
         let mut lifecycle = self.killer.lock().unwrap();
         let already_exited = self.exited.lock().unwrap().is_some();
         lifecycle.kill_if_safe(already_exited);
+    }
+
+    pub(crate) fn can_reclaim(&self) -> bool {
+        #[cfg(windows)]
+        if self.retirement.is_some() {
+            return false;
+        }
+        self.exit_state().is_some() && !self.attachment_in_use()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn native_lifetime(&self) -> crate::windows_conpty::SessionLifetime {
+        self.native_lifetime.clone()
     }
 
     /// Kill the child and block until the reader thread has reaped it, so no
@@ -1014,6 +1043,7 @@ impl Session {
     ///
     /// Used by the daemon shutdown path to terminate owned children
     /// deterministically rather than orphaning them when the daemon exits.
+    #[cfg(any(not(windows), test))]
     pub fn kill_and_wait(&self, timeout: std::time::Duration) -> bool {
         #[cfg(not(windows))]
         self.kill_child();

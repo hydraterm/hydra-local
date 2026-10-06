@@ -25,7 +25,10 @@ use std::sync::{OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 const EXTENSION_BINARY_NAME: &str = "hydra-agent";
+#[cfg(windows)]
+const EXTENSION_BINARY_NAME: &str = "hydra-agent.exe";
 const EXTENSION_COMMAND: &str = "extension";
 // Lifecycle Status resumes one bounded provider retry (8s today) plus exact
 // local cleanup proofs. Keep that child budget separate from the low-latency
@@ -92,6 +95,7 @@ pub fn publish_projection(projection: &RemoteExtensionProjection) {
 /// - macOS: `/Applications/Hydra.app/Contents/Resources/bin/{maestro-app,hydra-agent}`;
 /// - Linux: `/opt/hydra/bin/{maestro-app,hydra-agent}` (the `/usr/bin/hydraterms` launcher resolves
 ///   to the former before this process starts).
+/// - Windows: the installed version's `bin/{maestro-app.exe,hydra-agent.exe}`.
 ///
 /// Source builds normally have no such sibling and therefore remain local-only. There is no PATH
 /// lookup, environment override, repository fallback, or caller-supplied path in the product path.
@@ -1152,6 +1156,12 @@ fn exchange_with_command(
     timeout: Duration,
 ) -> Result<ExtensionExchange, ExtensionTransportError> {
     let deadline = Instant::now() + timeout;
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        // The extension speaks only over its redirected pipes; polling must not flash a console.
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
     command
         .arg(EXTENSION_COMMAND)
         .stdin(Stdio::piped())
@@ -1435,13 +1445,26 @@ mod tests {
 
     #[test]
     fn discovery_is_fixed_to_one_sibling() {
-        for (app, extension) in [
+        #[cfg(unix)]
+        let layouts = [
             ("/opt/hydra/bin/maestro-app", "/opt/hydra/bin/hydra-agent"),
             (
                 "/Applications/Hydra.app/Contents/Resources/bin/maestro-app",
                 "/Applications/Hydra.app/Contents/Resources/bin/hydra-agent",
             ),
-        ] {
+        ];
+        #[cfg(windows)]
+        let layouts = [
+            (
+                r"C:\Hydra\bin\maestro-app.exe",
+                r"C:\Hydra\bin\hydra-agent.exe",
+            ),
+            (
+                r"C:\User Apps\Hydra\versions\test\bin\maestro-app.exe",
+                r"C:\User Apps\Hydra\versions\test\bin\hydra-agent.exe",
+            ),
+        ];
+        for (app, extension) in layouts {
             let found = discover_installed_extension(Some(Path::new(app)), |path| {
                 path == Path::new(extension)
             });
@@ -1452,6 +1475,26 @@ mod tests {
             );
         }
         assert_eq!(discover_installed_extension(None, |_| true), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_extension_discovery_requires_exact_exe_sibling() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = directory.path().join("maestro-app.exe");
+        for decoy in ["hydra-agent", "hydra-agent.cmd", "hydra-agent.exe.bak"] {
+            fs::write(directory.path().join(decoy), b"not the extension").unwrap();
+        }
+        assert_eq!(
+            discover_installed_extension(Some(&app), Path::is_file),
+            None
+        );
+        let extension = directory.path().join("hydra-agent.exe");
+        fs::copy(std::env::current_exe().unwrap(), &extension).unwrap();
+        assert_eq!(
+            discover_installed_extension(Some(&app), Path::is_file),
+            Some(extension)
+        );
     }
 
     #[test]

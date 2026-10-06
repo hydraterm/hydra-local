@@ -24,6 +24,7 @@ pub mod browser_cert;
 pub mod browser_pop;
 pub mod conn_trace;
 pub mod consistency;
+mod daemon_transport;
 pub mod device_identity;
 pub mod device_request_auth;
 pub mod enrollment_migration;
@@ -58,4 +59,7 @@ mod setup_deadline;
 pub mod supervise;
 pub mod systemd;
 pub mod viewport_control;
+#[cfg(windows)]
+mod windows_private_authority;
+pub mod windows_service;
 pub mod winsize_owner;

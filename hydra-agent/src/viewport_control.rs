@@ -2,7 +2,7 @@
 //! the live private remote peer.
 //!
 //! The public host invokes a one-shot `hydra-agent extension` child. That child proxies only the
-//! negotiated typed viewport requests to this fixed private Unix socket; it cannot select a path,
+//! negotiated typed viewport requests to this fixed private local endpoint; it cannot select a path,
 //! cloud, account, key, or origin. The live peer is the sole owner of the in-memory remote viewport
 //! state. Kernel peer credentials and strict socket metadata prevent a different OS user from
 //! impersonating either end.
@@ -17,22 +17,32 @@ use maestro_extension_api::{
 use rand::RngCore as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, Read as _, Write};
+#[cfg(unix)]
 use std::os::fd::AsRawFd as _;
+#[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 pub const VIEWPORT_CONTROL_SOCKET_NAME: &str = "viewport-control-v1.sock";
+#[cfg(unix)]
 const SOCKET_MODE: u32 = 0o600;
 const IO_TIMEOUT: Duration = Duration::from_millis(750);
 const ACCEPT_POLL: Duration = Duration::from_millis(10);
 /// The host polls every five seconds. Seven seconds tolerates one delayed poll without retaining
 /// authority anywhere near the public contract's thirty-second ceiling.
 const SNAPSHOT_REFRESH_TTL_MS: u32 = 7_000;
+
+#[cfg(windows)]
+#[path = "viewport_control_windows.rs"]
+mod windows;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PublishedLease {
@@ -286,6 +296,7 @@ fn read_frame(reader: &mut impl BufRead) -> Result<Vec<u8>, ViewportControlError
     Ok(bytes)
 }
 
+#[cfg(unix)]
 fn write_frame(
     writer: &mut impl Write,
     response: &RemoteDesktopExtensionResponse,
@@ -308,12 +319,13 @@ fn classify_io(error: std::io::Error) -> ViewportControlError {
     }
 }
 
+#[cfg(unix)]
 fn effective_uid() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() as u32 }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn connected_peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
     let mut uid: libc::uid_t = 0;
     let mut gid: libc::gid_t = 0;
@@ -351,6 +363,7 @@ fn connected_peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
     }
 }
 
+#[cfg(unix)]
 fn validate_socket_metadata(path: &Path) -> Result<std::fs::Metadata, ViewportControlError> {
     let metadata =
         std::fs::symlink_metadata(path).map_err(|_| ViewportControlError::Unavailable)?;
@@ -363,6 +376,7 @@ fn validate_socket_metadata(path: &Path) -> Result<std::fs::Metadata, ViewportCo
     Ok(metadata)
 }
 
+#[cfg(unix)]
 fn configure_stream(stream: &UnixStream) -> Result<(), ViewportControlError> {
     stream
         // BSD/macOS may inherit O_NONBLOCK from the listener onto accepted sockets. Clear it
@@ -374,6 +388,7 @@ fn configure_stream(stream: &UnixStream) -> Result<(), ViewportControlError> {
         .map_err(classify_io)
 }
 
+#[cfg(unix)]
 fn handle_stream(
     mut stream: UnixStream,
     owner: &Arc<Mutex<crate::winsize_owner::WinsizeOwner>>,
@@ -386,8 +401,17 @@ fn handle_stream(
     let request_frame = read_frame(&mut std::io::BufReader::new(
         stream.try_clone().map_err(classify_io)?,
     ))?;
+    let response = handle_request_frame(&request_frame, owner, state)?;
+    write_frame(&mut stream, &response)
+}
+
+fn handle_request_frame(
+    request_frame: &[u8],
+    owner: &Arc<Mutex<crate::winsize_owner::WinsizeOwner>>,
+    state: &mut ViewportControlState,
+) -> Result<RemoteDesktopExtensionResponse, ViewportControlError> {
     let request = negotiated_contract()
-        .decode_remote_desktop_host_frame(&request_frame)
+        .decode_remote_desktop_host_frame(request_frame)
         .map_err(|_| ViewportControlError::Malformed)?;
     let request_id = request.request_id();
     let now_ms = unix_now_ms();
@@ -416,7 +440,7 @@ fn handle_stream(
         };
         result.unwrap_or_else(|error| response_error(request_id, error))
     };
-    write_frame(&mut stream, &response)
+    Ok(response)
 }
 
 fn unix_now_ms() -> u64 {
@@ -435,6 +459,7 @@ fn random_epoch() -> u64 {
     }
 }
 
+#[cfg(unix)]
 fn remove_stale_socket(path: &Path) -> Result<(), ViewportControlError> {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -451,12 +476,23 @@ fn remove_stale_socket(path: &Path) -> Result<(), ViewportControlError> {
 /// RAII owner for the live peer's fixed private control socket.
 pub struct ViewportControlServer {
     stop: Arc<AtomicBool>,
+    #[cfg(unix)]
     socket_path: PathBuf,
+    #[cfg(unix)]
     socket_identity: (u64, u64),
     thread: Option<JoinHandle<()>>,
 }
 
 impl ViewportControlServer {
+    #[cfg(windows)]
+    pub fn start(
+        agent_dir: &Path,
+        owner: Arc<Mutex<crate::winsize_owner::WinsizeOwner>>,
+    ) -> Result<Self, ViewportControlError> {
+        windows::start(agent_dir, owner)
+    }
+
+    #[cfg(unix)]
     pub fn start(
         agent_dir: &Path,
         owner: Arc<Mutex<crate::winsize_owner::WinsizeOwner>>,
@@ -507,6 +543,7 @@ impl Drop for ViewportControlServer {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        #[cfg(unix)]
         if let Ok(metadata) = std::fs::symlink_metadata(&self.socket_path) {
             if (metadata.dev(), metadata.ino()) == self.socket_identity {
                 let _ = std::fs::remove_file(&self.socket_path);
@@ -527,13 +564,19 @@ pub fn request(
     ) {
         return Err(ViewportControlError::UnexpectedRequest);
     }
-    let socket_path = agent_dir.join(VIEWPORT_CONTROL_SOCKET_NAME);
-    validate_socket_metadata(&socket_path)?;
-    let mut stream = UnixStream::connect(&socket_path).map_err(classify_io)?;
-    configure_stream(&stream)?;
-    if connected_peer_uid(&stream).map_err(classify_io)? != effective_uid() {
-        return Err(ViewportControlError::UnsafeSocket);
-    }
+    #[cfg(unix)]
+    let mut stream = {
+        let socket_path = agent_dir.join(VIEWPORT_CONTROL_SOCKET_NAME);
+        validate_socket_metadata(&socket_path)?;
+        let stream = UnixStream::connect(&socket_path).map_err(classify_io)?;
+        configure_stream(&stream)?;
+        if connected_peer_uid(&stream).map_err(classify_io)? != effective_uid() {
+            return Err(ViewportControlError::UnsafeSocket);
+        }
+        stream
+    };
+    #[cfg(windows)]
+    let mut stream = windows::connect(agent_dir)?;
     let encoded = serde_json::to_vec(request).map_err(|_| ViewportControlError::Malformed)?;
     if encoded.is_empty() || encoded.len() > MAX_EXTENSION_FRAME_BYTES {
         return Err(ViewportControlError::Malformed);
@@ -541,6 +584,9 @@ pub fn request(
     stream.write_all(&encoded).map_err(classify_io)?;
     stream.write_all(b"\n").map_err(classify_io)?;
     stream.flush().map_err(classify_io)?;
+    // Named pipes have no write half-close: the existing authenticated stream's shutdown
+    // aborts both directions. The bounded newline frame is sufficient on both transports.
+    #[cfg(unix)]
     stream
         .shutdown(std::net::Shutdown::Write)
         .map_err(classify_io)?;
@@ -777,6 +823,7 @@ mod tests {
         assert_eq!(locked.remote_owned_sessions(1_001), vec!["s1"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn fixed_socket_round_trip_and_unsafe_metadata_fail_closed() {
         let dir = tempfile::tempdir().unwrap();

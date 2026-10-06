@@ -440,9 +440,9 @@ mod tests {
         ExactExistingAttach, ExistingSessionAttach, ExistingSessionMissingStart, SessionService,
     };
     use crate::store::{self, ConditionalSessionAttachFinalize, LoadOutcome};
+    use crate::test_daemon_transport::{endpoint, Listener as UnixListener, Stream as UnixStream};
     use maestro_protocol::{AttachmentHandoff, ClientRequest};
     use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
     use std::sync::mpsc;
     use std::thread::JoinHandle;
@@ -472,7 +472,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let dir = TempDir::new().unwrap();
-            let path = dir.path().join("reserved-product-shell.sock");
+            let path = endpoint(dir.path(), "reserved-product-shell.sock");
             let listener = UnixListener::bind(&path).unwrap();
             let (request_tx, requests) = mpsc::channel();
             let handle = std::thread::spawn(move || {
@@ -524,6 +524,7 @@ mod tests {
             "generation_conditional_start": true,
             "start_operation_ledger": true,
             "generation_conditional_attach": true,
+            "windows_start_operation_retirement_barrier": true,
         })
     }
 

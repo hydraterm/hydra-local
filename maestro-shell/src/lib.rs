@@ -38,6 +38,10 @@ pub mod invariants;
 pub mod launch_environment;
 pub mod layout_preset;
 mod local_store_security;
+#[cfg(windows)]
+pub use local_store_security::{
+    WindowsPrivateDirectory, WindowsPrivateFileIdentity, WindowsPrivateLock,
+};
 pub mod migrate;
 pub mod names;
 pub mod ownership_repair;
@@ -56,13 +60,22 @@ pub mod session_service;
 pub mod shell_runtime;
 pub mod store;
 pub mod store_sqlite;
+#[cfg(test)]
+#[path = "../../maestro-app/src/bin_test_transport.rs"]
+mod test_daemon_transport;
 pub mod window_layout;
 #[cfg(windows)]
 mod windows_file_lock;
 #[cfg(windows)]
+pub use windows_file_lock::WindowsFileLock;
+#[cfg(windows)]
 mod windows_identity;
 #[cfg(windows)]
 mod windows_pipe_client;
+#[cfg(windows)]
+pub use windows_pipe_client::{WindowsDaemonProcessWitness, WindowsPipeStream};
+#[cfg(windows)]
+pub use windows_pipe_endpoint::default_pipe_name as windows_default_pipe_name;
 #[cfg(any(windows, test))]
 mod windows_pipe_endpoint;
 pub mod workspace_consent;
@@ -134,7 +147,6 @@ pub use project::{
     ConditionalCreatedProjectDelete, CreatedProject, NewProject, ProjectCreationReceipt,
     ProjectDeletionPlan, ProjectDeletionResult, ProjectService, ProjectServiceError, ProjectUpdate,
 };
-#[cfg(unix)]
 pub use provider_executable::{
     provider_executable_names, provider_executable_override_variable, resolve_provider_executable,
     ProviderLookupError, ProviderResolution,

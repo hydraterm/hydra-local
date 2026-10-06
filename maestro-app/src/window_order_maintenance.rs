@@ -1,5 +1,6 @@
 //! Bounded, metadata-only lifecycle maintenance. Never launches or retries a window/session.
 use super::*;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 
@@ -108,11 +109,19 @@ fn failure(message: impl Into<String>) -> maestro_app::SettingsFailure {
 
 #[derive(Clone, PartialEq, Eq)]
 struct SettingsStamp {
+    #[cfg(unix)]
     device: u64,
+    #[cfg(unix)]
     inode: u64,
     length: u64,
+    #[cfg(unix)]
     modified: (i64, i64),
+    #[cfg(unix)]
     changed: (i64, i64),
+    #[cfg(windows)]
+    modified: Option<SystemTime>,
+    #[cfg(windows)]
+    created: Option<SystemTime>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -139,11 +148,19 @@ impl Hints {
         };
         let settings = match std::fs::metadata(maestro_app::settings_file_path(paths.base())) {
             Ok(value) => Some(SettingsStamp {
+                #[cfg(unix)]
                 device: value.dev(),
+                #[cfg(unix)]
                 inode: value.ino(),
                 length: value.len(),
+                #[cfg(unix)]
                 modified: (value.mtime(), value.mtime_nsec()),
+                #[cfg(unix)]
                 changed: (value.ctime(), value.ctime_nsec()),
+                #[cfg(windows)]
+                modified: value.modified().ok(),
+                #[cfg(windows)]
+                created: value.created().ok(),
             }),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(failure(error.to_string())),
@@ -156,6 +173,8 @@ impl Hints {
 struct Discovery {
     hints: Option<Hints>,
     windows: Option<Vec<String>>,
+    #[cfg(test)]
+    reconcile_calls: usize,
 }
 
 impl Discovery {
@@ -174,6 +193,10 @@ impl Discovery {
         {
             self.hints = Some(hints);
             return Ok(false); // Unrelated SQLite writes do not trigger JSON maintenance.
+        }
+        #[cfg(test)]
+        {
+            self.reconcile_calls += 1;
         }
         let changed = maestro_app::reconcile_window_presentation_order(paths, None)?;
         // Preserve pre-operation hints: a concurrent commit/save must be discovered next time.

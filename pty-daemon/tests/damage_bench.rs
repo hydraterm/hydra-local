@@ -1,3 +1,6 @@
+// This wire fixture uses Unix domain sockets and POSIX child commands.
+#![cfg(unix)]
+
 //! Structured-damage benchmark harness, measured over the wire.
 //!
 //! These are not pass/fail micro-benchmarks; they exercise the live forwarder under

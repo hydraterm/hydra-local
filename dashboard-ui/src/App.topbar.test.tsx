@@ -48,6 +48,28 @@ afterEach(() => {
 })
 
 describe('native topbar semantics and intents', () => {
+  it('shows bounded native recovery errors as text and dismisses without sending an intent', async () => {
+    const intents: Array<Record<string, unknown>> = []
+    installWindow(intents)
+    await mount()
+    const message = 'Terminal connection was lost. Close and reopen this Hydra window, then retry.'
+    act(() => window.__HYDRA_DASHBOARD_SHOW_ERROR__?.(message))
+    const alert = renderer!.root.findByProps({ role: 'alert' })
+    expect(alert.findByType('span').children).toEqual([message])
+    expect(alert.props.style.maxHeight).toBe('calc(100% - 4px)')
+    act(() => renderer!.root.findByProps({ 'aria-label': 'Dismiss dashboard error' }).props.onClick())
+    expect(renderer!.root.findAllByProps({ role: 'alert' })).toHaveLength(0)
+    act(() => window.__HYDRA_DASHBOARD_SHOW_ERROR__?.('<img onerror="bad">' + 'x'.repeat(400)))
+    const bounded = renderer!.root.findByProps({ role: 'alert' }).findByType('span')
+    expect(String(bounded.children[0])).toHaveLength(320)
+    expect(String(bounded.children[0])).toContain('<img onerror="bad">')
+    expect(renderer!.root.findByProps({ role: 'alert' }).findAllByType('img')).toHaveLength(0)
+    expect(intents).toEqual([])
+    act(() => renderer!.unmount())
+    renderer = null
+    expect(window.__HYDRA_DASHBOARD_SHOW_ERROR__).toBeUndefined()
+  })
+
   it.each([
     ['onDragEnter', 'before'], ['onDragEnter', 'after'],
     ['onDragOver', 'before'], ['onDragOver', 'after'],

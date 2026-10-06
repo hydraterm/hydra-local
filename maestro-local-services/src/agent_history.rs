@@ -1151,6 +1151,72 @@ mod tests {
     use tempfile::TempDir;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+    const HOME_ENV: &str = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+
+    // Provider metadata uses local file URIs, not Windows verbatim paths or raw backslashes.
+    fn local_file_uri(path: &Path) -> String {
+        let raw = path.to_str().unwrap();
+        #[cfg(windows)]
+        let raw = raw.strip_prefix(r"\\?\").unwrap_or(raw).replace('\\', "/");
+        #[cfg(windows)]
+        let raw = format!("/{raw}");
+        let encoded: String = raw
+            .as_bytes()
+            .iter()
+            .map(|&byte| match byte {
+                b'A'..=b'Z'
+                | b'a'..=b'z'
+                | b'0'..=b'9'
+                | b'/'
+                | b':'
+                | b'-'
+                | b'_'
+                | b'.'
+                | b'~' => char::from(byte).to_string(),
+                _ => format!("%{byte:02X}"),
+            })
+            .collect();
+        format!("file://{encoded}")
+    }
+
+    #[test]
+    fn local_workspace_uri_roundtrips_native_paths_and_rejects_hosted_or_malformed_input() {
+        let root = TempDir::new().unwrap();
+        let folder = root.path().join("project space #% café");
+        fs::create_dir(&folder).unwrap();
+        let folder = normalize_cwd(&folder);
+        let uri = local_file_uri(&folder);
+        assert_eq!(normalize_cwd(&file_uri_path(&uri).unwrap()), folder);
+        for uri in [
+            "https:///project",
+            "file://host/project",
+            "file://localhost/project",
+            "file://relative",
+            "file:///project%",
+            "file:///project%0G",
+            "file:///project%FF",
+        ] {
+            assert!(file_uri_path(uri).is_none(), "accepted {uri}");
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn local_windows_workspace_uris_require_drive_qualified_paths() {
+        assert_eq!(
+            file_uri_path("file:///C:/projects/with%20space"),
+            Some(PathBuf::from(r"C:\projects\with space"))
+        );
+        for uri in [
+            "file:///C:relative",
+            "file:///projects/local",
+            "file:////server/share/project",
+            "file:///%5C%5Cserver/share/project",
+            "file:///C:/project%00suffix",
+        ] {
+            assert!(file_uri_path(uri).is_none(), "accepted {uri}");
+        }
+    }
 
     fn antigravity_state(home: &Path) -> PathBuf {
         let state = home.join(".gemini").join("antigravity-cli");
@@ -1247,7 +1313,38 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn claude_windows_project_slug_is_a_contained_component_for_native_and_canonical_paths() {
+        for (cwd, expected) in [
+            (
+                r"C:\Fixture\Example\project.name_v2 space",
+                "C--Fixture-Example-project-name-v2-space",
+            ),
+            (
+                r"\\?\C:\Fixture\Example\project.name_v2 space",
+                "C--Fixture-Example-project-name-v2-space",
+            ),
+            (r"C:/Fixture/Example/café", "C--Fixture-Example-caf-"),
+            (r"\\server\share\project", "--server-share-project"),
+            (r"\\?\UNC\server\share\project", "--server-share-project"),
+        ] {
+            let encoded = encode_claude_cwd(Path::new(cwd));
+            assert_eq!(encoded, expected);
+            assert_eq!(Path::new(&encoded).components().count(), 1);
+            let root = Path::new(r"C:\fixture-home\.claude\projects");
+            assert_eq!(root.join(encoded).parent(), Some(root));
+        }
+    }
+
+    #[test]
     fn bound_provider_history_identity_matches_legacy_recipe_not_wrapper_basename() {
+        let root = TempDir::new().unwrap();
+        let executable = root
+            .path()
+            .join("renamed-wrapper-v2")
+            .to_str()
+            .unwrap()
+            .to_owned();
         for (provider, params) in [
             (
                 "claude",
@@ -1270,7 +1367,7 @@ mod tests {
             let bound = LaunchSpec::BoundProvider {
                 launch_spec_id: provider.into(),
                 params,
-                executable: "/stable/renamed-wrapper-v2".into(),
+                executable: executable.clone(),
             };
             assert_eq!(agent_from_launch(&bound), agent_from_launch(&legacy));
             assert_eq!(
@@ -1281,7 +1378,7 @@ mod tests {
             let fresh = LaunchSpec::FreshProvider {
                 launch_spec_id: provider.into(),
                 params: vec![],
-                executable: "/stable/renamed-wrapper-v2".into(),
+                executable: executable.clone(),
             };
             assert_eq!(agent_from_launch(&fresh), agent_from_launch(&legacy));
             assert!(provider_session_id_from_launch(&fresh).is_none());
@@ -1594,8 +1691,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
 
         let project = normalize_cwd(&{
             let path = tmp.path().join("project");
@@ -1784,8 +1881,8 @@ mod tests {
         assert!(devin_store_path(tmp.path()).exists());
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -1794,8 +1891,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
         let project = tmp.path().join("project");
         fs::create_dir_all(&project).unwrap();
 
@@ -1829,8 +1926,8 @@ mod tests {
         assert!(list_folder_sessions(&app_paths, "devin", &project).is_empty());
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -1839,8 +1936,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
         let project = normalize_cwd(&{
             let path = tmp.path().join("project");
             fs::create_dir_all(&path).unwrap();
@@ -1885,8 +1982,8 @@ mod tests {
             .contains(&"é".repeat(64)));
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -1895,8 +1992,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
         let project = tmp.path().join("project");
         fs::create_dir_all(&project).unwrap();
         let project = normalize_cwd(&project);
@@ -1926,8 +2023,8 @@ mod tests {
         assert!(list_folder_sessions(&app_paths, "claude", &other_project).is_empty());
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -1936,8 +2033,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
         let project = normalize_cwd(&{
             let project = tmp.path().join("project");
             fs::create_dir_all(&project).unwrap();
@@ -2031,8 +2128,8 @@ mod tests {
         );
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -2041,8 +2138,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
 
         let project = normalize_cwd(&{
             let project = tmp.path().join("project");
@@ -2128,8 +2225,8 @@ mod tests {
             .any(|session| session.id == "unrelated-session"));
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -2138,8 +2235,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
 
         let project = normalize_cwd(&{
             let project = tmp.path().join("project");
@@ -2191,8 +2288,8 @@ mod tests {
         assert!(!alias_root.with_extension("").exists());
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -2201,8 +2298,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
 
         let project = normalize_cwd(&{
             let project = tmp.path().join("project");
@@ -2247,8 +2344,8 @@ mod tests {
         ));
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -2257,8 +2354,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
 
         let project = normalize_cwd(&{
             let path = tmp.path().join("project");
@@ -2316,8 +2413,8 @@ mod tests {
         );
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -2326,8 +2423,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
 
         let project = normalize_cwd(&{
             let path = tmp.path().join("project");
@@ -2367,8 +2464,8 @@ mod tests {
         assert_eq!(sessions[0].id, "current");
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -2400,8 +2497,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
 
         let project = normalize_cwd(&{
             let path = tmp.path().join("project");
@@ -2474,8 +2571,8 @@ mod tests {
         assert!(external_sidechain.exists());
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -2483,8 +2580,8 @@ mod tests {
     fn claude_delete_resolution_does_not_expand_after_registry_changes() {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
 
         let project = normalize_cwd(&{
             let path = tmp.path().join("project");
@@ -2553,8 +2650,8 @@ mod tests {
         assert!(!resolved.contains(&fs::canonicalize(&late_root).unwrap()));
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -2563,8 +2660,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
 
         let project = normalize_cwd(&{
             let path = tmp.path().join("project");
@@ -2661,8 +2758,8 @@ mod tests {
         assert!(sessions[0].in_use);
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -2672,8 +2769,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
 
         let real_project = tmp.path().join("real-project");
         let linked_project = tmp.path().join("linked-project");
@@ -2740,8 +2837,8 @@ mod tests {
         assert_eq!(gemini[0].id, "raw-gemini");
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -2750,8 +2847,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
         let project = tmp.path().join("project");
         let other_project = tmp.path().join("other-project");
         fs::create_dir_all(&project).unwrap();
@@ -2791,8 +2888,8 @@ mod tests {
         assert_eq!(sessions[0].first_message, "Codex session selected");
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -2801,14 +2898,19 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
         let project = normalize_cwd(&{
             let path = tmp.path().join("project");
             fs::create_dir_all(&path).unwrap();
             path
         });
-        let chats = tmp.path().join(".gemini/tmp/slug/chats");
+        let chats = tmp
+            .path()
+            .join(".gemini")
+            .join("tmp")
+            .join("slug")
+            .join("chats");
         fs::create_dir_all(&chats).unwrap();
         let project_hash = gemini_project_hash(&project);
         let id = "grouped-gemini";
@@ -2867,8 +2969,8 @@ mod tests {
         assert!(!serialized.contains("oversized"));
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -2877,8 +2979,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
         let project = normalize_cwd(&{
             let project = tmp.path().join("project");
             fs::create_dir_all(&project).unwrap();
@@ -3107,8 +3209,8 @@ mod tests {
         );
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -3652,8 +3754,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
         let project = normalize_cwd(&{
             let project = tmp.path().join("project");
             fs::create_dir_all(&project).unwrap();
@@ -3735,8 +3837,8 @@ mod tests {
         );
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -3764,8 +3866,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
 
         let project = normalize_cwd(&{
             let p = tmp.path().join("project");
@@ -3835,8 +3937,8 @@ mod tests {
         assert_eq!(sessions[0].file_path, "opencode://ses_selected");
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -3845,8 +3947,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
         let project = normalize_cwd(&{
             let path = tmp.path().join("project");
             fs::create_dir_all(&path).unwrap();
@@ -3906,8 +4008,8 @@ mod tests {
             .contains(&"é".repeat(64)));
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -3916,8 +4018,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
 
         let project = normalize_cwd(&{
             let path = tmp.path().join("project with spaces");
@@ -4039,8 +4141,8 @@ mod tests {
         assert!(state.join("events.jsonl").exists());
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -4049,8 +4151,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
 
         let project = normalize_cwd(&{
             let path = tmp.path().join("project with spaces");
@@ -4074,7 +4176,7 @@ mod tests {
             )
             .unwrap();
         let id = "30000000-0000-4000-8000-000000000001";
-        let uri = format!("file://{}", project.to_string_lossy().replace(' ', "%20"));
+        let uri = local_file_uri(&project);
         connection
             .execute(
                 "INSERT INTO conversation_summaries VALUES (?1,'Renderer review','Check Linux focus',8,'2026-07-18 08:04:59',?2,1,0)",
@@ -4101,8 +4203,8 @@ mod tests {
         );
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -4111,8 +4213,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
 
         let project = normalize_cwd(&{
             let path = tmp.path().join("project");
@@ -4128,10 +4230,7 @@ mod tests {
                 "INSERT INTO conversation_summaries VALUES (?1,'Indexed title','Indexed preview',8,'2026-07-18 08:04:59',?2,0,0)",
                 (
                     indexed_id,
-                    serde_json::to_string(&vec![format!(
-                        "file://{}",
-                        project.to_string_lossy()
-                    )])
+                    serde_json::to_string(&vec![local_file_uri(&project)])
                     .unwrap(),
                 ),
             )
@@ -4198,8 +4297,8 @@ mod tests {
         );
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -4208,8 +4307,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
         let project = normalize_cwd(&{
             let path = tmp.path().join("project");
             fs::create_dir_all(&path).unwrap();
@@ -4224,8 +4323,7 @@ mod tests {
         let oversized_workspace_id = "10000000-0000-4000-8000-000000000005";
         let unindexed_id = "10000000-0000-4000-8000-000000000006";
         let oversized_timestamp_id = "10000000-0000-4000-8000-000000000007";
-        let workspace =
-            serde_json::to_string(&vec![format!("file://{}", project.to_string_lossy())]).unwrap();
+        let workspace = serde_json::to_string(&vec![local_file_uri(&project)]).unwrap();
         let oversized_title = "é".repeat(ANTIGRAVITY_TITLE_MAX_BYTES);
         let oversized_workspace =
             serde_json::to_string(&vec!["x".repeat(ANTIGRAVITY_WORKSPACE_MAX_BYTES + 1)]).unwrap();
@@ -4311,8 +4409,8 @@ mod tests {
             .contains(&"é".repeat(64)));
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -4321,8 +4419,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
 
         let project = normalize_cwd(&{
             let path = tmp.path().join("project");
@@ -4342,10 +4440,40 @@ mod tests {
         ] {
             fs::create_dir_all(project.join(child)).unwrap();
         }
-        let selected_alias = project.join("selected-alias").join("..");
-        let history_alias = project.join("history-alias").join("..");
-        let child_alias = project.join("child-alias").join("..");
-        let killed_alias = project.join("killed-alias").join("..");
+        // Windows canonicalization returns a verbatim path, whose Path::join removes `..`.
+        // Build lexical aliases from an ordinary spelling of this owned fixture directory so
+        // the metadata map retains three distinct keys instead of overwriting the root UUID.
+        #[cfg(windows)]
+        let alias_base = PathBuf::from(
+            project
+                .to_str()
+                .unwrap()
+                .strip_prefix(r"\\?\")
+                .unwrap_or_else(|| project.to_str().unwrap()),
+        );
+        #[cfg(not(windows))]
+        let alias_base = project.clone();
+        let selected_alias = alias_base.join("selected-alias").join("..");
+        let history_alias = alias_base.join("history-alias").join("..");
+        let child_alias = alias_base.join("child-alias").join("..");
+        let killed_alias = alias_base.join("killed-alias").join("..");
+        let distinct_aliases: HashSet<_> = [
+            &project,
+            &selected_alias,
+            &history_alias,
+            &child_alias,
+            &killed_alias,
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            distinct_aliases.len(),
+            5,
+            "fixture aliases must remain distinct"
+        );
+        for alias in distinct_aliases {
+            assert_eq!(normalize_cwd(alias), project);
+        }
 
         let state = antigravity_state(tmp.path());
         let recovered_id = "10000000-0000-4000-8000-000000000011";
@@ -4354,10 +4482,8 @@ mod tests {
         let history_only_id = "10000000-0000-4000-8000-000000000014";
         let stale_id = "10000000-0000-4000-8000-000000000015";
         let connection = create_antigravity_modern_summary_store(&state);
-        let other_workspace =
-            serde_json::to_string(&vec![format!("file://{}", other.to_string_lossy())]).unwrap();
-        let project_workspace =
-            serde_json::to_string(&vec![format!("file://{}", project.to_string_lossy())]).unwrap();
+        let other_workspace = serde_json::to_string(&vec![local_file_uri(&other)]).unwrap();
+        let project_workspace = serde_json::to_string(&vec![local_file_uri(&project)]).unwrap();
         connection
             .execute(
                 "INSERT INTO conversation_summaries
@@ -4433,20 +4559,20 @@ mod tests {
         assert_eq!(sessions[0].message_count, None);
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
     #[test]
     fn antigravity_history_recovers_from_stale_or_missing_summary_store() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let old_home = std::env::var_os("HOME");
+        let old_home = std::env::var_os(HOME_ENV);
 
         for with_stale_summary in [true, false] {
             let tmp = TempDir::new().unwrap();
             let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-            std::env::set_var("HOME", tmp.path());
+            std::env::set_var(HOME_ENV, tmp.path());
             let project = normalize_cwd(&{
                 let path = tmp.path().join("project");
                 fs::create_dir_all(&path).unwrap();
@@ -4478,10 +4604,7 @@ mod tests {
                         "INSERT INTO conversation_summaries VALUES (?1,'Other folder','',1,'2026-07-18 08:04:59',?2,0,0)",
                         (
                             stale_id,
-                            serde_json::to_string(&vec![format!(
-                                "file://{}",
-                                other.to_string_lossy()
-                            )])
+                            serde_json::to_string(&vec![local_file_uri(&other)])
                             .unwrap(),
                         ),
                     )
@@ -4506,8 +4629,8 @@ mod tests {
         }
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -4516,8 +4639,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
 
         let project = normalize_cwd(&{
             let path = tmp.path().join("project");
@@ -4571,8 +4694,8 @@ mod tests {
         assert_eq!(other_sessions[0].id, other_id);
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -4581,8 +4704,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
 
         let project = normalize_cwd(&{
             let path = tmp.path().join("project");
@@ -4619,8 +4742,8 @@ mod tests {
         assert_eq!(sessions[0].id, newest_id);
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -4629,8 +4752,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
 
         let project = normalize_cwd(&{
             let path = tmp.path().join("project");
@@ -4647,8 +4770,7 @@ mod tests {
         create_antigravity_conversation_db(&state, killed_id);
         let mut connection = create_antigravity_summary_store(&state);
         let transaction = connection.transaction().unwrap();
-        let other_uris =
-            serde_json::to_string(&vec![format!("file://{}", other.to_string_lossy())]).unwrap();
+        let other_uris = serde_json::to_string(&vec![local_file_uri(&other)]).unwrap();
         for value in 1_u128..=500 {
             transaction
                 .execute(
@@ -4662,10 +4784,7 @@ mod tests {
                 "INSERT INTO conversation_summaries VALUES (?1,'Killed','',1,'2000-01-01 00:00:00',?2,0,1)",
                 (
                     killed_id,
-                    serde_json::to_string(&vec![format!(
-                        "file://{}",
-                        project.to_string_lossy()
-                    )])
+                    serde_json::to_string(&vec![local_file_uri(&project)])
                     .unwrap(),
                 ),
             )
@@ -4686,8 +4805,8 @@ mod tests {
         assert!(list_folder_sessions(&app_paths, "antigravity", &project).is_empty());
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -4696,8 +4815,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
 
         let project = normalize_cwd(&{
             let path = tmp.path().join("project with spaces");
@@ -4804,8 +4923,8 @@ mod tests {
         assert!(session_dir.join("state.json").exists());
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -4814,8 +4933,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
 
         let project = normalize_cwd(&{
             let path = tmp.path().join("project with spaces");
@@ -4900,8 +5019,8 @@ mod tests {
         assert!(root.join(format!("{id}.json")).exists());
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -4910,8 +5029,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
 
         let project = normalize_cwd(&{
             let path = tmp.path().join("project with spaces");
@@ -5002,8 +5121,8 @@ mod tests {
         assert!(transcript.exists());
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -5012,16 +5131,16 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
         let project = tmp.path().join("project");
         fs::create_dir_all(&project).unwrap();
         fs::create_dir_all(tmp.path().join(".copilot")).unwrap();
         rusqlite::Connection::open(tmp.path().join(".copilot/session-store.db")).unwrap();
         assert!(list_folder_sessions(&app_paths, "copilot", &project).is_empty());
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -5030,8 +5149,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
         let project = normalize_cwd(&{
             let p = tmp.path().join("project");
             fs::create_dir_all(&p).unwrap();
@@ -5105,8 +5224,8 @@ mod tests {
         assert!(keep_path.exists());
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -5459,8 +5578,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let app_paths = AppPaths::with_base(tmp.path().join("Hydra"));
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        let old_home = std::env::var_os(HOME_ENV);
+        std::env::set_var(HOME_ENV, tmp.path());
         let project = tmp.path().join("project");
         fs::create_dir_all(&project).unwrap();
 
@@ -5525,8 +5644,8 @@ mod tests {
         );
 
         match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var(HOME_ENV, value),
+            None => std::env::remove_var(HOME_ENV),
         }
     }
 
@@ -5708,7 +5827,42 @@ fn assign_folder_index(sessions: &mut [AgentHistorySession]) {
 }
 
 fn home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    return std::env::var_os("USERPROFILE").map(PathBuf::from);
+    #[cfg(not(windows))]
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Metadata-only process liveness for provider-owned lock files. An inaccessible process remains
+/// conservatively live; this check never grants launch, attachment, or termination authority.
+fn process_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        let result = unsafe { libc::kill(pid, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+            fn WaitForSingleObject(handle: *mut std::ffi::c_void, milliseconds: u32) -> u32;
+            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+        }
+        // SYNCHRONIZE is sufficient; zero-time waiting neither suspends nor signals the process.
+        let process = unsafe { OpenProcess(0x0010_0000, 0, pid) };
+        if process.is_null() {
+            return std::io::Error::last_os_error().raw_os_error() == Some(5);
+        }
+        let status = unsafe { WaitForSingleObject(process, 0) };
+        unsafe {
+            CloseHandle(process);
+        }
+        status != 0 // WAIT_TIMEOUT or an uncertain failure: conservatively live.
+    }
 }
 
 fn push_session(
@@ -5740,6 +5894,24 @@ fn push_session(
 }
 
 fn encode_claude_cwd(cwd: &Path) -> String {
+    #[cfg(windows)]
+    {
+        // Claude's native project bucket is a single sanitized component, not a path. Match
+        // the provider SDK's _internal/sessions.py::_sanitize_path substitution. Keeping a drive
+        // prefix here would make root.join(encoded) discard the .claude/projects boundary.
+        // Rust's canonicalization adds an extended-length prefix not present in provider cwd.
+        let raw = cwd.to_string_lossy();
+        let ordinary = if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{unc}")
+        } else {
+            raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_owned()
+        };
+        ordinary
+            .chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+            .collect()
+    }
+    #[cfg(not(windows))]
     cwd.to_string_lossy()
         .chars()
         .map(|ch| {
@@ -7517,15 +7689,14 @@ fn copilot_session_has_live_lock(
         let Some(pid) = name
             .strip_prefix("inuse.")
             .and_then(|value| value.strip_suffix(".lock"))
-            .and_then(|value| value.parse::<libc::pid_t>().ok())
+            .and_then(|value| value.parse::<u32>().ok())
             .filter(|pid| *pid > 0)
         else {
             continue;
         };
         // Signal 0 performs no mutation. EPERM still means a process owns the PID; any other result is
         // a stale lock. This avoids treating a leftover filename as an indefinitely live session.
-        let result = unsafe { libc::kill(pid, 0) };
-        if result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
+        if process_is_alive(pid) {
             return Ok(true);
         }
     }
@@ -8088,7 +8259,7 @@ fn antigravity_workspace_matches(raw: &str, cwd_candidates: &[PathBuf]) -> bool 
 fn file_uri_path(uri: &str) -> Option<PathBuf> {
     let encoded = uri.strip_prefix("file://")?;
     if !encoded.starts_with('/') {
-        // Reject remote/hosted file URIs. Provider workspaces are local absolute POSIX paths.
+        // Reject remote/hosted file URIs. Provider workspaces must be local absolute paths.
         return None;
     }
     let bytes = encoded.as_bytes();
@@ -8106,6 +8277,22 @@ fn file_uri_path(uri: &str) -> Option<PathBuf> {
         }
     }
     let decoded = String::from_utf8(decoded).ok()?;
+    #[cfg(windows)]
+    let decoded = {
+        // A local Windows file URI has /C:/... syntax. The leading URI slash is not part
+        // of its drive-qualified filesystem path. Never turn a hosted/UNC or drive-relative
+        // URI into authority to inspect a different workspace.
+        let drive_path = decoded.strip_prefix('/')?;
+        let bytes = drive_path.as_bytes();
+        if !bytes.first().is_some_and(u8::is_ascii_alphabetic)
+            || bytes.get(1) != Some(&b':')
+            || bytes.get(2) != Some(&b'/')
+            || bytes.contains(&0)
+        {
+            return None;
+        }
+        drive_path
+    };
     let path = PathBuf::from(decoded);
     path.is_absolute().then_some(path)
 }
@@ -8413,14 +8600,14 @@ fn kiro_session_has_live_lock(
     let Some(pid) = value
         .get("pid")
         .and_then(Value::as_i64)
-        .and_then(|pid| libc::pid_t::try_from(pid).ok())
+        .and_then(|pid| u32::try_from(pid).ok())
         .filter(|pid| *pid > 0)
     else {
         return Ok(false);
     };
-    let result = unsafe { libc::kill(pid, 0) };
+    let alive = process_is_alive(pid);
     cancellation.check()?;
-    Ok(result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+    Ok(alive)
 }
 
 fn list_kiro_sessions(

@@ -1,8 +1,27 @@
 //! Real headless CLI wiring; isolated records only, no daemon, GUI or provider.
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Permit an exact copied test artifact for the limited native qualification account.
+/// Never search PATH or infer a newer build; Cargo's artifact remains the default.
+fn app_bin() -> &'static Path {
+    static BINARY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BINARY
+        .get_or_init(|| {
+            let path = std::env::var_os("HYDRA_TEST_APP_BINARY")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_maestro-app")));
+            assert!(
+                path.is_absolute() && path.is_file(),
+                "HYDRA_TEST_APP_BINARY (or Cargo app artifact) must name an existing absolute file"
+            );
+            path
+        })
+        .as_path()
+}
+
 fn run(base: &std::path::Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_maestro-app"))
+    Command::new(app_bin())
         .args(args)
         .arg("--base")
         .arg(base)

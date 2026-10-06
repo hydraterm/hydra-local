@@ -1,3 +1,6 @@
+// This wire fixture uses Unix domain sockets and POSIX child commands.
+#![cfg(unix)]
+
 //! Proves the structured (rich-cell) grid snapshot preserves visual attributes,
 //! not just characters. We print a single 'X' with an SGR bold + red foreground
 //! (`\x1b[1;31mX\x1b[0m`), snapshot, and assert the cell for that 'X' reports

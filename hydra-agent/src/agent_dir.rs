@@ -1,6 +1,19 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+mod test_permissions;
+#[cfg(test)]
+pub(crate) use test_permissions::set_mode as set_authority_test_mode;
+
+#[cfg(all(test, windows))]
+pub fn secure_authority_test_dir(prefix: &str) -> tempfile::TempDir {
+    let root = tempfile::Builder::new().prefix(prefix).tempdir().unwrap();
+    set_authority_test_mode(root.path(), 0o700).unwrap();
+    maestro_shell::WindowsPrivateDirectory::open(root.path()).unwrap();
+    root
+}
+
 /// Return true only when an absolute path is written in its single canonical
 /// textual form. `Path::components` deliberately normalizes repeated
 /// separators, `.` and trailing separators, so component-only validation is
@@ -474,8 +487,7 @@ pub fn trusted_uid() -> u32 {
 
 #[cfg(not(unix))]
 pub fn ensure_owned_safe_directory(path: &std::path::Path) -> io::Result<()> {
-    std::fs::create_dir_all(path)?;
-    require_owned_safe_directory(path)
+    maestro_shell::WindowsPrivateDirectory::ensure(path).map(|_| ())
 }
 
 #[cfg(not(unix))]
@@ -490,14 +502,7 @@ pub fn ensure_owned_safe_private_service_directory(path: &std::path::Path) -> io
 
 #[cfg(not(unix))]
 pub fn require_owned_safe_directory(path: &std::path::Path) -> io::Result<()> {
-    if std::fs::metadata(path)?.is_dir() {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "Hydra authority path is not a directory",
-        ))
-    }
+    maestro_shell::WindowsPrivateDirectory::open(path).map(|_| ())
 }
 
 #[cfg(not(unix))]
@@ -520,7 +525,10 @@ pub fn trusted_session_account() -> io::Result<TrustedSessionAccount> {
 
 /// Default per-user directory for private identity and lifecycle state.
 pub fn default_agent_dir() -> io::Result<PathBuf> {
-    Ok(trusted_home_dir()?.join(".local/share/hydra-agent"))
+    Ok(trusted_home_dir()?
+        .join(".local")
+        .join("share")
+        .join("hydra-agent"))
 }
 
 #[cfg(test)]
@@ -532,7 +540,21 @@ mod tests {
         let home = trusted_home_dir().unwrap();
         let dir = default_agent_dir().unwrap();
         assert!(home.is_absolute());
-        assert_eq!(dir, home.join(".local/share/hydra-agent"));
+        assert_eq!(dir, home.join(".local").join("share").join("hydra-agent"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_default_agent_dir_is_canonically_encoded_under_the_current_account_home() {
+        let home = trusted_home_dir().unwrap();
+        let directory = default_agent_dir().unwrap();
+        assert!(is_canonically_encoded_absolute_path(&directory));
+        assert_eq!(directory.ancestors().nth(3), Some(home.as_path()));
+        let normalized = directory.components().collect::<PathBuf>();
+        assert_eq!(
+            directory.as_os_str().as_encoded_bytes(),
+            normalized.as_os_str().as_encoded_bytes()
+        );
     }
 
     #[cfg(unix)]

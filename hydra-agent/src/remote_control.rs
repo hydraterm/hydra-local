@@ -3587,7 +3587,9 @@ fn sanitize_label(label: Option<String>) -> Option<String> {
 fn sanitize_cwd(cwd: Option<String>) -> Option<String> {
     let cleaned: String = cwd?.chars().filter(|c| !c.is_control()).take(512).collect();
     let trimmed = cleaned.trim();
-    if trimmed.starts_with('/') && !trimmed.is_empty() {
+    // Preserve existing slash-prefixed wire paths while also recognizing the
+    // native drive/UNC absolute paths produced by Windows directory listings.
+    if trimmed.starts_with('/') || std::path::Path::new(trimmed).is_absolute() {
         Some(trimmed.to_string())
     } else {
         None
@@ -6627,10 +6629,12 @@ mod tests {
         let mut ch = ControlChannel::new(vk, "dev_a".into(), NOPE);
         let tok = token(&sk, "dev_a", 1000);
         ch.handle(&format!(r#"{{"type":"auth","token":"{tok}"}}"#), 1500);
-        let msg = format!(
-            r#"{{"type":"list_directories","request_id":"d2","path":"{}"}}"#,
-            dir.to_string_lossy()
-        );
+        let msg = serde_json::json!({
+            "type": "list_directories",
+            "request_id": "d2",
+            "path": dir.to_string_lossy(),
+        })
+        .to_string();
         match ch.handle(&msg, 1500) {
             Some(OutboundMsg::DirectoriesResult {
                 request_id,
@@ -6650,6 +6654,21 @@ mod tests {
             ),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_absolute_cwd_survives_remote_sanitization() {
+        for path in [r"C:\Fixture\fixture\project", r"\\server\share\project"] {
+            assert_eq!(sanitize_cwd(Some(format!(" {path} "))), Some(path.into()));
+        }
+        for path in [r"C:project", r"\project", "project", ""] {
+            assert_eq!(sanitize_cwd(Some(path.into())), None);
+        }
+        assert_eq!(
+            sanitize_cwd(Some("/legacy/path".into())),
+            Some("/legacy/path".into())
+        );
     }
 
     struct FakePreviewer {

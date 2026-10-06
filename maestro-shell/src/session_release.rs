@@ -1647,9 +1647,9 @@ pub(crate) fn resolve_exact_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_daemon_transport::{endpoint, Listener as UnixListener, Stream as UnixStream};
     use std::cell::Cell;
     use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
     use std::sync::mpsc;
     use std::thread::JoinHandle;
@@ -1720,6 +1720,7 @@ mod tests {
         _temp: tempfile::TempDir,
         handle: Option<JoinHandle<()>>,
         requests: mpsc::Receiver<String>,
+        accepted: mpsc::Receiver<()>,
     }
 
     impl ReleaseStub {
@@ -1727,11 +1728,13 @@ mod tests {
             serve: impl FnOnce(&mpsc::Sender<String>, &mut UnixStream) + Send + 'static,
         ) -> Self {
             let temp = tempfile::tempdir().unwrap();
-            let path = temp.path().join("release.sock");
+            let path = endpoint(temp.path(), "release.sock");
             let listener = UnixListener::bind(&path).unwrap();
             let (request_tx, requests) = mpsc::channel();
+            let (accepted_tx, accepted) = mpsc::channel();
             let handle = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
+                let _ = accepted_tx.send(());
                 serve(&request_tx, &mut stream);
             });
             Self {
@@ -1739,6 +1742,7 @@ mod tests {
                 _temp: temp,
                 handle: Some(handle),
                 requests,
+                accepted,
             }
         }
 
@@ -1777,7 +1781,7 @@ mod tests {
         );
         writeln!(
             stream,
-            "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test-v3\",\"daemon_instance_id\":\"22222222222242228222222222222222\",\"output_generation_echo\":true,\"child_environment\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"generation_conditional_attach\":true}}",
+            "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test-v3\",\"daemon_instance_id\":\"22222222222242228222222222222222\",\"output_generation_echo\":true,\"child_environment\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"windows_start_operation_retirement_barrier\":true,\"generation_conditional_attach\":true}}",
             maestro_protocol::DAEMON_PROTOCOL_VERSION
         )
         .unwrap();
@@ -2136,6 +2140,9 @@ mod tests {
         let resolved = pre_resolve_session_generations(&mut client, std::iter::empty::<&str>())
             .expect("empty unresolved cohort is local");
         assert!(resolved.is_empty());
+        stub.accepted
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("fixture accepted the connection and its platform auth prelude");
         drop(client);
         assert!(stub.collected_requests().is_empty());
     }

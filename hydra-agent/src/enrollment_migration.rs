@@ -16,9 +16,13 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
+#[cfg(unix)]
+use std::fs::{File, OpenOptions};
+#[cfg(unix)]
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const KEY_FILE: &str = "device-key";
@@ -29,6 +33,7 @@ const MARKER_FILE: &str = "legacy-xdg-enrollment-adoption.v1.json";
 const MAX_KEY_BYTES: usize = 512;
 const MAX_RECORD_BYTES: usize = 64 * 1024;
 const MAX_MARKER_BYTES: usize = 8 * 1024;
+#[cfg(unix)]
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -530,12 +535,11 @@ fn require_distinct_directory_identity(canonical_agent_dir: &Path, source: &Path
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn require_distinct_directory_identity(canonical_agent_dir: &Path, source: &Path) -> Result<()> {
-    let canonical = fs::canonicalize(canonical_agent_dir)
-        .context("resolve canonical enrollment directory identity")?;
-    let source =
-        fs::canonicalize(source).context("resolve legacy enrollment directory identity")?;
+    let canonical =
+        maestro_shell::WindowsPrivateDirectory::open(canonical_agent_dir)?.identity()?;
+    let source = maestro_shell::WindowsPrivateDirectory::open(source)?.identity()?;
     if canonical == source {
         bail!("legacy enrollment directory aliases the canonical enrollment directory");
     }
@@ -599,7 +603,7 @@ pub fn snapshot_corrupt_canonical_for_remove(
     lifecycle_lock
         .require_agent_dir(canonical_agent_dir)
         .context("corrupt enrollment snapshot lock is bound to another agent directory")?;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let record_path = canonical_agent_dir.join(RECORD_FILE);
         if !leaf_exists(&record_path)? {
@@ -623,7 +627,7 @@ pub fn snapshot_corrupt_canonical_for_remove(
             record_bytes,
         }))
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = canonical_agent_dir;
         Ok(None)
@@ -643,7 +647,7 @@ pub fn recover_corrupt_canonical_for_remove(
     lifecycle_locks
         .require_agent_dir(canonical_agent_dir)
         .context("corrupt enrollment recovery lock set omits the canonical root")?;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         if snapshot.canonical_agent_dir() != fs::canonicalize(canonical_agent_dir)? {
             bail!("corrupt enrollment snapshot belongs to another root");
@@ -663,8 +667,10 @@ pub fn recover_corrupt_canonical_for_remove(
         }
         // `execute_planned_deletion` first requires the exact durable journal,
         // exact complete lock set and revalidated owner marker, then performs
-        // digest/inode-bound unlink + parent fsync + NotFound readback before
-        // journaling completion. There is no convention-only raw unlink path.
+        // identity-bound deletion and NotFound readback before journaling
+        // completion. Unix also syncs the parent directory; Windows uses its
+        // native namespace checkpoint, not a claimed Unix fsync equivalent.
+        // There is no convention-only raw unlink path.
         crate::lifecycle_cleanup::execute_planned_deletion(
             canonical_agent_dir,
             expected,
@@ -673,7 +679,7 @@ pub fn recover_corrupt_canonical_for_remove(
         )?;
         Ok(CorruptRecoveryOutcome::Recovered)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (canonical_agent_dir, snapshot);
         Ok(CorruptRecoveryOutcome::NotApplicable)
@@ -692,7 +698,7 @@ pub fn retire_adopted_legacy_enrollment(
 }
 
 fn retire_adopted_legacy_enrollment_unlocked(canonical_agent_dir: &Path) -> Result<()> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let uid = crate::agent_dir::trusted_uid();
         let marker_path = canonical_agent_dir.join(MARKER_FILE);
@@ -727,7 +733,7 @@ fn retire_adopted_legacy_enrollment_unlocked(canonical_agent_dir: &Path) -> Resu
         remove_regular_owned_file(&marker_path, uid, "adoption marker")?;
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = canonical_agent_dir;
         Ok(())
@@ -843,9 +849,11 @@ fn require_owned_directory(path: &Path, uid: u32, label: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn require_owned_directory(_path: &Path, _uid: u32, _label: &str) -> Result<()> {
-    Ok(())
+#[cfg(windows)]
+fn require_owned_directory(path: &Path, _uid: u32, label: &str) -> Result<()> {
+    maestro_shell::WindowsPrivateDirectory::open(path)
+        .map(|_| ())
+        .with_context(|| format!("inspect {label} Windows private authority"))
 }
 
 #[cfg(unix)]
@@ -865,9 +873,11 @@ fn ensure_owned_private_directory(path: &Path, uid: u32) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn ensure_owned_private_directory(path: &Path, _uid: u32) -> Result<()> {
-    fs::create_dir_all(path).context("create fixed enrollment directory")
+    maestro_shell::WindowsPrivateDirectory::ensure(path)
+        .map(|_| ())
+        .context("create fixed private enrollment directory")
 }
 
 #[cfg(unix)]
@@ -901,19 +911,20 @@ fn read_owned_private_regular(path: &Path, uid: u32, max: usize, label: &str) ->
     Ok(bytes)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn read_owned_private_regular(path: &Path, _uid: u32, max: usize, label: &str) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    File::open(path)
-        .with_context(|| format!("open {label}"))?
-        .take((max + 1) as u64)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > max {
-        bail!("{label} exceeds its size limit");
-    }
-    Ok(bytes)
+    crate::windows_private_authority::read(path, max)
+        .map(|(bytes, _)| bytes)
+        .with_context(|| format!("read {label}"))
 }
 
+#[cfg(windows)]
+fn publish_private_no_replace(path: &Path, bytes: &[u8]) -> Result<()> {
+    crate::windows_private_authority::publish(path, bytes, false)
+        .context("publish private enrollment file without replacing existing authority")
+}
+
+#[cfg(unix)]
 fn publish_private_no_replace(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
@@ -991,10 +1002,21 @@ fn rename_no_replace(source: &Path, target: &Path) -> std::io::Result<()> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn rename_no_replace(source: &Path, target: &Path) -> std::io::Result<()> {
     fs::hard_link(source, target)?;
     fs::remove_file(source)
+}
+
+#[cfg(windows)]
+fn remove_regular_owned_file(path: &Path, _uid: u32, label: &str) -> Result<()> {
+    // Native handle disposition plus absence readback; unlike the Unix implementation this
+    // does not claim a parent-directory fsync / sudden-power-loss persistence barrier.
+    let file = crate::windows_private_authority::open(path, false)?;
+    let identity = maestro_shell::WindowsPrivateDirectory::validate_file(&file)?;
+    drop(file);
+    crate::windows_private_authority::remove(path, Some(identity))
+        .with_context(|| format!("remove exact private {label}"))
 }
 
 #[cfg(unix)]
@@ -1035,7 +1057,6 @@ fn adopt_from_legacy_data_home(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt as _;
 
     fn fixture(label: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
         // macOS commonly points TMPDIR at /var/folders/... whose intermediate
@@ -1048,9 +1069,15 @@ mod tests {
             crate::agent_dir::secure_authority_test_dir(&format!("hydra-xdg-adopt-{label}-"));
         let legacy_base = root.path().join("legacy-data");
         let legacy = legacy_base.join("hydra-agent");
-        let target = root.path().join("fixed/hydra-agent");
+        let target = root.path().join("fixed").join("hydra-agent");
+        assert!(crate::agent_dir::is_canonically_encoded_absolute_path(
+            &legacy
+        ));
+        assert!(crate::agent_dir::is_canonically_encoded_absolute_path(
+            &target
+        ));
         fs::create_dir_all(&legacy).unwrap();
-        fs::set_permissions(&legacy, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::agent_dir::set_authority_test_mode(&legacy, 0o700).unwrap();
         let key = crate::device_identity::load_or_create_key(&legacy).unwrap();
         let record = crate::device_identity::DeviceRecord {
             device_id: "dev_synthetic_migration".to_string(),
@@ -1083,9 +1110,9 @@ mod tests {
             let root = crate::agent_dir::secure_authority_test_dir(&format!(
                 "hydra-xdg-existing-safe-{mode:o}-"
             ));
-            let target = root.path().join("fixed/hydra-agent");
+            let target = root.path().join("fixed").join("hydra-agent");
             fs::create_dir_all(&target).unwrap();
-            fs::set_permissions(&target, fs::Permissions::from_mode(mode)).unwrap();
+            crate::agent_dir::set_authority_test_mode(&target, mode).unwrap();
             let before = fs::symlink_metadata(&target).unwrap();
 
             assert_eq!(
@@ -1120,9 +1147,14 @@ mod tests {
         let unit = target
             .parent()
             .unwrap()
-            .join("LaunchAgents/com.hydra.agent.plist");
+            .join("LaunchAgents")
+            .join("com.hydra.agent.plist");
         #[cfg(not(target_os = "macos"))]
-        let unit = target.parent().unwrap().join("systemd/hydra-agent.service");
+        let unit = target
+            .parent()
+            .unwrap()
+            .join("systemd")
+            .join("hydra-agent.service");
         let roots = std::collections::BTreeSet::from([target.clone()]);
         crate::lifecycle_cleanup::CleanupTombstone::new(
             crate::lifecycle_cleanup::CleanupIntent::Remove,
@@ -1147,9 +1179,9 @@ mod tests {
 
     fn copy_private(source: &Path, target: &Path) {
         fs::create_dir_all(target.parent().unwrap()).unwrap();
-        fs::set_permissions(target.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+        crate::agent_dir::set_authority_test_mode(target.parent().unwrap(), 0o700).unwrap();
         fs::copy(source, target).unwrap();
-        fs::set_permissions(target, fs::Permissions::from_mode(0o600)).unwrap();
+        crate::agent_dir::set_authority_test_mode(target, 0o600).unwrap();
     }
 
     fn assert_complete_target(target: &Path) {
@@ -1192,8 +1224,8 @@ mod tests {
             source.join(crate::device_identity::ENROLLMENT_DIAGNOSTICS_TEMP_FILE);
         fs::write(&diagnostics, br#"{"version":1,"events":[]}"#).unwrap();
         fs::write(&diagnostics_temporary, b"crash-before-rename").unwrap();
-        fs::set_permissions(&diagnostics, fs::Permissions::from_mode(0o600)).unwrap();
-        fs::set_permissions(&diagnostics_temporary, fs::Permissions::from_mode(0o600)).unwrap();
+        crate::agent_dir::set_authority_test_mode(&diagnostics, 0o600).unwrap();
+        crate::agent_dir::set_authority_test_mode(&diagnostics_temporary, 0o600).unwrap();
 
         assert_eq!(
             adopt_from_legacy_data_home(&target, &legacy_base, crate::agent_dir::trusted_uid())
@@ -1229,7 +1261,7 @@ mod tests {
             adopt_from_legacy_agent_dir(&target, None, uid).unwrap(),
             AdoptionOutcome::AlreadyAdopted
         );
-        let changed = root.path().join("different-data/hydra-agent");
+        let changed = root.path().join("different-data").join("hydra-agent");
         assert_eq!(
             adopt_from_legacy_agent_dir(&target, Some(&changed), uid).unwrap(),
             AdoptionOutcome::AlreadyAdopted
@@ -1274,7 +1306,7 @@ mod tests {
             serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
         marker.source_agent_dir = symlink_alias.to_string_lossy().into_owned();
         fs::write(&marker_path, serde_json::to_vec_pretty(&marker).unwrap()).unwrap();
-        fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o600)).unwrap();
+        crate::agent_dir::set_authority_test_mode(&marker_path, 0o600).unwrap();
 
         let lock = crate::service::LifecycleLock::acquire(&target).unwrap();
         assert!(verified_completed_legacy_source(&target, &lock).is_err());
@@ -1324,7 +1356,7 @@ mod tests {
     #[test]
     fn no_proven_source_allows_first_local_binding_then_denies_transfer() {
         let root = crate::agent_dir::secure_authority_test_dir("hydra-first-local-binding-");
-        let target = root.path().join("fixed/hydra-agent");
+        let target = root.path().join("fixed").join("hydra-agent");
         let uid = crate::agent_dir::trusted_uid();
 
         // Existing local PTYs carry no remote-account fact. With no installed
@@ -1450,7 +1482,7 @@ mod tests {
         let source_owner = fs::read(source.join(OWNER_FILE)).unwrap();
 
         fs::create_dir_all(&target).unwrap();
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::agent_dir::set_authority_test_mode(&target, 0o700).unwrap();
         crate::device_identity::load_or_create_key(&target).unwrap();
         let account_b = crate::device_identity::DeviceRecord {
             device_id: "dev_synthetic_canonical_b".into(),
@@ -1479,7 +1511,7 @@ mod tests {
     fn explicit_remove_recovers_corrupt_record_only_with_durable_owner() {
         let (_root, _legacy_base, target) = fixture("corrupt-recovery");
         fs::create_dir_all(&target).unwrap();
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::agent_dir::set_authority_test_mode(&target, 0o700).unwrap();
         let account_a = crate::device_identity::DeviceRecord {
             device_id: "dev_synthetic_corrupt_a".into(),
             account_id: "acct_synthetic_corrupt_a".into(),
@@ -1489,7 +1521,7 @@ mod tests {
         crate::device_identity::load_or_create_key(&target).unwrap();
         crate::device_identity::save_record(&target, &account_a).unwrap();
         fs::write(target.join(RECORD_FILE), b"{not-json").unwrap();
-        fs::set_permissions(target.join(RECORD_FILE), fs::Permissions::from_mode(0o600)).unwrap();
+        crate::agent_dir::set_authority_test_mode(target.join(RECORD_FILE), 0o600).unwrap();
 
         let locks = crate::service::LifecycleLockSet::acquire([target.clone()]).unwrap();
         let lock = locks.lock_for(&target).unwrap();
@@ -1530,7 +1562,7 @@ mod tests {
     fn corrupt_remove_unlink_before_proof_resumes_through_already_absent() {
         let (_root, _legacy_base, target) = fixture("corrupt-unlink-before-proof");
         fs::create_dir_all(&target).unwrap();
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::agent_dir::set_authority_test_mode(&target, 0o700).unwrap();
         let owner_record = crate::device_identity::DeviceRecord {
             device_id: "dev_synthetic_corrupt_resume".into(),
             account_id: "acct_synthetic_corrupt_resume".into(),
@@ -1540,7 +1572,7 @@ mod tests {
         crate::device_identity::load_or_create_key(&target).unwrap();
         crate::device_identity::save_record(&target, &owner_record).unwrap();
         fs::write(target.join(RECORD_FILE), b"{corrupt-resume").unwrap();
-        fs::set_permissions(target.join(RECORD_FILE), fs::Permissions::from_mode(0o600)).unwrap();
+        crate::agent_dir::set_authority_test_mode(target.join(RECORD_FILE), 0o600).unwrap();
         let locks = crate::service::LifecycleLockSet::acquire([target.clone()]).unwrap();
         let lock = locks.lock_for(&target).unwrap();
         let snapshot = snapshot_corrupt_canonical_for_remove(&target, lock)
@@ -1575,11 +1607,11 @@ mod tests {
     #[test]
     fn corrupt_record_without_independent_owner_remains_fail_closed() {
         let root = crate::agent_dir::secure_authority_test_dir("hydra-corrupt-unowned-");
-        let target = root.path().join("fixed/hydra-agent");
+        let target = root.path().join("fixed").join("hydra-agent");
         fs::create_dir_all(&target).unwrap();
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::agent_dir::set_authority_test_mode(&target, 0o700).unwrap();
         fs::write(target.join(RECORD_FILE), b"{not-json").unwrap();
-        fs::set_permissions(target.join(RECORD_FILE), fs::Permissions::from_mode(0o600)).unwrap();
+        crate::agent_dir::set_authority_test_mode(target.join(RECORD_FILE), 0o600).unwrap();
 
         let lock = crate::service::LifecycleLock::acquire(&target).unwrap();
         assert!(snapshot_corrupt_canonical_for_remove(&target, &lock).is_err());
@@ -1592,12 +1624,12 @@ mod tests {
     #[test]
     fn corrupt_snapshot_and_migration_helpers_reject_a_lock_for_another_root() {
         let root = crate::agent_dir::secure_authority_test_dir("hydra-corrupt-wrong-lock-");
-        let first = root.path().join("first/hydra-agent");
-        let second = root.path().join("second/hydra-agent");
+        let first = root.path().join("first").join("hydra-agent");
+        let second = root.path().join("second").join("hydra-agent");
         fs::create_dir_all(&first).unwrap();
         fs::create_dir_all(&second).unwrap();
-        fs::set_permissions(&first, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::set_permissions(&second, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::agent_dir::set_authority_test_mode(&first, 0o700).unwrap();
+        crate::agent_dir::set_authority_test_mode(&second, 0o700).unwrap();
         let owner_record = crate::device_identity::DeviceRecord {
             device_id: "dev_synthetic_wrong_lock".into(),
             account_id: "acct_synthetic_wrong_lock".into(),
@@ -1607,7 +1639,7 @@ mod tests {
         crate::device_identity::load_or_create_key(&first).unwrap();
         crate::device_identity::save_record(&first, &owner_record).unwrap();
         fs::write(first.join(RECORD_FILE), b"{wrong-lock-corrupt").unwrap();
-        fs::set_permissions(first.join(RECORD_FILE), fs::Permissions::from_mode(0o600)).unwrap();
+        crate::agent_dir::set_authority_test_mode(first.join(RECORD_FILE), 0o600).unwrap();
         let wrong_locks = crate::service::LifecycleLockSet::acquire([first.clone()]).unwrap();
         let lock = wrong_locks.lock_for(&first).unwrap();
         let first_snapshot = snapshot_corrupt_canonical_for_remove(&first, lock)
@@ -1642,7 +1674,7 @@ mod tests {
                 "record-only" => copy_private(&source.join(RECORD_FILE), &target.join(RECORD_FILE)),
                 "owner-only" => {
                     fs::create_dir_all(&target).unwrap();
-                    fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+                    crate::agent_dir::set_authority_test_mode(&target, 0o700).unwrap();
                     let record: crate::device_identity::DeviceRecord =
                         serde_json::from_slice(&fs::read(source.join(RECORD_FILE)).unwrap())
                             .unwrap();
@@ -1679,7 +1711,7 @@ mod tests {
         let (_root, legacy_base, target) = fixture("complete-before-marker");
         let source = legacy_base.join("hydra-agent");
         fs::create_dir_all(&target).unwrap();
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::agent_dir::set_authority_test_mode(&target, 0o700).unwrap();
         let record: crate::device_identity::DeviceRecord =
             serde_json::from_slice(&fs::read(source.join(RECORD_FILE)).unwrap()).unwrap();
         crate::device_identity::claim_or_verify_owner_for_record(&target, &record).unwrap();
@@ -1706,7 +1738,7 @@ mod tests {
     fn owner_marker_collision_is_refused_before_credential_publication() {
         let (_root, legacy_base, target) = fixture("owner-collision");
         fs::create_dir_all(&target).unwrap();
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::agent_dir::set_authority_test_mode(&target, 0o700).unwrap();
         let wrong = crate::device_identity::DeviceRecord {
             device_id: "dev_other".into(),
             account_id: "acct_other".into(),
@@ -1729,7 +1761,7 @@ mod tests {
     fn complete_canonical_wins_without_source_but_conflicting_proven_source_fails() {
         let (_root, legacy_base, target) = fixture("collision");
         fs::create_dir_all(&target).unwrap();
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::agent_dir::set_authority_test_mode(&target, 0o700).unwrap();
         let other = crate::device_identity::DeviceRecord {
             device_id: "dev_other".into(),
             account_id: "acct_other".into(),
@@ -1760,7 +1792,7 @@ mod tests {
     fn complete_canonical_refuses_a_proven_record_without_its_key() {
         let (_root, legacy_base, target) = fixture("canonical-partial-legacy");
         fs::create_dir_all(&target).unwrap();
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::agent_dir::set_authority_test_mode(&target, 0o700).unwrap();
         let canonical = crate::device_identity::DeviceRecord {
             device_id: "dev_current".into(),
             account_id: "acct_current".into(),
@@ -1830,8 +1862,8 @@ mod tests {
         // mirror the same ordering here so this remains a serialization test,
         // not a race to create the lock directory.
         fs::create_dir_all(&target).unwrap();
-        fs::set_permissions(target.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::agent_dir::set_authority_test_mode(target.parent().unwrap(), 0o700).unwrap();
+        crate::agent_dir::set_authority_test_mode(&target, 0o700).unwrap();
         crate::agent_dir::ensure_owned_safe_authority_directory(&target).unwrap();
         let barrier = Arc::new(Barrier::new(2));
         let mut workers = Vec::new();
@@ -1884,13 +1916,31 @@ mod tests {
         let key = legacy.join(KEY_FILE);
         let real = legacy.join("real-key");
         fs::rename(&key, &real).unwrap();
+        #[cfg(unix)]
         std::os::unix::fs::symlink(&real, &key).unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            fs::create_dir(legacy.join("reparse-target")).unwrap();
+            // A junction exercises native reparse rejection without requiring the developer-mode
+            // privilege needed by file symlinks. Command words and relative names are fixed.
+            let output = std::process::Command::new("cmd.exe")
+                .args(["/D", "/C", "mklink", "/J", KEY_FILE, "reparse-target"])
+                .current_dir(&legacy)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "junction fixture: {output:?}");
+            assert_ne!(
+                fs::symlink_metadata(&key).unwrap().file_attributes() & 0x400,
+                0
+            );
+        }
         assert!(adopt_from_legacy_data_home(&target, &legacy_base, uid).is_err());
 
         let (_root, legacy_base, target) = fixture("mode");
-        fs::set_permissions(
+        crate::agent_dir::set_authority_test_mode(
             legacy_base.join("hydra-agent").join(RECORD_FILE),
-            fs::Permissions::from_mode(0o644),
+            0o644,
         )
         .unwrap();
         assert!(adopt_from_legacy_data_home(&target, &legacy_base, uid).is_err());
@@ -1927,7 +1977,7 @@ mod tests {
         adopt_from_legacy_data_home(&target, &legacy_base, uid).unwrap();
         let record = legacy_base.join("hydra-agent").join(RECORD_FILE);
         fs::write(&record, b"changed").unwrap();
-        fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).unwrap();
+        crate::agent_dir::set_authority_test_mode(&record, 0o600).unwrap();
         let locks = lifecycle_lock_set_for(&target);
         assert!(retire_adopted_legacy_enrollment(&target, &locks).is_err());
         assert!(record.exists());

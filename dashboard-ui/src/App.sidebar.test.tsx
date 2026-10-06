@@ -5,6 +5,7 @@ import { mockDashboardModel } from './data/mock'
 import type { DashboardModel } from './types/model'
 
 type SidebarTestWindow = Window & {
+  __HYDRA_WINDOWS_SIDEBAR_CSS__?: boolean
   __HYDRA_DASHBOARD_APPLY_SIDEBAR_STATE__?: (state: {
     width_logical_px: number
     last_expanded_width_logical_px: number
@@ -74,6 +75,11 @@ function installWindow(
   let modelListener: ((model: DashboardModel) => void) | null = null
   const browserWindow = Object.assign(new EventTarget(), {
     location: { href: `hydra://localhost/index.html${search}`, search },
+    // Each fixture is a new native WebView, not the previous test's cached replay.
+    __HYDRA_PENDING_SIDEBAR_STATE__: {
+      width_logical_px: 460,
+      last_expanded_width_logical_px: 460,
+    },
     setTimeout: globalThis.setTimeout.bind(globalThis),
     clearTimeout: globalThis.clearTimeout.bind(globalThis),
     hydraDashboard: {
@@ -124,6 +130,88 @@ afterEach(() => {
 })
 
 describe('native sidebar geometry and focus', () => {
+  it('keeps one Windows sidebar tree and toggle mounted across stale host collapse replay', async () => {
+    const intents: Array<Record<string, unknown>> = []
+    const browserWindow = installWindow('?chrome=sidebar', intents)
+    browserWindow.__HYDRA_WINDOWS_SIDEBAR_CSS__ = true
+    browserWindow.__HYDRA_PENDING_SIDEBAR_STATE__ = {
+      width_logical_px: 24,
+      last_expanded_width_logical_px: 377,
+    }
+    let viewportWidth = 220
+    browserWindow.matchMedia = vi.fn((query) => {
+      expect(query).toBe('(max-width: 25px)')
+      return { matches: viewportWidth <= 25 } as MediaQueryList
+    })
+    await mount()
+    const toggle = renderer!.root.findByProps({ className: 'sidebar__collapse' })
+    const tree = renderer!.root.findByProps({ role: 'tree' })
+    const pane = renderer!.root.findByProps({ 'aria-label': 'Focus codex — renderer' })
+    expect(renderer!.root.findByProps({ className: 'sidebar ' })).toBeTruthy()
+    expect(toggle.props['aria-label']).toBeUndefined()
+    expect(toggle.findAllByType('button')).toHaveLength(1)
+    expect(renderer!.root.findAllByProps({ role: 'separator' })).toHaveLength(1)
+    expect(intents).toHaveLength(0)
+
+    act(() => toggle.props.onClick({ detail: 0 }))
+    expect(intents).toEqual([{ type: 'setSidebarWidth', width: 24 }])
+    viewportWidth = 24.35 // A rounded physical rail at a fractional native DPI.
+    act(() => browserWindow.__HYDRA_DASHBOARD_APPLY_SIDEBAR_STATE__?.({
+      width_logical_px: 460, last_expanded_width_logical_px: 377,
+    }))
+    act(() => toggle.props.onClick({ detail: 0 }))
+    expect(intents).toEqual([
+      { type: 'setSidebarWidth', width: 24 },
+      { type: 'setSidebarWidth', width: 377 },
+    ])
+    expect(renderer!.root.findByProps({ className: 'sidebar__collapse' })).toBe(toggle)
+    expect(renderer!.root.findByProps({ role: 'tree' })).toBe(tree)
+    expect(renderer!.root.findByProps({ 'aria-label': 'Focus codex — renderer' })).toBe(pane)
+    expect(renderer!.root.findAllByProps({ className: 'sidebar__collapse' })).toHaveLength(1)
+  })
+
+  it('admits Windows resize only from the actual expanded viewport, not delayed host width', async () => {
+    const intents: Array<Record<string, unknown>> = []
+    const browserWindow = installWindow('?chrome=sidebar', intents)
+    browserWindow.__HYDRA_WINDOWS_SIDEBAR_CSS__ = true
+    let viewportWidth = 24
+    Object.defineProperty(browserWindow, 'innerWidth', { get: () => viewportWidth })
+    browserWindow.matchMedia = vi.fn((query) => {
+      expect(query).toBe('(max-width: 25px)')
+      return { matches: viewportWidth <= 25 } as MediaQueryList
+    })
+    await mount()
+    const separator = renderer!.root.findByProps({ role: 'separator' })
+    const pointer = createPointerTarget()
+    act(() => separator.props.onPointerDown(pointerEvent(pointer.target)))
+    act(() => separator.props.onKeyDown({ key: 'ArrowRight', preventDefault: vi.fn() }))
+    expect(pointer.target.setPointerCapture).not.toHaveBeenCalled()
+    expect(intents).toHaveLength(0)
+    viewportWidth = 300
+    act(() => browserWindow.__HYDRA_DASHBOARD_APPLY_SIDEBAR_STATE__?.({
+      width_logical_px: 24, last_expanded_width_logical_px: 460,
+    }))
+    act(() => separator.props.onPointerDown(pointerEvent(pointer.target, { screenX: 300 })))
+    act(() => separator.props.onPointerMove(pointerEvent(pointer.target, { screenX: 320 })))
+    act(() => separator.props.onPointerUp(pointerEvent(pointer.target)))
+    act(() => separator.props.onKeyDown({ key: 'ArrowRight', preventDefault: vi.fn() }))
+    expect(intents).toEqual([
+      { type: 'setSidebarWidth', width: 320 },
+      { type: 'setSidebarWidth', width: 316 },
+    ])
+  })
+
+  it('does not enable viewport CSS for the full shell even if the Windows hint is present', async () => {
+    const browserWindow = installWindow('', [])
+    browserWindow.__HYDRA_WINDOWS_SIDEBAR_CSS__ = true
+    browserWindow.__HYDRA_PENDING_SIDEBAR_STATE__ = {
+      width_logical_px: 24, last_expanded_width_logical_px: 460,
+    }
+    await mount()
+    expect(renderer!.root.findByProps({ 'aria-label': 'Expand sidebar' })).toBeTruthy()
+    expect(renderer!.root.findAllByProps({ role: 'separator' })).toHaveLength(0)
+  })
+
   it('keeps a remembered visible window and otherwise uses the first durable visible window', () => {
     const template = structuredClone(mockDashboardModel.details.sample.windows[0])
     const windows = (['exited', 'unknown', 'live'] as const).map((status) => {
@@ -1328,7 +1416,7 @@ describe('native sidebar geometry and focus', () => {
     let separator = renderer!.root.findByProps({ role: 'separator' })
     expect(separator.props.tabIndex).toBe(0)
     expect(separator.props['aria-valuemin']).toBe(220)
-    expect(separator.props['aria-valuemax']).toBe(560)
+    expect(separator.props['aria-valuemax']).toBe(720)
     expect(separator.props['aria-valuenow']).toBe(460)
 
     act(() => separator.props.onKeyDown({ key: 'ArrowLeft', preventDefault: vi.fn() }))
@@ -1340,7 +1428,7 @@ describe('native sidebar geometry and focus', () => {
     expect(intents[intents.length - 1]).toEqual({ type: 'setSidebarWidth', width: 220 })
     separator = renderer!.root.findByProps({ role: 'separator' })
     act(() => separator.props.onKeyDown({ key: 'End', preventDefault: vi.fn() }))
-    expect(intents[intents.length - 1]).toEqual({ type: 'setSidebarWidth', width: 560 })
+    expect(intents[intents.length - 1]).toEqual({ type: 'setSidebarWidth', width: 720 })
   })
 
   it('uses the owning pointer screen coordinate and deduplicates clamped resize intents', async () => {
@@ -1376,7 +1464,7 @@ describe('native sidebar geometry and focus', () => {
 
     expect(intents.filter((intent) => intent.type === 'setSidebarWidth')).toEqual([
       { type: 'setSidebarWidth', width: 500 },
-      { type: 'setSidebarWidth', width: 560 },
+      { type: 'setSidebarWidth', width: 720 },
     ])
     act(() => separator.props.onPointerUp(pointerEvent(pointer.target, { buttons: 0 })))
     expect(pointer.target.releasePointerCapture).toHaveBeenCalledWith(7)
@@ -1406,6 +1494,36 @@ describe('native sidebar geometry and focus', () => {
       { type: 'setSidebarWidth', width: 480 },
     ])
     expect(document.body.classList.contains('is-resizing-sidebar')).toBe(false)
+  })
+
+  it('starts a DOM drag and collapse/expand from the latest native gutter width', async () => {
+    const intents: Array<Record<string, unknown>> = []
+    const browserWindow = installWindow('?chrome=sidebar', intents)
+    await mount()
+    act(() =>
+      browserWindow.__HYDRA_DASHBOARD_APPLY_SIDEBAR_STATE__?.({
+        width_logical_px: 623,
+        last_expanded_width_logical_px: 623,
+      }),
+    )
+    const separator = renderer!.root.findByProps({ role: 'separator' })
+    expect(separator.props['aria-valuenow']).toBe(623)
+    const pointer = createPointerTarget()
+    act(() =>
+      separator.props.onPointerDown(pointerEvent(pointer.target, { screenX: 680 })),
+    )
+    act(() =>
+      separator.props.onPointerMove(pointerEvent(pointer.target, { screenX: 640 })),
+    )
+    act(() => separator.props.onPointerUp(pointerEvent(pointer.target, { buttons: 0 })))
+    expect(intents[intents.length - 1]).toEqual({ type: 'setSidebarWidth', width: 583 })
+    act(() =>
+      renderer!.root.findByProps({ 'aria-label': 'Collapse sidebar' }).props.onClick({ detail: 0 }),
+    )
+    act(() =>
+      renderer!.root.findByProps({ 'aria-label': 'Expand sidebar' }).props.onClick({ detail: 0 }),
+    )
+    expect(intents[intents.length - 1]).toEqual({ type: 'setSidebarWidth', width: 583 })
   })
 
   it('drops a captured resize when New Project suppresses the sidebar WebView', async () => {

@@ -55,6 +55,7 @@ use crate::workspace_consent::{
 };
 
 /// Owner-only mode for every directory this module creates (matches the record store).
+#[cfg(unix)]
 const DIR_MODE: u32 = 0o700;
 
 /// Why a workspace could not be prepared.
@@ -365,6 +366,8 @@ pub(crate) fn noncanonicalizable_agent_launch(argv: &[String]) -> LaunchSpec {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PreparedSessionBinding {
+    /// An explicit product default-shell choice, never inferred from arbitrary argv.
+    DefaultShell,
     /// Compatibility surface for public raw `StartParams` APIs. It never grants Agent authority.
     LegacyShellAdHoc,
     /// Shell-minted exact source argv; Shell or custom Agent, with no AgentTask association.
@@ -534,6 +537,41 @@ impl PreparedWorkspace {
             rows,
             now_ms,
         )
+    }
+
+    /// Seal an explicit default-shell choice in this prepared cwd. Callers must carry that choice
+    /// separately from custom argv: recognizing a shell executable is not this authority.
+    /// OptOut never replays these launch bytes; explicit Reopen selects the then-current reviewed
+    /// default shell, while automatic startup remains denied for ordinary OptOut panes.
+    pub fn default_shell_session_spec(
+        &self,
+        default_argv: &[String],
+        cols: u16,
+        rows: u16,
+        now_ms: u64,
+    ) -> Result<PreparedSessionSpec, WorkspaceExecError> {
+        let (command, args) = default_argv
+            .split_first()
+            .filter(|(command, _)| !command.trim().is_empty())
+            .ok_or(WorkspaceExecError::InvalidPreparedSessionSpec)?;
+        Ok(PreparedSessionSpec {
+            params: StartParams {
+                session_id: self.session_id.clone(),
+                workspace_id: self.workspace_id.clone(),
+                kind: SessionKind::Shell,
+                launch: LaunchSpec::OptOut,
+                cwd: self.cwd.to_string_lossy().into_owned(),
+                command: command.clone(),
+                args: args.to_vec(),
+                cols,
+                rows,
+                agent_task_id: None,
+                now_ms,
+            },
+            publication_launch: LaunchSpec::OptOut,
+            binding: PreparedSessionBinding::DefaultShell,
+            worktree_provenance: self.take_worktree_provenance()?,
+        })
     }
 
     /// Seal an exact ad-hoc Shell or Agent launch. Metadata is recomputed from the same live argv;
@@ -1721,11 +1759,17 @@ mod tests {
             &fresh.publication_launch
         ));
         assert_eq!(fresh.params.launch, fresh.publication_launch);
+        #[cfg(unix)]
         assert!(fresh
             .params
             .args
             .iter()
             .any(|arg| arg.contains(locator.to_str().unwrap())));
+        #[cfg(windows)]
+        {
+            assert_eq!(fresh.params.command, locator.to_str().unwrap());
+            assert!(fresh.params.args.is_empty());
+        }
     }
 
     impl LaunchEnvLookup for PreparedLaunchEnv {
@@ -1752,8 +1796,15 @@ mod tests {
             .provider_session_spec("claude", &source, &PreparedLaunchEnv, 80, 24, 10)
             .unwrap();
         assert_eq!(spec.params.kind, SessionKind::Agent);
+        #[cfg(unix)]
         assert_eq!(spec.params.command, "/bin/prepared-shell");
+        #[cfg(unix)]
         assert_eq!(spec.params.args.first().map(String::as_str), Some("-lic"));
+        #[cfg(windows)]
+        {
+            assert_eq!(spec.params.command, source[0]);
+            assert_eq!(spec.params.args, source[1..]);
+        }
         assert!(matches!(
             &spec.params.launch,
             LaunchSpec::AdHocRedacted {
@@ -1971,8 +2022,15 @@ mod tests {
             .provider_custom_adhoc_session_spec("claude", &source, &PreparedLaunchEnv, 80, 24, 10)
             .unwrap();
         assert_eq!(spec.binding, PreparedSessionBinding::AgentAdHocLoginShell);
+        #[cfg(unix)]
         assert_eq!(spec.params.command, "/bin/prepared-shell");
+        #[cfg(unix)]
         assert_eq!(spec.params.args.first().map(String::as_str), Some("-lic"));
+        #[cfg(windows)]
+        {
+            assert_eq!(spec.params.command, source[0]);
+            assert_eq!(spec.params.args, source[1..]);
+        }
         assert_eq!(spec.params.launch, spec.publication_launch);
         let LaunchSpec::AdHocRedacted {
             argv,

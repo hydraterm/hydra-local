@@ -1,3 +1,6 @@
+// This wire fixture uses Unix domain sockets and POSIX child commands.
+#![cfg(unix)]
+
 //! Tier-(a) survival smoke test: a PTY session outlives the client that started
 //! it. We start the daemon binary, open a session, feed it a marker, drop the
 //! connection entirely, then reconnect and assert the marker replays out of the

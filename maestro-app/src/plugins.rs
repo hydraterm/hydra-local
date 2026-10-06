@@ -201,12 +201,14 @@ fn mutation_guard(base: &Path) -> Result<fs::File, String> {
     let dir = registry(base);
     if !dir.try_exists().map_err(|e| e.to_string())? {
         fs::create_dir_all(base).map_err(|e| e.to_string())?;
-        let mut builder = fs::DirBuilder::new();
+        let builder = fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::DirBuilderExt;
+            let mut builder = builder;
             builder.mode(0o700);
-        }
+            builder
+        };
         match builder.create(&dir) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -223,11 +225,38 @@ fn mutation_guard(base: &Path) -> Result<fs::File, String> {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let lock = options
-        .open(dir.join(".registry.lock"))
-        .map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Exclusive sharing is an OS-owned nonblocking lease, released with this File.
+        // It also denies rename/delete of the authority name while a mutation is active.
+        // Open the literal lock object rather than following a reparse point.
+        options.share_mode(0).custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let lock = options.open(dir.join(".registry.lock")).map_err(|e| {
+        #[cfg(windows)]
+        if e.raw_os_error() == Some(32) {
+            // ERROR_SHARING_VIOLATION: preserve the Unix contention contract.
+            return "plugin registry is being changed; retry this command".into();
+        }
+        e.to_string()
+    })?;
     if !lock.metadata().map_err(|e| e.to_string())?.is_file() {
         return Err("plugin registry lock is not a regular file".into());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if lock
+            .metadata()
+            .map_err(|e| e.to_string())?
+            .file_attributes()
+            & 0x400
+            != 0
+        {
+            // FILE_ATTRIBUTE_REPARSE_POINT; inspect the opened object, not a second path.
+            return Err("plugin registry lock must not be a reparse point".into());
+        }
     }
     #[cfg(unix)]
     {
@@ -520,6 +549,12 @@ pub fn start_background(
                     .stdin(Stdio::null())
                     .stdout(log.try_clone().map_err(|e| e.to_string())?)
                     .stderr(log);
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt as _;
+                    // A GUI owner otherwise gives console plugins a new visible console.
+                    command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+                }
                 let mut child = command
                     .spawn()
                     .map_err(|e| format!("could not launch: {e}"))?;
@@ -543,6 +578,155 @@ pub fn start_background(
 mod tests {
     use super::*;
 
+    const LITERAL_ARGUMENTS: &[&str] = &[
+        "$(exit 99)",
+        "%PATH%",
+        "& echo not-a-command",
+        "",
+        "quoted \"argument\" with spaces",
+        "trailing\\",
+        "日本語 🦀",
+    ];
+
+    fn native_fixture_command(mode: &str) -> Vec<String> {
+        vec![
+            std::env::current_exe()
+                .unwrap()
+                .to_str()
+                .expect("fixture executable path is Unicode")
+                .to_owned(),
+            "--exact".into(),
+            "plugins::tests::native_plugin_child".into(),
+            "--ignored".into(),
+            "--nocapture".into(),
+            "--".into(),
+            mode.into(),
+        ]
+    }
+
+    #[test]
+    #[ignore = "native child entry, invoked only by plugin process fixtures"]
+    fn native_plugin_child() {
+        // libtest accepts additional filters after `--`. The exact entry above selects
+        // this child, while those literal process arguments remain available for checking.
+        let args: Vec<String> = std::env::args().collect();
+        let separator = args.iter().position(|arg| arg == "--").unwrap();
+        let payload = &args[separator + 1..];
+        match payload[0].as_str() {
+            #[cfg(windows)]
+            "report-console" => {
+                let attached =
+                    unsafe { !windows_sys::Win32::System::Console::GetConsoleWindow().is_null() };
+                println!("HYDRA_PLUGIN_CONSOLE_ATTACHED={attached}");
+                std::io::stdout().flush().unwrap();
+            }
+            #[cfg(windows)]
+            "background-console-owner" => {
+                assert!(unsafe {
+                    windows_sys::Win32::System::Console::GetConsoleWindow().is_null()
+                });
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path().join("source");
+                let mut manifest = fixture(&root);
+                manifest.actions[0].command = native_fixture_command("report-console");
+                // The operator can use a GUI-subsystem copy for this owner while
+                // keeping the reporting child an ordinary console executable.
+                if let Some(reporter) = std::env::var_os("HYDRA_TEST_PLUGIN_CONSOLE_REPORTER") {
+                    manifest.actions[0].command[0] = reporter.into_string().unwrap();
+                }
+                fs::write(
+                    root.join("hydra-plugin.json"),
+                    serde_json::to_vec(&manifest).unwrap(),
+                )
+                .unwrap();
+                let base = temp.path().join("base");
+                install_local(&base, &root).unwrap();
+                let (tx, rx) = std::sync::mpsc::channel();
+                start_background(
+                    &base,
+                    Path::new(r"\\.\pipe\Hydra.PluginFixture.Unused"),
+                    "plugin:example.test:run",
+                    Context::default(),
+                    InvocationIdentity {
+                        generation: 7,
+                        invocation: 41,
+                    },
+                    tx,
+                )
+                .unwrap();
+                let running = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+                assert!(running.text.contains("running; log"));
+                let completed = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+                assert_eq!(completed.generation, 7);
+                assert_eq!(completed.invocation, 41);
+                assert_eq!(completed.action_id, "plugin:example.test:run");
+                assert!(completed.text.contains("exit code: 0"));
+                let log = completed.text.split_once("; log ").unwrap().1;
+                let output = fs::read_to_string(log).unwrap();
+                assert!(
+                    output
+                        .lines()
+                        .any(|line| line == "HYDRA_PLUGIN_CONSOLE_ATTACHED=false"),
+                    "background plugin allocated a console despite its non-console owner"
+                );
+            }
+            "registry-lock-release" | "registry-lock-exit" => {
+                let base = PathBuf::from(&payload[1]);
+                let guard = mutation_guard(&base).unwrap();
+                fs::write(base.join("child-ready"), b"locked").unwrap();
+                let mut signal = [0u8; 1];
+                std::io::stdin().read_exact(&mut signal).unwrap();
+                if payload[0] == "registry-lock-exit" {
+                    // Deliberately bypass Rust destructors to prove OS lifetime cleanup.
+                    std::process::exit(23);
+                }
+                drop(guard);
+            }
+            "exit23" => std::process::exit(23),
+            "logged-exit23" => {
+                std::io::stdout().write_all(b"out").unwrap();
+                std::io::stdout().flush().unwrap();
+                std::io::stderr().write_all(b"err").unwrap();
+                std::io::stderr().flush().unwrap();
+                std::process::exit(23);
+            }
+            "literal-context" => {
+                assert_eq!(&payload[1..], LITERAL_ARGUMENTS);
+                for (key, value) in [
+                    ("HYDRA_PLUGIN_ID", "example.test"),
+                    ("HYDRA_SESSION_ID", "chosen"),
+                    ("HYDRA_WINDOW_ID", "window"),
+                    ("HYDRA_PLUGIN_ACTION_ID", "run"),
+                ] {
+                    assert_eq!(std::env::var(key).unwrap(), value);
+                }
+                let root = PathBuf::from(std::env::var_os("HYDRA_PLUGIN_ROOT").unwrap());
+                assert_eq!(
+                    std::env::current_dir().unwrap().canonicalize().unwrap(),
+                    root
+                );
+                let app = PathBuf::from(std::env::var_os("HYDRA_BIN_PATH").unwrap());
+                assert_eq!(app, std::env::current_exe().unwrap());
+                let base = PathBuf::from(std::env::var_os("HYDRA_BASE_DIR").unwrap());
+                assert_eq!(
+                    base,
+                    root.parent().unwrap().join("base").canonicalize().unwrap()
+                );
+                let socket = PathBuf::from(std::env::var_os("HYDRA_SOCKET_PATH").unwrap());
+                assert!(socket.is_absolute());
+                assert_eq!(socket.file_name().unwrap(), "relative.sock");
+                let context: serde_json::Value =
+                    serde_json::from_str(&std::env::var("HYDRA_PLUGIN_CONTEXT_JSON").unwrap())
+                        .unwrap();
+                assert_eq!(
+                    context,
+                    serde_json::json!({"window_id":"window","session_id":"chosen"})
+                );
+            }
+            mode => panic!("unknown native plugin fixture mode: {mode}"),
+        }
+    }
+
     fn fixture(root: &Path) -> Manifest {
         let manifest = Manifest {
             schema_version: 1,
@@ -552,7 +736,7 @@ mod tests {
             actions: vec![Action {
                 id: "run".into(),
                 title: "Run test".into(),
-                command: vec!["sh".into(), "-c".into(), "exit 23".into()],
+                command: native_fixture_command("exit23"),
             }],
         };
         fs::create_dir_all(root).unwrap();
@@ -655,7 +839,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn mutations_serialize_and_invalid_registration_can_be_removed() {
         let temp = tempfile::tempdir().unwrap();
@@ -674,13 +857,79 @@ mod tests {
     }
 
     #[test]
+    fn registry_lock_serializes_processes_and_recovers_after_release_or_exit() {
+        use std::time::{Duration, Instant};
+        struct Probe(Child);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let _ = self.0.kill(); // Only our disposable, explicitly spawned test child.
+                let _ = self.0.wait();
+            }
+        }
+        for mode in ["registry-lock-release", "registry-lock-exit"] {
+            let temp = tempfile::tempdir().unwrap();
+            let base = temp.path().join("base");
+            let root = temp.path().join("source");
+            fixture(&root);
+            install_local(&base, &root).unwrap();
+            let argv = native_fixture_command(mode);
+            let mut child = Probe(
+                Command::new(&argv[0])
+                    .args(&argv[1..])
+                    .arg(&base)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !base.join("child-ready").exists() {
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "lock child exited early"
+                );
+                assert!(Instant::now() < deadline, "lock child did not become ready");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let retry = "plugin registry is being changed; retry this command";
+            assert_eq!(
+                set_enabled(&base, "example.test", false).unwrap_err(),
+                retry
+            );
+            assert_eq!(remove(&base, "example.test").unwrap_err(), retry);
+            assert!(load(&base, "example.test").unwrap().enabled);
+            #[cfg(windows)]
+            {
+                let lock = registry(&base).join(".registry.lock");
+                assert!(fs::rename(&lock, registry(&base).join("moved.lock")).is_err());
+                assert!(fs::remove_file(&lock).is_err());
+            }
+            child.0.stdin.take().unwrap().write_all(b"x").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(Instant::now() < deadline, "lock child did not exit");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert_eq!(
+                status.code(),
+                Some(if mode.ends_with("exit") { 23 } else { 0 })
+            );
+            set_enabled(&base, "example.test", false).unwrap();
+            assert!(!load(&base, "example.test").unwrap().enabled);
+            remove(&base, "example.test").unwrap();
+        }
+    }
+
+    #[test]
     fn argv_is_literal_and_context_is_host_owned() {
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path().join("base");
         let root = temp.path().join("source");
         let mut manifest = fixture(&root);
-        manifest.actions[0].command = vec!["sh".into(), "-c".into(),
-            "test \"$1\" = '$(exit 99)' && test \"$HYDRA_PLUGIN_ID\" = example.test && test \"$HYDRA_SESSION_ID\" = chosen && test \"$HYDRA_WINDOW_ID\" = window && test \"$HYDRA_PLUGIN_ACTION_ID\" = run && test \"$PWD\" = \"$HYDRA_PLUGIN_ROOT\" && test -n \"$HYDRA_BIN_PATH\"".into(), "fixture".into()];
+        manifest.actions[0].command = native_fixture_command("literal-context");
         fs::write(
             root.join("hydra-plugin.json"),
             serde_json::to_vec(&manifest).unwrap(),
@@ -696,7 +945,10 @@ mod tests {
             Some(Path::new("relative.sock")),
             "example.test",
             "run",
-            &["$(exit 99)".into()],
+            &LITERAL_ARGUMENTS
+                .iter()
+                .map(|arg| (*arg).into())
+                .collect::<Vec<_>>(),
             &context,
             false
         )
@@ -785,11 +1037,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("source");
         let mut manifest = fixture(&root);
-        manifest.actions[0].command = vec![
-            "sh".into(),
-            "-c".into(),
-            "printf out; printf err >&2; exit 23".into(),
-        ];
+        manifest.actions[0].command = native_fixture_command("logged-exit23");
         fs::write(
             root.join("hydra-plugin.json"),
             serde_json::to_vec(&manifest).unwrap(),
@@ -841,6 +1089,77 @@ mod tests {
             .unwrap()
             .text
             .contains("disabled"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn background_action_from_non_console_owner_does_not_allocate_console() {
+        use std::os::windows::process::CommandExt as _;
+        use std::time::{Duration, Instant};
+
+        struct OwnedChild(Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let mut argv = native_fixture_command("background-console-owner");
+        // Model the installed GUI executable, not a CREATE_NO_WINDOW console
+        // parent (whose descendants have different default console inheritance).
+        let reporter = std::env::var_os("HYDRA_TEST_PLUGIN_CONSOLE_REPORTER")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_exe().unwrap());
+        let owner_dir = tempfile::tempdir().unwrap();
+        let owner = owner_dir.path().join("plugin-gui-owner.exe");
+        let mut image = fs::read(&reporter).unwrap();
+        let pe = u32::from_le_bytes(image[60..64].try_into().unwrap()) as usize;
+        assert_eq!(&image[pe..pe + 4], b"PE\0\0");
+        assert_eq!(&image[pe + 24..pe + 26], &0x20bu16.to_le_bytes());
+        let subsystem = pe + 24 + 68;
+        assert_eq!(&image[subsystem..subsystem + 2], &3u16.to_le_bytes());
+        image[subsystem..subsystem + 2].copy_from_slice(&2u16.to_le_bytes());
+        fs::write(&owner, image).unwrap();
+        argv[0] = owner.to_str().unwrap().to_owned();
+        let mut child = OwnedChild(
+            Command::new(&argv[0])
+                .args(&argv[1..])
+                .env("HYDRA_TEST_PLUGIN_CONSOLE_REPORTER", reporter)
+                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW: model the installed GUI parent.
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(25);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "owned console fixture timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let mut output = String::new();
+        child
+            .0
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        child
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        assert!(
+            status.success(),
+            "non-console plugin owner failed: {output}"
+        );
     }
 
     #[cfg(unix)]

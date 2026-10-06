@@ -1,0 +1,5 @@
+// Shared group-icon ordinal used by Explorer and the Windows winit adapter.
+// Hydra.ico is a checked-in asset generated once using New-HydraIcon.ps1.
+// Original assets/Hydra.png SHA256:
+// f083a299ea8eb42250c56338c5184a0eaaf59def36faafbf12758f07e9e0b31c
+1 ICON "Hydra.ico"

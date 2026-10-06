@@ -36,6 +36,17 @@ wry = { version = "0.55.1", default-features = false, features = ["devtools", "p
 # `default-features = false` drops image support; Hydra only reads/writes text.
 arboard = { version = "=3.4.1", default-features = false }
 
+# Windows hosts the same React chrome in WebView2 beside the native winit/WGPU terminal.
+[target.'cfg(windows)'.dependencies]
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+arboard = { version = "=3.4.1", default-features = false }
+wry = { version = "0.55.1", default-features = false, features = ["protocol", "transparent"] }
+rfd = "0.15"
+windows-sys = { version = "0.61.2", features = ["Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes"] }
+
 # Linux DashboardHost adapter. This is a PLATFORM-GATED HOST BOUNDARY, not a renderer
 # fork: the production renderer stays winit-driven on macOS. On Linux the window + event loop are Tao/GTK so
 # WebKitGTK (wry) can host the React dashboard as a GTK child while the existing WGPU renderer presents into a

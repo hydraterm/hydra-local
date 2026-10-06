@@ -1,7 +1,8 @@
 //! Safe, platform-neutral file-drop text construction.
 //!
 //! Native hosts provide paths only. This module never opens, resolves, or executes them; it turns a
-//! bounded set of absolute UTF-8 paths into one POSIX-shell-quoted insertion payload. The caller may
+//! bounded set of absolute UTF-8 paths into a quoted insertion payload (POSIX on Unix,
+//! PowerShell on Windows, matching the native default shell). The caller may
 //! then pass that payload through the renderer's existing bracketed-paste encoder.
 
 use std::path::{Path, PathBuf};
@@ -31,7 +32,7 @@ pub(crate) fn append_quoted_paths(
         let Some(raw) = admissible_path(&path) else {
             continue;
         };
-        let quoted = quote_posix_path(raw);
+        let quoted = quote_native_path(raw);
         let separator = usize::from(!payload.is_empty());
         let Some(next_len) = payload
             .len()
@@ -74,7 +75,8 @@ fn admissible_path(path: &Path) -> Option<&str> {
 /// by ending the single-quoted run, emitting it inside double quotes, then reopening the run:
 /// `'a'"'"'b'`. Shell operators, substitutions, backticks, whitespace, and embedded newlines therefore
 /// remain data. The function deliberately always quotes, including paths that look simple.
-fn quote_posix_path(path: &str) -> String {
+#[cfg(not(windows))]
+fn quote_native_path(path: &str) -> String {
     let mut quoted = String::with_capacity(path.len().saturating_add(2));
     quoted.push('\'');
     for ch in path.chars() {
@@ -88,7 +90,14 @@ fn quote_posix_path(path: &str) -> String {
     quoted
 }
 
-#[cfg(test)]
+#[cfg(windows)]
+fn quote_native_path(path: &str) -> String {
+    // PowerShell literal strings escape a quote by doubling it. Backticks, dollar signs,
+    // operators and backslashes stay literal. Never append Enter or a call operator.
+    format!("'{}'", path.replace('\'', "''"))
+}
+
+#[cfg(all(test, not(windows)))]
 mod tests {
     use super::*;
 
@@ -166,5 +175,107 @@ mod tests {
         assert_eq!(bounded, "'/tmp/fits'");
         assert!(bounded.len() <= MAX_DROPPED_INSERT_BYTES);
         assert!(bounded.ends_with('\''));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn powershell_drop_preserves_quotes_unicode_and_metacharacters() {
+        let raw = r"C:\QA folder\a'b $HOME `literal`; & 日本語 🦀";
+        let mut text = String::new();
+        let mut count = 0;
+        assert_eq!(
+            append_quoted_paths(&mut text, &mut count, [PathBuf::from(raw)]),
+            1
+        );
+        assert_eq!(text, format!("'{}'", raw.replace('\'', "''")));
+        assert!(!text.ends_with('\n'));
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn native_powershell_receives_dropped_paths_as_exact_literal_arguments() {
+        use std::os::windows::process::CommandExt;
+        let inputs = [
+            r"C:\QA folder\a'b $HOME `literal`; & 日本語 🦀",
+            r"C:\QA\plain",
+        ];
+        let mut text = String::new();
+        let mut count = 0;
+        assert_eq!(
+            append_quoted_paths(&mut text, &mut count, inputs.iter().map(PathBuf::from)),
+            2
+        );
+        let shell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let script=format!("[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); function HydraDropProbe {{ $args | ConvertTo-Json -Compress }}; HydraDropProbe {text}");
+        let output = std::process::Command::new(shell)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &script,
+            ])
+            .creation_flags(0x08000000)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let received: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(received, inputs);
+    }
+
+    #[test]
+    fn native_invalid_paths_do_not_damage_neighboring_paths() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+        let paths = [
+            PathBuf::from("relative"),
+            PathBuf::from("C:relative"),
+            PathBuf::from("C:\\bad\nname"),
+            PathBuf::from("C:\\bad\tname"),
+            PathBuf::from("C:\\bad\rname"),
+            PathBuf::from("C:\\bad\u{1b}name"),
+            PathBuf::from(OsString::from_wide(&[67, 58, 92, 0xd800])),
+            PathBuf::from(r"C:\QA\good"),
+        ];
+        let mut text = String::new();
+        let mut count = 0;
+        assert_eq!(append_quoted_paths(&mut text, &mut count, paths), 1);
+        assert_eq!(text, r"'C:\QA\good'");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn native_count_and_byte_caps_preserve_whole_paths() {
+        let mut text = String::new();
+        let mut count = 0;
+        assert_eq!(
+            append_quoted_paths(
+                &mut text,
+                &mut count,
+                (0..MAX_DROPPED_PATHS + 4).map(|n| PathBuf::from(format!(r"C:\QA\{n}")))
+            ),
+            MAX_DROPPED_PATHS
+        );
+        assert_eq!(count, MAX_DROPPED_PATHS);
+        let mut text = String::new();
+        let mut count = 0;
+        assert_eq!(
+            append_quoted_paths(
+                &mut text,
+                &mut count,
+                [
+                    PathBuf::from(format!(r"C:\{}", "x".repeat(MAX_DROPPED_INSERT_BYTES))),
+                    PathBuf::from(r"C:\QA\fits")
+                ]
+            ),
+            1
+        );
+        assert_eq!(text, r"'C:\QA\fits'");
+        assert_eq!(count, 1);
     }
 }

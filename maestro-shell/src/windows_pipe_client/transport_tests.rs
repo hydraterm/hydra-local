@@ -150,6 +150,50 @@ fn create_server(endpoint: &Path) -> io::Result<OwnedHandle> {
     owned_handle(raw, "CreateNamedPipeW")
 }
 
+#[test]
+fn absent_endpoint_preserves_not_found_before_startup_deadline() {
+    let endpoint = unique_endpoint("absent-startup");
+    let started = Instant::now();
+    let error = WindowsPipeStream::connect_until(&endpoint, started + CONNECT_WITHIN)
+        .err()
+        .expect("unique unbound endpoint must be absent");
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    assert_eq!(error.raw_os_error(), Some(2));
+    assert!(started.elapsed() < CLIENT_IO_BOUND);
+}
+
+#[test]
+fn occupied_endpoint_times_out_without_authorizing_daemon_replacement() {
+    let endpoint = unique_endpoint("busy-startup");
+    let server = create_server(&endpoint).expect("create sole protected server instance");
+    let name: Vec<u16> = endpoint.as_os_str().encode_wide().chain(Some(0)).collect();
+    // Occupy the only server instance without involving protocol authentication or async I/O.
+    let occupant = owned_handle(
+        unsafe {
+            windows_sys::Win32::Storage::FileSystem::CreateFileW(
+                name.as_ptr(),
+                windows_sys::Win32::Foundation::GENERIC_READ
+                    | windows_sys::Win32::Foundation::GENERIC_WRITE,
+                0,
+                null(),
+                windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                null_mut(),
+            )
+        },
+        "occupy server instance",
+    )
+    .expect("connect occupant");
+    let started = Instant::now();
+    let error = WindowsPipeStream::connect_until(&endpoint, started + CLIENT_IO_TIMEOUT)
+        .err()
+        .expect("occupied endpoint cannot admit a second client");
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(started.elapsed() < CLIENT_IO_BOUND);
+    drop(occupant);
+    drop(server);
+}
+
 fn create_event() -> io::Result<OwnedHandle> {
     // SAFETY: default security, manual reset, initially nonsignalled, and no name are valid here.
     owned_handle(
@@ -379,7 +423,17 @@ fn spawn_server(
 }
 
 fn connect_client(endpoint: &Path) -> io::Result<WindowsPipeStream> {
-    WindowsPipeStream::connect_until(endpoint, Instant::now() + CONNECT_WITHIN)
+    // Test-created child servers may not have bound yet. Readiness belongs to the fixture,
+    // not production connect: a real absent endpoint must stay promptly classifiable.
+    let deadline = Instant::now() + CONNECT_WITHIN;
+    loop {
+        match WindowsPipeStream::connect_until(endpoint, deadline) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
 }
 
 fn expect_client_eof(pipe: &OwnedHandle) -> io::Result<()> {
@@ -549,6 +603,7 @@ fn abort_from_clone_wakes_a_blocked_read() {
         .recv_timeout(SERVER_IO_WITHIN)
         .expect("raw server consumed authentication byte");
     let aborter = reader.try_clone().expect("clone production pipe stream");
+    let witness = reader.daemon_process_witness();
     reader
         .set_read_timeout(Some(SERVER_IO_WITHIN))
         .expect("set defensive reader timeout");
@@ -588,6 +643,9 @@ fn abort_from_clone_wakes_a_blocked_read() {
         .recv_timeout(CLIENT_IO_BOUND)
         .expect("cancelled operations release pipe authority while the idle clone is still alive");
     drop(aborter);
+    assert!(witness
+        .matches_live(&witness)
+        .expect("retained process query"));
     server.finish().expect("join silent raw named-pipe server");
 }
 
@@ -599,6 +657,8 @@ fn server_process_death_yields_eof_broken_pipe_and_false_liveness() {
     let expected_pid = child.id();
     let mut client = connect_client(&endpoint).expect("connect production named-pipe client");
     assert_eq!(client.server_pid(), expected_pid);
+    let witness = client.daemon_process_witness();
+    assert!(witness.matches_live(&witness).expect("live witness query"));
     assert!(client
         .state
         .server_is_alive_checked()
@@ -625,6 +685,110 @@ fn server_process_death_yields_eof_broken_pipe_and_false_liveness() {
         .write(b"after-exit")
         .expect_err("write after server process death must fail");
     assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    drop(client);
+    assert!(!witness.matches_live(&witness).expect("dead witness query"));
+}
+
+#[test]
+fn handoff_witness_survives_claim_and_cancel_without_retaining_pipe() {
+    use crate::daemon_client::{AttachmentHandoffAuthority, DaemonClient};
+
+    for cancel in [false, true] {
+        let endpoint = unique_endpoint("handoff-witness");
+        let server = spawn_server(&endpoint, move |pipe, _released| {
+            consume_authentication_byte(pipe)?;
+            if cancel {
+                let expected = concat!(
+                    "{\"op\":\"cancel_attachment_handoff\",\"id\":\"witness-fixture\",",
+                    "\"token\":\"0123456789abcdef0123456789abcdef\",",
+                    "\"expected_daemon_instance\":\"22222222222242228222222222222222\"}\n"
+                );
+                let mut request = vec![0; expected.len()];
+                read_exact(pipe, &mut request)?;
+                assert_eq!(request, expected.as_bytes());
+                write_all(
+                    pipe,
+                    concat!(
+                        "{\"ev\":\"attachment_handoff_cancelled\",\"id\":\"witness-fixture\",",
+                        "\"token\":\"0123456789abcdef0123456789abcdef\",",
+                        "\"daemon_instance_id\":\"22222222222242228222222222222222\"}\n"
+                    )
+                    .as_bytes(),
+                )?;
+            }
+            expect_client_eof(pipe)
+        })
+        .expect("start handoff witness server");
+        let client = DaemonClient::connect_with_timeout(&endpoint, SERVER_IO_WITHIN)
+            .expect("connect exact authority client");
+        let authority = AttachmentHandoffAuthority::from_connected_client_for_test(client);
+        let witness = authority.daemon_process_witness();
+        if cancel {
+            authority.cancel().expect("acknowledged exact cancellation");
+        } else {
+            // State/lifetime control, not a claim of a daemon-side Claim wire exchange.
+            authority.mark_claim_admitted();
+            authority.mark_claimed();
+        }
+        let after = authority.daemon_process_witness();
+        assert!(witness
+            .matches_live(&after)
+            .expect("post-transition witness"));
+        server
+            .finish()
+            .expect("EOF despite live authority and witnesses");
+        assert_eq!(
+            format!("{witness:?}"),
+            "WindowsDaemonProcessWitness(<redacted>)"
+        );
+    }
+}
+
+#[test]
+fn independent_connections_match_the_same_live_process_not_arc_identity() {
+    let first = unique_endpoint("witness-first");
+    let second = unique_endpoint("witness-second");
+    let first_server = spawn_server(&first, |pipe, _released| {
+        consume_authentication_byte(pipe)?;
+        expect_client_eof(pipe)
+    })
+    .expect("first witness server");
+    let second_server = spawn_server(&second, |pipe, _released| {
+        consume_authentication_byte(pipe)?;
+        expect_client_eof(pipe)
+    })
+    .expect("second witness server");
+    let a = connect_client(&first).expect("first connection");
+    let b = connect_client(&second).expect("second connection");
+    let wa = a.daemon_process_witness();
+    let wb = b.daemon_process_witness();
+    assert!(!std::sync::Arc::ptr_eq(&wa.process, &wb.process));
+    assert!(wa.matches_live(&wb).expect("independent process handles"));
+    drop((a, b));
+    first_server.finish().expect("first connection EOF");
+    second_server.finish().expect("second connection EOF");
+    assert!(wa.matches_live(&wb).expect("witnesses outlive both pipes"));
+}
+
+#[test]
+fn process_witness_propagates_native_query_failure() {
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    // WaitForSingleObject requires SYNCHRONIZE. This owned current-process handle deliberately
+    // lacks that right; no handle is closed beneath an in-flight wait and no daemon is queried.
+    let process = owned_handle(
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, std::process::id()) },
+        "open query-only fixture process",
+    )
+    .expect("open exact current-process fixture handle");
+    let witness = super::WindowsDaemonProcessWitness {
+        process: std::sync::Arc::new(process),
+        pid: std::process::id(),
+    };
+    assert!(
+        witness.matches_live(&witness).is_err(),
+        "failed native wait must not authorize a peer"
+    );
 }
 
 #[test]

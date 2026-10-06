@@ -31,9 +31,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION, CREATE_NEW, DELETE, FILE_ALL_ACCESS,
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK,
-    FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA, OPEN_ALWAYS, OPEN_EXISTING,
-    READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
+    OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
 
@@ -186,8 +186,13 @@ fn file_info(file: &File, directory: bool) -> io::Result<BY_HANDLE_FILE_INFORMAT
 fn open_directory(path: &Path, is_base: bool) -> io::Result<File> {
     let path = wide(path.as_os_str())?;
     // No FILE_SHARE_DELETE: every held ancestor stays at the name that was walked. Do not
-    // request directory write/ACL access for parents that Hydra will only inspect.
-    let access = READ_CONTROL | FILE_READ_ATTRIBUTES | if is_base { WRITE_DAC } else { 0 };
+    // request directory write/ACL access for parents that Hydra will only inspect. Metadata-only
+    // handles do not participate in Windows sharing checks: FILE_LIST_DIRECTORY (FILE_READ_DATA)
+    // is required for omission of FILE_SHARE_DELETE to actually pin the directory name.
+    let access = READ_CONTROL
+        | FILE_READ_ATTRIBUTES
+        | FILE_LIST_DIRECTORY
+        | if is_base { WRITE_DAC } else { 0 };
     let handle = unsafe {
         CreateFileW(
             path.as_ptr(),
@@ -275,13 +280,21 @@ impl AncestorTrust {
 }
 
 fn allowed_ace(acl: *mut ACL, index: u32) -> io::Result<Option<(u32, PSID, u8)>> {
+    allowed_ace_with_inheritance(acl, index, false)
+}
+
+fn allowed_ace_with_inheritance(
+    acl: *mut ACL,
+    index: u32,
+    include_inherit_only: bool,
+) -> io::Result<Option<(u32, PSID, u8)>> {
     let mut raw = null_mut();
     if unsafe { GetAce(acl, index, &mut raw) } == 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: GetAce points inside the validated, retained Windows descriptor allocation.
     let header = unsafe { &*raw.cast::<ACE_HEADER>() };
-    if u32::from(header.AceFlags) & INHERIT_ONLY_ACE != 0
+    if (!include_inherit_only && u32::from(header.AceFlags) & INHERIT_ONLY_ACE != 0)
         || u32::from(header.AceType) == ACCESS_DENIED_ACE_TYPE
     {
         return Ok(None);
@@ -306,26 +319,33 @@ fn allowed_ace(acl: *mut ACL, index: u32) -> io::Result<Option<(u32, PSID, u8)>>
     Ok(Some((ace.Mask, sid, header.AceFlags)))
 }
 
+fn ancestor_takeover_mask(pinned_volume_root: bool) -> u32 {
+    let takeover = WRITE_DAC | WRITE_OWNER | FILE_DELETE_CHILD | GENERIC_ALL | GENERIC_WRITE;
+    if pinned_volume_root {
+        takeover
+    } else {
+        takeover | DELETE | FILE_WRITE_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES
+    }
+}
+
 fn validate_ancestor(file: &File, trust: &AncestorTrust) -> io::Result<()> {
+    validate_ancestor_mask(file, trust, ancestor_takeover_mask(false))
+}
+
+fn validate_ancestor_mask(file: &File, trust: &AncestorTrust, dangerous: u32) -> io::Result<()> {
     let security = ObjectSecurity::read(file)?;
     if !trust.contains(security.owner)? {
         return Err(denied("store ancestry has foreign ownership"));
     }
     let acl = security.descriptor.dacl()?;
-    let dangerous = DELETE
-        | WRITE_DAC
-        | WRITE_OWNER
-        | FILE_DELETE_CHILD
-        | FILE_WRITE_DATA
-        | FILE_WRITE_EA
-        | FILE_WRITE_ATTRIBUTES
-        | GENERIC_ALL
-        | GENERIC_WRITE;
     // Conservatively reject an untrusted destructive allow even if a later/conditional deny
     // might narrow it. Read/traverse and create-subdirectory-only grants do not permit takeover.
     for index in 0..u32::from(unsafe { (*acl).AceCount }) {
         if let Some((mask, sid, _)) = allowed_ace(acl, index)? {
-            if mask & dangerous != 0 && !trust.contains(sid)? {
+            // OWNER RIGHTS denotes the object's owner, whose ancestry trust was proved above.
+            let owner_rights =
+                OwnedSid::copy_from(sid, "directory trustee has no SID")?.to_string()? == "S-1-3-4";
+            if mask & dangerous != 0 && !owner_rights && !trust.contains(sid)? {
                 return Err(denied(
                     "store ancestry can be changed by another local user",
                 ));
@@ -333,6 +353,46 @@ fn validate_ancestor(file: &File, trust: &AncestorTrust) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn local_drive_root(path: &Path) -> Option<u8> {
+    let mut components = path.components();
+    let Component::Prefix(prefix) = components.next()? else {
+        return None;
+    };
+    let drive = match prefix.kind() {
+        Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => drive.to_ascii_uppercase(),
+        _ => return None,
+    };
+    (components.next() == Some(Component::RootDir) && components.next().is_none()).then_some(drive)
+}
+
+fn is_same_local_volume_root(requested: &Path, resolved: &Path) -> bool {
+    matches!((local_drive_root(requested), local_drive_root(resolved)),
+        (Some(requested), Some(resolved)) if requested == resolved)
+}
+
+/// A volume root has no replaceable parent entry. Its data/attribute grants cannot redirect this
+/// walk while a validated existing child keeps it nonempty. Keep this exception out of ordinary
+/// ancestry: FILE_WRITE_DATA/ATTRIBUTES can set a reparse point on an empty directory (MS-FSA
+/// FSCTL_SET_REPARSE_POINT processing), and a syntactic drive root can actually be a SUBST directory or a remote share.
+fn pin_volume_root_child(
+    root: &File,
+    root_path: &Path,
+    first_name: &OsStr,
+    trust: &AncestorTrust,
+) -> io::Result<File> {
+    if !is_same_local_volume_root(root_path, &directory_path(root)?) {
+        return Err(denied("store root is not a verified local volume root"));
+    }
+    // No creation, repair or store access before this proof. An absent child remains unsupported
+    // under a broad root ACL. No delete sharing pins the child throughout the secured-store life.
+    let child = open_directory(&root_path.join(first_name), false)?;
+    validate_ancestor(&child, trust)?;
+    file_info(root, true)?;
+    validate_ancestor_mask(root, trust, ancestor_takeover_mask(true))?;
+    file_info(root, true)?;
+    Ok(child)
 }
 
 fn protect_owner(file: &File, owner: &OwnedSid, directory: bool) -> io::Result<()> {
@@ -344,33 +404,25 @@ fn protect_owner(file: &File, owner: &OwnedSid, directory: bool) -> io::Result<(
     if owner_acl_matches(&existing, owner, directory).unwrap_or(false) {
         return Ok(());
     }
-    let repair;
-    let target = if directory {
-        repair = open_directory_for_repair(file)?;
-        ObjectSecurity::read(&repair)?.require_owner(owner)?;
-        &repair
-    } else {
-        file
-    };
     let expected = Descriptor::owner_only(owner, directory)?;
     let acl = expected.dacl()?;
-    // Directory repairs use a short-lived non-shared handle. SetSecurityInfo's documented
-    // exclusive-directory behavior prevents inheritable ACEs from propagating into existing
-    // children. The ordinary pinned metadata handle survives throughout; close the repair
-    // handle before returning so normal migration directory enumeration remains possible.
-    let status = unsafe {
-        SetSecurityInfo(
-            target.as_raw_handle(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            null_mut(),
-            null_mut(),
-            acl,
-            null(),
-        )
-    };
-    if status != 0 {
-        return Err(io::Error::from_raw_os_error(status as i32));
+    if directory {
+        set_directory_dacl_without_propagation(file, &expected)?;
+    } else {
+        let status = unsafe {
+            SetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                acl,
+                null(),
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
     }
     let observed = ObjectSecurity::read(file)?;
     observed.require_owner(owner)?;
@@ -381,40 +433,38 @@ fn protect_owner(file: &File, owner: &OwnedSid, directory: bool) -> io::Result<(
     Ok(())
 }
 
-fn open_directory_for_repair(file: &File) -> io::Result<File> {
-    let before = file_info(file, true)?;
-    let path = wide(directory_path(file)?.as_os_str())?;
-    let handle = unsafe {
-        CreateFileW(
-            path.as_ptr(),
-            READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
-            0,
-            null(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            null_mut(),
+fn set_directory_dacl_without_propagation(file: &File, descriptor: &Descriptor) -> io::Result<()> {
+    // SetSecurityInfo walks existing children to propagate inheritable ACEs. A metadata-only
+    // "exclusive" reopen does not suppress that walk, and a truly exclusive read handle would
+    // conflict with our pinned read handle. Set only this already-proved object's DACL through
+    // the documented native object-security operation instead. Future children still inherit the
+    // owner ACE; existing children retain byte-identical ACLs and are secured individually when
+    // their own authority is opened. The caller always verifies owner, protected DACL and type.
+    // https://learn.microsoft.com/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntsetsecurityobject
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtSetSecurityObject(
+            handle: windows_sys::Win32::Foundation::HANDLE,
+            information: u32,
+            descriptor: PSECURITY_DESCRIPTOR,
+        ) -> i32;
+        fn RtlNtStatusToDosError(status: i32) -> u32;
+    }
+    // SAFETY: the uniquely owned handle and complete self-relative descriptor remain alive for
+    // this synchronous call. WRITE_DAC was requested at open; no owner/SACL change is requested.
+    let status = unsafe {
+        NtSetSecurityObject(
+            file.as_raw_handle(),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            descriptor.0,
         )
     };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: the successful non-inheritable handle is transferred to its unique File owner.
-    let repair = unsafe { File::from_raw_handle(handle) };
-    let after = file_info(&repair, true)?;
-    if (
-        before.dwVolumeSerialNumber,
-        before.nFileIndexHigh,
-        before.nFileIndexLow,
-    ) != (
-        after.dwVolumeSerialNumber,
-        after.nFileIndexHigh,
-        after.nFileIndexLow,
-    ) {
-        return Err(invalid(
-            "store directory identity changed before ACL repair",
+    if status < 0 {
+        return Err(io::Error::from_raw_os_error(
+            unsafe { RtlNtStatusToDosError(status) } as i32,
         ));
     }
-    Ok(repair)
+    Ok(())
 }
 
 fn owner_acl_matches(
@@ -446,7 +496,59 @@ fn owner_acl_matches(
         && u32::from(flags) == expected_flags)
 }
 
+/// Prove privacy, not equality with the template used to create new objects. A normal private
+/// Windows profile may inherit owner/System/Admin ACEs or split the owner's grants. Harmless
+/// metadata/traverse grants are not content exposure. Denies cannot broaden an allow; conditional
+/// and object-specific allow entries remain unsupported rather than being guessed about.
+fn private_acl_is_safe(
+    observed: &ObjectSecurity,
+    owner: &OwnedSid,
+    directory: bool,
+) -> io::Result<bool> {
+    use windows_sys::Win32::Foundation::GENERIC_EXECUTE;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_EXECUTE, SYNCHRONIZE};
+    let acl = observed.descriptor.dacl()?;
+    for index in 0..u32::from(unsafe { (*acl).AceCount }) {
+        let Some((mask, sid, flags)) = allowed_ace_with_inheritance(acl, index, directory)? else {
+            continue;
+        };
+        let sid_text = OwnedSid::copy_from(sid, "private ACL trustee is invalid")?.to_string()?;
+        let trusted = unsafe { EqualSid(sid, owner.as_ptr()) } != 0
+            || matches!(sid_text.as_str(), "S-1-5-18" | "S-1-5-32-544" | "S-1-3-4")
+            // CREATOR OWNER is only a descendant-owner placeholder, never current-object
+            // authority. Each opened child must independently prove its actual owner SID.
+            || (directory && u32::from(flags) & INHERIT_ONLY_ACE != 0 && sid_text == "S-1-3-0");
+        if trusted {
+            continue;
+        }
+        let metadata = READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+        let harmless = if directory {
+            metadata | FILE_EXECUTE | GENERIC_EXECUTE
+        } else {
+            metadata
+        };
+        if mask & !harmless != 0 {
+            return Ok(false);
+        }
+        // An inherit-only grant does not expose this directory, but an inheritable file-execute
+        // grant is not merely directory traversal. New authority still always receives an
+        // explicit protected descriptor, independent of this compatibility inspection.
+        if directory && u32::from(flags) & OBJECT_INHERIT_ACE != 0 && mask & !metadata != 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub(super) fn secure_app_support(base: &Path) -> io::Result<SecureAppSupport> {
+    open_app_support(base, true, true)
+}
+
+pub(super) fn private_authority(base: &Path, create: bool) -> io::Result<SecureAppSupport> {
+    open_app_support(base, create, false)
+}
+
+fn open_app_support(base: &Path, create: bool, repair: bool) -> io::Result<SecureAppSupport> {
     if !base.is_absolute() {
         return Err(invalid("app-support base must be absolute"));
     }
@@ -481,14 +583,24 @@ pub(super) fn secure_app_support(base: &Path) -> io::Result<SecureAppSupport> {
     let mut current = PathBuf::from(prefix.as_os_str());
     current.push(r"\");
     let root = open_directory(&current, false)?;
-    validate_ancestor(&root, &trust)?;
+    let pinned_root_child = match validate_ancestor(&root, &trust) {
+        Ok(()) => None,
+        Err(original) => match pin_volume_root_child(&root, &current, names[0], &trust) {
+            Ok(child) => Some(child),
+            Err(_) => return Err(original),
+        },
+    };
     let mut ancestors = vec![root];
+    // Retain the nonempty proof even while later components are opened/revalidated separately.
+    if let Some(child) = pinned_root_child {
+        ancestors.push(child);
+    }
     for (index, name) in names.iter().enumerate() {
         current.push(name);
         let is_base = index + 1 == names.len();
-        let next = match open_directory(&current, is_base) {
+        let next = match open_directory(&current, is_base && repair) {
             Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Err(error) if create && error.kind() == io::ErrorKind::NotFound => {
                 let path = wide(current.as_os_str())?;
                 if unsafe { CreateDirectoryW(path.as_ptr(), &attributes) } == 0 {
                     let error = io::Error::last_os_error();
@@ -497,12 +609,16 @@ pub(super) fn secure_app_support(base: &Path) -> io::Result<SecureAppSupport> {
                     }
                 }
                 // An AlreadyExists race is classified by handle and owner, never overwritten.
-                open_directory(&current, is_base)?
+                open_directory(&current, is_base && repair)?
             }
             Err(error) => return Err(error),
         };
         if is_base {
-            protect_owner(&next, &owner, true)?;
+            if repair {
+                protect_owner(&next, &owner, true)?;
+            } else {
+                require_private(&next, true)?;
+            }
             return Ok(SecureAppSupport {
                 dir: next,
                 _ancestors: ancestors,
@@ -549,7 +665,7 @@ fn validate_filename(name: &OsStr) -> io::Result<()> {
     Ok(())
 }
 
-fn directory_path(file: &File) -> io::Result<PathBuf> {
+pub(super) fn directory_path(file: &File) -> io::Result<PathBuf> {
     let needed = unsafe { GetFinalPathNameByHandleW(file.as_raw_handle(), null_mut(), 0, 0) };
     if needed == 0 {
         return Err(io::Error::last_os_error());
@@ -567,6 +683,290 @@ fn directory_path(file: &File) -> io::Result<PathBuf> {
     }
     path.truncate(copied as usize);
     Ok(PathBuf::from(OsString::from_wide(&path)))
+}
+
+pub(super) fn require_private(file: &File, directory: bool) -> io::Result<(u64, u64)> {
+    let info = file_info(file, directory)?;
+    let owner = OwnedSid::current_process()?;
+    let observed = ObjectSecurity::read(file)?;
+    observed.require_owner(&owner)?;
+    if !private_acl_is_safe(&observed, &owner, directory)? {
+        return Err(denied(
+            "private authority grants content or mutation access to an untrusted principal",
+        ));
+    }
+    Ok((
+        u64::from(info.dwVolumeSerialNumber),
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    ))
+}
+
+pub(super) fn open_private_file_at(
+    base: &File,
+    name: &OsStr,
+    create_new: bool,
+) -> io::Result<File> {
+    validate_filename(name)?;
+    require_private(base, true)?;
+    let owner = OwnedSid::current_process()?;
+    let descriptor = Descriptor::owner_only(&owner, false)?;
+    let attributes = descriptor.attributes();
+    let path = wide(directory_path(base)?.join(name).as_os_str())?;
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            GENERIC_READ | READ_CONTROL | if create_new { GENERIC_WRITE } else { 0 },
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &attributes,
+            if create_new {
+                CREATE_NEW
+            } else {
+                OPEN_EXISTING
+            },
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let file = unsafe { File::from_raw_handle(handle) };
+    // Observe only: never adopt a previously exposed key by repairing its ACL.
+    require_private(&file, false)?;
+    Ok(file)
+}
+
+pub(super) fn publish_private_at(
+    base: &File,
+    name: &OsStr,
+    bytes: &[u8],
+    replace: bool,
+) -> io::Result<()> {
+    publish_private_with_hook(base, name, bytes, replace, |_, _| Ok(()))
+}
+
+fn publish_private_with_hook(
+    base: &File,
+    name: &OsStr,
+    bytes: &[u8],
+    replace: bool,
+    before_rename: impl FnOnce(&File, &OsStr) -> io::Result<()>,
+) -> io::Result<()> {
+    use std::io::Write as _;
+    validate_filename(name)?;
+    require_private(base, true)?;
+    let existing = match open_private_file_at(base, name, false) {
+        Ok(file) if replace => Some(file),
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "private authority already exists",
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let mut temporary = OsString::from(".");
+    temporary.push(name);
+    temporary.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = open_private_file_at(base, &temporary, true)?;
+    let identity = require_private(&file, false)?;
+    let mut moved = false;
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        before_rename(&file, &temporary)?;
+        if let Some(existing) = &existing {
+            let named = open_private_file_at(base, name, false)?;
+            if require_private(&named, false)? != require_private(existing, false)? {
+                return Err(denied("private publication target changed"));
+            }
+        }
+        // Rename this exact opened object into the pinned parent. Never resolve the temporary
+        // source pathname again: another same-user writer may have replaced that directory entry.
+        rename_private_file_at(base, &file, name, replace)?;
+        moved = true;
+        let published = open_private_file_at(base, name, false)?;
+        if require_private(&published, false)? != identity {
+            return Err(denied("private publication identity changed"));
+        }
+        // The read-only verification handle deliberately does not demand mutation access.
+        // Flush through our original writable source handle after publication has been recorded,
+        // so a failed flush cannot route cleanup into deleting an already-published file.
+        file.sync_all()
+    })();
+    if result.is_err() && !moved {
+        // Retire our exact temporary handle, not whichever file might now occupy its old name.
+        let _ = remove_private_file(&file);
+    }
+    result
+}
+
+fn rename_private_file_at(base: &File, file: &File, name: &OsStr, replace: bool) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileRenameInfoEx, ReOpenFile, SetFileInformationByHandle, FILE_RENAME_INFO,
+    };
+    validate_filename(name)?;
+    require_private(base, true)?;
+    let identity = require_private(file, false)?;
+    // ReOpenFile adds DELETE on the same object, without reopening its mutable pathname.
+    let handle = unsafe {
+        ReOpenFile(
+            file.as_raw_handle(),
+            GENERIC_READ | GENERIC_WRITE | READ_CONTROL | DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let source = unsafe { File::from_raw_handle(handle) };
+    if require_private(&source, false)? != identity {
+        return Err(denied("private rename source changed"));
+    }
+    // Use the Win32 absolute destination form. The complete parent walk is retained without
+    // delete sharing, so its name cannot be swapped while this source-handle rename is in flight.
+    let destination = directory_path(base)?.join(name);
+    let name: Vec<u16> = destination.as_os_str().encode_wide().collect();
+    let filename_bytes = name
+        .len()
+        .checked_mul(size_of::<u16>())
+        .ok_or_else(|| invalid("private filename is too long"))?;
+    let buffer_bytes = size_of::<FILE_RENAME_INFO>()
+        .checked_add(filename_bytes)
+        .ok_or_else(|| invalid("private rename buffer is too long"))?;
+    let length =
+        u32::try_from(buffer_bytes).map_err(|_| invalid("private rename buffer is too long"))?;
+    // usize storage satisfies FILE_RENAME_INFO's native pointer alignment; reserve the complete
+    // header plus variable UTF-16 tail (including zero padding for the optional terminator).
+    let mut buffer = vec![0usize; buffer_bytes.div_ceil(size_of::<usize>())];
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    unsafe {
+        // Documented FileRenameInformationEx flags: REPLACE_IF_EXISTS | POSIX_SEMANTICS.
+        // POSIX replacement keeps already-open reader handles valid. No-clobber uses no flags.
+        (*info).Anonymous.Flags = if replace { 0x1 | 0x2 } else { 0 };
+        (*info).RootDirectory = null_mut();
+        (*info).FileNameLength =
+            u32::try_from(filename_bytes).map_err(|_| invalid("private filename is too long"))?;
+        std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+        if SetFileInformationByHandle(
+            source.as_raw_handle(),
+            FileRenameInfoEx,
+            info.cast(),
+            length,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    // The caller records successful publication before flushing the still-owned writable file.
+    // File flushing does not claim Unix parent-directory fsync / durable-absence equivalence.
+    Ok(())
+}
+
+pub(super) fn remove_private_file(file: &File) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, ReOpenFile, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+    };
+    require_private(file, false)?;
+    let handle = unsafe {
+        ReOpenFile(
+            file.as_raw_handle(),
+            GENERIC_READ | GENERIC_WRITE | READ_CONTROL | DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let deleting = unsafe { File::from_raw_handle(handle) };
+    require_private(&deleting, false)?;
+    deleting.sync_all()?;
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    if unsafe {
+        SetFileInformationByHandle(
+            deleting.as_raw_handle(),
+            FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    deleting.sync_all()
+}
+
+pub(super) fn remove_private_file_at(base: &File, file: &File) -> io::Result<()> {
+    require_private(base, true)?;
+    let name = directory_path(file)?;
+    if name.parent() != Some(directory_path(base)?.as_path()) {
+        return Err(denied(
+            "private file does not belong to the pinned directory",
+        ));
+    }
+    remove_private_file(file)
+}
+
+pub(super) fn remove_empty_private_directory_at(base: &File, name: &OsStr) -> io::Result<bool> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+    };
+    validate_filename(name)?;
+    require_private(base, true)?;
+    let path = directory_path(base)?.join(name);
+    let encoded = wide(path.as_os_str())?;
+    // The parent stays pinned. This separately held child permits DELETE access and is never
+    // re-opened by name for mutation; regular-file/reparse targets fail before disposition.
+    let handle = unsafe {
+        CreateFileW(
+            encoded.as_ptr(),
+            READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::NotFound {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    let child = unsafe { File::from_raw_handle(handle) };
+    require_private(&child, true)?;
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    if unsafe {
+        SetFileInformationByHandle(
+            child.as_raw_handle(),
+            FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    } == 0
+    {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::DirectoryNotEmpty {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    drop(child);
+    require_private(base, true)?;
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+        Ok(_) => Err(denied(
+            "private directory remained or was replaced after removal",
+        )),
+    }
 }
 
 pub(super) fn open_owner_file_at(
@@ -616,12 +1016,515 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
 
+    #[test]
+    fn root_policy_accepts_modify_but_never_child_or_acl_takeover() {
+        let modify = 0x0013_01bf;
+        assert_eq!(modify & ancestor_takeover_mask(true), 0);
+        assert_ne!(modify & ancestor_takeover_mask(false), 0);
+        for right in [
+            WRITE_DAC,
+            WRITE_OWNER,
+            FILE_DELETE_CHILD,
+            GENERIC_ALL,
+            GENERIC_WRITE,
+        ] {
+            assert_ne!(right & ancestor_takeover_mask(true), 0);
+            assert_ne!(right & ancestor_takeover_mask(false), 0);
+        }
+        for right in [
+            DELETE,
+            FILE_WRITE_DATA,
+            FILE_WRITE_EA,
+            FILE_WRITE_ATTRIBUTES,
+        ] {
+            assert_ne!(right & ancestor_takeover_mask(false), 0);
+        }
+        assert_eq!(0x0012_00a9 & ancestor_takeover_mask(false), 0); // read/traverse
+        assert_eq!(4 & ancestor_takeover_mask(false), 0); // create-subdirectory only
+    }
+
+    #[test]
+    fn root_proof_rejects_subst_targets_unc_and_nonroot_paths() {
+        assert!(is_same_local_volume_root(
+            Path::new(r"C:\"),
+            Path::new(r"\\?\C:\")
+        ));
+        assert!(is_same_local_volume_root(
+            Path::new(r"c:\"),
+            Path::new(r"\\?\C:\")
+        ));
+        for resolved in [
+            r"\\?\C:\mapped",
+            r"\\?\D:\",
+            r"\\server\share\",
+            r"\\?\UNC\server\share\",
+        ] {
+            assert!(!is_same_local_volume_root(
+                Path::new(r"C:\"),
+                Path::new(resolved)
+            ));
+        }
+        assert!(!is_same_local_volume_root(
+            Path::new(r"C:\folder"),
+            Path::new(r"C:\folder")
+        ));
+    }
+
+    #[test]
+    fn ordinary_directory_cannot_supply_volume_root_child_proof() {
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        let owner = OwnedSid::current_process().unwrap();
+        let trust = AncestorTrust::new(&owner).unwrap();
+        let directory = open_directory(temp.path(), false).unwrap();
+        assert!(
+            pin_volume_root_child(&directory, temp.path(), OsStr::new("child"), &trust).is_err()
+        );
+    }
+
     fn dacl_bytes(file: &File) -> Vec<u8> {
-        let security = ObjectSecurity::read(file).unwrap();
-        let acl = security.descriptor.dacl().unwrap();
-        // SAFETY: dacl() validated this retained allocation and AclSize describes its byte span.
+        // GetSecurityInfo synthesizes INHERITED_ACE flags against the current parent ACL even
+        // when the stored child descriptor has not changed. Compare the raw object descriptor,
+        // not that inheritance projection. The same byte-identity assertions must detect actual
+        // descendant writes (the former SetSecurityInfo repair reduced three child ACEs to one).
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtQuerySecurityObject(
+                handle: windows_sys::Win32::Foundation::HANDLE,
+                information: u32,
+                descriptor: PSECURITY_DESCRIPTOR,
+                length: u32,
+                needed: *mut u32,
+            ) -> i32;
+        }
+        let mut needed = 0;
+        unsafe {
+            NtQuerySecurityObject(
+                file.as_raw_handle(),
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                0,
+                &mut needed,
+            );
+        }
+        assert!(needed > 0);
+        let mut descriptor = vec![0usize; (needed as usize).div_ceil(size_of::<usize>())];
+        let status = unsafe {
+            NtQuerySecurityObject(
+                file.as_raw_handle(),
+                DACL_SECURITY_INFORMATION,
+                descriptor.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        };
+        assert!(
+            status >= 0,
+            "raw security descriptor query failed: {status:#x}"
+        );
+        let mut acl = null_mut();
+        let mut present = 0;
+        let mut defaulted = 0;
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorDacl(
+                    descriptor.as_mut_ptr().cast(),
+                    &mut present,
+                    &mut acl,
+                    &mut defaulted,
+                )
+            },
+            0
+        );
+        assert_ne!(present, 0);
+        assert!(!acl.is_null());
+        assert_ne!(unsafe { IsValidAcl(acl) }, 0);
+        // SAFETY: the validated ACL is inside the retained descriptor and has a bounded AclSize.
         unsafe { std::slice::from_raw_parts(acl.cast::<u8>(), usize::from((*acl).AclSize)) }
             .to_vec()
+    }
+
+    fn set_test_acl(path: &Path, directory: bool, text: &str) {
+        let text = wide(OsStr::new(text)).unwrap();
+        let mut descriptor = null_mut();
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    text.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    null_mut(),
+                )
+            },
+            0
+        );
+        let descriptor = Descriptor(descriptor);
+        let path = wide(path.as_os_str()).unwrap();
+        let handle = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                READ_CONTROL | WRITE_DAC,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT
+                    | if directory {
+                        FILE_FLAG_BACKUP_SEMANTICS
+                    } else {
+                        0
+                    },
+                null_mut(),
+            )
+        };
+        assert_ne!(handle, INVALID_HANDLE_VALUE);
+        let file = unsafe { File::from_raw_handle(handle) };
+        assert_eq!(
+            unsafe {
+                SetSecurityInfo(
+                    file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    null_mut(),
+                    null_mut(),
+                    descriptor.dacl().unwrap(),
+                    null(),
+                )
+            },
+            0
+        );
+    }
+
+    #[test]
+    fn private_authority_accepts_safe_inherited_and_split_acl_without_repair() {
+        use super::super::WindowsPrivateDirectory as Directory;
+        let temp = tempfile::tempdir().unwrap();
+        let sid = OwnedSid::current_process().unwrap().to_string().unwrap();
+        set_test_acl(
+            temp.path(),
+            true,
+            &format!("D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"),
+        );
+        let base = temp.path().join("inherited");
+        std::fs::create_dir(&base).unwrap();
+        let raw = open_directory(&base, false).unwrap();
+        let before = dacl_bytes(&raw);
+        let private = Directory::open(&base).unwrap();
+        private
+            .publish(OsStr::new("key"), b"stable", false)
+            .unwrap();
+        assert_eq!(dacl_bytes(&raw), before);
+        // Multiple owner grants and safe metadata/traversal rights for others are not exposure.
+        set_test_acl(&base, true, &format!("D:P(A;;FR;;;{sid})(A;;FW;;;{sid})(A;;FX;;;{sid})(A;;SDWDWO;;;{sid})(A;;0x1200a0;;;WD)(A;OIIO;FR;;;{sid})(D;;WD;;;AN)"));
+        let before = dacl_bytes(&raw);
+        assert!(Directory::open(&base).is_ok());
+        assert_eq!(before, dacl_bytes(&raw));
+    }
+
+    #[test]
+    fn private_authority_reads_owner_read_only_file_without_requesting_write_access() {
+        use super::super::WindowsPrivateDirectory as Directory;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("identity");
+        let directory = Directory::ensure(&base).unwrap();
+        let name = OsStr::new("device-key");
+        directory.publish(name, b"stable", false).unwrap();
+        let sid = OwnedSid::current_process().unwrap().to_string().unwrap();
+        set_test_acl(
+            &base.join(name),
+            false,
+            &format!("D:P(A;;FR;;;{sid})(A;;0x120080;;;WD)"),
+        );
+        let mut file = directory.open_file(name, false).unwrap();
+        let before = dacl_bytes(&file);
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"stable");
+        assert_eq!(before, dacl_bytes(&file));
+    }
+
+    #[test]
+    fn private_authority_publication_renames_the_handle_not_a_substituted_source_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let base_path = temp.path().join("identity");
+        let base = private_authority(&base_path, true).unwrap();
+        let target = OsStr::new("device-key");
+        let mut substituted = None;
+        publish_private_with_hook(
+            &base.dir,
+            target,
+            b"original",
+            false,
+            |original, temporary| {
+                let moved = base_path.join("held-original");
+                std::fs::rename(base_path.join(temporary), &moved)?;
+                let mut impostor = open_private_file_at(&base.dir, temporary, true)?;
+                impostor.write_all(b"impostor")?;
+                impostor.sync_all()?;
+                assert_ne!(
+                    require_private(original, false)?,
+                    require_private(&impostor, false)?
+                );
+                substituted = Some(temporary.to_os_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(base_path.join(target)).unwrap(), b"original");
+        assert_eq!(
+            std::fs::read(base_path.join(substituted.unwrap())).unwrap(),
+            b"impostor"
+        );
+        assert!(!base_path.join("held-original").exists());
+    }
+
+    #[test]
+    fn private_authority_concurrent_no_replace_has_one_complete_winner() {
+        use super::super::WindowsPrivateDirectory as Directory;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("identity");
+        let _root = Directory::ensure(&base).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = [b"first".as_slice(), b"second".as_slice()]
+            .into_iter()
+            .map(|bytes| {
+                let base = base.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let directory = Directory::open(&base).unwrap();
+                    barrier.wait();
+                    (
+                        bytes,
+                        directory.publish(OsStr::new("device-key"), bytes, false),
+                    )
+                })
+            })
+            .collect();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(
+            results.iter().filter(|(_, result)| result.is_ok()).count(),
+            1
+        );
+        let winner = results.iter().find(|(_, result)| result.is_ok()).unwrap().0;
+        let loser = results.iter().find(|(_, result)| result.is_err()).unwrap();
+        assert_eq!(
+            loser.1.as_ref().unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(base.join("device-key")).unwrap(), winner);
+    }
+
+    #[test]
+    fn private_authority_observes_exposed_directory_without_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("identity");
+        std::fs::create_dir(&base).unwrap();
+        let sid = OwnedSid::current_process().unwrap().to_string().unwrap();
+        set_test_acl(
+            &base,
+            true,
+            &format!("D:P(A;OICI;FA;;;{sid})(A;OICI;FR;;;WD)"),
+        );
+        let directory = open_directory(&base, false).unwrap();
+        let before = dacl_bytes(&directory);
+        assert!(private_authority(&base, false).is_err());
+        assert!(private_authority(&base, true).is_err());
+        assert_eq!(before, dacl_bytes(&directory));
+        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn private_authority_publication_preserves_winner_and_has_real_identity() {
+        use super::super::WindowsPrivateDirectory as Directory;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("identity");
+        let directory = Directory::ensure(&base).unwrap();
+        let name = OsStr::new("device-key");
+        directory.publish(name, b"first", false).unwrap();
+        let first = directory.open_file(name, false).unwrap();
+        let first_identity = Directory::validate_file(&first).unwrap();
+        assert_ne!(first_identity.file_index, 0);
+        assert_eq!(
+            directory.publish(name, b"loser", false).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(base.join(name)).unwrap(), b"first");
+        directory.publish(name, b"second", true).unwrap();
+        let second = directory.open_file(name, false).unwrap();
+        assert_ne!(Directory::validate_file(&second).unwrap(), first_identity);
+        assert_eq!(std::fs::read(base.join(name)).unwrap(), b"second");
+        drop(first);
+        directory.remove_opened_file(second).unwrap();
+        assert!(!base.join(name).exists());
+    }
+
+    #[test]
+    fn private_authority_rejects_foreign_file_access_and_hardlinks_without_repair() {
+        use super::super::WindowsPrivateDirectory as Directory;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("identity");
+        let directory = Directory::ensure(&base).unwrap();
+        let exposed = base.join("unprotected");
+        std::fs::write(&exposed, b"preserve").unwrap();
+        // Safe inherited owner access is accepted, but an actual foreign read grant is not.
+        directory
+            .open_file(OsStr::new("unprotected"), false)
+            .unwrap();
+        let sid = OwnedSid::current_process().unwrap().to_string().unwrap();
+        set_test_acl(&exposed, false, &format!("D:P(A;;FA;;;{sid})(A;;FR;;;WD)"));
+        let file = File::open(&exposed).unwrap();
+        let before = dacl_bytes(&file);
+        assert!(directory
+            .open_file(OsStr::new("unprotected"), false)
+            .is_err());
+        assert_eq!(before, dacl_bytes(&file));
+        assert_eq!(std::fs::read(&exposed).unwrap(), b"preserve");
+        directory
+            .publish(OsStr::new("original"), b"private", false)
+            .unwrap();
+        std::fs::hard_link(base.join("original"), base.join("alias")).unwrap();
+        assert!(directory.open_file(OsStr::new("alias"), false).is_err());
+        assert!(directory
+            .publish(OsStr::new("original"), b"replacement", true)
+            .is_err());
+        assert_eq!(std::fs::read(base.join("original")).unwrap(), b"private");
+    }
+
+    #[test]
+    fn private_authority_checks_foreign_inherit_only_grants_on_directories() {
+        use super::super::WindowsPrivateDirectory as Directory;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("identity");
+        let directory = Directory::ensure(&base).unwrap();
+        let sid = OwnedSid::current_process().unwrap().to_string().unwrap();
+        set_test_acl(
+            &base,
+            true,
+            &format!("D:P(A;OICI;FA;;;{sid})(A;OIIO;FR;;;WD)"),
+        );
+        assert!(Directory::open(&base).is_err());
+        assert!(directory
+            .publish(OsStr::new("record"), b"must-not-publish", false)
+            .is_err());
+        assert!(!base.join("record").exists());
+    }
+
+    #[test]
+    fn private_authority_accepts_owner_aliases_but_not_creator_group_or_effective_creator_owner() {
+        use super::super::WindowsPrivateDirectory as Directory;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("identity");
+        let directory = Directory::ensure(&base).unwrap();
+        let sid = OwnedSid::current_process().unwrap().to_string().unwrap();
+        set_test_acl(
+            &base,
+            true,
+            &format!("D:P(A;;FA;;;{sid})(A;;FA;;;S-1-3-4)(A;OICIIO;FA;;;CO)"),
+        );
+        assert!(Directory::open(&base).is_ok());
+        // Reopening a nested authority also revalidates this directory as ancestry.
+        let nested = Directory::ensure(&base.join("nested")).unwrap();
+        nested
+            .publish(OsStr::new("record"), b"private", false)
+            .unwrap();
+        drop(nested);
+        for acl in [
+            format!("D:P(A;;FA;;;{sid})(A;OICIIO;FA;;;CG)"),
+            format!("D:P(A;;FA;;;{sid})(A;;FA;;;CO)"),
+        ] {
+            set_test_acl(&base, true, &acl);
+            let raw = open_directory(&base, false).unwrap();
+            let before = dacl_bytes(&raw);
+            let observed = ObjectSecurity::read(&raw).unwrap();
+            let dacl = observed.descriptor.dacl().unwrap();
+            // Windows may materialize CREATOR OWNER into the current owner's SID when applying
+            // this DACL. Judge the actual stored trustees, not the input template spelling.
+            let mut foreign = false;
+            for index in 0..u32::from(unsafe { (*dacl).AceCount }) {
+                if let Some((_, trustee, flags)) =
+                    allowed_ace_with_inheritance(dacl, index, true).unwrap()
+                {
+                    let trustee = OwnedSid::copy_from(trustee, "test ACL trustee")
+                        .unwrap()
+                        .to_string()
+                        .unwrap();
+                    let inherited_owner =
+                        trustee == "S-1-3-0" && u32::from(flags) & INHERIT_ONLY_ACE != 0;
+                    foreign |= trustee != sid && trustee != "S-1-3-4" && !inherited_owner;
+                }
+            }
+            assert_eq!(Directory::open(&base).is_err(), foreign);
+            assert_eq!(directory.identity().is_err(), foreign);
+            assert_eq!(before, dacl_bytes(&raw));
+        }
+    }
+
+    #[test]
+    fn private_authority_removes_only_empty_real_child_directories() {
+        use super::super::WindowsPrivateDirectory as Directory;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("identity");
+        let directory = Directory::ensure(&base).unwrap();
+        let name = OsStr::new("recovery");
+        assert!(!directory.remove_empty_child(name).unwrap());
+        let child = Directory::ensure(&base.join(name)).unwrap();
+        child
+            .publish(OsStr::new("journal"), b"retain", false)
+            .unwrap();
+        drop(child);
+        assert!(!directory.remove_empty_child(name).unwrap());
+        assert_eq!(
+            std::fs::read(base.join(name).join("journal")).unwrap(),
+            b"retain"
+        );
+        let child = Directory::open(&base.join(name)).unwrap();
+        let journal = child.open_file(OsStr::new("journal"), false).unwrap();
+        child.remove_opened_file(journal).unwrap();
+        drop(child);
+        assert!(directory.remove_empty_child(name).unwrap());
+        assert!(!base.join(name).exists());
+        directory.publish(name, b"not-a-directory", false).unwrap();
+        assert!(directory.remove_empty_child(name).is_err());
+        assert_eq!(std::fs::read(base.join(name)).unwrap(), b"not-a-directory");
+    }
+
+    #[test]
+    fn private_authority_lock_contends_and_pins_its_root() {
+        use super::super::WindowsPrivateDirectory as Directory;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("identity");
+        let directory = Directory::ensure(&base).unwrap();
+        let name = OsStr::new("lifecycle.lock");
+        let lock = directory.try_lock(name).unwrap();
+        assert_eq!(
+            directory.try_lock(name).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(std::fs::remove_file(base.join(name)).is_err());
+        assert!(std::fs::rename(&base, temp.path().join("moved")).is_err());
+        drop(lock);
+        directory.try_lock(name).unwrap();
+    }
+
+    #[test]
+    fn private_authority_cannot_delete_another_directorys_file() {
+        use super::super::WindowsPrivateDirectory as Directory;
+        let temp = tempfile::tempdir().unwrap();
+        let first = Directory::ensure(&temp.path().join("first")).unwrap();
+        let second_path = temp.path().join("second");
+        let second = Directory::ensure(&second_path).unwrap();
+        second
+            .publish(OsStr::new("record"), b"preserve", false)
+            .unwrap();
+        let file = second.open_file(OsStr::new("record"), false).unwrap();
+        assert!(first.remove_opened_file(file).is_err());
+        assert_eq!(
+            std::fs::read(second_path.join("record")).unwrap(),
+            b"preserve"
+        );
     }
 
     #[test]

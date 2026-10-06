@@ -61,6 +61,7 @@ type Props = {
   selectedId: string | null
   focusedWindowId: string | null
   collapsed?: boolean
+  viewportCollapse?: boolean
   onToggleCollapsed?: (event: React.MouseEvent<HTMLButtonElement>) => void
   onSelect: (projectId: string) => void
   onReorder: (orderedIds: string[]) => void
@@ -114,6 +115,7 @@ export function Sidebar({
   selectedId,
   focusedWindowId,
   collapsed = false,
+  viewportCollapse = false,
   onToggleCollapsed,
   onSelect,
   onReorder,
@@ -682,11 +684,22 @@ export function Sidebar({
           <button
             type="button"
             className="sidebar__collapse"
-            aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-            title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            aria-label={viewportCollapse ? undefined : collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            title={viewportCollapse ? undefined : collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
             onClick={onToggleCollapsed}
           >
-            {collapsed ? '>' : '‹'}
+            {viewportCollapse ? (
+              <>
+                <span className="sidebar__viewport-expand">
+                  <span aria-hidden>{'>'}</span>
+                  <span className="sidebar__action-name">Expand sidebar</span>
+                </span>
+                <span className="sidebar__viewport-collapse">
+                  <span aria-hidden>‹</span>
+                  <span className="sidebar__action-name">Collapse sidebar</span>
+                </span>
+              </>
+            ) : collapsed ? '>' : '‹'}
           </button>
         )}
       </div>

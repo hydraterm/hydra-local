@@ -1,3 +1,6 @@
+// This wire fixture uses Unix domain sockets and POSIX child commands.
+#![cfg(unix)]
+
 //! Over-the-wire scrollback read path: a `scrollback` request is answered with a
 //! `ScrollbackRows` event (NEVER a `Grid`), carrying STRUCTURED historical rows that
 //! scrolled above the live screen. We print more numbered lines than the screen holds so

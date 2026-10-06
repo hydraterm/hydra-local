@@ -1,3 +1,6 @@
+// This wire fixture uses Unix domain sockets and POSIX child commands.
+#![cfg(unix)]
+
 //! Coverage for two daemon-side guarantees the renderer relies on:
 //!
 //! 1. **Late attachment** — a client that attaches *after* the child already

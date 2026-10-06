@@ -1,3 +1,6 @@
+// This wire fixture uses Unix domain sockets and POSIX child commands.
+#![cfg(unix)]
+
 //! The generation + revision backbone, observed over the wire. These are the
 //! guarantees a renderer relies on to know whether its screen is still a
 //! contiguous view of the daemon's grid:

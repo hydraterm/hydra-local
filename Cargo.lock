@@ -1743,10 +1743,12 @@ dependencies = [
 
 [[package]]
 name = "hydra-launcher"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "libc",
  "maestro-protocol",
+ "maestro-shell",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2125,7 +2127,7 @@ checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
 
 [[package]]
 name = "maestro-app"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "libc",
  "maestro-extension-api",
@@ -2137,6 +2139,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2194,6 +2197,7 @@ dependencies = [
  "wayland-sys",
  "webkit2gtk",
  "wgpu",
+ "windows-sys 0.61.2",
  "winit",
  "wry",
 ]
@@ -3108,6 +3112,7 @@ dependencies = [
  "portable-pty",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

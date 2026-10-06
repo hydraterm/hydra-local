@@ -288,7 +288,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let paths = paths_in(&tmp);
         let env = MapEnv::new(&[("XDG_RUNTIME_DIR", "/run/user/1000")]);
-        let fresh_default = default_socket_path(&env);
+        let fresh_default = default_socket_path_for_uid(&env, 1000);
         let retained_path = PathBuf::from("/run/user/1000/pre-update-retained.sock");
         assert_ne!(retained_path, fresh_default);
         store_endpoint(

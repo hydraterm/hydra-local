@@ -23,6 +23,10 @@ use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 pub fn host_event_from_winit(event: &WindowEvent) -> Option<HostEvent> {
     Some(match event {
         WindowEvent::CloseRequested => HostEvent::CloseRequested,
+        // WM_SIZE/SIZE_MINIMIZED reports zero pixels. Keep the last visible terminal and
+        // chrome geometry; restore supplies the next real size. Host queries do the same.
+        #[cfg(target_os = "windows")]
+        WindowEvent::Resized(size) if size.width == 0 || size.height == 0 => return None,
         WindowEvent::Resized(size) => HostEvent::Resized {
             width: size.width,
             height: size.height,
@@ -171,6 +175,17 @@ pub fn host_key_event(event: &winit::event::KeyEvent) -> HostKeyEvent {
 mod tests {
     use super::*;
     use winit::dpi::{PhysicalPosition, PhysicalSize};
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn minimized_size_is_not_terminal_resize_authority() {
+        for (width, height) in [(0, 0), (800, 0), (0, 600)] {
+            assert_eq!(
+                host_event_from_winit(&WindowEvent::Resized(PhysicalSize::new(width, height))),
+                None
+            );
+        }
+    }
 
     #[test]
     fn resized_and_close_map_directly() {

@@ -1,7 +1,7 @@
 use super::*;
 use std::sync::mpsc;
 use std::time::Duration;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::time::Instant;
 
 fn mutate(base: &Path, action: &str) -> Result<SettingsSetSuccess, SettingsFailure> {
@@ -123,7 +123,7 @@ fn independent_threads_merge_different_settings_without_temp_file_collisions() {
             .contains(".tmp.")));
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn a_waiting_profile_does_not_block_an_independent_profile() {
     let base_a = tempfile::tempdir().unwrap();
@@ -186,6 +186,9 @@ fn readers_remain_lock_free_and_reset_keeps_the_coordination_inode() {
     );
     reader.join().unwrap();
     drop(writer);
+    #[cfg(windows)]
+    let file_identity =
+        windows_file_identity(&settings_dir(base.path()).join(".settings-writer.lock"));
     #[cfg(unix)]
     let inode = {
         use std::os::unix::fs::MetadataExt;
@@ -196,6 +199,11 @@ fn readers_remain_lock_free_and_reset_keeps_the_coordination_inode() {
     reset_all_settings(base.path()).unwrap();
     assert!(!settings_file_path(base.path()).exists());
     set_theme(base.path(), THEME_HIGH_CONTRAST_DARK).unwrap();
+    #[cfg(windows)]
+    assert_eq!(
+        windows_file_identity(&settings_dir(base.path()).join(".settings-writer.lock")),
+        file_identity
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -205,6 +213,27 @@ fn readers_remain_lock_free_and_reset_keeps_the_coordination_inode() {
         assert_eq!(metadata.nlink(), 1);
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
     }
+}
+
+#[cfg(windows)]
+fn windows_file_identity(path: &Path) -> (u32, u32, u32) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let file = std::fs::File::open(path).unwrap();
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the real file handle and writable output remain alive throughout the native query.
+    assert_ne!(
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) },
+        0
+    );
+    assert_eq!(info.nNumberOfLinks, 1);
+    (
+        info.dwVolumeSerialNumber,
+        info.nFileIndexHigh,
+        info.nFileIndexLow,
+    )
 }
 
 #[test]
@@ -260,10 +289,10 @@ fn malformed_foreign_and_invalid_inputs_keep_existing_behavior() {
     assert!(!settings_dir(base.path()).exists());
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct ChildFixture(std::process::Child);
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Drop for ChildFixture {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -271,7 +300,7 @@ impl Drop for ChildFixture {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn wait_for(mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !condition() {
@@ -283,7 +312,7 @@ fn wait_for(mut condition: impl FnMut() -> bool) {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn child_settings_writer() {
     let Some(base) = std::env::var_os("HYDRA_SETTINGS_WRITER_TEST_BASE") else {
@@ -295,7 +324,7 @@ fn child_settings_writer() {
     mutate(&base, &action).unwrap();
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn separate_process_set_and_reset_wait_for_the_same_complete_transaction() {
     for action in ["theme", "reset_all"] {

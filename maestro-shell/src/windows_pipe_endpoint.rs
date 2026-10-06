@@ -47,7 +47,7 @@ pub(crate) fn validate_local_pipe_name(name: &OsStr) -> io::Result<OsString> {
 
 /// Return the same stable, privacy-preserving current-user pipe name as `pty-daemon.exe`.
 #[cfg(windows)]
-pub(crate) fn default_pipe_name() -> io::Result<PathBuf> {
+pub fn default_pipe_name() -> io::Result<PathBuf> {
     default_pipe_name_with_sid(|| OwnedSid::current_process()?.to_string())
 }
 

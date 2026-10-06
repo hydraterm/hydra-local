@@ -52,6 +52,7 @@ pub mod plugins;
 pub mod provider_attention;
 mod settings;
 pub mod startup_failure;
+mod system_http;
 /// Non-blocking new-release check against the published downloads manifest.
 pub mod update_check;
 mod window;

@@ -3,6 +3,7 @@
 //! Native resize reports actual completion; it never kills a terminal because a timer elapsed.
 
 use crate::windows_command::Command;
+use crate::windows_conpty_runtime;
 use crate::windows_job::{
     create_session_job, duplicate_handle, job_is_empty, owned_handle, process_exit_code,
     raw_handle, ProcessAttributeList,
@@ -22,9 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, Weak};
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE, WAIT_TIMEOUT};
-use windows_sys::Win32::System::Console::{
-    ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, COORD, HPCON,
-};
+use windows_sys::Win32::System::Console::{COORD, HPCON};
 use windows_sys::Win32::System::JobObjects::{
     JobObjectAssociateCompletionPortInformation, SetInformationJobObject, TerminateJobObject,
     JOBOBJECT_ASSOCIATE_COMPLETION_PORT,
@@ -48,6 +47,7 @@ pub(crate) struct PtyPair {
 
 pub(crate) fn openpty(size: PtySize) -> Result<PtyPair> {
     validate_size(size)?;
+    let api = windows_conpty_runtime::api()?;
 
     // Hydra owns overlapped server ends. ConPTY receives synchronous client ends, matching the
     // public ConPTY contract while allowing CancelIoEx on every daemon-side operation.
@@ -56,11 +56,10 @@ pub(crate) fn openpty(size: PtySize) -> Result<PtyPair> {
 
     let mut hpc: HPCON = 0;
     let result = unsafe {
-        CreatePseudoConsole(
+        api.create(
             coord(size),
             raw_handle(&input_conpty),
             raw_handle(&output_conpty),
-            0,
             &mut hpc,
         )
     };
@@ -74,7 +73,7 @@ pub(crate) fn openpty(size: PtySize) -> Result<PtyPair> {
         bail!("CreatePseudoConsole returned a null pseudoconsole handle");
     }
 
-    let control = ConptyControl::start(hpc)?;
+    let control = ConptyControl::start(hpc, api)?;
     let input_cancel = Arc::new(Event::manual_reset()?);
     let output_cancel = Arc::new(Event::manual_reset()?);
     let job = create_session_job()?;
@@ -330,6 +329,26 @@ impl Drop for MonitorGate {
 pub(crate) struct SessionLifetime(Arc<Lifecycle>);
 
 impl SessionLifetime {
+    #[cfg(test)]
+    pub(crate) fn hold_next_resize_for_test(
+        &self,
+    ) -> (tokio::sync::oneshot::Receiver<()>, mpsc::Sender<()>) {
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let (release, resumed) = mpsc::channel();
+        let previous = self
+            .0
+            .control
+            .resize_gate
+            .lock()
+            .unwrap()
+            .replace((entered, resumed));
+        assert!(
+            previous.is_none(),
+            "only one owned resize gate may be installed"
+        );
+        (observed, release)
+    }
+
     pub(crate) fn is_retired(&self) -> io::Result<bool> {
         self.0.job_is_empty()
     }
@@ -482,7 +501,12 @@ struct ConptyControl {
     hpc: HPCON,
     tx: mpsc::SyncSender<ControlMessage>,
     closing: Arc<AtomicBool>,
+    #[cfg(test)]
+    resize_gate: Arc<Mutex<Option<ResizeTestGate>>>,
 }
+
+#[cfg(test)]
+type ResizeTestGate = (tokio::sync::oneshot::Sender<()>, mpsc::Receiver<()>);
 
 enum ControlMessage {
     Resize(COORD, mpsc::Sender<io::Result<()>>),
@@ -490,10 +514,14 @@ enum ControlMessage {
 }
 
 impl ConptyControl {
-    fn start(hpc: HPCON) -> Result<Arc<Self>> {
+    fn start(hpc: HPCON, api: &'static windows_conpty_runtime::Api) -> Result<Arc<Self>> {
         let (tx, rx) = mpsc::sync_channel(1);
         let closing = Arc::new(AtomicBool::new(false));
         let worker_closing = closing.clone();
+        #[cfg(test)]
+        let resize_gate = Arc::new(Mutex::new(None::<ResizeTestGate>));
+        #[cfg(test)]
+        let worker_resize_gate = resize_gate.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("conpty-control".into())
             .spawn(move || {
@@ -504,7 +532,16 @@ impl ConptyControl {
                     }
                     match message {
                         ControlMessage::Resize(size, reply) => {
-                            let result = unsafe { ResizePseudoConsole(hpc, size) };
+                            #[cfg(test)]
+                            {
+                                let gate = worker_resize_gate.lock().unwrap().take();
+                                if let Some((entered, resumed)) = gate {
+                                    let _ = entered.send(());
+                                    // Dropping the fixture sender also releases the worker on panic.
+                                    let _ = resumed.recv();
+                                }
+                            }
+                            let result = unsafe { api.resize(hpc, size) };
                             let outcome = if result >= 0 {
                                 Ok(())
                             } else {
@@ -520,14 +557,20 @@ impl ConptyControl {
                 }
                 // Before Windows 11 24H2 this can wait for output drain. It is neither
                 // the reader thread nor the daemon authority/runtime thread.
-                unsafe { ClosePseudoConsole(hpc) };
+                unsafe { api.close(hpc) };
             })
         {
             // No child is attached yet; the caller still owns both synchronous pipe ends.
-            unsafe { ClosePseudoConsole(hpc) };
+            unsafe { api.close(hpc) };
             return Err(error.into());
         }
-        Ok(Arc::new(Self { hpc, tx, closing }))
+        Ok(Arc::new(Self {
+            hpc,
+            tx,
+            closing,
+            #[cfg(test)]
+            resize_gate,
+        }))
     }
 
     fn raw_hpc(&self) -> HPCON {
@@ -684,6 +727,7 @@ fn coord(size: PtySize) -> COORD {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    mod fidelity;
     use crate::windows_overlapped_io::tests::run_exact_owned_child;
     use crate::windows_process_encoding::snapshot_environment;
     use std::ffi::OsString;
@@ -946,6 +990,9 @@ pub(super) mod tests {
     #[ignore = "owned native child entry; invoked only through the exact ConPTY fixture"]
     fn interactive_child() {
         let mode = std::env::var(CHILD_MARKER).unwrap();
+        if mode == "unicode-fidelity" {
+            fidelity::write_unicode_fixture();
+        }
         if mode == "descendant-root" {
             let mut descendant = Command::new(std::env::current_exe().unwrap())
                 .args([

@@ -166,9 +166,14 @@ pub fn parse_headless_daemon_unit_for_removal(
     let shell = shell_entry
         .strip_prefix("SHELL=")
         .ok_or_else(|| "retained daemon SHELL entry is invalid".to_string())?;
+    #[cfg(unix)]
     let shell_is_safe = crate::agent_dir::validate_login_shell(Path::new(shell))
         .map(|validated| validated == shell)
         .unwrap_or(false);
+    // This parser grants authority to a retained Unix systemd account shell, not a
+    // Windows executable. Windows remote lifecycle uses its native manager adapter.
+    #[cfg(windows)]
+    let shell_is_safe = false;
     if !canonical_absolute_runtime_path(home)
         || !canonical_absolute_runtime_path(shell)
         || Path::new(home) == Path::new("/")
@@ -493,7 +498,9 @@ pub fn plan_status(paths: &ServicePaths) -> ServicePlan {
 mod tests {
     use super::*;
     use crate::launchd::DEFAULT_CLOUD_PUBKEY;
-    use crate::service::{is_mutating, ActionRunner, SystemRunner};
+    #[cfg(unix)]
+    use crate::service::SystemRunner;
+    use crate::service::{is_mutating, ActionRunner};
 
     fn opts() -> SystemdUnitOptions {
         SystemdUnitOptions {
@@ -589,6 +596,23 @@ WantedBy=default.target
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_does_not_grant_linux_shell_runtime_authority() {
+        let options = daemon_opts();
+        let unit = generate_headless_daemon_unit(&options);
+        assert!(parse_headless_daemon_unit_for_removal(
+            &unit,
+            &options.binary_path,
+            &options.socket_path,
+            Path::new(&options.home_dir),
+        )
+        .is_err());
+    }
+
+    // This positive authority assertion inspects a real Unix login-shell executable.
+    // Windows's actual persistent manager authority is covered by windows_service tests.
+    #[cfg(unix)]
     #[test]
     fn historical_safe_shell_is_accepted_but_daemon_unit_drift_is_rejected() {
         let options = daemon_opts();

@@ -231,8 +231,8 @@ pub struct NewTabPreparedStart {
     pub params: maestro_shell::StartParams,
 }
 
-/// Launch input owned by one foreground new-tab/split attempt. The ordinary shell arm is sealed as
-/// exact ad-hoc metadata at the prepared cwd. Provider/custom Agent callers use the consume-once
+/// Launch input owned by one foreground new-tab/split attempt. Default-shell choice stays distinct
+/// from exact custom shell argv at the prepared cwd. Provider/custom Agent callers use the consume-once
 /// source arm so no caller-built `StartParams` or repeatable prepared spec crosses the transaction
 /// boundary.
 pub struct NewTabForegroundLaunch {
@@ -241,6 +241,9 @@ pub struct NewTabForegroundLaunch {
 }
 
 enum NewTabForegroundLaunchKind {
+    DefaultShell {
+        argv: Vec<String>,
+    },
     ShellAdHoc {
         argv: Vec<String>,
     },
@@ -261,6 +264,16 @@ enum NewTabForegroundLaunchKind {
 }
 
 impl NewTabForegroundLaunch {
+    /// Only for an explicit default-shell choice, not shell-looking custom argv.
+    pub fn default_shell(argv: &[String]) -> Self {
+        Self {
+            provider_executable: None,
+            kind: NewTabForegroundLaunchKind::DefaultShell {
+                argv: argv.to_vec(),
+            },
+        }
+    }
+
     pub fn with_provider_executable(
         mut self,
         executable: Option<maestro_shell::ProviderExecutable>,
@@ -325,7 +338,8 @@ impl NewTabForegroundLaunch {
     fn matches_plan_source(&self, source: &NewTabLaunchSource) -> bool {
         match (&self.kind, source) {
             (
-                NewTabForegroundLaunchKind::ShellAdHoc { .. },
+                NewTabForegroundLaunchKind::DefaultShell { .. }
+                | NewTabForegroundLaunchKind::ShellAdHoc { .. },
                 NewTabLaunchSource::DefaultShellDev,
             ) => true,
             (
@@ -346,6 +360,12 @@ impl NewTabForegroundLaunch {
 
     fn is_valid_for_preparation(&self) -> bool {
         match &self.kind {
+            NewTabForegroundLaunchKind::DefaultShell { argv } => {
+                self.provider_executable.is_none()
+                    && argv
+                        .first()
+                        .is_some_and(|command| !command.trim().is_empty())
+            }
             NewTabForegroundLaunchKind::ShellAdHoc { argv }
             | NewTabForegroundLaunchKind::AgentAdHoc {
                 source_argv: argv, ..
@@ -390,6 +410,15 @@ impl NewTabForegroundLaunch {
             }
         };
         match self.kind {
+            NewTabForegroundLaunchKind::DefaultShell { argv } => {
+                if env.selected.is_some() {
+                    return Err(NewTabStartParamsError::PreparedLaunch);
+                }
+                check(&argv, None)?;
+                prepared
+                    .default_shell_session_spec(&argv, cols, rows, now_ms)
+                    .map_err(|_| NewTabStartParamsError::PreparedLaunch)
+            }
             NewTabForegroundLaunchKind::ShellAdHoc { argv } => {
                 if env.selected.is_some() {
                     check(&argv, None)?;
@@ -4813,11 +4842,95 @@ pub fn execute_preset_restore(
 }
 
 #[cfg(test)]
+mod test_transport;
+
+#[cfg(test)]
 mod tests {
+    use super::test_transport::{endpoint as daemon_endpoint, Listener, Stream};
     use super::*;
 
     fn s(v: &str) -> String {
         v.to_string()
+    }
+
+    #[test]
+    fn default_shell_provenance_survives_split_preparation_without_promoting_custom_argv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = maestro_shell::AppPaths::with_base(tmp.path().join("base"));
+        let project = maestro_shell::ProjectService::new(&paths)
+            .create(
+                "default-shell-project",
+                "Terminal",
+                tmp.path().to_string_lossy(),
+                maestro_shell::NewProject::default(),
+                1,
+            )
+            .unwrap();
+        let workspace = maestro_shell::Workspace {
+            workspace_id: "default-shell-workspace".into(),
+            project_id: project.project_id.clone(),
+            root: tmp.path().to_string_lossy().into_owned(),
+            policy: maestro_shell::WorkspacePolicy::ScratchCwd,
+            consent: maestro_shell::WorkspaceConsent::default(),
+        };
+        maestro_shell::store::write_record(
+            &paths,
+            maestro_shell::RecordKind::Workspace,
+            &workspace.workspace_id,
+            1,
+            &workspace,
+        )
+        .unwrap();
+        // Identical bytes do not confer identical authority: only the explicit choice is OptOut.
+        let argv = vec![s("fixture-default-shell"), s("-l")];
+        for (id, launch, expected) in [
+            (
+                "default",
+                NewTabForegroundLaunch::default_shell(&argv),
+                maestro_shell::LaunchSpec::OptOut,
+            ),
+            (
+                "custom",
+                NewTabForegroundLaunch::shell_adhoc(&argv),
+                maestro_shell::LaunchSpec::AdHocRedacted {
+                    argv: argv.clone(),
+                    redacted: false,
+                    restart_requires_user: true,
+                },
+            ),
+        ] {
+            assert!(launch.matches_plan_source(&NewTabLaunchSource::DefaultShellDev));
+            assert!(launch.is_valid_for_preparation());
+            let prepared = maestro_shell::PreparedWorkspace::unsealed(
+                workspace.policy,
+                &workspace.workspace_id,
+                id,
+                tmp.path(),
+            );
+            let spec = launch
+                .into_session_spec_with_reprobe(&prepared, 80, 24, 2, |actual, agent, cwd| {
+                    assert_eq!(actual, argv);
+                    assert_eq!(agent, None);
+                    assert_eq!(cwd, tmp.path());
+                    Ok(())
+                })
+                .unwrap();
+            let _start = maestro_shell::WindowLayoutService::new(&paths)
+                .prepare_unplaced_session_with_spec(&project, &workspace, spec)
+                .unwrap();
+            let Some(maestro_shell::store::LoadOutcome::Loaded(row)) =
+                maestro_shell::store::load_one::<maestro_shell::SessionRecord>(
+                    &paths,
+                    maestro_shell::RecordKind::Session,
+                    id,
+                )
+                .unwrap()
+            else {
+                panic!("sealed Session missing")
+            };
+            assert_eq!(row.launch, expected);
+            assert_eq!(row.status, maestro_shell::SessionStatus::Unknown);
+        }
     }
 
     /// A deterministic `IdGen` that hands out ids from fixed queues, recording how many times each
@@ -5066,22 +5179,28 @@ mod tests {
 
     #[test]
     fn selected_provider_carrier_seals_without_repeating_path_lookup() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         struct OwnedEnv(PathBuf);
         impl maestro_shell::LaunchEnvLookup for OwnedEnv {
             fn shell_utf8(&self) -> Option<String> {
+                #[cfg(windows)]
+                return Some("cmd.exe".into());
+                #[cfg(unix)]
                 Some(self.0.join("shell").to_str().unwrap().into())
             }
             fn home_os(&self) -> Option<std::ffi::OsString> {
                 Some(self.0.as_os_str().to_owned())
             }
             fn path_os(&self) -> Option<std::ffi::OsString> {
-                Some("/usr/bin:/bin".into())
+                Some(self.0.join(".local/bin").into_os_string())
             }
         }
         let root = tempfile::tempdir().unwrap();
         let env = OwnedEnv(root.path().to_owned());
         let executable = root.path().join(".local/bin/claude");
+        #[cfg(windows)]
+        let executable = executable.with_extension("cmd");
         std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
         for (path, text) in [
             (&executable, "#!/bin/sh\nexit 0\n"),
@@ -5091,6 +5210,7 @@ mod tests {
             ),
         ] {
             std::fs::write(path, text).unwrap();
+            #[cfg(unix)]
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         let Some(maestro_shell::ProviderResolution::Executable(selected)) =
@@ -5446,7 +5566,7 @@ mod tests {
     // ---- new-tab session start (start_new_tab_prepared_session) -----------------------------
     //
     // These tests exercise new-tab startup through the daemon/session runtime. A
-    // loopback stub daemon (a `UnixListener` on a temp socket) stands in for a real `pty-daemon`:
+    // loopback stub daemon (Unix socket or Windows named pipe) stands in for a real `pty-daemon`:
     // no PTY, GUI, renderer, network, git, or child process. The whole planner -> preparer ->
     // prepared-start -> start chain is driven end to end so the helper's success path is the real
     // one a GUI caller takes.
@@ -5475,30 +5595,42 @@ mod tests {
     /// socket path and its temp dir.
     struct StubDaemon {
         handle: Option<std::thread::JoinHandle<()>>,
-        socket_path: std::path::PathBuf,
         stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl StubDaemon {
         fn spawn_at<F>(path: std::path::PathBuf, serve: F) -> StubDaemon
         where
-            F: FnOnce(&mut std::os::unix::net::UnixStream) + Send + 'static,
+            F: FnOnce(&mut Stream) + Send + 'static,
         {
-            let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind stub socket");
+            let listener = Listener::bind(&path).expect("bind stub endpoint");
+            listener.set_nonblocking(true).expect("nonblocking fixture");
             let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let worker_stopping = std::sync::Arc::clone(&stopping);
             let handle = std::thread::spawn(move || {
-                if let Ok((mut stream, _)) = listener.accept() {
-                    if worker_stopping.load(std::sync::atomic::Ordering::Acquire) {
-                        return;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !worker_stopping.load(std::sync::atomic::Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            #[cfg(unix)]
+                            stream
+                                .set_nonblocking(false)
+                                .expect("blocking fixture stream");
+                            serve(&mut stream);
+                            return;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(error) => panic!("accept fixture connection: {error}"),
                     }
-                    serve(&mut stream);
-                    drop(stream);
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "fixture accept timed out"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(2));
                 }
             });
             StubDaemon {
                 handle: Some(handle),
-                socket_path: path,
                 stopping,
             }
         }
@@ -5509,8 +5641,10 @@ mod tests {
             if let Some(h) = self.handle.take() {
                 self.stopping
                     .store(true, std::sync::atomic::Ordering::Release);
-                let _ = std::os::unix::net::UnixStream::connect(&self.socket_path);
-                let _ = h.join();
+                let result = h.join();
+                if !std::thread::panicking() {
+                    result.expect("stub daemon protocol assertions");
+                }
             }
         }
     }
@@ -5528,10 +5662,7 @@ mod tests {
     /// A serve script that accepts the protocol-v3/capability mutation probe, then answers the StartSession +
     /// Attach handshake with a grid for `id` at `generation` (a successful start) — mirrors the
     /// shell-runtime test stub.
-    fn serve_grid(
-        id: String,
-        generation: String,
-    ) -> impl FnOnce(&mut std::os::unix::net::UnixStream) + Send + 'static {
+    fn serve_grid(id: String, generation: String) -> impl FnOnce(&mut Stream) + Send + 'static {
         serve_grid_with_start_observer(id, generation, |_| {})
     }
 
@@ -5539,7 +5670,7 @@ mod tests {
         id: String,
         generation: String,
         observe_start: F,
-    ) -> impl FnOnce(&mut std::os::unix::net::UnixStream) + Send + 'static
+    ) -> impl FnOnce(&mut Stream) + Send + 'static
     where
         F: FnOnce(&maestro_protocol::ClientRequest) + Send + 'static,
     {
@@ -5552,7 +5683,7 @@ mod tests {
             );
             writeln!(
                 stream,
-                "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"daemon_instance_id\":\"22222222222242228222222222222222\",\"output_generation_echo\":true,\"child_environment\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"generation_conditional_attach\":true}}",
+                "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"daemon_instance_id\":\"22222222222242228222222222222222\",\"output_generation_echo\":true,\"child_environment\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"windows_start_operation_retirement_barrier\":true,\"generation_conditional_attach\":true}}",
                 maestro_protocol::DAEMON_PROTOCOL_VERSION
             )
             .expect("write daemon_info");
@@ -5693,7 +5824,7 @@ mod tests {
         let prepared = prepared_start_for(&paths, "tab-1", "sess-1");
 
         let sock_dir = tempfile::tempdir().expect("sock dir");
-        let sock_path = sock_dir.path().join("stub.sock");
+        let sock_path = daemon_endpoint(sock_dir.path(), "stub.sock");
         let stub = StubDaemon::spawn_at(sock_path.clone(), serve_grid(s("sess-1"), s("gen-1")));
 
         let env = MapEnv::new(&[]);
@@ -5731,7 +5862,7 @@ mod tests {
 
         // An explicit socket path with no daemon listening: connect must fail before any session or
         // endpoint record is written.
-        let missing = tmp.path().join("nope.sock");
+        let missing = daemon_endpoint(tmp.path(), "nope.sock");
         let env = MapEnv::new(&[]);
         let err = start_new_tab_prepared_session(&paths, Some(missing), &env, &prepared)
             .expect_err("an unreachable daemon must fail the start");
@@ -5770,7 +5901,7 @@ mod tests {
         seed_default_scratch_workspace_parents(paths);
         let prepared = prepared_start_for(paths, tab_id, session_id);
         let sock_dir = tempfile::tempdir().expect("sock dir");
-        let sock_path = sock_dir.path().join("stub.sock");
+        let sock_path = daemon_endpoint(sock_dir.path(), "stub.sock");
         let stub = StubDaemon::spawn_at(sock_path.clone(), serve_grid(s(session_id), s("gen-1")));
         let env = MapEnv::new(&[]);
         let started = start_new_tab_prepared_session(paths, Some(sock_path), &env, &prepared)
@@ -6661,7 +6792,7 @@ mod tests {
 
         // --- Launch phase: consent-gated worktree pipeline opens ONE tab/session. ---
         let sock_dir = tempfile::tempdir().expect("sock dir");
-        let sock_path = sock_dir.path().join("stub.sock");
+        let sock_path = daemon_endpoint(sock_dir.path(), "stub.sock");
         let stub = StubDaemon::spawn_at(sock_path.clone(), serve_grid(s("sess-1"), s("gen-1")));
         let env = MapEnv::new(&[]);
         let mut id_gen = ScriptedIdGen::new(&["tab-1"], &["sess-1"]);
@@ -6802,7 +6933,7 @@ mod tests {
 
         // --- Launch phase: consent-gated pipeline opens ONE tab/session in the live checkout. ---
         let sock_dir = tempfile::tempdir().expect("sock dir");
-        let sock_path = sock_dir.path().join("stub.sock");
+        let sock_path = daemon_endpoint(sock_dir.path(), "stub.sock");
         let stub = StubDaemon::spawn_at(sock_path.clone(), serve_grid(s("sess-1"), s("gen-1")));
         let env = MapEnv::new(&[]);
         let mut id_gen = ScriptedIdGen::new(&["tab-1"], &["sess-1"]);
@@ -7094,7 +7225,7 @@ mod tests {
                 &mut ScriptedIdGen::new(&["selected-tab"], &["selected-session"]),
             );
             let socket_dir = tempfile::tempdir().unwrap();
-            let socket = socket_dir.path().join("stub.sock");
+            let socket = daemon_endpoint(socket_dir.path(), "stub.sock");
             let expected_cwd = child.root.clone();
             let stub = (case == "live").then(|| StubDaemon::spawn_at(socket.clone(), serve_grid_with_start_observer(
                 s("selected-session"), s("selected-generation"), move |request| {
@@ -7215,7 +7346,7 @@ mod tests {
         one_existing_tab_window(&paths, "maestro-app-dev-project");
 
         let sock_dir = tempfile::tempdir().expect("sock dir");
-        let sock_path = sock_dir.path().join("stub.sock");
+        let sock_path = daemon_endpoint(sock_dir.path(), "stub.sock");
         let stub = StubDaemon::spawn_at(sock_path.clone(), serve_grid(s("sess-1"), s("gen-1")));
         let env = MapEnv::new(&[]);
         let plan = create_plan("tab-1", "sess-1", NewTabLaunchSource::DefaultShellDev);
@@ -7306,7 +7437,7 @@ mod tests {
         };
 
         let sock_dir = tempfile::tempdir().expect("sock dir");
-        let sock_path = sock_dir.path().join("stub.sock");
+        let sock_path = daemon_endpoint(sock_dir.path(), "stub.sock");
         let stub = StubDaemon::spawn_at(sock_path.clone(), serve_grid(s("sess-agent"), s("gen-1")));
         let env = MapEnv::new(&[]);
         let plan = create_plan(
@@ -7314,7 +7445,15 @@ mod tests {
             "sess-agent",
             NewTabLaunchSource::PreparedAgentAdHoc,
         );
-        let launch = NewTabForegroundLaunch::agent_adhoc(vec![s("/bin/sh"), s("-l")], None)
+        #[cfg(unix)]
+        let source_argv = vec![s("/bin/sh"), s("-l")];
+        #[cfg(windows)]
+        let source_argv = {
+            let launcher = tmp.path().join("custom-agent.cmd");
+            std::fs::write(&launcher, "@exit /b 0\r\n").expect("native custom agent fixture");
+            vec![launcher.to_str().unwrap().to_owned(), s("literal-argument")]
+        };
+        let launch = NewTabForegroundLaunch::agent_adhoc(source_argv, None)
             .expect("absolute custom Agent source is valid");
         let (mut rt, rx) = RendererTabRuntime::new();
         rt.seed_active_tab("w1", "t0", "sess-t0");
@@ -7419,15 +7558,27 @@ mod tests {
             prepare_fresh_new_tab_scratch_workspace(&paths, &plan, "").unwrap();
 
         let sock_dir = tempfile::tempdir().expect("sock dir");
-        let sock_path = sock_dir.path().join("stub.sock");
+        let sock_path = daemon_endpoint(sock_dir.path(), "stub.sock");
         let paths_at_wire = paths.clone();
         let serve =
             serve_grid_with_start_observer(s("sess-provider"), s("gen-provider"), |request| {
                 match request {
                     maestro_protocol::ClientRequest::StartSession { args, .. } => {
-                        let packed = args.last().expect("login-shell provider command");
-                        assert!(packed.contains("--session-id") && packed.contains(PROVIDER_ID));
-                        assert!(!packed.contains("--resume"));
+                        #[cfg(unix)]
+                        {
+                            let packed = args.last().expect("login-shell provider command");
+                            assert!(
+                                packed.contains("--session-id") && packed.contains(PROVIDER_ID)
+                            );
+                            assert!(!packed.contains("--resume"));
+                        }
+                        #[cfg(windows)]
+                        {
+                            // Native ConPTY gets literal argv, not one POSIX shell command.
+                            // Exact equality proves the assigned identity and excludes resume,
+                            // fallback selectors, shell flags, or silently added arguments.
+                            assert_eq!(args, &[s("--session-id"), s(PROVIDER_ID)]);
+                        }
                     }
                     other => panic!("expected StartSession, got {other:?}"),
                 }
@@ -7560,22 +7711,30 @@ mod tests {
             prepare_fresh_new_tab_scratch_workspace(&paths, &plan, "").unwrap();
 
         let sock_dir = tempfile::tempdir().expect("sock dir");
-        let sock_path = sock_dir.path().join("stub.sock");
+        let sock_path = daemon_endpoint(sock_dir.path(), "stub.sock");
         let paths_at_wire = paths.clone();
         let serve = serve_grid_with_start_observer(
             s("sess-provider-custom"),
             s("gen-provider-custom"),
             |request| match request {
                 maestro_protocol::ClientRequest::StartSession { command, args, .. } => {
-                    assert_ne!(
-                        command, "claude",
-                        "provider-word source uses private shell wire"
-                    );
-                    assert_eq!(args.first().map(String::as_str), Some("-lic"));
-                    assert!(
-                        args.iter().any(|arg| arg.contains("claude")),
-                        "private login-shell wire retains the reviewed source command"
-                    );
+                    #[cfg(unix)]
+                    {
+                        assert_ne!(
+                            command, "claude",
+                            "provider-word source uses private shell wire"
+                        );
+                        assert_eq!(args.first().map(String::as_str), Some("-lic"));
+                        assert!(
+                            args.iter().any(|arg| arg.contains("claude")),
+                            "private login-shell wire retains the reviewed source command"
+                        );
+                    }
+                    #[cfg(windows)]
+                    {
+                        assert!(command == "claude" || std::path::Path::new(command).is_absolute());
+                        assert_eq!(args, &[s("mcp"), s("--serve")], "native wire preserves each opaque user argument without shell wrapping");
+                    }
                 }
                 other => panic!("expected StartSession, got {other:?}"),
             },
@@ -7724,7 +7883,7 @@ mod tests {
         let err = run_new_tab_foreground_pipeline_with_consent(
             NewTabForegroundRequest {
                 paths: &paths,
-                socket_path: tmp.path().join("unused.sock"),
+                socket_path: daemon_endpoint(tmp.path(), "unused.sock"),
                 window_id: "w1",
                 plan: &plan,
                 launch: NewTabForegroundLaunch::shell_adhoc(&argv),
@@ -7809,7 +7968,7 @@ mod tests {
         one_existing_tab_window(&paths, "proj-wt");
 
         let sock_dir = tempfile::tempdir().expect("sock dir");
-        let sock_path = sock_dir.path().join("stub.sock");
+        let sock_path = daemon_endpoint(sock_dir.path(), "stub.sock");
         let stub = StubDaemon::spawn_at(sock_path.clone(), serve_grid(s("sess-1"), s("gen-1")));
         let env = MapEnv::new(&[]);
         let plan =
@@ -10140,7 +10299,7 @@ mod tests {
         one_existing_tab_window(&paths, "maestro-app-dev-project");
 
         let sock_dir = tempfile::tempdir().expect("sock dir");
-        let sock_path = sock_dir.path().join("stub.sock");
+        let sock_path = daemon_endpoint(sock_dir.path(), "stub.sock");
         let stub = StubDaemon::spawn_at(sock_path.clone(), serve_grid(s("sess-1"), s("gen-1")));
         let env = MapEnv::new(&[]);
         let plan = create_plan("tab-1", "sess-1", NewTabLaunchSource::DefaultShellDev);
@@ -10212,7 +10371,7 @@ mod tests {
         let argv = vec![s("/bin/zsh"), s("-l")];
         let (mut rt, rx) = RendererTabRuntime::new();
         rt.seed_active_tab("w1", "t0", "sess-t0");
-        let missing_socket = tmp.path().join("missing.sock");
+        let missing_socket = daemon_endpoint(tmp.path(), "missing.sock");
 
         let mut err = run_new_tab_foreground_pipeline(
             NewTabForegroundRequest {
@@ -10242,7 +10401,7 @@ mod tests {
 
         let report = execute_production_new_tab_recovery(
             &paths,
-            &tmp.path().join("missing-again.sock"),
+            &daemon_endpoint(tmp.path(), "missing-again.sock"),
             1_700_000_001,
             &mut err,
             &[],
@@ -10568,7 +10727,7 @@ mod tests {
         }
     }
 
-    fn assert_no_socket_connection(listener: &std::os::unix::net::UnixListener) {
+    fn assert_no_socket_connection(listener: &Listener) {
         match listener.accept() {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Ok(_) => panic!("recovery unexpectedly connected to the daemon socket"),
@@ -10596,7 +10755,7 @@ mod tests {
         {
             *session_generation = s("tampered-diagnostic-generation");
         }
-        let socket = tmp.path().join("offline.sock");
+        let socket = daemon_endpoint(tmp.path(), "offline.sock");
         let (mut runtime, commands) = RendererTabRuntime::new();
         runtime.seed_active_tab("window-recovery", "tab-old", "session-old");
         let previous_strip_tabs = vec![snapshot_tab("tab-old", "session-old", 0)];
@@ -10690,7 +10849,7 @@ mod tests {
             seed_production_new_tab_recovery_graph(&paths, &scratch, Some("generation-a"), true);
         let mut error =
             created_tab_recovery_error(snapshot, session, "generation-a", Some(scratch.clone()));
-        let socket = tmp.path().join("offline.sock");
+        let socket = daemon_endpoint(tmp.path(), "offline.sock");
         let (mut runtime, commands) = RendererTabRuntime::new();
 
         let report = execute_production_new_tab_recovery(
@@ -10752,8 +10911,8 @@ mod tests {
             &session_b,
         )
         .expect("replace Session A with B");
-        let socket = tmp.path().join("must-not-connect.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind probe socket");
+        let socket = daemon_endpoint(tmp.path(), "must-not-connect.sock");
+        let listener = Listener::bind(&socket).expect("bind probe endpoint");
         listener
             .set_nonblocking(true)
             .expect("set probe nonblocking");
@@ -10833,7 +10992,7 @@ mod tests {
 
         let report = execute_production_new_tab_recovery(
             &paths,
-            &tmp.path().join("offline.sock"),
+            &daemon_endpoint(tmp.path(), "offline.sock"),
             3,
             &mut error,
             &[],
@@ -10871,8 +11030,8 @@ mod tests {
         let mut error = NewTabForegroundError::StartedSessionGenerationMissing {
             session_id: session.session_id.clone(),
         };
-        let socket = tmp.path().join("must-not-connect.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind probe socket");
+        let socket = daemon_endpoint(tmp.path(), "must-not-connect.sock");
+        let listener = Listener::bind(&socket).expect("bind probe endpoint");
         listener
             .set_nonblocking(true)
             .expect("set probe nonblocking");
@@ -11159,7 +11318,7 @@ mod tests {
             error: NewTabStartParamsError::NotCreate,
         };
         let (mut runtime, _rx) = RendererTabRuntime::new();
-        let missing_socket = tmp.path().join("missing.sock");
+        let missing_socket = daemon_endpoint(tmp.path(), "missing.sock");
         let report = execute_production_new_tab_recovery(
             &paths,
             &missing_socket,
@@ -11211,7 +11370,7 @@ mod tests {
             let (mut runtime, _rx) = RendererTabRuntime::new();
             let report = execute_production_new_tab_recovery(
                 &paths,
-                &tmp.path().join("missing.sock"),
+                &daemon_endpoint(tmp.path(), "missing.sock"),
                 1,
                 &mut error,
                 &[],
@@ -11291,7 +11450,7 @@ mod tests {
         let (mut runtime, _rx) = RendererTabRuntime::new();
         let report = execute_production_new_tab_recovery(
             &paths_b,
-            &tmp_b.path().join("missing.sock"),
+            &daemon_endpoint(tmp_b.path(), "missing.sock"),
             1,
             &mut error,
             &[],
@@ -11307,7 +11466,7 @@ mod tests {
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
         let replay = execute_production_new_tab_recovery(
             &paths_a,
-            &tmp_a.path().join("missing.sock"),
+            &daemon_endpoint(tmp_a.path(), "missing.sock"),
             2,
             &mut error,
             &[],
@@ -11899,7 +12058,7 @@ mod tests {
         let argv = vec![s("/bin/zsh"), s("-l")];
         let (mut rt, _rx) = RendererTabRuntime::new();
         rt.seed_active_tab("w1", "t0", "sess-t0");
-        let missing_socket = tmp.path().join("missing.sock");
+        let missing_socket = daemon_endpoint(tmp.path(), "missing.sock");
 
         let mut err = run_new_tab_foreground_pipeline(
             NewTabForegroundRequest {
@@ -11968,7 +12127,7 @@ mod tests {
         let expected = paths.scratch_base().join("sess-agent");
         let (mut runtime, rx) = RendererTabRuntime::new();
         runtime.seed_active_tab("w1", "t0", "sess-t0");
-        let missing_socket = tmp.path().join("must-not-connect.sock");
+        let missing_socket = daemon_endpoint(tmp.path(), "must-not-connect.sock");
 
         let mut error = run_new_tab_foreground_pipeline(
             NewTabForegroundRequest {
@@ -12061,7 +12220,7 @@ mod tests {
             runtime.seed_active_tab("w1", "t0", "sess-t0");
             let request = NewTabForegroundRequest {
                 paths: &paths,
-                socket_path: tmp.path().join("must-not-connect.sock"),
+                socket_path: daemon_endpoint(tmp.path(), "must-not-connect.sock"),
                 window_id: "w1",
                 plan: &plan,
                 launch: NewTabForegroundLaunch::shell_adhoc(&argv),
@@ -12122,7 +12281,7 @@ mod tests {
         let mut error = run_new_tab_foreground_pipeline(
             NewTabForegroundRequest {
                 paths: &paths,
-                socket_path: tmp.path().join("must-not-connect.sock"),
+                socket_path: daemon_endpoint(tmp.path(), "must-not-connect.sock"),
                 window_id: "missing-window",
                 plan: &plan,
                 launch: NewTabForegroundLaunch::shell_adhoc(&argv),
@@ -12151,7 +12310,7 @@ mod tests {
         assert!(cwd.is_dir());
         let report = execute_production_new_tab_recovery(
             &paths,
-            &tmp.path().join("unused.sock"),
+            &daemon_endpoint(tmp.path(), "unused.sock"),
             2,
             &mut error,
             &[],
@@ -12198,7 +12357,7 @@ mod tests {
             let (mut runtime, _rx) = RendererTabRuntime::new();
             let report = execute_production_new_tab_recovery(
                 &paths,
-                &tmp.path().join("unused.sock"),
+                &daemon_endpoint(tmp.path(), "unused.sock"),
                 1,
                 &mut error,
                 &[],
@@ -12560,7 +12719,7 @@ mod tests {
         let error = execute_preset_restore(
             PresetRestoreRequest {
                 paths: &paths,
-                socket_path: tmp.path().join("does-not-open.sock"),
+                socket_path: daemon_endpoint(tmp.path(), "does-not-open.sock"),
                 window_id: "win-restore",
                 plan: &plan,
                 source_tabs: &source_tabs,
@@ -12616,7 +12775,7 @@ mod tests {
         let error = execute_preset_restore(
             PresetRestoreRequest {
                 paths: &paths,
-                socket_path: tmp.path().join("does-not-open.sock"),
+                socket_path: daemon_endpoint(tmp.path(), "does-not-open.sock"),
                 window_id: "win-restore",
                 plan: &plan,
                 source_tabs: &source_tabs,
@@ -12667,7 +12826,7 @@ mod tests {
         let error = execute_preset_restore(
             PresetRestoreRequest {
                 paths: &paths,
-                socket_path: tmp.path().join("does-not-open.sock"),
+                socket_path: daemon_endpoint(tmp.path(), "does-not-open.sock"),
                 window_id: "win-restore",
                 plan: &plan,
                 source_tabs: &source_tabs,

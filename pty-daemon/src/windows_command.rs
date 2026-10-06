@@ -20,12 +20,25 @@ pub(super) struct Command {
 
 impl Command {
     pub(super) fn new(program: impl AsRef<OsStr>) -> Result<Self> {
-        Ok(Self {
+        Ok(Self::from_environment(
+            program,
+            snapshot_environment()?,
+            crate::windows_child_path::refresh,
+        ))
+    }
+
+    fn from_environment(
+        program: impl AsRef<OsStr>,
+        mut environment: Vec<(OsString, OsString)>,
+        refresh_path: impl FnOnce(&mut [(OsString, OsString)]),
+    ) -> Self {
+        refresh_path(&mut environment);
+        Self {
             program: program.as_ref().into(),
             arguments: Vec::new(),
-            environment: snapshot_environment()?,
+            environment,
             directory: None,
-        })
+        }
     }
 
     pub(super) fn args<I, S>(&mut self, arguments: I)
@@ -72,6 +85,7 @@ impl Command {
                 || wide_case_cmp(extension, OsStr::new("bat")) == Ordering::Equal
         });
         if !batch {
+            let executable = compatible_executable_spelling(executable);
             return PreparedProcess::new(
                 executable.as_os_str(),
                 &self.arguments,
@@ -83,6 +97,7 @@ impl Command {
             Some(program) => resolve_executable(program, &directory, &self.environment)?,
             None => system_directory()?.join("cmd.exe"),
         };
+        let interpreter = compatible_executable_spelling(interpreter);
         let script = batch_script_path(&executable)?;
         let line = batch_command_line(&script, &self.arguments)?;
         PreparedProcess::with_command_line(
@@ -92,6 +107,59 @@ impl Command {
             Some(directory.as_os_str()),
         )
     }
+}
+
+// Some legacy .NET applications (including Windows PowerShell) cannot initialize from a
+// verbatim executable name even though CreateProcessW accepts it. Change only the native
+// launch spelling, never the selected/durable provider locator or any user argument.
+fn compatible_executable_spelling(executable: PathBuf) -> PathBuf {
+    let Some(ordinary) = ordinary_executable_candidate(&executable) else {
+        return executable;
+    };
+    // This is a conservative equivalence check, not a new executable selection policy.
+    // Keep the original on errors or different targets; do not fall back to another program.
+    match (executable.canonicalize(), ordinary.canonicalize()) {
+        (Ok(original), Ok(candidate)) if original == candidate => ordinary,
+        _ => executable,
+    }
+}
+
+fn ordinary_executable_candidate(executable: &Path) -> Option<PathBuf> {
+    if !matches!(executable.components().next(), Some(Component::Prefix(prefix))
+        if matches!(prefix.kind(), Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(_, _)))
+    {
+        return None;
+    }
+    // Reuse the existing exact Win32 normalization checks. Preserve long paths rather than
+    // removing the namespace required by programs without long-path awareness.
+    let ordinary = batch_script_path(executable).ok()?;
+    let units: Vec<u16> = ordinary.as_os_str().encode_wide().collect();
+    if units.len() >= 260
+        || units
+            .split(|unit| *unit == b'\\' as u16)
+            .any(reserved_dos_component)
+    {
+        return None;
+    }
+    Some(ordinary)
+}
+
+fn reserved_dos_component(component: &[u16]) -> bool {
+    let mut stem = component
+        .split(|unit| *unit == b'.' as u16)
+        .next()
+        .unwrap_or_default();
+    while stem.last() == Some(&(b' ' as u16)) {
+        stem = &stem[..stem.len() - 1];
+    }
+    let stem = OsString::from_wide(stem);
+    [
+        "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM1", "COM2", "COM3", "COM4", "COM5",
+        "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7",
+        "LPT8", "LPT9", "COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³",
+    ]
+    .iter()
+    .any(|name| wide_case_cmp(&stem, OsStr::new(name)) == Ordering::Equal)
 }
 
 fn environment_value<'a>(
@@ -332,6 +400,7 @@ mod tests {
             "%HYDRA_EXPAND%",
             "a&b|c<d>e^f(!)",
             "Türkçe日本語",
+            r"\\?\C:\literal\unchanged",
         ]
         .map(OsString::from)
         .into();
@@ -360,6 +429,105 @@ mod tests {
             OsString::from_wide(&[0xd800, b'x' as u16]),
         );
         command
+    }
+
+    #[test]
+    fn powershell_executable_spelling_starts_from_dos_and_verbatim_paths() {
+        const CASE: &str = "windows_command::tests::powershell_executable_spelling_starts_from_dos_and_verbatim_paths";
+        if run_exact_owned_child(CASE) {
+            return;
+        }
+        let root = FixtureDirectory::new();
+        let ordinary = system_directory()
+            .unwrap()
+            .join(r"WindowsPowerShell\v1.0\powershell.exe");
+        let verbatim = ordinary.canonicalize().unwrap();
+        assert_ne!(ordinary, verbatim);
+        for program in [&ordinary, &verbatim] {
+            let mut command = Command::new(program).unwrap();
+            command.cwd(&root.0);
+            command.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[System.Net.ServicePointManager]::SecurityProtocol | Out-Null; [Console]::WriteLine('HYDRA_NATIVE_ARGUMENTS_OK')",
+            ]);
+            assert_native_command_output(command);
+        }
+        println!("\nHYDRA_WINDOWS_IO_PASS:{CASE}");
+    }
+
+    #[test]
+    fn executable_spelling_preserves_native_arguments_for_canonical_unicode_path() {
+        const CASE: &str = "windows_command::tests::executable_spelling_preserves_native_arguments_for_canonical_unicode_path";
+        if run_exact_owned_child(CASE) {
+            return;
+        }
+        let root = FixtureDirectory::new();
+        let executable = root.0.join("native Türkçe 日本語.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let canonical = executable.canonicalize().unwrap();
+        let command = child_command(&canonical, "exe", &root.0);
+        assert_eq!(command.program, canonical.as_os_str());
+        assert_native_command_output(command);
+        println!("\nHYDRA_WINDOWS_IO_PASS:{CASE}");
+    }
+
+    #[test]
+    fn executable_spelling_candidate_preserves_namespace_and_normalization_semantics() {
+        assert_eq!(
+            ordinary_executable_candidate(Path::new(r"\\?\C:\Windows\tool.exe")),
+            Some(PathBuf::from(r"C:\Windows\tool.exe"))
+        );
+        // Candidate calculation does not access a network share.
+        assert_eq!(
+            ordinary_executable_candidate(Path::new(r"\\?\UNC\server\share\tool.exe")),
+            Some(PathBuf::from(r"\\server\share\tool.exe"))
+        );
+        for path in [
+            r"C:\Windows\tool.exe",
+            r"\\?\Volume{abcd}\tool.exe",
+            r"\\.\C:\tool.exe",
+            r"\\?\C:\dir\..\tool.exe",
+            r"\\?\C:\dir.\tool.exe",
+            r"\\?\C:\dir \tool.exe",
+            r"\\?\C:\dir\tool.exe.",
+            r"\\?\C:\dir\tool.exe ",
+            r"\\?\C:\dir/NUL.exe",
+            r"\\?\C:\NUL.exe",
+            r"\\?\C:\aux\tool.exe",
+            r"\\?\C:\COM1.exe",
+            r"\\?\C:\lpt².exe",
+            r"\\?\C:\CONIN$",
+        ] {
+            assert_eq!(
+                ordinary_executable_candidate(Path::new(path)),
+                None,
+                "{path}"
+            );
+        }
+        let long = format!(r"\\?\C:\{}\tool.exe", "directory\\".repeat(30));
+        assert_eq!(ordinary_executable_candidate(Path::new(&long)), None);
+    }
+
+    #[test]
+    fn executable_spelling_requires_existing_equivalent_target() {
+        let root = FixtureDirectory::new();
+        let executable = root.0.join("ordinary.exe");
+        std::fs::write(&executable, b"synthetic path identity fixture").unwrap();
+        let canonical = executable.canonicalize().unwrap();
+        let ordinary = compatible_executable_spelling(canonical.clone());
+        assert_eq!(ordinary.canonicalize().unwrap(), canonical);
+        assert!(
+            matches!(ordinary.components().next(), Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), Prefix::Disk(_)))
+        );
+        let missing = root.0.canonicalize().unwrap().join("missing.exe");
+        assert_eq!(compatible_executable_spelling(missing.clone()), missing);
+        let sensitive = root.0.canonicalize().unwrap().join("trailing.exe.");
+        std::fs::write(&sensitive, b"literal trailing dot fixture").unwrap();
+        assert_eq!(compatible_executable_spelling(sensitive.clone()), sensitive);
     }
 
     #[test]
@@ -438,8 +606,85 @@ mod tests {
             std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap(),
             std::fs::canonicalize(std::env::var_os("HYDRA_EXPECT_CWD").unwrap()).unwrap()
         );
+        if let Some(expected) = std::env::var_os("HYDRA_EXPECT_REFRESH_PATH") {
+            assert_eq!(std::env::var_os("PATH"), Some(expected));
+        }
         println!("\nHYDRA_NATIVE_ARGUMENTS_OK");
         std::io::stdout().flush().unwrap();
+    }
+
+    #[test]
+    fn os_baseline_refresh_reaches_native_shim_dependency_without_replacing_custom_environment() {
+        use crate::windows_child_path::PathPolicy;
+
+        const CASE: &str = "windows_command::tests::os_baseline_refresh_reaches_native_shim_dependency_without_replacing_custom_environment";
+        if run_exact_owned_child(CASE) {
+            return;
+        }
+        let root = FixtureDirectory::new();
+        let old = root.0.join("old empty PATH");
+        let installed = root.0.join("new dependency 日本語");
+        let custom = root.0.join("explicit custom PATH");
+        for directory in [&old, &installed, &custom] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        let dependency = format!("hydra-path-{}.exe", uuid::Uuid::new_v4().simple());
+        for directory in [&installed, &custom] {
+            std::fs::copy(
+                std::env::current_exe().unwrap(),
+                directory.join(&dependency),
+            )
+            .unwrap();
+        }
+        let shim = root.0.join("selected-provider.cmd");
+        std::fs::write(&shim, format!("@echo off\r\n{dependency} %*\r\n")).unwrap();
+
+        // Controlled OS observations exercise the production constructor/policy and real ConPTY
+        // without editing the account's registry or process environment. The separate native OS
+        // block test exercises token/block allocation and cleanup with the actual Windows API.
+        for (inherited, startup_os, current_os, explicit, expected) in [
+            (&old, &old, Some(&installed), None, &installed),
+            (&custom, &old, Some(&installed), None, &custom),
+            (&old, &old, Some(&installed), Some(&custom), &custom),
+            (&custom, &custom, None, None, &custom),
+        ] {
+            let mut original = child_command(&shim, "batch", &root.0);
+            original.env("pAtH", inherited);
+            original.env("HYDRA_EXPECT_REFRESH_PATH", expected);
+            original.env_remove("COMSPEC");
+            let other_values: Vec<_> = original
+                .environment
+                .iter()
+                .filter(|(key, _)| wide_case_cmp(key, OsStr::new("PATH")) != Ordering::Equal)
+                .cloned()
+                .collect();
+            let policy =
+                PathPolicy::capture(Some(inherited.as_os_str()), Some(startup_os.as_os_str()));
+            let mut command =
+                Command::from_environment(&shim, original.environment, |environment| {
+                    policy.refresh(environment, || {
+                        current_os.map(|path| path.as_os_str().to_owned())
+                    });
+                });
+            command.arguments = original.arguments;
+            command.directory = original.directory;
+            if let Some(explicit) = explicit {
+                command.env("PATH", explicit);
+            }
+            assert_eq!(command.get_env("path"), Some(expected.as_os_str()));
+            assert!(
+                command
+                    .environment
+                    .iter()
+                    .filter(|(key, _)| wide_case_cmp(key, OsStr::new("PATH")) != Ordering::Equal)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    == other_values,
+                "refresh must preserve every other inherited value, including WTF-16"
+            );
+            assert_native_command_output(command);
+        }
+        println!("\nHYDRA_WINDOWS_IO_PASS:{CASE}");
     }
 
     #[test]
@@ -481,7 +726,9 @@ mod tests {
         ];
         assert_eq!(
             resolve_executable(OsStr::new("tool"), &root.0, &environment).unwrap(),
-            root.0.join("first").join("tool.cmd")
+            // The chosen suffix preserves the caller's PATHEXT spelling. Windows
+            // opens the same fixture file regardless of this lexical case difference.
+            root.0.join("first").join("tool.CMD")
         );
         assert_eq!(
             resolve_executable(OsStr::new("second\\tool.cmd"), &root.0, &environment).unwrap(),

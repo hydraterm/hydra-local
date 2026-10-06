@@ -1108,7 +1108,12 @@ mod tests {
     fn claude_resume_preserves_safe_dangerous_flag() {
         let launch = LaunchSpec::AdHocRedacted {
             argv: vec![
-                "/Users/test/.local/bin/claude".into(),
+                if cfg!(windows) {
+                    r"C:\Fixture\fixture\.local\bin\claude"
+                } else {
+                    "/Users/test/.local/bin/claude"
+                }
+                .into(),
                 "--resume".into(),
                 "abc".into(),
                 "--dangerously-skip-permissions".into(),
@@ -1215,7 +1220,12 @@ mod tests {
     fn antigravity_preserves_conversation_and_uses_agy_launch_id() {
         let launch = LaunchSpec::AdHocRedacted {
             argv: vec![
-                "/opt/antigravity/bin/agy".into(),
+                if cfg!(windows) {
+                    r"C:\Tools\antigravity\bin\agy"
+                } else {
+                    "/opt/antigravity/bin/agy"
+                }
+                .into(),
                 "--conversation".into(),
                 "conversation-123".into(),
                 "--model".into(),
@@ -1244,7 +1254,12 @@ mod tests {
     fn kimi_preserves_selected_session_model_and_yolo() {
         let launch = LaunchSpec::AdHocRedacted {
             argv: vec![
-                "/Users/test/.kimi-code/bin/kimi".into(),
+                if cfg!(windows) {
+                    r"C:\Fixture\fixture\.kimi-code\bin\kimi"
+                } else {
+                    "/Users/test/.kimi-code/bin/kimi"
+                }
+                .into(),
                 "--session".into(),
                 "session_abc123".into(),
                 "--model".into(),
@@ -1273,7 +1288,12 @@ mod tests {
     fn kiro_preserves_chat_selected_uuid_model_and_trust_flag() {
         let launch = LaunchSpec::AdHocRedacted {
             argv: vec![
-                "/usr/local/bin/kiro-cli".into(),
+                if cfg!(windows) {
+                    r"C:\Tools\kiro-cli"
+                } else {
+                    "/usr/local/bin/kiro-cli"
+                }
+                .into(),
                 "chat".into(),
                 "--resume-id".into(),
                 "20000000-0000-4000-8000-000000000001".into(),

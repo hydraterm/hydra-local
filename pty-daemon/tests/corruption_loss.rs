@@ -1,3 +1,6 @@
+// This wire fixture uses Unix domain sockets and POSIX child commands.
+#![cfg(unix)]
+
 //! Hardening tests for three corruption/loss failure modes:
 //!   - split multibyte UTF-8 across PTY reads survives intact (no replacement
 //!     chars) — proves base64 framing + the grid parser, not lossy String conv;

@@ -22,8 +22,14 @@ pub enum BinaryKind {
 }
 
 impl BinaryKind {
-    /// The on-disk file name (no extension; these are unix dev binaries).
+    /// The platform's on-disk executable filename.
     pub fn file_name(self) -> &'static str {
+        #[cfg(windows)]
+        return match self {
+            BinaryKind::Daemon => "pty-daemon.exe",
+            BinaryKind::Renderer => "maestro-renderer.exe",
+        };
+        #[cfg(not(windows))]
         match self {
             BinaryKind::Daemon => "pty-daemon",
             BinaryKind::Renderer => "maestro-renderer",
@@ -49,6 +55,12 @@ pub fn dev_socket_path(runtime_base: &Path) -> PathBuf {
 /// (`XDG_RUNTIME_DIR`, then `TMPDIR`, then `/tmp`) but skipping empty values. Pure over an injected
 /// env lookup.
 pub fn runtime_base_dir(get_env: impl Fn(&str) -> Option<String>) -> PathBuf {
+    #[cfg(windows)]
+    for key in ["TEMP", "TMP", "LOCALAPPDATA"] {
+        if let Some(value) = get_env(key).filter(|value| Path::new(value).is_absolute()) {
+            return PathBuf::from(value);
+        }
+    }
     for key in ["XDG_RUNTIME_DIR", "TMPDIR"] {
         if let Some(v) = get_env(key) {
             if !v.is_empty() {
@@ -68,27 +80,45 @@ pub fn runtime_base_dir(get_env: impl Fn(&str) -> Option<String>) -> PathBuf {
 /// when `$HOME` is unset. Crucially this is NEVER a repo root, satisfying the "do not write
 /// Maestro metadata into repo roots" rule.
 pub fn default_base_dir(get_env: impl Fn(&str) -> Option<String>, runtime_base: &Path) -> PathBuf {
-    #[cfg(not(target_os = "macos"))]
-    if let Some(data) = get_env("XDG_DATA_HOME") {
-        if !data.is_empty() && Path::new(&data).is_absolute() {
-            return PathBuf::from(data).join("maestro-dev");
+    #[cfg(windows)]
+    {
+        if let Some(base) =
+            get_env("MAESTRO_APP_SUPPORT_DIR").filter(|value| Path::new(value).is_absolute())
+        {
+            return PathBuf::from(base);
         }
-    }
-    if let Some(home) = get_env("HOME") {
-        if !home.is_empty() {
-            #[cfg(target_os = "macos")]
-            return PathBuf::from(home)
-                .join("Library")
-                .join("Application Support")
-                .join("Maestro-dev");
-            #[cfg(not(target_os = "macos"))]
-            return PathBuf::from(home)
-                .join(".local")
-                .join("share")
-                .join("maestro-dev");
+        if let Some(base) = get_env("LOCALAPPDATA").filter(|value| Path::new(value).is_absolute()) {
+            return PathBuf::from(base).join("Hydra");
         }
+        if let Some(home) = get_env("USERPROFILE").filter(|value| Path::new(value).is_absolute()) {
+            return PathBuf::from(home).join("AppData/Local/Hydra");
+        }
+        return runtime_base.join("Hydra");
     }
-    runtime_base.join("maestro-app-dev-base")
+    #[cfg(not(windows))]
+    {
+        #[cfg(not(target_os = "macos"))]
+        if let Some(data) = get_env("XDG_DATA_HOME") {
+            if !data.is_empty() && Path::new(&data).is_absolute() {
+                return PathBuf::from(data).join("maestro-dev");
+            }
+        }
+        if let Some(home) = get_env("HOME") {
+            if !home.is_empty() {
+                #[cfg(target_os = "macos")]
+                return PathBuf::from(home)
+                    .join("Library")
+                    .join("Application Support")
+                    .join("Maestro-dev");
+                #[cfg(not(target_os = "macos"))]
+                return PathBuf::from(home)
+                    .join(".local")
+                    .join("share")
+                    .join("maestro-dev");
+            }
+        }
+        runtime_base.join("maestro-app-dev-base")
+    }
 }
 
 /// How a required binary path was resolved, for the report/debug surface.
@@ -164,6 +194,37 @@ pub fn session_argv(user_argv: &[String], get_env: impl Fn(&str) -> Option<Strin
     if !user_argv.is_empty() {
         return user_argv.to_vec();
     }
+    #[cfg(windows)]
+    {
+        // Pass a native executable and exact argv; never wrap a POSIX login-shell command.
+        if let Some(path) = get_env("PATH") {
+            for directory in std::env::split_paths(&path).filter(|path| path.is_absolute()) {
+                let candidate = directory.join("pwsh.exe");
+                if candidate.is_file() {
+                    if let Some(path) = candidate.to_str() {
+                        return vec![path.to_owned()];
+                    }
+                }
+            }
+        }
+        let candidates = [
+            get_env("ProgramFiles").map(|p| PathBuf::from(p).join("PowerShell/7/pwsh.exe")),
+            get_env("SystemRoot")
+                .map(|p| PathBuf::from(p).join("System32/WindowsPowerShell/v1.0/powershell.exe")),
+            get_env("ComSpec").map(PathBuf::from),
+            get_env("SystemRoot").map(|p| PathBuf::from(p).join("System32/cmd.exe")),
+        ];
+        for candidate in candidates.into_iter().flatten() {
+            if candidate.is_absolute() && candidate.is_file() {
+                if let Some(path) = candidate.to_str() {
+                    return vec![path.to_owned()];
+                }
+            }
+        }
+        // No guessed bare executable/PATH fallback when the native shell is missing.
+        return Vec::new();
+    }
+    #[cfg(not(windows))]
     match get_env("SHELL") {
         Some(sh) if !sh.is_empty() => vec![sh, "-l".to_string()],
         _ => vec!["/bin/sh".to_string()],
@@ -273,13 +334,11 @@ pub fn child_log_path(log_dir: &Path, kind: ChildLogKind, stream: ChildLogStream
 /// decision is unit-testable without any process IO.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RendererMode {
-    /// Renderer launched; the app waits for it to exit, then cleans up a daemon it spawned (unless
-    /// `--keep-daemon`).
+    /// Renderer launched; the app waits for it to exit without stopping the retained daemon.
     Foreground,
     /// Renderer launched fire-and-forget; the app does not wait and leaves a spawned daemon alive.
     Detached,
-    /// No renderer (`--no-run-renderer`); a daemon this process spawned is cleaned up unless
-    /// `--keep-daemon`.
+    /// No renderer (`--no-run-renderer`); the daemon remains independently retained.
     None,
 }
 
@@ -313,28 +372,22 @@ pub fn renderer_binary_required(mode: RendererMode) -> bool {
 
 /// Whether a daemon THIS process spawned should be left running after the launch completes.
 ///
-/// Pure policy, the single source of truth for both the foreground and headless paths:
-/// - if we did NOT spawn the daemon (reused an existing one), we NEVER touch it -> always kept;
-/// - if `--keep-daemon` is set, a spawned daemon is kept;
-/// - in `Detached` mode the spawned daemon is always kept (the renderer outlives us);
-/// - in `Foreground` and `None` modes a spawned daemon is cleaned up (returns false).
+/// Spawning is not exclusive ownership of a shared endpoint. A second launcher can adopt the
+/// daemon even before the creator's readiness proof; every mode therefore retains it from spawn.
+/// The legacy parameters/flag remain accepted for CLI compatibility, not termination authority.
 pub fn should_keep_spawned_daemon(
-    daemon_spawned: bool,
-    mode: RendererMode,
-    keep_daemon: bool,
+    _daemon_spawned: bool,
+    _mode: RendererMode,
+    _keep_daemon: bool,
 ) -> bool {
-    if !daemon_spawned {
-        return true; // reused daemon — out of bounds, leave it alone
-    }
-    if keep_daemon {
-        return true;
-    }
-    matches!(mode, RendererMode::Detached)
+    true
 }
 
 /// Whether the daemon socket path should be cleaned up after the launch completes.
 ///
-/// Pure policy, derived from the same lifecycle facts as [`should_keep_spawned_daemon`]:
+/// Legacy pure helper retained for API compatibility. It is not used by production startup:
+/// spawning never proves exclusive endpoint ownership, and all launches report `daemon_kept=true`.
+/// A caller must independently own an exact, explicitly stopped private fixture before cleanup:
 /// - we only ever clean up a socket whose daemon THIS process spawned (`daemon_started`);
 /// - we only clean up when that spawned daemon was NOT kept (`!daemon_kept`) — i.e. we just
 ///   stopped it, so the socket file is now stale.
@@ -439,6 +492,7 @@ mod tests {
         assert_eq!(runtime_base_dir(env_of(&[])), PathBuf::from("/tmp"));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn default_base_uses_home_dev_dir_and_is_not_a_repo_root() {
         let base = default_base_dir(env_of(&[("HOME", "/example/home")]), Path::new("/tmp"));
@@ -454,7 +508,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
     #[test]
     fn default_base_prefers_xdg_data_home_off_macos() {
         let base = default_base_dir(
@@ -467,7 +521,40 @@ mod tests {
     #[test]
     fn default_base_falls_back_under_runtime_when_no_home() {
         let base = default_base_dir(env_of(&[]), Path::new("/var/tmp"));
+        #[cfg(not(windows))]
         assert_eq!(base, PathBuf::from("/var/tmp/maestro-app-dev-base"));
+        #[cfg(windows)]
+        assert_eq!(base, Path::new("/var/tmp").join("Hydra"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn default_base_uses_native_profile_and_explicit_override() {
+        let runtime = Path::new(r"C:\Temp");
+        assert_eq!(
+            default_base_dir(env_of(&[("USERPROFILE", r"C:\Fixture\fixture")]), runtime),
+            Path::new(r"C:\Fixture\fixture").join("AppData/Local/Hydra")
+        );
+        assert_eq!(
+            default_base_dir(
+                env_of(&[
+                    ("USERPROFILE", r"C:\Fixture\fixture"),
+                    ("LOCALAPPDATA", r"D:\Local")
+                ]),
+                runtime
+            ),
+            Path::new(r"D:\Local").join("Hydra")
+        );
+        assert_eq!(
+            default_base_dir(
+                env_of(&[
+                    ("LOCALAPPDATA", r"D:\Local"),
+                    ("MAESTRO_APP_SUPPORT_DIR", r"E:\QA")
+                ]),
+                runtime
+            ),
+            PathBuf::from(r"E:\QA")
+        );
     }
 
     // ---- binary resolution ------------------------------------------------------------------
@@ -507,39 +594,29 @@ mod tests {
 
     #[test]
     fn sibling_of_exe_resolved() {
+        let expected = Path::new("/repo/target/release").join(BinaryKind::Daemon.file_name());
         let got = resolve_binary(
             BinaryKind::Daemon,
             None,
             env_of(&[]),
             Some(Path::new("/repo/target/release/maestro-app")),
-            |p| p == Path::new("/repo/target/release/pty-daemon"),
+            |p| p == expected,
         );
-        assert_eq!(
-            got,
-            Some((
-                PathBuf::from("/repo/target/release/pty-daemon"),
-                BinarySource::SiblingOfExe
-            ))
-        );
+        assert_eq!(got, Some((expected, BinarySource::SiblingOfExe)));
     }
 
     #[test]
     fn cargo_target_fallback_probes_debug_and_release() {
         // Exe in release dir, but the daemon only exists under debug -> CargoTarget find.
+        let expected = Path::new("/repo/target/debug").join(BinaryKind::Daemon.file_name());
         let got = resolve_binary(
             BinaryKind::Daemon,
             None,
             env_of(&[]),
             Some(Path::new("/repo/target/release/maestro-app")),
-            |p| p == Path::new("/repo/target/debug/pty-daemon"),
+            |p| p == expected,
         );
-        assert_eq!(
-            got,
-            Some((
-                PathBuf::from("/repo/target/debug/pty-daemon"),
-                BinarySource::CargoTarget
-            ))
-        );
+        assert_eq!(got, Some((expected, BinarySource::CargoTarget)));
     }
 
     #[test]
@@ -562,12 +639,14 @@ mod tests {
         assert_eq!(got, argv(&["htop"]));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn session_argv_uses_shell_login_fallback() {
         let got = session_argv(&[], env_of(&[("SHELL", "/bin/zsh")]));
         assert_eq!(got, argv(&["/bin/zsh", "-l"]));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn session_argv_falls_back_to_sh_without_shell() {
         let got = session_argv(&[], env_of(&[]));
@@ -592,23 +671,45 @@ mod tests {
         assert_eq!(got, argv(&["/bin/zsh", "-l"]));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn effective_session_argv_absent_default_falls_back_to_shell_env() {
         let got = effective_session_argv(&[], None, env_of(&[("SHELL", "/bin/bash")]));
         assert_eq!(got, argv(&["/bin/bash", "-l"]));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn effective_session_argv_absent_default_no_shell_falls_back_to_sh() {
         let got = effective_session_argv(&[], None, env_of(&[]));
         assert_eq!(got, argv(&["/bin/sh"]));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn effective_session_argv_empty_configured_default_is_ignored() {
         let empty: Vec<String> = Vec::new();
         let got = effective_session_argv(&[], Some(&empty), env_of(&[("SHELL", "/bin/bash")]));
         assert_eq!(got, argv(&["/bin/bash", "-l"]));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_shell_fallback_is_exact_for_absent_and_empty_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let shell = temp.path().join("native shell.exe");
+        std::fs::write(&shell, b"test fixture; not executed").unwrap();
+        let shell = shell.to_str().unwrap();
+        let env = || env_of(&[("ComSpec", shell), ("SHELL", "/bin/zsh")]);
+        assert_eq!(session_argv(&[], env()), argv(&[shell]));
+        assert_eq!(effective_session_argv(&[], None, env()), argv(&[shell]));
+        assert_eq!(
+            effective_session_argv(&[], Some(&[]), env()),
+            argv(&[shell])
+        );
+        assert!(session_argv(&[], env_of(&[])).is_empty());
+        assert!(effective_session_argv(&[], None, env_of(&[])).is_empty());
+        assert!(effective_session_argv(&[], Some(&[]), env_of(&[])).is_empty());
     }
 
     // ---- renderer command -------------------------------------------------------------------
@@ -781,15 +882,13 @@ mod tests {
     }
 
     #[test]
-    fn spawned_daemon_cleanup_policy() {
-        // Foreground / None: spawned daemon cleaned up by default...
-        assert!(!should_keep_spawned_daemon(
+    fn spawned_daemon_retention_is_independent_of_mode_and_legacy_flag() {
+        assert!(should_keep_spawned_daemon(
             true,
             RendererMode::Foreground,
             false
         ));
-        assert!(!should_keep_spawned_daemon(true, RendererMode::None, false));
-        // ...but kept with --keep-daemon...
+        assert!(should_keep_spawned_daemon(true, RendererMode::None, false));
         assert!(should_keep_spawned_daemon(
             true,
             RendererMode::Foreground,

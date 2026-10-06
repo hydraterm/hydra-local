@@ -6,8 +6,13 @@
 
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
+#[cfg(windows)]
+include!("main_windows_service.rs");
+#[cfg(all(test, windows))]
+#[path = "agent_dir/test_permissions.rs"]
+mod windows_test_permissions;
 
-fn main() -> Result<()> {
+pub(crate) fn main() -> Result<()> {
     // DB-write log net: attribute every store mutation this process makes to "hydra-agent" (the shared store has two
     // writers — this + the desktop app — so every db-write.jsonl line is attributable to which side wrote it).
     maestro_shell::write_trace::set_writer_tag("hydra-agent");
@@ -25,6 +30,16 @@ fn main() -> Result<()> {
     };
 
     match cmd {
+        #[cfg(windows)]
+        "windows-service-manager" => {
+            if args.len() != 5 || args.get(3).map(String::as_str) != Some("--dir") {
+                bail!("invalid fixed Windows service-manager invocation");
+            }
+            hydra_agent::windows_service::contain_attach_only_supervisor()?;
+            let state = hydra_agent::windows_service::run_manager_helper(&args[2], &dir)?;
+            println!("{}", serde_json::to_string(&state)?);
+            Ok(())
+        }
         "version" => {
             println!("hydra-agent {}", hydra_agent::build_stamp());
             Ok(())
@@ -900,7 +915,7 @@ fn verify_legacy_authority_migration_service(
     })
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn verify_legacy_authority_migration_service_evidence(
     trusted_home: &std::path::Path,
     authority_root: &std::path::Path,
@@ -1744,21 +1759,23 @@ fn desired_cleanup_unit(
     if !binary.is_absolute() || !binary.is_file() {
         bail!("installed Hydra agent binary is unavailable");
     }
-    let app_support_dir = extension_maestro_app_support_dir(&home);
+    let app_support_dir = extension_maestro_app_support_dir(&home)?;
     let (socket, fixed_external_daemon) =
         extension_daemon_target(&home, dir, &binary, &app_support_dir)?;
     let plan = platform_plan_install(
         &descriptor.desired_paths,
         PlatformInstallOptions {
+            #[cfg(unix)]
             home: &home,
             app_support_dir: &app_support_dir,
+            #[cfg(unix)]
             label: &descriptor.desired_paths.label,
             binary_path: binary.to_string_lossy().into_owned(),
             socket_path: socket.to_string_lossy().into_owned(),
             fixed_external_daemon,
             sessions: Vec::new(),
         },
-    );
+    )?;
     let (path, contents) = plan
         .actions
         .iter()
@@ -2669,6 +2686,7 @@ fn extension_service_install_plan(
 )> {
     let home =
         hydra_agent::agent_dir::trusted_home_dir().context("resolve effective OS account home")?;
+    #[cfg(unix)]
     let label = default_service_label();
     if descriptor.canonical_root != dir || descriptor.desired_paths.agent_dir != dir {
         bail!("lifecycle descriptor is bound to a different enrollment root");
@@ -2682,7 +2700,7 @@ fn extension_service_install_plan(
     if !binary.is_absolute() || !binary.is_file() {
         bail!("installed Hydra agent binary is unavailable");
     }
-    let app_support_dir = extension_maestro_app_support_dir(&home);
+    let app_support_dir = extension_maestro_app_support_dir(&home)?;
     let (socket, fixed_external_daemon) =
         extension_daemon_target(&home, dir, &binary, &app_support_dir)?;
     hydra_agent::release_trust::active().validate()?;
@@ -2691,15 +2709,17 @@ fn extension_service_install_plan(
     let install = platform_plan_install(
         &paths,
         PlatformInstallOptions {
+            #[cfg(unix)]
             home: &home,
             app_support_dir: &app_support_dir,
+            #[cfg(unix)]
             label,
             binary_path: binary.to_string_lossy().into_owned(),
             socket_path: socket.to_string_lossy().into_owned(),
             fixed_external_daemon,
             sessions: Vec::new(),
         },
-    );
+    )?;
     Ok((paths, install, socket, binding))
 }
 
@@ -3140,8 +3160,29 @@ fn run_remove_remote_cmd(args: &[String], dir: &std::path::Path) -> Result<()> {
 fn run_supervise_cmd(args: &[String], dir: &std::path::Path) -> Result<()> {
     use hydra_agent::supervise::{dry_run_plan, run, SuperviseOptions};
 
-    let explicit_sock = flag(args, "--sock")
-        .unwrap_or_else(|| default_daemon_socket().to_string_lossy().into_owned());
+    #[cfg(windows)]
+    if let Some(stamp) = flag(args, "--service-build-stamp") {
+        if stamp != hydra_agent::build_stamp()
+            || flag(args, "--service-binding-stamp").as_deref()
+                != Some(hydra_agent::supervise::service_binding_stamp().as_str())
+        {
+            bail!("installed Windows service stamps do not match this binary");
+        }
+        let support =
+            flag(args, "--app-support-dir").context("Windows service omits app-support root")?;
+        if !hydra_agent::agent_dir::is_canonically_encoded_absolute_path(std::path::Path::new(
+            &support,
+        )) {
+            bail!("Windows service app-support root is not canonical absolute");
+        }
+        // Single-threaded CLI startup, before Tokio or supervision creates threads/children.
+        std::env::set_var("MAESTRO_APP_SUPPORT_DIR", support);
+    }
+
+    let explicit_sock = match flag(args, "--sock") {
+        Some(path) => path,
+        None => default_daemon_socket()?.to_string_lossy().into_owned(),
+    };
     let attach_daemon_only = supervise_standalone_flag(args, "--attach-daemon-only");
     let fixed_external_daemon = supervise_standalone_flag(args, "--fixed-daemon-only");
     if fixed_external_daemon && !attach_daemon_only {
@@ -3176,12 +3217,17 @@ fn run_supervise_cmd(args: &[String], dir: &std::path::Path) -> Result<()> {
         .unwrap_or_default();
     // default the pty-daemon binary to a sibling of this executable; the agent binary to the current exe.
     let self_exe = std::env::current_exe().ok();
+    let daemon_name = if cfg!(windows) {
+        "pty-daemon.exe"
+    } else {
+        "pty-daemon"
+    };
     let pty_daemon_bin = flag(args, "--pty-daemon-bin").unwrap_or_else(|| {
         self_exe
             .as_ref()
             .and_then(|p| p.parent())
-            .map(|d| d.join("pty-daemon").to_string_lossy().into_owned())
-            .unwrap_or_else(|| "pty-daemon".to_string())
+            .map(|d| d.join(daemon_name).to_string_lossy().into_owned())
+            .unwrap_or_else(|| daemon_name.to_string())
     });
     let hydra_agent_bin = flag(args, "--hydra-agent-bin").unwrap_or_else(|| {
         self_exe
@@ -3215,12 +3261,14 @@ fn run_supervise_cmd(args: &[String], dir: &std::path::Path) -> Result<()> {
 fn run_health_cmd(args: &[String], dir: &std::path::Path) -> Result<()> {
     use hydra_agent::health::{assess, gather, render, Verdict};
 
-    let socket_path = flag(args, "--sock")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(default_daemon_socket);
+    let socket_path = match flag(args, "--sock") {
+        Some(path) => PathBuf::from(path),
+        None => default_daemon_socket()?,
+    };
 
     // Persistent-install signal: the launchd plist on macOS, the systemd user unit on Linux.
     // Best-effort: missing HOME/uid → no service file.
+    #[cfg(unix)]
     let plist_present = {
         let home = std::env::var("HOME").ok().map(std::path::PathBuf::from);
         let uid = current_uid_string();
@@ -3234,6 +3282,7 @@ fn run_health_cmd(args: &[String], dir: &std::path::Path) -> Result<()> {
     };
 
     // content-blind process detection via `pgrep -f <pattern>` (matches the full argv, like the triage script).
+    #[cfg(unix)]
     let proc_matches = |pattern: &str| {
         std::process::Command::new("pgrep")
             .arg("-f")
@@ -3243,7 +3292,16 @@ fn run_health_cmd(args: &[String], dir: &std::path::Path) -> Result<()> {
             .unwrap_or(false)
     };
 
+    #[cfg(unix)]
     let facts = gather(dir, &socket_path, plist_present, now_ms(), proc_matches);
+    #[cfg(windows)]
+    let facts = {
+        let (installed, supervisor, peer) = windows_health_process_presence(dir, &socket_path)?;
+        let mut facts = gather(dir, &socket_path, installed, now_ms(), |_| false);
+        facts.supervise_running = supervisor;
+        facts.remote_peer_running = peer;
+        facts
+    };
     let report = assess(&facts);
     print!("{}", render(&report));
     if report.verdict == Verdict::NotReady {
@@ -3254,11 +3312,21 @@ fn run_health_cmd(args: &[String], dir: &std::path::Path) -> Result<()> {
 
 /// The daemon's default socket path when `--sock` is omitted — the SAME per-user resolution the
 /// daemon and the desktop app use (`XDG_RUNTIME_DIR` → `TMPDIR` → `/tmp` + the shared filename),
-/// via `maestro_shell::default_socket_path`. Keeping every component on one resolver means a
+/// via the shared shell resolver (current-user SID-scoped named pipe on Windows). Keeping every
+/// component on one resolver means a
 /// fresh install talks to itself out of the box in the user's own runtime dir (no permissions
 /// needed beyond the user's), instead of one side defaulting to a world-shared `/tmp` name.
-fn default_daemon_socket() -> PathBuf {
-    maestro_shell::default_socket_path(&|k: &str| std::env::var(k).ok())
+fn default_daemon_socket() -> Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        Ok(maestro_shell::default_socket_path(&|k: &str| {
+            std::env::var(k).ok()
+        }))
+    }
+    #[cfg(windows)]
+    {
+        maestro_shell::windows_default_pipe_name().context("resolve current-user daemon pipe")
+    }
 }
 
 /// The service name whose installed definition `health` looks for. macOS deployments install
@@ -3268,13 +3336,14 @@ fn health_service_label() -> &'static str {
     "com.hydra.agent"
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn health_service_label() -> &'static str {
     "hydra-agent"
 }
 
 /// The current uid as a string (for the launchd service target), or None. `id -u` avoids a libc dependency;
 /// content-blind (a uid number only).
+#[cfg(unix)]
 fn current_uid_string() -> Option<String> {
     std::process::Command::new("id")
         .arg("-u")
@@ -3301,13 +3370,19 @@ fn run_service_cmd(args: &[String], dir: &std::path::Path) -> Result<()> {
     let sub = args.get(2).map(String::as_str).unwrap_or("");
     let dry_run = args.iter().any(|a| a == "--dry-run");
     let label = flag(args, "--label").unwrap_or_else(|| default_service_label().to_string());
+    #[cfg(unix)]
     let home = std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."));
+    #[cfg(windows)]
+    let home = hydra_agent::agent_dir::trusted_home_dir()?;
+    #[cfg(unix)]
     let uid = flag(args, "--uid").unwrap_or_else(|| {
         // SAFETY: getuid() is always available + has no failure mode.
         unsafe { libc_getuid() }.to_string()
     });
+    #[cfg(windows)]
+    let uid = hydra_agent::windows_service::current_user_sid()?;
     let paths = platform_service_paths(&home, dir, &label, &uid);
     let apply = args.iter().any(|a| a == "--apply");
     let forget = sub == "uninstall" && args.iter().any(|a| a == "--forget");
@@ -3376,8 +3451,10 @@ fn run_service_cmd(args: &[String], dir: &std::path::Path) -> Result<()> {
                         .collect()
                 })
                 .unwrap_or_default();
-            let socket_path = flag(args, "--sock")
-                .unwrap_or_else(|| default_daemon_socket().to_string_lossy().into_owned());
+            let socket_path = match flag(args, "--sock") {
+                Some(path) => path,
+                None => default_daemon_socket()?.to_string_lossy().into_owned(),
+            };
             // Retain the exact socket for both readiness (`ensure`) and the
             // retained-session safety guard (`install` and `ensure`).
             ensure_expected_socket = Some(PathBuf::from(&socket_path));
@@ -3391,15 +3468,17 @@ fn run_service_cmd(args: &[String], dir: &std::path::Path) -> Result<()> {
             let install = platform_plan_install(
                 &paths,
                 PlatformInstallOptions {
+                    #[cfg(unix)]
                     home: &home,
                     app_support_dir: &app_support_dir,
+                    #[cfg(unix)]
                     label: &label,
                     binary_path,
                     socket_path,
                     fixed_external_daemon: false,
                     sessions,
                 },
-            );
+            )?;
             if sub == "ensure" {
                 ensure_fallback_install = Some(install.clone());
                 if service_definition_matches(&install) {
@@ -3566,6 +3645,7 @@ fn parse_systemd_build_stamp(definition: &str) -> Result<String> {
     )?)
 }
 
+#[cfg(unix)]
 fn installed_service_definition(path: &std::path::Path) -> Result<String> {
     let bytes = read_owned_service_definition(path)?
         .ok_or_else(|| anyhow::anyhow!("installed Hydra service definition is absent"))?;
@@ -3581,7 +3661,7 @@ fn installed_service_build_stamp(paths: &hydra_agent::service::ServicePaths) -> 
     Ok(parse_full_launchd_service_definition(definition.as_bytes())?.build_stamp)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn installed_service_build_stamp(paths: &hydra_agent::service::ServicePaths) -> Result<String> {
     let definition = installed_service_definition(&platform_service_file(paths))?;
     Ok(parse_full_systemd_service_definition(definition.as_bytes())?.build_stamp)
@@ -3797,6 +3877,7 @@ fn daemon_socket_is_usable(path: &std::path::Path) -> bool {
     client.list_sessions().is_ok()
 }
 
+#[cfg(any(unix, test))]
 fn classify_process_ps(
     success: bool,
     exit_code: Option<i32>,
@@ -3825,6 +3906,7 @@ fn classify_process_ps(
     bail!("process liveness probe failed ambiguously")
 }
 
+#[cfg(unix)]
 fn process_is_live_exact(pid: u32) -> Result<bool> {
     if pid == 0 {
         bail!("process liveness probe received PID zero");
@@ -3963,6 +4045,9 @@ fn supervise_standalone_flag(args: &[String], wanted: &str) -> bool {
                 | "--sessions"
                 | "--pty-daemon-bin"
                 | "--hydra-agent-bin"
+                | "--app-support-dir"
+                | "--service-build-stamp"
+                | "--service-binding-stamp"
         ) {
             2
         } else {
@@ -3985,6 +4070,7 @@ struct LegacySupervisorTrust {
 }
 
 impl LegacySupervisorTrust {
+    #[cfg(any(unix, test))]
     fn binding_stamp(&self) -> String {
         use sha2::{Digest as _, Sha256};
         let mut digest = Sha256::new();
@@ -4015,10 +4101,24 @@ struct RunningSupervisorInvocation {
     legacy_trust: Option<LegacySupervisorTrust>,
 }
 
-fn parse_supervisor_invocation(arguments: &[Vec<u8>]) -> Result<RunningSupervisorInvocation> {
-    use std::ffi::OsString;
-    use std::os::unix::ffi::OsStringExt as _;
+/// Unix process inventories preserve arbitrary native bytes. Windows inventories must supply
+/// lossless UTF-8 path values; never reinterpret raw Unix bytes as native Windows UTF-16 or use
+/// lossy decoding to manufacture a different authority path.
+fn process_argument_path(bytes: &[u8]) -> Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt as _;
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
+    }
+    #[cfg(windows)]
+    {
+        Ok(PathBuf::from(
+            std::str::from_utf8(bytes).context("Windows process path is not lossless UTF-8")?,
+        ))
+    }
+}
 
+fn parse_supervisor_invocation(arguments: &[Vec<u8>]) -> Result<RunningSupervisorInvocation> {
     if arguments.get(1).map(Vec::as_slice) != Some(b"supervise") {
         bail!("manager process is not a Hydra supervisor invocation");
     }
@@ -4030,6 +4130,13 @@ fn parse_supervisor_invocation(arguments: &[Vec<u8>]) -> Result<RunningSuperviso
     let mut index = 2;
     while index < arguments.len() {
         match arguments[index].as_slice() {
+            #[cfg(windows)]
+            b"--app-support-dir" | b"--service-build-stamp" | b"--service-binding-stamp" => {
+                if arguments.get(index + 1).is_none_or(Vec::is_empty) {
+                    bail!("Windows supervisor metadata argument has no value");
+                }
+                index += 2;
+            }
             b"--attach-daemon-only" => {
                 attach_daemon_only = true;
                 index += 1;
@@ -4051,12 +4158,12 @@ fn parse_supervisor_invocation(arguments: &[Vec<u8>]) -> Result<RunningSuperviso
                     if agent_dir.is_some() {
                         bail!("manager supervisor has more than one --dir value");
                     }
-                    agent_dir = Some(PathBuf::from(OsString::from_vec(value.clone())));
+                    agent_dir = Some(process_argument_path(value)?);
                 } else if flag == b"--sock" {
                     if socket_path.is_some() {
                         bail!("manager supervisor has more than one --sock value");
                     }
-                    socket_path = Some(PathBuf::from(OsString::from_vec(value.clone())));
+                    socket_path = Some(process_argument_path(value)?);
                 } else if let Some(name) = match flag {
                     b"--environment" => Some("environment"),
                     b"--expected-cloud" => Some("expected_cloud"),
@@ -4110,6 +4217,7 @@ fn parse_supervisor_invocation(arguments: &[Vec<u8>]) -> Result<RunningSuperviso
 }
 
 #[cfg(any(not(target_os = "macos"), test))]
+#[cfg(any(unix, test))]
 fn parse_nul_arguments(bytes: &[u8]) -> Vec<Vec<u8>> {
     bytes
         .split(|byte| *byte == 0)
@@ -4214,7 +4322,7 @@ fn manager_process_snapshot(pid: u32) -> Result<ManagerProcessSnapshot> {
     parse_macos_procargs2_snapshot(&bytes)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn manager_process_snapshot(pid: u32) -> Result<ManagerProcessSnapshot> {
     use std::io::Read as _;
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -4250,12 +4358,16 @@ fn manager_process_arguments(pid: u32) -> Result<Vec<Vec<u8>>> {
     Ok(manager_process_snapshot(pid)?.arguments)
 }
 
+#[cfg(any(unix, test))]
 const MAX_PROCESS_INVENTORY_BYTES: usize = 1024 * 1024;
 const MAX_REMOTE_PEER_PROCESSES: usize = 32;
 
+#[cfg(any(unix, test))]
 const MAX_PROCESS_INVENTORY_ENTRIES: usize = 16 * 1024;
+#[cfg(any(unix, test))]
 const MAX_PROCESS_COMMAND_BYTES: usize = 4 * 1024;
 
+#[cfg(any(unix, test))]
 fn take_process_inventory_field<'a>(line: &'a str, label: &str) -> Result<(&'a str, &'a str)> {
     // `ps` aligns columns with ordinary spaces. Do not normalize tabs, CR, or
     // other control characters into separators: hostile/control-bearing input
@@ -4269,6 +4381,7 @@ fn take_process_inventory_field<'a>(line: &'a str, label: &str) -> Result<(&'a s
     Ok((field, rest))
 }
 
+#[cfg(any(unix, test))]
 fn parse_process_inventory(text: &str) -> Result<Vec<(u32, u32, String)>> {
     if text.len() > MAX_PROCESS_INVENTORY_BYTES {
         bail!("process inventory exceeds its byte bound");
@@ -4313,9 +4426,6 @@ fn remote_peer_agent_dir(arguments: &[Vec<u8>]) -> Result<Option<PathBuf>> {
     if arguments.get(1).map(Vec::as_slice) != Some(b"remote-peer") {
         return Ok(None);
     }
-    use std::ffi::OsString;
-    use std::os::unix::ffi::OsStringExt as _;
-
     let mut agent_dir = None;
     let mut seen_flags = std::collections::BTreeSet::new();
     let mut index = 2;
@@ -4362,7 +4472,7 @@ fn remote_peer_agent_dir(arguments: &[Vec<u8>]) -> Result<Option<PathBuf>> {
             if agent_dir.is_some() {
                 bail!("remote-peer process has more than one --dir value");
             }
-            let path = PathBuf::from(OsString::from_vec(value.clone()));
+            let path = process_argument_path(value)?;
             if !hydra_agent::agent_dir::is_canonically_encoded_absolute_path(&path) {
                 bail!("remote-peer process has a non-canonical --dir value");
             }
@@ -4375,6 +4485,7 @@ fn remote_peer_agent_dir(arguments: &[Vec<u8>]) -> Result<Option<PathBuf>> {
         .ok_or_else(|| anyhow::anyhow!("remote-peer process omits --dir"))
 }
 
+#[cfg(unix)]
 fn remote_peer_inventory_once(
     agent_dirs: &std::collections::BTreeSet<PathBuf>,
 ) -> Result<std::collections::BTreeSet<u32>> {
@@ -4444,6 +4555,7 @@ fn remote_peer_inventory(
 const MAX_INSTALLED_SERVICE_DEFINITION_BYTES: usize = 128 * 1024;
 #[cfg(any(target_os = "linux", test))]
 const MAX_SYSTEMD_FRAGMENT_PATH_BYTES: usize = 16 * 1024;
+#[cfg(any(unix, test))]
 const MAX_MANAGER_ENVIRONMENT_BYTES: usize = 128 * 1024;
 
 #[cfg(any(target_os = "linux", test))]
@@ -4706,6 +4818,8 @@ impl SystemdReadinessTracker {
 
 #[derive(Default)]
 struct PlatformServiceReadinessTracker {
+    #[cfg(windows)]
+    windows: Option<std::sync::Arc<hydra_agent::windows_service::ProcessWitness>>,
     #[cfg(target_os = "macos")]
     launchd: LaunchdReadinessTracker,
     #[cfg(target_os = "linux")]
@@ -5561,6 +5675,7 @@ struct ManagerRuntimeEnvironment {
     binding_stamp: Option<String>,
 }
 
+#[cfg(any(unix, test))]
 fn parse_manager_runtime_environment(bytes: &[u8]) -> Result<ManagerRuntimeEnvironment> {
     if bytes.len() > MAX_MANAGER_ENVIRONMENT_BYTES {
         bail!("manager environment exceeded its size limit");
@@ -5607,6 +5722,7 @@ fn parse_manager_runtime_environment(bytes: &[u8]) -> Result<ManagerRuntimeEnvir
     })
 }
 
+#[cfg(unix)]
 fn manager_runtime_environment(pid: u32) -> Result<ManagerRuntimeEnvironment> {
     let snapshot = manager_process_snapshot(pid)?;
     parse_manager_runtime_environment(&snapshot.environment)
@@ -5626,6 +5742,7 @@ fn read_owned_service_definition(path: &std::path::Path) -> Result<Option<Vec<u8
     read_owned_service_definition_for_home(path, &home)
 }
 
+#[cfg(unix)]
 fn read_owned_service_definition_for_home(
     path: &std::path::Path,
     trusted_home: &std::path::Path,
@@ -5693,6 +5810,7 @@ fn require_fixed_systemd_home(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(any(unix, test))]
 struct ParsedGeneratedSupervisorArguments {
     invocation: RunningSupervisorInvocation,
     binary_path: String,
@@ -5708,14 +5826,19 @@ enum GeneratedServicePlatform {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(any(unix, test))]
 const LEGACY_028_LINUX_BUILD_STAMP: &str = "git=36d69db built=1786095258338";
 #[cfg(target_arch = "aarch64")]
 const LEGACY_028_LINUX_ARM64_BUILD_STAMP: &str = "git=36d69db built=1786095205145";
 #[cfg(any(target_os = "macos", test))]
 const LEGACY_028_MACOS_BUILD_STAMP: &str = "git=36d69db built=1786095177153";
+#[cfg(any(unix, test))]
 const LEGACY_028_ENVIRONMENT: &str = "production";
+#[cfg(any(unix, test))]
 const LEGACY_028_CLOUD_BASE: &str = "https://api.hydraterms.com";
+#[cfg(any(unix, test))]
 const LEGACY_028_CLOUD_PUBKEY: &str = "eKNpAYrE3JwA1btPJMtqQZ5ePDX6k/hPjBxZnTmoanM=";
+#[cfg(any(unix, test))]
 const LEGACY_028_ALLOWED_ORIGIN: &str = "https://app.hydraterms.com";
 
 #[cfg(any(target_os = "linux", test))]
@@ -6118,6 +6241,7 @@ fn render_allowlisted_launchd_definition(
     ))
 }
 
+#[cfg(any(unix, test))]
 fn require_exact_definition_line(
     lines: &[&str],
     index: &mut usize,
@@ -6131,6 +6255,7 @@ fn require_exact_definition_line(
     Ok(())
 }
 
+#[cfg(any(unix, test))]
 fn require_absolute_normalized_path(
     value: &str,
     name: &str,
@@ -6251,6 +6376,7 @@ fn canonical_systemd_arguments(arguments: &[Vec<u8>]) -> Result<String> {
     Ok(encoded.join(" "))
 }
 
+#[cfg(any(unix, test))]
 fn parse_exact_generated_supervisor_arguments(
     arguments: &[Vec<u8>],
 ) -> Result<ParsedGeneratedSupervisorArguments> {
@@ -6351,6 +6477,7 @@ fn parse_exact_generated_supervisor_arguments(
     })
 }
 
+#[cfg(any(unix, test))]
 fn validate_generated_service_generation(
     invocation: &RunningSupervisorInvocation,
     build_stamp: &str,
@@ -6500,6 +6627,11 @@ fn guard_disruptive_service_change(
             let _ = error;
             None
         }
+        #[cfg(windows)]
+        Err(error) if dormant_windows_replacement_is_safe(paths)? => {
+            let _ = error;
+            None
+        }
         Err(error) => return Err(error),
     };
     let Some(manager_pid) = manager_pid else {
@@ -6607,6 +6739,7 @@ fn dormant_attach_only_launchd_replacement_is_safe(
     ))
 }
 
+#[cfg(unix)]
 fn manager_absence(stderr: &str) -> bool {
     let detail = stderr.to_ascii_lowercase();
     detail.contains("could not find service")
@@ -6729,12 +6862,12 @@ fn launchctl_running_pid(output: &str) -> Option<u32> {
         .qualified_running_pid()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn platform_service_manager_pid(paths: &hydra_agent::service::ServicePaths) -> Result<Option<u32>> {
     systemd_user_unit_state(&paths.label)?.exact_running_or_absent()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn platform_service_manager_pid_for_readiness(
     paths: &hydra_agent::service::ServicePaths,
     tracker: &mut PlatformServiceReadinessTracker,
@@ -6749,9 +6882,10 @@ fn platform_service_manager_pid_for_readiness(
 /// active base; operator installs keep the platform default. Relative overrides are rejected
 /// because launchd/systemd services have no trustworthy working directory.
 fn service_app_support_dir(args: &[String], home: &std::path::Path) -> Result<PathBuf> {
-    let path = flag(args, "--app-support-dir")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| platform_maestro_app_support_dir(home));
+    let path = match flag(args, "--app-support-dir") {
+        Some(path) => PathBuf::from(path),
+        None => platform_maestro_app_support_dir(home)?,
+    };
     if !path.is_absolute() {
         bail!("--app-support-dir must be an absolute path");
     }
@@ -6760,6 +6894,7 @@ fn service_app_support_dir(args: &[String], home: &std::path::Path) -> Result<Pa
 
 // getuid via the C library — only used to default the launchctl `gui/<uid>` target. Overridable via --uid
 // (tests inject one), so no real syscall is exercised in unit tests.
+#[cfg(unix)]
 extern "C" {
     #[link_name = "getuid"]
     fn libc_getuid() -> u32;
@@ -6792,7 +6927,7 @@ fn platform_service_paths(
     hydra_agent::service::default_macos_paths(home, agent_dir, label, uid)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn platform_service_paths(
     home: &std::path::Path,
     agent_dir: &std::path::Path,
@@ -6809,6 +6944,7 @@ fn platform_service_paths(
 
 /// `$<var>` when set to an absolute path, else `<home>/<fallback>` — the XDG base-dir rule.
 #[cfg(not(target_os = "macos"))]
+#[cfg(unix)]
 fn xdg_dir(home: &std::path::Path, var: &str, fallback: &str) -> PathBuf {
     if let Some(dir) = std::env::var_os(var) {
         let p = PathBuf::from(dir);
@@ -6822,27 +6958,29 @@ fn xdg_dir(home: &std::path::Path, var: &str, fallback: &str) -> PathBuf {
 /// The desktop app-support base the installed service should read (daemon endpoint + kill
 /// switch). Mirrors the dev-mode base the desktop app currently publishes to on each platform.
 #[cfg(target_os = "macos")]
-fn platform_maestro_app_support_dir(home: &std::path::Path) -> PathBuf {
-    home.join("Library")
+fn platform_maestro_app_support_dir(home: &std::path::Path) -> Result<PathBuf> {
+    Ok(home
+        .join("Library")
         .join("Application Support")
-        .join("Maestro-dev")
+        .join("Maestro-dev"))
 }
 
-#[cfg(not(target_os = "macos"))]
-fn platform_maestro_app_support_dir(home: &std::path::Path) -> PathBuf {
-    xdg_dir(home, "XDG_DATA_HOME", ".local/share").join("maestro-dev")
+#[cfg(target_os = "linux")]
+fn platform_maestro_app_support_dir(home: &std::path::Path) -> Result<PathBuf> {
+    Ok(xdg_dir(home, "XDG_DATA_HOME", ".local/share").join("maestro-dev"))
 }
 
 #[cfg(target_os = "macos")]
-fn extension_maestro_app_support_dir(home: &std::path::Path) -> PathBuf {
-    home.join("Library")
+fn extension_maestro_app_support_dir(home: &std::path::Path) -> Result<PathBuf> {
+    Ok(home
+        .join("Library")
         .join("Application Support")
-        .join("Maestro-dev")
+        .join("Maestro-dev"))
 }
 
-#[cfg(not(target_os = "macos"))]
-fn extension_maestro_app_support_dir(home: &std::path::Path) -> PathBuf {
-    home.join(".local/share/maestro-dev")
+#[cfg(target_os = "linux")]
+fn extension_maestro_app_support_dir(home: &std::path::Path) -> Result<PathBuf> {
+    Ok(home.join(".local/share/maestro-dev"))
 }
 
 /// Extension-owned service paths ignore XDG/HOME process variables. The
@@ -6857,7 +6995,7 @@ fn extension_platform_service_paths(
     hydra_agent::service::default_macos_paths(home, agent_dir, label, uid)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn extension_platform_service_paths(
     home: &std::path::Path,
     agent_dir: &std::path::Path,
@@ -6872,10 +7010,11 @@ fn extension_platform_service_paths(
     )
 }
 
-fn reviewed_daemon_socket(app_support_dir: &std::path::Path) -> PathBuf {
+#[cfg(unix)]
+fn reviewed_daemon_socket(app_support_dir: &std::path::Path) -> Result<PathBuf> {
     let fallback = maestro_shell::default_socket_path(&|_: &str| None);
     let paths = maestro_shell::AppPaths::with_base(app_support_dir.to_path_buf());
-    match maestro_shell::load_endpoint(&paths) {
+    Ok(match maestro_shell::load_endpoint(&paths) {
         Ok(Some(endpoint)) => {
             let path = PathBuf::from(endpoint.socket_path);
             if path.is_absolute() && path.exists() {
@@ -6885,7 +7024,16 @@ fn reviewed_daemon_socket(app_support_dir: &std::path::Path) -> PathBuf {
             }
         }
         _ => fallback,
-    }
+    })
+}
+
+#[cfg(windows)]
+fn reviewed_daemon_socket(app_support_dir: &std::path::Path) -> Result<PathBuf> {
+    // Resolve the same published endpoint/default as the desktop. Pipe names are not disk
+    // files; the operational transport proves peer identity and availability on its own stream.
+    let paths = maestro_shell::AppPaths::with_base(app_support_dir.to_path_buf());
+    maestro_shell::resolve_socket_path(&paths, None, &|_: &str| None)
+        .context("resolve published Windows daemon endpoint")
 }
 
 /// Resolve the agent's daemon authority. A reviewed standalone daemon unit is the durable headless marker:
@@ -6948,12 +7096,14 @@ fn extension_daemon_target(
         }
     }
     let _ = (home, agent_dir, agent_binary);
-    Ok((reviewed_daemon_socket(app_support_dir), false))
+    Ok((reviewed_daemon_socket(app_support_dir)?, false))
 }
 
 struct PlatformInstallOptions<'a> {
+    #[cfg(unix)]
     home: &'a std::path::Path,
     app_support_dir: &'a std::path::Path,
+    #[cfg(unix)]
     label: &'a str,
     binary_path: String,
     socket_path: String,
@@ -6965,7 +7115,7 @@ struct PlatformInstallOptions<'a> {
 fn platform_plan_install(
     paths: &hydra_agent::service::ServicePaths,
     opts: PlatformInstallOptions<'_>,
-) -> hydra_agent::service::ServicePlan {
+) -> Result<hydra_agent::service::ServicePlan> {
     let _ = opts.fixed_external_daemon;
     let plist = hydra_agent::launchd::LaunchdPlistOptions {
         label: opts.label.to_string(),
@@ -6979,14 +7129,14 @@ fn platform_plan_install(
         home_dir: opts.home.to_string_lossy().into_owned(),
         maestro_app_support_dir: opts.app_support_dir.to_string_lossy().into_owned(),
     };
-    hydra_agent::service::plan_install(paths, &plist)
+    Ok(hydra_agent::service::plan_install(paths, &plist))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn platform_plan_install(
     paths: &hydra_agent::service::ServicePaths,
     opts: PlatformInstallOptions<'_>,
-) -> hydra_agent::service::ServicePlan {
+) -> Result<hydra_agent::service::ServicePlan> {
     let unit = hydra_agent::systemd::SystemdUnitOptions {
         unit_name: opts.label.to_string(),
         binary_path: opts.binary_path,
@@ -6998,7 +7148,7 @@ fn platform_plan_install(
         home_dir: opts.home.to_string_lossy().into_owned(),
         maestro_app_support_dir: opts.app_support_dir.to_string_lossy().into_owned(),
     };
-    hydra_agent::systemd::plan_install(paths, &unit)
+    Ok(hydra_agent::systemd::plan_install(paths, &unit))
 }
 
 #[cfg(target_os = "macos")]
@@ -7016,14 +7166,14 @@ fn platform_plan_start(
     hydra_agent::service::plan_start(paths)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn platform_plan_start(
     paths: &hydra_agent::service::ServicePaths,
 ) -> hydra_agent::service::ServicePlan {
     hydra_agent::systemd::plan_start(paths)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn platform_plan_uninstall(
     paths: &hydra_agent::service::ServicePaths,
     forget: bool,
@@ -7038,7 +7188,7 @@ fn platform_plan_status(
     hydra_agent::service::plan_status(paths)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn platform_plan_status(
     paths: &hydra_agent::service::ServicePaths,
 ) -> hydra_agent::service::ServicePlan {
@@ -7052,7 +7202,7 @@ fn platform_service_file(paths: &hydra_agent::service::ServicePaths) -> PathBuf 
     paths.plist_path()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn platform_service_file(paths: &hydra_agent::service::ServicePaths) -> PathBuf {
     hydra_agent::systemd::unit_path(paths)
 }
@@ -7202,6 +7352,7 @@ fn run_self_revoke(dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn hostname_fallback() -> Option<String> {
     let mut bytes = [0u8; 256];
     if unsafe { libc::gethostname(bytes.as_mut_ptr().cast(), bytes.len()) } != 0 {
@@ -7215,6 +7366,15 @@ fn hostname_fallback() -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+#[cfg(windows)]
+fn hostname_fallback() -> Option<String> {
+    // Display label only. Never use this inherited value as a user/process/daemon identity.
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
 }
 
 fn default_device_label() -> String {
@@ -7270,7 +7430,7 @@ fn resolve_desktop_daemon_sock_with_source(explicit: PathBuf) -> DaemonSocketRes
         match maestro_shell::load_endpoint(&paths) {
             Ok(Some(ep)) if !ep.socket_path.trim().is_empty() => {
                 let published = PathBuf::from(ep.socket_path);
-                if published.exists() {
+                if published_endpoint_is_candidate(&published) {
                     Some(published)
                 } else {
                     eprintln!(
@@ -7292,6 +7452,11 @@ fn resolve_desktop_daemon_sock_with_source(explicit: PathBuf) -> DaemonSocketRes
     if let Some(base) = std::env::var_os("MAESTRO_APP_SUPPORT_DIR") {
         bases.push(PathBuf::from(base));
     }
+    #[cfg(windows)]
+    if let Ok(paths) = maestro_shell::AppPaths::production() {
+        bases.push(paths.base().to_path_buf());
+    }
+    #[cfg(unix)]
     if let Some(home) = std::env::var_os("HOME") {
         let home = PathBuf::from(home);
         #[cfg(target_os = "macos")]
@@ -7323,6 +7488,20 @@ fn resolve_desktop_daemon_sock_with_source(explicit: PathBuf) -> DaemonSocketRes
     daemon_socket_resolution(explicit, None)
 }
 
+fn published_endpoint_is_candidate(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        path.exists()
+    }
+    #[cfg(windows)]
+    {
+        // Keep a published pipe authoritative even when busy/unavailable. Treating it as a
+        // missing filesystem path would authorize a second, unrelated standalone daemon.
+        // The authenticated connect rejects invalid/untrusted names without fallback.
+        !path.as_os_str().is_empty()
+    }
+}
+
 fn resolve_desktop_daemon_sock(explicit: PathBuf) -> PathBuf {
     resolve_desktop_daemon_sock_with_source(explicit).path
 }
@@ -7336,46 +7515,190 @@ fn now_ms() -> u64 {
 }
 
 #[cfg(test)]
+mod platform_endpoint_tests {
+    use super::*;
+
+    #[test]
+    fn process_argument_paths_preserve_unicode_without_lossy_conversion() {
+        let text = "folder/terminal-λ";
+        assert_eq!(
+            process_argument_path(text.as_bytes()).unwrap(),
+            PathBuf::from(text)
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            process_argument_path(&[0xff])
+                .unwrap()
+                .as_os_str()
+                .as_encoded_bytes(),
+            &[0xff]
+        );
+        #[cfg(windows)]
+        assert!(process_argument_path(&[0xff]).is_err());
+    }
+
+    #[test]
+    fn published_pipe_selection_does_not_use_disk_existence_as_windows_authority() {
+        let pipe = std::path::Path::new(r"\\.\pipe\Hydra.Maestro.endpoint-selection-fixture");
+        assert_eq!(published_endpoint_is_candidate(pipe), cfg!(windows));
+        assert!(!published_endpoint_is_candidate(std::path::Path::new("")));
+    }
+
+    #[test]
+    fn default_endpoint_uses_the_shared_platform_resolver() {
+        #[cfg(unix)]
+        assert_eq!(
+            default_daemon_socket().unwrap(),
+            maestro_shell::default_socket_path(&|key: &str| std::env::var(key).ok())
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            default_daemon_socket().unwrap(),
+            maestro_shell::windows_default_pipe_name().unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
 mod cli_contract_tests {
+    #[cfg(unix)]
     use super::{
-        capture_destructive_cleanup, classify_process_ps, cleanup_retired_authority_then_service,
-        close_remote_fail_closed, commit_filesystem_ack_before_lifecycle,
-        converge_connectivity_closed_for_enrollment, converge_service_upgrade_if_needed,
-        daemon_socket_resolution, dormant_launchd_pending_shape_is_safe,
-        dormant_launchd_replacement_shape_is_safe, drive_destructive_cleanup_with,
-        effective_remote_open, enrollment_lifecycle_failure, establish_extension_canonical_root,
-        execute_extension_request, execute_pending_local_cleanup_with,
-        extension_request_uses_lifecycle_preflight, failed_activation_cleanup_result,
-        finalize_extension_service_activation, finish_extension_service_rollback,
-        finish_failed_enrollment_activation, installed_systemd_supervisor_invocation,
-        installed_systemd_supervisor_invocation_for_home, launchctl_running_pid,
-        legacy_manager_change_is_safe, lifecycle_preflight_error_response,
-        lifecycle_status_with_convergence, migration_probe_response,
-        parse_generated_systemd_exec_start, parse_launchctl_job_state, parse_launchd_build_stamp,
-        parse_manager_runtime_environment, parse_nul_arguments, parse_process_inventory,
-        parse_supervisor_invocation, parse_systemd_build_stamp, parse_systemd_fragment_path,
-        parse_systemd_unit_state, peer_inventory_roots, prepare_connectivity_closed_for_enrollment,
-        prepare_forget_before_service_guard, process_is_live_exact, prove_exact_peer_stopped_with,
-        prove_peer_inventory_stopped_with, read_owned_service_definition,
+        capture_destructive_cleanup, converge_connectivity_closed_for_enrollment,
+        drive_destructive_cleanup_with, establish_extension_canonical_root,
+        execute_pending_local_cleanup_with, extension_request_uses_lifecycle_preflight,
+        installed_systemd_supervisor_invocation, installed_systemd_supervisor_invocation_for_home,
+        lifecycle_preflight_error_response, migration_probe_response,
+        prepare_connectivity_closed_for_enrollment, read_owned_service_definition,
         read_owned_service_definition_for_home, reconcile_proven_legacy_agent_dir_candidates,
+        retry_one_provider_revocation_with, ProviderRetryDisposition,
+    };
+    use super::{
+        classify_process_ps, cleanup_retired_authority_then_service, close_remote_fail_closed,
+        commit_filesystem_ack_before_lifecycle, converge_service_upgrade_if_needed,
+        daemon_socket_resolution, dormant_launchd_pending_shape_is_safe,
+        dormant_launchd_replacement_shape_is_safe, effective_remote_open,
+        enrollment_lifecycle_failure, execute_extension_request, failed_activation_cleanup_result,
+        finalize_extension_service_activation, finish_extension_service_rollback,
+        finish_failed_enrollment_activation, launchctl_running_pid, legacy_manager_change_is_safe,
+        lifecycle_status_with_convergence, parse_generated_systemd_exec_start,
+        parse_launchctl_job_state, parse_launchd_build_stamp, parse_manager_runtime_environment,
+        parse_nul_arguments, parse_process_inventory, parse_supervisor_invocation,
+        parse_systemd_build_stamp, parse_systemd_fragment_path, parse_systemd_unit_state,
+        peer_inventory_roots, prepare_forget_before_service_guard, process_is_live_exact,
+        prove_exact_peer_stopped_with, prove_peer_inventory_stopped_with,
         reconcile_proven_legacy_agent_dirs, remote_peer_agent_dir,
         remove_local_authority_before_cleanup, require_pre_mutation_manager_state,
-        require_pre_mutation_service_guard, required_systemd_fragment_invocation,
-        retry_one_provider_revocation_with, run_service_cmd, service_app_support_dir,
-        service_definition_entry_exists, service_upgrade_needed, supervise_standalone_flag,
-        supervisor_owns_daemon, supervisor_readiness_agent_dir, systemd_unit_state_proves_absent,
-        systemd_unit_state_uses_loaded_fragment, validate_closed_peer_inventory,
-        validate_expected_systemd_fragment, validate_extension_argv,
-        validate_single_peer_inventory, with_recaptured_lifecycle_state, CloseRemoteOutcome,
-        LaunchdJobState, LaunchdReadinessTracker, ProviderRetryDisposition,
-        ServiceActivationPriorState, SystemdReadinessTracker, SystemdUnitState,
-        MAX_PROCESS_COMMAND_BYTES, MAX_PROCESS_INVENTORY_BYTES, MAX_PROCESS_INVENTORY_ENTRIES,
-        SERVICE_USAGE,
+        require_pre_mutation_service_guard, required_systemd_fragment_invocation, run_service_cmd,
+        service_app_support_dir, service_definition_entry_exists, service_upgrade_needed,
+        supervise_standalone_flag, supervisor_owns_daemon, supervisor_readiness_agent_dir,
+        systemd_unit_state_proves_absent, systemd_unit_state_uses_loaded_fragment,
+        validate_closed_peer_inventory, validate_expected_systemd_fragment,
+        validate_extension_argv, validate_single_peer_inventory, with_recaptured_lifecycle_state,
+        CloseRemoteOutcome, LaunchdJobState, LaunchdReadinessTracker, ServiceActivationPriorState,
+        SystemdReadinessTracker, SystemdUnitState, MAX_PROCESS_COMMAND_BYTES,
+        MAX_PROCESS_INVENTORY_BYTES, MAX_PROCESS_INVENTORY_ENTRIES, SERVICE_USAGE,
     };
     #[cfg(target_os = "macos")]
     use super::{parse_macos_procargs2, parse_macos_procargs2_snapshot};
 
     const INSTALL_BINARY: &str = "/usr/local/bin/hydra-agent";
+
+    fn exact_child_test_name(name: &str) -> String {
+        // The service executable includes this file below `agent_cli`; libtest names omit only
+        // the crate segment, not that extra module. A zero-test child is not an isolated proof.
+        let (_, module) = module_path!().split_once("::").expect("test module path");
+        format!("{module}::{name}")
+    }
+
+    #[cfg(unix)]
+    const LAUNCHD_DEFINITION_PATH: &str = "/Users/test/Library/LaunchAgents/com.hydra.agent.plist";
+    #[cfg(windows)]
+    const LAUNCHD_DEFINITION_PATH: &str =
+        r"C:\Fixture\test\Library\LaunchAgents\com.hydra.agent.plist";
+
+    // Shared parsers validate paths using host Path semantics. Preserve every
+    // component (including deliberately invalid aliases) in native fixtures.
+    fn native_fixture_path(path: &str) -> String {
+        #[cfg(windows)]
+        if path.starts_with('/') {
+            return format!("C:{}", path.replace('/', "\\"));
+        }
+        path.to_owned()
+    }
+
+    fn native_fixture_arguments(bytes: &[u8]) -> Vec<Vec<u8>> {
+        parse_nul_arguments(bytes)
+            .into_iter()
+            .map(|arg| native_fixture_path(std::str::from_utf8(&arg).unwrap()).into_bytes())
+            .collect()
+    }
+
+    struct FixtureChild(std::process::Child);
+    impl std::ops::Deref for FixtureChild {
+        type Target = std::process::Child;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+    impl std::ops::DerefMut for FixtureChild {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+    impl Drop for FixtureChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    fn fixture_process(stay_alive: bool) -> FixtureChild {
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = std::process::Command::new("/bin/sh");
+            command.args(["-c", if stay_alive { "sleep 30" } else { "exit 0" }]);
+            command
+        };
+        #[cfg(windows)]
+        let mut command = {
+            use std::os::windows::process::CommandExt as _;
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.creation_flags(0x08000000);
+            command.args([
+                "--exact",
+                &exact_child_test_name("windows_lifecycle_child"),
+                "--ignored",
+            ]);
+            command.env(
+                "HYDRA_WINDOWS_LIFECYCLE_TEST_WAIT",
+                if stay_alive { "1" } else { "0" },
+            );
+            command
+        };
+        FixtureChild(
+            command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    }
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "bounded child fixture invoked by native lifecycle tests"]
+    fn windows_lifecycle_child() {
+        if std::env::var("HYDRA_WINDOWS_LIFECYCLE_TEST_WAIT").as_deref() == Ok("1") {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+    }
+
+    #[cfg(windows)]
+    fn secure_authority_test_dir(prefix: &str) -> tempfile::TempDir {
+        let root = tempfile::Builder::new().prefix(prefix).tempdir().unwrap();
+        super::windows_test_permissions::set_mode(root.path(), 0o700).unwrap();
+        maestro_shell::WindowsPrivateDirectory::open(root.path()).unwrap();
+        root
+    }
 
     #[cfg(unix)]
     fn secure_authority_test_dir(prefix: &str) -> tempfile::TempDir {
@@ -7416,7 +7739,7 @@ mod cli_contract_tests {
         format!(
             "gui/501/com.hydra.agent = {{\n\
              \tactive count = 0\n\
-             \tpath = /Users/test/Library/LaunchAgents/com.hydra.agent.plist\n\
+             \tpath = {LAUNCHD_DEFINITION_PATH}\n\
              \tstate = {state}\n\
              \tlast exit code = 0\n\
              \tresource coalition = {{\n\
@@ -7764,23 +8087,23 @@ mod cli_contract_tests {
                 .is_err()
         );
         assert!(parse_process_inventory(&"x".repeat(MAX_PROCESS_INVENTORY_BYTES + 1)).is_err());
-        let predecessor = parse_nul_arguments(
+        let predecessor = native_fixture_arguments(
             b"/opt/hydra/hydra-agent\0remote-peer\0--dir\0/home/test/.local/share/hydra-agent\0--sock\0/run/user/501/hydra.sock\0--environment\0production\0--expected-cloud\0https://api.example.invalid\0--cloud-pubkey\0synthetic\0--allowed-origin\0https://app.example.invalid\0--sessions\0one,two\0",
         );
         assert_eq!(
             remote_peer_agent_dir(&predecessor).unwrap(),
-            Some(std::path::PathBuf::from(
+            Some(std::path::PathBuf::from(native_fixture_path(
                 "/home/test/.local/share/hydra-agent"
-            ))
+            )))
         );
-        let headless = parse_nul_arguments(
+        let headless = native_fixture_arguments(
             b"/usr/bin/hydra-agent\0remote-peer\0--dir\0/home/test/.local/share/hydra-agent\0--sock\0/tmp/hydra-maestro-1000.sock\0--headless-server\0",
         );
         assert_eq!(
             remote_peer_agent_dir(&headless).unwrap(),
-            Some(std::path::PathBuf::from(
+            Some(std::path::PathBuf::from(native_fixture_path(
                 "/home/test/.local/share/hydra-agent"
-            ))
+            )))
         );
         let duplicate_headless = parse_nul_arguments(
             b"hydra-agent\0remote-peer\0--dir\0/one\0--sock\0/socket\0--headless-server\0--headless-server\0",
@@ -8232,15 +8555,17 @@ mod cli_contract_tests {
         // and its generated Linux unit carries this git value plus the exact
         // historical XDG --dir and retired trust argv represented below.
         const PUBLISHED_028_SOURCE: &str = "36d69db";
-        let canonical = std::path::Path::new("/home/test/.local/share/hydra-agent");
-        let legacy = std::path::Path::new("/home/test/.xdg-data/hydra-agent");
+        let canonical_path = native_fixture_path("/home/test/.local/share/hydra-agent");
+        let legacy_path = native_fixture_path("/home/test/.xdg-data/hydra-agent");
+        let canonical = std::path::Path::new(&canonical_path);
+        let legacy = std::path::Path::new(&legacy_path);
         let roots = peer_inventory_roots(canonical, Some(legacy)).unwrap();
         assert_eq!(
             roots,
             std::collections::BTreeSet::from([canonical.to_path_buf(), legacy.to_path_buf(),])
         );
 
-        let predecessor = parse_supervisor_invocation(&parse_nul_arguments(
+        let predecessor = parse_supervisor_invocation(&native_fixture_arguments(
             b"/opt/hydra/hydra-agent\0supervise\0--attach-daemon-only\0--dir\0/home/test/.xdg-data/hydra-agent\0--sock\0/run/user/501/hydra.sock\0--environment\0production\0--expected-cloud\0https://api.example.invalid\0--cloud-pubkey\0synthetic\0--allowed-origin\0https://app.example.invalid\0",
         ))
         .unwrap();
@@ -8322,18 +8647,12 @@ mod cli_contract_tests {
 
     #[test]
     fn platform_process_seam_distinguishes_exited_child_from_surviving_orphan() {
-        let mut exited = std::process::Command::new("/bin/sh")
-            .args(["-c", "exit 0"])
-            .spawn()
-            .unwrap();
+        let mut exited = fixture_process(false);
         let exited_pid = exited.id();
         exited.wait().unwrap();
         prove_exact_peer_stopped_with(exited_pid, 1, process_is_live_exact, || {}).unwrap();
 
-        let mut orphan = std::process::Command::new("/bin/sh")
-            .args(["-c", "sleep 30"])
-            .spawn()
-            .unwrap();
+        let mut orphan = fixture_process(true);
         let orphan_pid = orphan.id();
         assert!(process_is_live_exact(orphan_pid).unwrap());
         assert!(
@@ -8346,14 +8665,8 @@ mod cli_contract_tests {
 
     #[test]
     fn installed_predecessor_to_new_proof_retires_old_and_requires_one_new_peer() {
-        let mut old = std::process::Command::new("/bin/sh")
-            .args(["-c", "sleep 30"])
-            .spawn()
-            .unwrap();
-        let mut new = std::process::Command::new("/bin/sh")
-            .args(["-c", "sleep 30"])
-            .spawn()
-            .unwrap();
+        let mut old = fixture_process(true);
+        let mut new = fixture_process(true);
         let old_pid = old.id();
         let new_pid = new.id();
         old.kill().unwrap();
@@ -9399,6 +9712,29 @@ mod cli_contract_tests {
         let link = dir.join("hydra-agent.service");
         #[cfg(unix)]
         std::os::unix::fs::symlink(dir.join("missing-target"), &link).unwrap();
+        #[cfg(windows)]
+        {
+            // Directory junction creation does not require symlink privilege.
+            // Remove the target afterwards to exercise a real dangling reparse entry.
+            use std::os::windows::process::CommandExt as _;
+            std::fs::create_dir(dir.join("missing-target")).unwrap();
+            let output = std::process::Command::new("cmd.exe")
+                .creation_flags(0x08000000)
+                .args([
+                    "/D",
+                    "/C",
+                    "mklink",
+                    "/J",
+                    "hydra-agent.service",
+                    "missing-target",
+                ])
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "junction fixture: {:?}", output);
+            std::fs::remove_dir(dir.join("missing-target")).unwrap();
+            assert!(!link.exists());
+        }
         assert!(service_definition_entry_exists(&link).unwrap());
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -9758,7 +10094,9 @@ mod cli_contract_tests {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "cli_contract_tests::status_and_enroll_route_absent_root_through_safe_canonical_preflight",
+                    &exact_child_test_name(
+                        "status_and_enroll_route_absent_root_through_safe_canonical_preflight",
+                    ),
                     "--nocapture",
                 ])
                 .env(CHILD, "1")
@@ -9955,11 +10293,11 @@ mod cli_contract_tests {
             "service".to_string(),
             "install".to_string(),
             "--app-support-dir".to_string(),
-            "/tmp/Hydra QA/base".to_string(),
+            native_fixture_path("/tmp/Hydra QA/base"),
         ];
         assert_eq!(
             service_app_support_dir(&args, std::path::Path::new("/home/test")).unwrap(),
-            std::path::PathBuf::from("/tmp/Hydra QA/base")
+            std::path::PathBuf::from(native_fixture_path("/tmp/Hydra QA/base"))
         );
     }
 
@@ -10033,9 +10371,7 @@ mod cli_contract_tests {
             assert_eq!(state.pid, None);
             assert_eq!(
                 state.definition_path.as_deref(),
-                Some(std::path::Path::new(
-                    "/Users/test/Library/LaunchAgents/com.hydra.agent.plist"
-                ))
+                Some(std::path::Path::new(LAUNCHD_DEFINITION_PATH))
             );
         }
     }
@@ -10507,6 +10843,7 @@ ExecStart="/opt/Hydra Agent/hydra-agent" "supervise" "--attach-daemon-only" "--d
         assert_eq!(after.permissions().mode() & 0o777, 0o664);
     }
 
+    #[cfg(unix)]
     #[test]
     fn historical_systemd_fragment_recovers_old_xdg_config_service() {
         let root = tempfile::tempdir().unwrap();
@@ -10541,14 +10878,11 @@ ExecStart="/opt/Hydra Agent/hydra-agent" "supervise" "--attach-daemon-only" "--d
     #[test]
     fn systemd_fragment_path_parser_is_bounded_and_unambiguous() {
         assert_eq!(parse_systemd_fragment_path(b"\n").unwrap(), None);
+        let expected =
+            native_fixture_path("/home/test/home/.config/systemd/user/hydra-agent.service");
         assert_eq!(
-            parse_systemd_fragment_path(
-                b"/home/test/home/.config/systemd/user/hydra-agent.service\n"
-            )
-            .unwrap(),
-            Some(std::path::PathBuf::from(
-                "/home/test/home/.config/systemd/user/hydra-agent.service"
-            ))
+            parse_systemd_fragment_path(format!("{expected}\n").as_bytes()).unwrap(),
+            Some(std::path::PathBuf::from(expected))
         );
         for invalid in [
             b"relative/hydra-agent.service\n".as_slice(),
@@ -10573,15 +10907,14 @@ ExecStart="/opt/Hydra Agent/hydra-agent" "supervise" "--attach-daemon-only" "--d
 
     #[test]
     fn systemd_descriptor_state_is_named_bounded_and_exact() {
+        let fragment = native_fixture_path("/old/config/systemd/user/hydra-agent.service");
         let state = parse_systemd_unit_state(
-            b"FragmentPath=/old/config/systemd/user/hydra-agent.service\nDropInPaths=\nLoadState=loaded\nActiveState=failed\nUnitFileState=enabled\nMainPID=0\n",
+            format!("FragmentPath={fragment}\nDropInPaths=\nLoadState=loaded\nActiveState=failed\nUnitFileState=enabled\nMainPID=0\n").as_bytes(),
         )
         .unwrap();
         assert_eq!(
             state.fragment_path,
-            Some(std::path::PathBuf::from(
-                "/old/config/systemd/user/hydra-agent.service"
-            ))
+            Some(std::path::PathBuf::from(fragment))
         );
         assert_eq!(state.load_state, "loaded");
         assert_eq!(state.active_state, "failed");
@@ -10618,6 +10951,92 @@ ExecStart="/opt/Hydra Agent/hydra-agent" "supervise" "--attach-daemon-only" "--d
             unit_file_state: String::new(),
             main_pid: None,
         }
+    }
+
+    #[cfg(windows)]
+    fn windows_task_fixture(
+        root: &std::path::Path,
+    ) -> hydra_agent::windows_service::WindowsServiceOptions {
+        hydra_agent::windows_service::WindowsServiceOptions {
+            binary_path: root.join("hydra-agent.exe").to_string_lossy().into_owned(),
+            build_stamp: hydra_agent::build_stamp(),
+            binding_stamp: hydra_agent::supervise::service_binding_stamp(),
+            user_sid: hydra_agent::windows_service::current_user_sid().unwrap(),
+            agent_dir: root.to_path_buf(),
+            app_support_dir: root.join("desktop"),
+            socket_path: r"\\.\pipe\Hydra.Maestro.cli-definition-fixture".into(),
+            sessions: vec!["retained-fixture".into()],
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_task_definition_roundtrip_preserves_supervisor_provenance() {
+        let root = secure_authority_test_dir("hydra-windows-cli-definition-");
+        let options = windows_task_fixture(root.path());
+        let xml = hydra_agent::windows_service::generate_task_xml(&options).unwrap();
+        assert_eq!(
+            hydra_agent::windows_service::parse_task_xml(&xml).unwrap(),
+            options
+        );
+        let mut argv = vec![options.binary_path.as_bytes().to_vec()];
+        argv.extend(options.arguments().into_iter().map(String::into_bytes));
+        let invocation = parse_supervisor_invocation(&argv).unwrap();
+        assert!(invocation.attach_daemon_only);
+        assert!(!invocation.fixed_external_daemon);
+        assert_eq!(invocation.agent_dir.as_deref(), Some(root.path()));
+        assert_eq!(
+            invocation.socket_path,
+            std::path::PathBuf::from(&options.socket_path)
+        );
+        assert!(invocation.legacy_trust.is_none());
+        for (from, to) in [
+            ("LeastPrivilege", "HighestAvailable"),
+            ("--attach-daemon-only", "--own-daemon"),
+            (
+                "</Actions>",
+                "<Exec><Command>other.exe</Command></Exec></Actions>",
+            ),
+        ] {
+            let changed = xml.replacen(from, to, 1);
+            assert_ne!(changed, xml);
+            assert!(hydra_agent::windows_service::parse_task_xml(&changed).is_err());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn installed_native_task_uses_exact_private_definition_and_current_account() {
+        use std::io::Write as _;
+        let root = secure_authority_test_dir("hydra-windows-cli-installed-");
+        let options = windows_task_fixture(root.path());
+        let paths = hydra_agent::windows_service::default_paths(root.path(), &options.user_sid);
+        let private =
+            maestro_shell::WindowsPrivateDirectory::ensure(&paths.launch_agents_dir).unwrap();
+        let path = hydra_agent::windows_service::definition_path(&paths);
+        let xml = hydra_agent::windows_service::generate_task_xml(&options).unwrap();
+        let mut file = private.open_file(path.file_name().unwrap(), true).unwrap();
+        file.write_all(xml.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let descriptor = super::installed_windows_service_descriptor(&path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(descriptor.path, path);
+        assert_eq!(descriptor.bytes, xml.as_bytes());
+        assert_eq!(descriptor.build_stamp, options.build_stamp);
+        assert_eq!(
+            descriptor.invocation.unwrap().agent_dir.as_deref(),
+            Some(root.path())
+        );
+        let mut different_owner = options;
+        different_owner.user_sid = "S-1-5-21-111-222-333-9999".into();
+        std::fs::write(
+            &path,
+            hydra_agent::windows_service::generate_task_xml(&different_owner).unwrap(),
+        )
+        .unwrap();
+        assert!(super::installed_windows_service_descriptor(&path).is_err());
     }
 
     #[test]
@@ -10879,6 +11298,9 @@ ExecStart="/opt/Hydra Agent/hydra-agent" "supervise" "--attach-daemon-only" "--d
         .is_err());
     }
 
+    // These exact published cohorts are Unix service formats and fixed Unix paths;
+    // the native task tests above cover Windows definition/runtime provenance.
+    #[cfg(unix)]
     #[test]
     fn full_service_parsers_accept_only_current_or_exact_published_028_generations() {
         let current_systemd = current_systemd_definition();
@@ -10929,6 +11351,7 @@ ExecStart="/opt/Hydra Agent/hydra-agent" "supervise" "--attach-daemon-only" "--d
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn authority_migration_accepts_only_the_exact_fixed_028_service_owner() {
         let home = std::path::PathBuf::from("/home/test/home");
@@ -11148,14 +11571,14 @@ ExecStart="/opt/Hydra Agent/hydra-agent" "supervise" "--attach-daemon-only" "--d
             "opt/hydra/bin/hydra-agent",
         ] {
             assert!(super::require_absolute_normalized_path(
-                value,
+                &native_fixture_path(value),
                 "test path",
                 Some("hydra-agent")
             )
             .is_err());
         }
         assert!(super::require_absolute_normalized_path(
-            "/opt/hydra/bin/hydra-agent",
+            &native_fixture_path("/opt/hydra/bin/hydra-agent"),
             "test path",
             Some("hydra-agent")
         )
@@ -11197,8 +11620,9 @@ ExecStart="/opt/Hydra Agent/hydra-agent" "supervise" "--attach-daemon-only" "--d
 
     #[test]
     fn running_and_installed_legacy_provenance_must_agree() {
-        let canonical = std::path::Path::new("/home/test/home/.local/share/hydra-agent");
-        let legacy = std::path::PathBuf::from("/mnt/legacy/hydra-agent");
+        let canonical_path = native_fixture_path("/home/test/home/.local/share/hydra-agent");
+        let canonical = std::path::Path::new(&canonical_path);
+        let legacy = std::path::PathBuf::from(native_fixture_path("/mnt/legacy/hydra-agent"));
         assert_eq!(
             reconcile_proven_legacy_agent_dirs(
                 canonical,
@@ -11210,8 +11634,8 @@ ExecStart="/opt/Hydra Agent/hydra-agent" "supervise" "--attach-daemon-only" "--d
         );
         assert!(reconcile_proven_legacy_agent_dirs(
             canonical,
-            Some("/mnt/a/hydra-agent".into()),
-            Some("/mnt/b/hydra-agent".into())
+            Some(native_fixture_path("/mnt/a/hydra-agent").into()),
+            Some(native_fixture_path("/mnt/b/hydra-agent").into())
         )
         .is_err());
         assert_eq!(
@@ -11280,8 +11704,7 @@ ExecStart="/opt/Hydra Agent/hydra-agent" "supervise" "--attach-daemon-only" "--d
         let not_running =
             parse_launchctl_job_state(dormant_launchctl_job_fixture("not running").as_bytes())
                 .unwrap();
-        let installed =
-            std::path::Path::new("/Users/test/Library/LaunchAgents/com.hydra.agent.plist");
+        let installed = std::path::Path::new(LAUNCHD_DEFINITION_PATH);
         assert!(dormant_launchd_replacement_shape_is_safe(
             &not_running,
             true,

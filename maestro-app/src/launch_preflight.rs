@@ -20,13 +20,15 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
+#[cfg(unix)]
 use std::ffi::CString;
 use std::fmt;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 // Keep preflight and both local/remote PTY launch paths on one platform policy.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use maestro_local_services::LOGIN_SHELL_COMMAND_FLAGS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,7 +188,7 @@ impl LaunchPreflightError {
                     .to_string()
             }
             Self::MutationDaemonUnavailable => {
-                "Hydra cannot create a new session with the retained terminal service yet. Existing sessions are safe; finish them, restart Hydra, and try again."
+                "Hydra could not reach a compatible terminal service. Close and reopen this Hydra window, then retry. No new session was created."
                     .to_string()
             }
             Self::ProbeUnavailable(agent) => format!(
@@ -582,7 +584,11 @@ trait AgentExecutableProbe {
 struct LoginShellAgentProbe {
     login_shell: PathBuf,
     home: Option<PathBuf>,
+    #[cfg(windows)]
+    roaming_app_data: Option<std::ffi::OsString>,
     selected: RefCell<Option<maestro_shell::ProviderExecutable>>,
+    #[cfg(test)]
+    fixture_path: Option<std::ffi::OsString>,
 }
 
 impl maestro_shell::LaunchEnvLookup for LoginShellAgentProbe {
@@ -592,10 +598,22 @@ impl maestro_shell::LaunchEnvLookup for LoginShellAgentProbe {
     fn home_os(&self) -> Option<std::ffi::OsString> {
         self.home.as_ref().map(|home| home.as_os_str().to_owned())
     }
+    #[cfg(windows)]
+    fn roaming_app_data_os(&self) -> Option<std::ffi::OsString> {
+        self.roaming_app_data.clone()
+    }
     fn path_os(&self) -> Option<std::ffi::OsString> {
+        #[cfg(test)]
+        if let Some(path) = &self.fixture_path {
+            return Some(path.clone());
+        }
         std::env::var_os("PATH")
     }
     fn configured_provider_path(&self, provider: &str) -> Option<PathBuf> {
+        #[cfg(test)]
+        if self.fixture_path.is_some() {
+            return None;
+        }
         maestro_shell::provider_executable_override_variable(provider)
             .and_then(std::env::var_os)
             .map(PathBuf::from)
@@ -604,20 +622,21 @@ impl maestro_shell::LaunchEnvLookup for LoginShellAgentProbe {
 
 impl LoginShellAgentProbe {
     fn from_process_env() -> Self {
-        let login_shell = std::env::var_os("SHELL")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                if cfg!(target_os = "macos") {
-                    PathBuf::from("/bin/zsh")
-                } else {
-                    PathBuf::from("/bin/sh")
-                }
-            });
+        Self::from_launch_env(&maestro_shell::ProcessLaunchEnv)
+    }
+
+    fn from_launch_env(env: &impl maestro_shell::LaunchEnvLookup) -> Self {
         Self {
-            login_shell,
-            home: std::env::var_os("HOME").map(PathBuf::from),
+            // Match actual launch selection: USERPROFILE/COMSPEC on Windows, HOME/SHELL on
+            // Unix. A Windows GUI normally has no HOME; skipping its native home silently
+            // disabled the shared .local/bin, npm and OpenCode discovery roots.
+            login_shell: PathBuf::from(maestro_shell::login_shell_program(env)),
+            home: env.home_os().map(PathBuf::from),
+            #[cfg(windows)]
+            roaming_app_data: env.roaming_app_data_os(),
             selected: RefCell::new(None),
+            #[cfg(test)]
+            fixture_path: None,
         }
     }
 
@@ -644,14 +663,28 @@ impl LoginShellAgentProbe {
 /// accepting a mode bit that may belong only to another user/group. Shared with the actual OpenCode
 /// launch resolver so preflight and execution cannot disagree.
 pub(crate) fn is_executable_file(path: &Path) -> bool {
-    if !path.metadata().map(|meta| meta.is_file()).unwrap_or(false) {
-        return false;
+    #[cfg(windows)]
+    {
+        // Match the ConPTY native-command adapter: cmd/bat provider shims are executed with
+        // literal arguments by that adapter, never interpolated into dashboard-controlled text.
+        path.is_file()
+            && path.extension().is_some_and(|extension| {
+                ["exe", "com", "cmd", "bat"]
+                    .iter()
+                    .any(|allowed| extension.eq_ignore_ascii_case(allowed))
+            })
     }
-    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
-        return false;
-    };
-    // SAFETY: `path` is a live, NUL-terminated C string and `access` does not retain it.
-    unsafe { access(path.as_ptr(), X_OK) == 0 }
+    #[cfg(unix)]
+    {
+        if !path.metadata().map(|meta| meta.is_file()).unwrap_or(false) {
+            return false;
+        }
+        let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        // SAFETY: `path` is a live, NUL-terminated C string and `access` does not retain it.
+        unsafe { access(path.as_ptr(), X_OK) == 0 }
+    }
 }
 
 fn process_path_executable_in(
@@ -666,6 +699,15 @@ fn process_path_executable_in(
             cwd.join(entry)
         };
         let candidate = base.join(command);
+        #[cfg(windows)]
+        let candidate = if candidate.extension().is_none() {
+            ["exe", "com", "cmd", "bat"]
+                .iter()
+                .map(|extension| candidate.with_extension(extension))
+                .find(|path| is_executable_file(path))?
+        } else {
+            candidate
+        };
         // LaunchSpec argv is UTF-8. Never claim that an executable was prepared if its exact path
         // cannot be represented without a lossy conversion.
         (candidate.to_str().is_some() && is_executable_file(&candidate)).then_some(candidate)
@@ -677,8 +719,10 @@ fn process_path_executable(command: &str, cwd: &Path) -> Option<PathBuf> {
     process_path_executable_in(&path, command, cwd)
 }
 
+#[cfg(unix)]
 const X_OK: std::ffi::c_int = 1;
 
+#[cfg(unix)]
 unsafe extern "C" {
     fn access(path: *const std::ffi::c_char, mode: std::ffi::c_int) -> std::ffi::c_int;
     #[cfg(test)]
@@ -768,7 +812,9 @@ fn preflight_with(
         resolved_command,
         selected_agent,
         cwd,
-        std::env::var_os("HOME").as_deref().map(Path::new),
+        maestro_shell::LaunchEnvLookup::home_os(&maestro_shell::ProcessLaunchEnv)
+            .as_deref()
+            .map(Path::new),
         probe,
     )
 }
@@ -892,7 +938,9 @@ pub(crate) fn reprobe_selected_provider(
     reprobe_selected_provider_with_home(
         argv,
         selected,
-        std::env::var_os("HOME").as_deref().map(Path::new),
+        maestro_shell::LaunchEnvLookup::home_os(&maestro_shell::ProcessLaunchEnv)
+            .as_deref()
+            .map(Path::new),
     )
 }
 
@@ -950,20 +998,186 @@ pub(crate) fn reprobe_prepared_argv(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    fn write_executable(path: &Path) {
+        std::fs::write(
+            path,
+            if cfg!(windows) {
+                "@exit /b 0\r\n"
+            } else {
+                "#!/bin/sh\nexit 0\n"
+            },
+        )
+        .unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn native_executable(path: PathBuf) -> PathBuf {
+        if cfg!(windows) {
+            path.with_extension("cmd")
+        } else {
+            path
+        }
+    }
 
     struct StubProbe {
         available: bool,
     }
 
+    #[test]
+    fn preflight_snapshots_the_shared_launch_environment_without_new_defaults() {
+        struct Env {
+            shell: Option<String>,
+            home: Option<std::ffi::OsString>,
+        }
+        impl maestro_shell::LaunchEnvLookup for Env {
+            fn shell_utf8(&self) -> Option<String> {
+                self.shell.clone()
+            }
+            fn home_os(&self) -> Option<std::ffi::OsString> {
+                self.home.clone()
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let configured = Env {
+            shell: Some(home.path().join("selected shell").to_str().unwrap().into()),
+            home: Some(home.path().as_os_str().to_owned()),
+        };
+        let probe = LoginShellAgentProbe::from_launch_env(&configured);
+        assert_eq!(
+            probe.login_shell,
+            PathBuf::from(configured.shell.as_ref().unwrap())
+        );
+        assert_eq!(probe.home.as_deref(), Some(home.path()));
+        for shell in [None, Some(String::new()), Some("  ".into())] {
+            let env = Env { shell, home: None };
+            let probe = LoginShellAgentProbe::from_launch_env(&env);
+            assert_eq!(
+                probe.login_shell,
+                PathBuf::from(maestro_shell::login_shell_program(&env))
+            );
+            assert!(probe.home.is_none(), "no guessed home directory");
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn process_preflight_uses_userprofile_without_home() {
+        const CHILD_ROOT: &str = "HYDRA_PREFLIGHT_USERPROFILE_FIXTURE";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            assert!(std::env::var_os("HOME").is_none());
+            let probe = LoginShellAgentProbe::from_process_env();
+            assert_eq!(probe.home.as_deref(), Some(root.as_path()));
+            assert_eq!(
+                probe.login_shell,
+                PathBuf::from(std::env::var_os("COMSPEC").unwrap())
+            );
+            for (provider, folder) in [("claude", ".local"), ("opencode", ".opencode")] {
+                let prepared = prepare_with_provider(None, Some(provider), &root).unwrap();
+                let selected = prepared.provider_executable.unwrap();
+                let expected = root
+                    .join(folder)
+                    .join("bin")
+                    .join(format!("{provider}.cmd"));
+                assert_eq!(selected.path_for(provider), Some(expected.as_path()));
+                assert!(reprobe_selected_provider(&[provider.into()], &selected).is_ok());
+                if provider == "claude" {
+                    std::fs::remove_file(&expected).unwrap();
+                    std::fs::create_dir_all(root.join(".claude").join("projects")).unwrap();
+                    assert_eq!(
+                        reprobe_selected_provider(&[provider.into()], &selected).unwrap_err(),
+                        LaunchPreflightError::MissingWithHistoryStore(
+                            SupportedAgentExecutable::Claude
+                        )
+                    );
+                }
+            }
+            let selected = prepare_with_provider(None, Some("codex"), &root)
+                .unwrap()
+                .provider_executable
+                .unwrap();
+            assert_eq!(
+                selected.path_for("codex"),
+                Some(
+                    root.join("redirected roaming")
+                        .join("npm")
+                        .join("codex.cmd")
+                        .as_path()
+                )
+            );
+            return;
+        }
+        use std::os::windows::process::CommandExt as _;
+        use std::process::{Command, Stdio};
+        let root = tempfile::tempdir().unwrap();
+        let empty_path = root.path().join("empty-path");
+        std::fs::create_dir(&empty_path).unwrap();
+        for (provider, folder) in [("claude", ".local"), ("opencode", ".opencode")] {
+            let bin = root.path().join(folder).join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            write_executable(&bin.join(format!("{provider}.cmd")));
+        }
+        let roaming = root.path().join("redirected roaming");
+        std::fs::create_dir_all(roaming.join("npm")).unwrap();
+        write_executable(&roaming.join("npm").join("codex.cmd"));
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "launch_preflight::tests::process_preflight_uses_userprofile_without_home",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, root.path())
+            .env("USERPROFILE", root.path())
+            .env("APPDATA", &roaming)
+            .env("PATH", empty_path)
+            .env_remove("HOME")
+            .env("COMSPEC", root.path().join("configured-command-shell.exe"))
+            .env("SHELL", "/ignored/posix/shell")
+            .env_remove("HYDRA_PROVIDER_CLAUDE_EXECUTABLE")
+            .env_remove("HYDRA_PROVIDER_OPENCODE_EXECUTABLE")
+            .env_remove("HYDRA_PROVIDER_CODEX_EXECUTABLE")
+            .creation_flags(0x08000000)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("owned native preflight fixture exceeded deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "native preflight fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn missing_binary_probe(home: &Path) -> LoginShellAgentProbe {
         let login_shell = home.join("missing-provider-shell");
         std::fs::write(&login_shell, "#!/bin/sh\nexit 1\n").unwrap();
+        #[cfg(unix)]
         std::fs::set_permissions(&login_shell, std::fs::Permissions::from_mode(0o700)).unwrap();
         LoginShellAgentProbe {
             login_shell,
             home: Some(home.to_path_buf()),
+            #[cfg(windows)]
+            roaming_app_data: None,
             selected: RefCell::new(None),
+            fixture_path: Some(home.join("empty-fixture-path").into_os_string()),
         }
     }
 
@@ -1006,7 +1220,10 @@ mod tests {
     #[test]
     fn history_presence_enriches_known_direct_paths_but_not_custom_cwd_or_probe_errors() {
         let root = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
         let mut probe = missing_binary_probe(root.path());
+        #[cfg(windows)]
+        let probe = missing_binary_probe(root.path());
         std::fs::create_dir_all(root.path().join(".claude/projects")).unwrap();
         let direct = root.path().join("claude");
         assert_eq!(
@@ -1041,13 +1258,18 @@ mod tests {
             ),
             Err(LaunchPreflightError::InvalidWorkingDirectory)
         );
-        probe.login_shell = root.path().join("missing-shell");
-        assert_eq!(
-            preflight_with_home(Some("claude"), None, root.path(), Some(root.path()), &probe),
-            Err(LaunchPreflightError::ProbeUnavailable(
-                SupportedAgentExecutable::Claude
-            ))
-        );
+        // Only Unix discovery invokes a login shell. Native Windows discovery deliberately does
+        // not depend on shell availability; its deterministic empty PATH remains a missing tool.
+        #[cfg(unix)]
+        {
+            probe.login_shell = root.path().join("missing-shell");
+            assert_eq!(
+                preflight_with_home(Some("claude"), None, root.path(), Some(root.path()), &probe),
+                Err(LaunchPreflightError::ProbeUnavailable(
+                    SupportedAgentExecutable::Claude
+                ))
+            );
+        }
     }
 
     #[test]
@@ -1089,6 +1311,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn canonical_probe_uses_the_shared_login_shell_mode() {
         let root = tempfile::tempdir().unwrap();
         let fake_shell = root.path().join("fake-shell");
@@ -1105,6 +1328,7 @@ mod tests {
             login_shell: fake_shell,
             home: Some(root.path().to_path_buf()),
             selected: RefCell::new(None),
+            fixture_path: Some(root.path().into()),
         };
         assert!(probe
             .login_shell_has(SupportedAgentExecutable::Codex, root.path())
@@ -1118,10 +1342,9 @@ mod tests {
     #[test]
     fn known_root_preparation_keeps_provider_grammar_and_selected_executable_separate() {
         let root = tempfile::tempdir().unwrap();
-        let executable = root.path().join(".local/bin/claude");
+        let executable = native_executable(root.path().join(".local/bin/claude"));
         std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
-        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_executable(&executable);
         let prepared = prepare_with_probe(
             Some("claude --resume owned-conversation"),
             Some("claude"),
@@ -1149,6 +1372,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn login_shell_mode_matches_the_qualified_platform_policy() {
         assert_eq!(LOGIN_SHELL_COMMAND_FLAGS, "-lic");
     }
@@ -1160,7 +1384,34 @@ mod tests {
     }
 
     fn cwd() -> &'static Path {
-        Path::new("/tmp")
+        #[cfg(unix)]
+        return Path::new("/tmp");
+        #[cfg(windows)]
+        {
+            static CWD: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+            CWD.get_or_init(std::env::temp_dir).as_path()
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn native_direct_path_checks_supported_files_not_directories_or_unknown_formats() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["tool.exe", "tool.COM", "tool.cmd", "tool.BAT"] {
+            let path = root.path().join(name);
+            write_executable(&path);
+            assert!(is_executable_file(&path), "native executable suffix {name}");
+            std::fs::remove_file(&path).unwrap();
+            assert!(!is_executable_file(&path));
+            std::fs::create_dir(&path).unwrap();
+            assert!(
+                !is_executable_file(&path),
+                "directory is never an executable"
+            );
+        }
+        let text = root.path().join("tool.txt");
+        write_executable(&text);
+        assert!(!is_executable_file(&text));
     }
 
     #[test]
@@ -1494,6 +1745,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn direct_path_check_uses_current_user_execute_access() {
         let dir = tempfile::tempdir().unwrap();
         let executable = dir.path().join("claude");
@@ -1515,7 +1767,8 @@ mod tests {
 
     #[test]
     fn custom_command_probe_uses_exec_path_and_never_shell_syntax() {
-        assert!(process_path_executable("sh", cwd()).is_some());
+        let command = if cfg!(windows) { "cmd.exe" } else { "sh" };
+        assert!(process_path_executable(command, cwd()).is_some());
         assert!(process_path_executable("sh; touch /tmp/nope", cwd()).is_none());
     }
 
@@ -1524,11 +1777,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let bin = root.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
-        let relative = bin.join("relative-wrapper");
-        let empty = root.path().join("cwd-wrapper");
+        let relative = native_executable(bin.join("relative-wrapper"));
+        let empty = native_executable(root.path().join("cwd-wrapper"));
         for executable in [&relative, &empty] {
-            std::fs::write(executable, b"#!/bin/sh\nexit 0\n").unwrap();
-            std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            write_executable(executable);
         }
 
         assert_eq!(
@@ -1540,7 +1792,11 @@ mod tests {
             Some(relative)
         );
         assert_eq!(
-            process_path_executable_in(std::ffi::OsStr::new(":"), "cwd-wrapper", root.path()),
+            process_path_executable_in(
+                std::ffi::OsStr::new(if cfg!(windows) { ";" } else { ":" }),
+                "cwd-wrapper",
+                root.path()
+            ),
             Some(empty)
         );
         assert!(process_path_executable_in(
@@ -1613,7 +1869,7 @@ mod tests {
             target_for(Some("'./claude' --resume abc"), Some("claude"), cwd()).unwrap(),
             Some(ProbeTarget::DirectPath {
                 agent: SupportedAgentExecutable::Claude,
-                path: PathBuf::from("/tmp/./claude"),
+                path: cwd().join("./claude"),
             })
         );
     }
@@ -1621,11 +1877,14 @@ mod tests {
     #[test]
     fn prepared_direct_command_records_the_absolute_checked_identity() {
         let root = tempfile::tempdir().unwrap();
-        let executable = root.path().join("custom-wrapper");
-        std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = native_executable(root.path().join("custom-wrapper"));
+        write_executable(&executable);
 
-        let prepared = prepare(Some("./custom-wrapper --flag"), Some("claude"), root.path())
+        let command = format!(
+            "./{} --flag",
+            executable.file_name().unwrap().to_str().unwrap()
+        );
+        let prepared = prepare(Some(&command), Some("claude"), root.path())
             .expect("direct executable should prepare")
             .expect("explicit argv");
         assert_eq!(
@@ -1634,6 +1893,16 @@ mod tests {
         );
         assert_eq!(prepared[1], "--flag");
         assert!(Path::new(&prepared[0]).is_absolute());
+    }
+
+    #[test]
+    fn unavailable_daemon_message_does_not_claim_existing_sessions_survived() {
+        let error = LaunchPreflightError::MutationDaemonUnavailable;
+        assert_eq!(error.code(), "daemon_mutation_unavailable");
+        assert_eq!(
+            error.user_message(),
+            "Hydra could not reach a compatible terminal service. Close and reopen this Hydra window, then retry. No new session was created."
+        );
     }
 
     #[test]

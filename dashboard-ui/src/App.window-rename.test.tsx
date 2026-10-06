@@ -41,7 +41,11 @@ async function mount(): Promise<void> {
     renderer = create(<App />, {
       createNodeMock: (element) => element.type === 'input' ? inputNode
         : element.type === 'button' ? { focus: buttonFocus }
-        : { contains: (node: unknown) => node === inputNode },
+        : {
+          contains: (node: unknown) => node === inputNode,
+          scrollLeft: 0,
+          getBoundingClientRect: () => ({ left: 0, right: 800 }),
+        },
     })
     await Promise.resolve()
   })

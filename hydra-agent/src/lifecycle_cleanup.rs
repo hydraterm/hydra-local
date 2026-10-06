@@ -5,15 +5,24 @@
 //! so existing 0.2.8 agent roots (which can be 0755) remain compatible while a
 //! crash after authority is cut cannot erase the facts needed to finish exact,
 //! idempotent cleanup.
+//!
+//! Unix checkpoints fsync the parent directory. Windows checkpoints instead combine exact
+//! handle-bound disposition, observed namespace readback under pinned private ownership, and
+//! flushed atomic journal-file publication. The existing journal is retained until observations
+//! complete; Windows does not claim Unix directory-fsync or sudden-power-loss equivalence.
 
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
+use std::fs;
+#[cfg(unix)]
+use std::fs::OpenOptions;
+#[cfg(unix)]
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
+#[cfg(any(unix, test))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const DIRECTORY_NAME: &str = "lifecycle-recovery";
@@ -32,6 +41,7 @@ const MAX_ENROLLMENT_DIAGNOSTIC_DELETION_TARGETS: usize = 2;
 const MAX_DELETION_TARGETS: usize =
     MAX_PRE_DIAGNOSTIC_DELETION_TARGETS + MAX_ENROLLMENT_DIAGNOSTIC_DELETION_TARGETS;
 const MAX_DESIRED_UNIT_BYTES: usize = 32 * 1024;
+#[cfg(any(unix, test))]
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -530,7 +540,6 @@ impl ExactFileEvidence {
         if self.owner_uid != expected_uid() {
             bail!("lifecycle file evidence has an unexpected owner");
         }
-        #[cfg(unix)]
         if self.inode == 0 {
             bail!("lifecycle file evidence has an invalid inode");
         }
@@ -567,8 +576,9 @@ impl ExactFileEvidence {
 
 /// Durable proof that one authority-bearing file was absent while the exact
 /// lifecycle lock set was held. The parent directory is synced between two
-/// NotFound observations, so this is evidence of a durable absence rather than
-/// an unchecked caller assertion.
+/// NotFound observations on Unix. Windows uses two observations under a verified private parent,
+/// with the platform persistence distinction documented at the module boundary. The serialized
+/// name remains unchanged; neither platform accepts an unchecked caller assertion.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DurableFileAbsence {
@@ -764,9 +774,9 @@ fn captured_file_state(evidence: &ExactFileEvidence) -> Result<CapturedFileState
     Ok(CapturedFileState::Superseded)
 }
 
-/// Remove one exact observed lifecycle file and make the absence durable.
-/// Even AlreadyAbsent syncs the real parent directory before readback, which
-/// closes the power-loss case where an earlier unlink had not been persisted.
+/// Remove one exact observed lifecycle file and checkpoint its absence. On Unix even AlreadyAbsent
+/// fsyncs the real parent. Windows uses exact-handle disposition and namespace readback, with its
+/// recovery journal retained across errors; it does not equate this to a directory persistence flush.
 fn remove_exact_file_durably(
     evidence: &ExactFileEvidence,
     locks: &crate::service::LifecycleLockSet,
@@ -784,7 +794,7 @@ fn remove_exact_file_durably(
         // The captured file had nlink=1, so a different inode at its only path
         // proves that exact file is gone. Sync the directory and observe again
         // before journaling completion. The replacement is not ours to delete.
-        sync_directory(parent).context("sync superseding service definition parent")?;
+        checkpoint_namespace(parent).context("checkpoint superseding service definition parent")?;
         return match captured_file_state(evidence)? {
             CapturedFileState::Absent | CapturedFileState::Superseded => {
                 Ok(DurableRemovalOutcome::Superseded)
@@ -794,11 +804,26 @@ fn remove_exact_file_durably(
             }
         };
     }
+    #[cfg(unix)]
+    let remove = |target: &Path| fs::remove_file(target).context("remove exact lifecycle file");
+    #[cfg(windows)]
+    let remove = |target: &Path| {
+        crate::windows_private_authority::remove(
+            target,
+            Some(crate::windows_private_authority::Identity {
+                volume: evidence.device,
+                file_index: evidence.inode,
+            }),
+        )
+        .context("remove exact Windows lifecycle file")
+    };
     remove_exact_file_durably_with(
         evidence,
         locks,
-        |target| fs::remove_file(target).context("remove exact lifecycle file"),
-        |parent| sync_directory(parent).context("sync lifecycle file parent after removal"),
+        remove,
+        |parent| {
+            checkpoint_namespace(parent).context("checkpoint lifecycle file parent after removal")
+        },
         prove_path_absent,
     )
 }
@@ -863,8 +888,8 @@ fn prove_path_absent_durably(target: &Path) -> Result<bool> {
     if !prove_path_absent(target)? {
         return Ok(false);
     }
-    sync_directory(parent).context("sync lifecycle absence parent")?;
-    prove_path_absent(target).context("repeat lifecycle absence readback after parent sync")
+    checkpoint_namespace(parent).context("checkpoint lifecycle absence parent")?;
+    prove_path_absent(target).context("repeat lifecycle absence readback after parent checkpoint")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2153,8 +2178,9 @@ pub fn complete_revocation(
     if outbox.targets.is_empty() {
         let target = revocation_outbox_path(agent_dir);
         if read_private_regular_if_present(&target, MAX_FILE_BYTES)?.is_some() {
-            fs::remove_file(&target).context("remove empty provider revocation outbox")?;
-            sync_directory(&recovery)?;
+            remove_private_lifecycle_file(&target)
+                .context("remove empty provider revocation outbox")?;
+            checkpoint_namespace(&recovery)?;
         }
         match fs::symlink_metadata(&target) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2658,6 +2684,7 @@ pub fn clear(
         if !current.all_deletions_proven() {
             bail!("cleanup journal still has unproven deletion targets");
         }
+        #[cfg(unix)]
         current.prove_service_definitions_retired(locks)?;
         if matches!(
             current.intent,
@@ -2672,8 +2699,13 @@ pub fn clear(
         {
             bail!("FullForget cannot clear before provider, outbox, and key completion");
         }
-        fs::remove_file(&target).context("remove completed cleanup tombstone")?;
-        sync_directory(&recovery).context("sync completed cleanup removal")?;
+        #[cfg(windows)]
+        {
+            recheck_completed_windows_deletions(&current, locks)?;
+            current.prove_service_definitions_retired(locks)?;
+        }
+        remove_private_lifecycle_file(&target).context("remove completed cleanup tombstone")?;
+        checkpoint_namespace(&recovery).context("checkpoint completed cleanup removal")?;
     }
     match fs::symlink_metadata(&target) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2683,6 +2715,31 @@ pub fn clear(
     remove_recovery_dir_if_empty(agent_dir)
 }
 
+#[cfg(windows)]
+fn recheck_completed_windows_deletions(
+    current: &CleanupTombstone,
+    locks: &crate::service::LifecycleLockSet,
+) -> Result<()> {
+    // A completed flag is not a power-loss namespace promise on Windows. Before discarding the
+    // retained journal, observe every exact target again and retire only its captured identity.
+    // A replacement is preserved (or a safe superseding service definition is accepted).
+    let mut planned: Vec<_> = current.deletion_targets.values().collect();
+    planned.sort_by_key(|target| match target.evidence.kind {
+        LifecycleFileKind::CanonicalOwnerMarker => 3,
+        LifecycleFileKind::CanonicalStableKey => 2,
+        LifecycleFileKind::AdoptionMarker => 1,
+        _ => 0,
+    });
+    for target in planned {
+        if !target.proven_absent {
+            bail!("cleanup still has unproven Windows deletion targets");
+        }
+        remove_exact_file_durably(&target.evidence, locks)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn remove_recovery_dir_if_empty(agent_dir: &Path) -> Result<()> {
     let recovery = recovery_dir(agent_dir);
     match fs::remove_dir(&recovery) {
@@ -2690,6 +2747,30 @@ fn remove_recovery_dir_if_empty(agent_dir: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
         Err(error) => Err(error).context("remove lifecycle recovery directory"),
+    }
+}
+
+#[cfg(windows)]
+fn remove_recovery_dir_if_empty(agent_dir: &Path) -> Result<()> {
+    let directory = maestro_shell::WindowsPrivateDirectory::open(agent_dir)?;
+    if directory.remove_empty_child(std::ffi::OsStr::new(DIRECTORY_NAME))? {
+        checkpoint_namespace(agent_dir)?;
+    }
+    Ok(())
+}
+
+fn remove_private_lifecycle_file(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        fs::remove_file(path).context("remove private lifecycle file")
+    }
+    #[cfg(windows)]
+    {
+        let file = crate::windows_private_authority::open(path, false)?;
+        let identity = maestro_shell::WindowsPrivateDirectory::validate_file(&file)?;
+        drop(file);
+        crate::windows_private_authority::remove(path, Some(identity))
+            .context("remove exact private lifecycle file")
     }
 }
 
@@ -2716,10 +2797,10 @@ fn remove_stale_temporaries(recovery: &Path) -> Result<()> {
         if read_private_regular_if_present(&entry.path(), MAX_FILE_BYTES)?.is_none() {
             bail!("stale lifecycle temporary vanished ambiguously");
         }
-        fs::remove_file(entry.path()).context("remove stale lifecycle temporary")?;
+        remove_private_lifecycle_file(&entry.path()).context("remove stale lifecycle temporary")?;
     }
     if count > 0 {
-        sync_directory(recovery).context("sync stale lifecycle temporary cleanup")?;
+        checkpoint_namespace(recovery).context("checkpoint stale lifecycle temporary cleanup")?;
     }
     Ok(())
 }
@@ -2942,39 +3023,35 @@ fn sync_directory(dir: &Path) -> Result<()> {
         .context("sync directory")
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn require_agent_parent(dir: &Path) -> Result<()> {
-    if dir.is_absolute() && dir.is_dir() {
-        Ok(())
-    } else {
-        bail!("agent directory is unavailable")
-    }
+    maestro_shell::WindowsPrivateDirectory::open(dir)
+        .map(|_| ())
+        .context("inspect private agent directory")
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn ensure_private_directory(dir: &Path) -> Result<()> {
-    fs::create_dir(dir).context("create lifecycle recovery directory")
+    maestro_shell::WindowsPrivateDirectory::ensure(dir)
+        .map(|_| ())
+        .context("create private lifecycle recovery directory")
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn require_private_directory(dir: &Path) -> Result<()> {
-    if dir.is_dir() {
-        Ok(())
-    } else {
-        bail!("lifecycle recovery directory is unavailable")
-    }
+    maestro_shell::WindowsPrivateDirectory::open(dir)
+        .map(|_| ())
+        .context("inspect private lifecycle recovery directory")
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn require_owned_safe_directory(dir: &Path) -> Result<()> {
-    if dir.is_dir() {
-        Ok(())
-    } else {
-        bail!("lifecycle file parent is unavailable")
-    }
+    maestro_shell::WindowsPrivateDirectory::open(dir)
+        .map(|_| ())
+        .context("inspect private lifecycle parent directory")
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 struct ExactRegularFile {
     bytes: Vec<u8>,
     mode: u32,
@@ -2983,57 +3060,93 @@ struct ExactRegularFile {
     inode: u64,
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn read_exact_owned_regular_if_present(
     path: &Path,
     max: usize,
 ) -> Result<Option<ExactRegularFile>> {
-    let Some(bytes) = read_private_regular_if_present(path, max)? else {
-        return Ok(None);
+    let (bytes, identity) = match crate::windows_private_authority::read(path, max) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("read exact private lifecycle file"),
     };
     Ok(Some(ExactRegularFile {
         bytes,
         mode: 0o600,
         owner_uid: expected_uid(),
-        device: 0,
-        inode: 0,
+        device: identity.volume,
+        inode: identity.file_index,
     }))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn read_private_regular_if_present(path: &Path, max: usize) -> Result<Option<Vec<u8>>> {
-    let mut file = match fs::File::open(path) {
-        Ok(file) => file,
+    match crate::windows_private_authority::read(path, max) {
+        Ok((bytes, _)) => Ok(Some(bytes)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).context("open cleanup tombstone"),
-    };
-    let mut bytes = Vec::new();
-    std::io::Read::by_ref(&mut file)
-        .take((max + 1) as u64)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > max {
-        bail!("cleanup tombstone exceeds its byte bound");
+        Err(error) => Err(error).context("read private lifecycle record"),
     }
-    Ok(Some(bytes))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn atomic_replace_private(dir: &Path, target: &Path, bytes: &[u8]) -> Result<()> {
     remove_stale_temporaries(dir)?;
-    let temporary = dir.join(format!(".{FILE_NAME}.{}.tmp", std::process::id()));
-    fs::write(&temporary, bytes)?;
-    fs::rename(&temporary, target)?;
-    Ok(())
+    crate::windows_private_authority::publish(target, bytes, true)
+        .context("publish private lifecycle record")
 }
 
-#[cfg(not(unix))]
-fn sync_directory(_dir: &Path) -> Result<()> {
-    Ok(())
+/// Platform checkpoint, deliberately not named a Windows directory sync. The journal/file
+/// mutations themselves flush their writable file handles; this step revalidates the observed
+/// private namespace before its required second readback. Unix keeps the original fsync barrier.
+fn checkpoint_namespace(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        sync_directory(dir)
+    }
+    #[cfg(windows)]
+    {
+        let held = maestro_shell::WindowsPrivateDirectory::open(dir)?;
+        let identity = held.identity()?;
+        let named = maestro_shell::WindowsPrivateDirectory::open(dir)?;
+        if named.identity()? != identity {
+            bail!("lifecycle checkpoint parent was replaced");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn expected_uid() -> u32 {
+    // Compatibility field only: every Windows observation independently proves the current
+    // process SID and protected private DACL, plus volume/file identity, on its open handle.
+    crate::agent_dir::trusted_uid()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn recovery_directory_noops_and_exact_empty_removal_work_on_windows() {
+        let temp = tempfile::tempdir().unwrap();
+        let agent = temp.path().join("private-agent");
+        let _root = maestro_shell::WindowsPrivateDirectory::ensure(&agent).unwrap();
+        let recovery = recovery_dir(&agent);
+        remove_recovery_dir_if_empty(&agent).unwrap();
+        assert!(!recovery.exists());
+        std::fs::create_dir(&recovery).unwrap();
+        std::fs::write(recovery.join("retained"), b"preserve").unwrap();
+        remove_recovery_dir_if_empty(&agent).unwrap();
+        assert_eq!(
+            std::fs::read(recovery.join("retained")).unwrap(),
+            b"preserve"
+        );
+        std::fs::remove_file(recovery.join("retained")).unwrap();
+        remove_recovery_dir_if_empty(&agent).unwrap();
+        assert!(!recovery.exists());
+        remove_recovery_dir_if_empty(&agent).unwrap();
+    }
 
     #[test]
     fn deletion_target_bound_includes_the_full_max_shape_and_two_diagnostics() {
@@ -3484,7 +3597,7 @@ mod tests {
                 |_| bail!("remove callback must not run for an absent target"),
                 |parent| {
                     parent_synced = true;
-                    sync_directory(parent)
+                    checkpoint_namespace(parent)
                 },
                 prove_path_absent,
             )
@@ -3582,7 +3695,7 @@ mod tests {
         fs::write(&replacement, b"new package service unit").unwrap();
         fs::set_permissions(&replacement, fs::Permissions::from_mode(0o644)).unwrap();
         fs::rename(&replacement, &unit).unwrap();
-        sync_directory(unit.parent().unwrap()).unwrap();
+        checkpoint_namespace(unit.parent().unwrap()).unwrap();
 
         let completed = execute_planned_deletion(&agent, &durable, &unit, &locks).unwrap();
         assert!(completed.all_deletions_proven());
@@ -3746,7 +3859,7 @@ mod tests {
             &evidence,
             &locks,
             |target| fs::remove_file(target).context("injected removal"),
-            sync_directory,
+            checkpoint_namespace,
             |target| {
                 fs::write(target, b"reappeared").context("inject reappeared file")?;
                 #[cfg(unix)]
@@ -3818,7 +3931,7 @@ mod tests {
         // Complete a separate no-delete Close and supersede it; the old
         // expected value must never erase the newer journal.
         let _ = fs::remove_file(path(&agent));
-        sync_directory(&recovery_dir(&agent)).unwrap();
+        checkpoint_namespace(&recovery_dir(&agent)).unwrap();
         let no_delete = sample(temp.path(), CleanupIntent::Close);
         store(&agent, &no_delete, &locks).unwrap();
         let remove = sample(temp.path(), CleanupIntent::Remove);

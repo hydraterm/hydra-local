@@ -1,3 +1,6 @@
+// This wire fixture uses Unix domain sockets and POSIX child commands.
+#![cfg(unix)]
+
 //! Protocol-contract hardening from the daemon-renderer-contract domain, observed
 //! over the wire. These complement `live_damage.rs` (which proves the happy-path
 //! damage envelope) by focusing on the failure surface the contract must survive:

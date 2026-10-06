@@ -1202,6 +1202,8 @@ struct AttachmentHandoffAuthorityCore {
     /// an exact match on the renderer's Claim connection; other supported Unix platforms expose no
     /// peer PID and retain `None` alongside the per-process daemon instance identity.
     expected_server_pid: Option<u32>,
+    #[cfg(windows)]
+    daemon_process_witness: crate::windows_pipe_client::WindowsDaemonProcessWitness,
     expected_generation: String,
     claim_admitted: std::sync::atomic::AtomicBool,
     state: std::sync::Mutex<AttachmentHandoffAuthorityState>,
@@ -1223,17 +1225,36 @@ enum AttachmentHandoffAuthorityState {
 }
 
 impl AttachmentHandoffAuthority {
+    #[cfg(all(windows, test))]
+    pub(crate) fn from_connected_client_for_test(mut client: DaemonClient) -> Self {
+        let instance = "22222222222242228222222222222222".parse().unwrap();
+        client.daemon_instance_id = Some(instance);
+        Self::from_offer(
+            AttachmentHandoffSeed {
+                session_id: SessionId("witness-fixture".into()),
+                token: "0123456789abcdef0123456789abcdef".parse().unwrap(),
+                expected_daemon_instance: client.daemon_instance_id.clone().unwrap(),
+                expected_generation: Some("fixture-generation".into()),
+            },
+            client,
+        )
+    }
+
     pub(crate) fn from_offer(seed: AttachmentHandoffSeed, client: DaemonClient) -> Self {
         let expected_generation = seed
             .expected_generation
             .expect("renderer handoff authority requires an accepted exact Grid generation");
         let expected_server_pid = client.server_pid();
+        #[cfg(windows)]
+        let daemon_process_witness = client.writer.daemon_process_witness();
         Self {
             core: std::sync::Arc::new(AttachmentHandoffAuthorityCore {
                 session_id: seed.session_id,
                 token: seed.token,
                 expected_daemon_instance: seed.expected_daemon_instance,
                 expected_server_pid,
+                #[cfg(windows)]
+                daemon_process_witness,
                 expected_generation,
                 claim_admitted: std::sync::atomic::AtomicBool::new(false),
                 state: std::sync::Mutex::new(AttachmentHandoffAuthorityState::Pending(client)),
@@ -1255,6 +1276,12 @@ impl AttachmentHandoffAuthority {
     /// comparison; it is not process-management authority.
     pub fn expected_server_pid(&self) -> Option<u32> {
         self.core.expected_server_pid
+    }
+
+    /// The same authenticated process object survives Claim/Cancel without retaining the pipe.
+    #[cfg(windows)]
+    pub fn daemon_process_witness(&self) -> crate::WindowsDaemonProcessWitness {
+        self.core.daemon_process_witness.clone()
     }
 
     /// The exact daemon lifetime whose Grid completed the Offer-side attach. A renderer may retire
@@ -1829,6 +1856,12 @@ impl DaemonClient {
     /// This lets a service owner bind protocol readiness to the exact PID its manager reports.
     pub fn server_pid(&self) -> Option<u32> {
         self.server_pid
+    }
+
+    /// Exact authenticated Windows server lifetime, independent of this pipe's attachment guard.
+    #[cfg(windows)]
+    pub fn daemon_process_witness(&self) -> crate::WindowsDaemonProcessWitness {
+        self.writer.daemon_process_witness()
     }
 
     pub fn daemon_instance_id(&self) -> Option<&DaemonInstanceId> {

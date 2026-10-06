@@ -21,8 +21,8 @@
 //! into the app-owned window/tab layout: it ensures a `WindowLayout` exists and ensures a tab exists
 //! for the session (default window `main`, tab id = session id), then stamps `window_recorded`/
 //! `window_id`/`tab_id` onto the success JSON. Recording is POST-ATTACH metadata work, so a failed
-//! session start never leaves a tab behind; a recording failure is `window_record_failed` and still
-//! applies the owned-daemon cleanup. Without `--record-window`, launch behavior is unchanged.
+//! session start never leaves a tab behind; a recording failure is `window_record_failed` and
+//! leaves the independently retained daemon untouched. Without `--record-window`, launch behavior is unchanged.
 //!
 //! Installed launchers use the separate `--product-startup` contract. A zero-state install gets the
 //! stable built-in Terminal; later opens choose the first canonical visible persisted pane and try
@@ -48,22 +48,17 @@
 //! Beyond `launch`, this binary also exposes two narrow HEADLESS agent-task commands —
 //! `agent-start` and `agent-resume` — that compose `maestro_shell::AgentTaskRuntime` over a fresh
 //! post-`--` argv. They reuse the SAME base/socket/daemon/log-dir policy as `launch` and ensure a
-//! connectable daemon identically, but they open no renderer. Their lifecycle differs in one way:
-//! on a SUCCESSFUL start/resume, a daemon THIS command spawned is kept running even without
-//! `--keep-daemon`, because the agent task's PTY lives inside it and must survive the command's
-//! exit. A failure after spawn still drops the un-kept daemon (kill + owned-socket cleanup).
+//! connectable daemon identically, but they open no renderer. Like every launch mode, they leave
+//! a spawned daemon running even on failure and without `--keep-daemon`.
 //!
 //! All the pure, deterministic decisions (CLI parsing, binary-path resolution, the dev-socket path,
 //! and the structured-output shaping) live in `lib.rs`. This file owns ONLY the process IO: spawning
-//! the daemon, the bounded connect wait, calling the runtime, and launching the renderer. We only
-//! ever terminate a daemon THIS process spawned — an already-running daemon is reused and left
-//! untouched. When we DO stop a daemon we spawned, we also remove its now-stale Unix socket file,
-//! but never one that still accepts connections and never a reused/kept/detached daemon's socket.
-//!
-//! That kill-then-clean-socket policy is bound to the [`SpawnedDaemon`] guard's `Drop`, not to the
-//! final success branch, so it runs identically on success AND on every `?` error path after the
-//! daemon is spawned (a failed session start, a renderer runtime error): the app never leaks a
-//! daemon it started, and never leaves a stale owned socket behind, regardless of where it returns.
+//! the daemon, the bounded connect wait, calling the runtime, and launching the renderer. Spawning
+//! a daemon does not grant exclusive ownership: another authenticated launcher can adopt its
+//! endpoint before the creator proves readiness. Ordinary success, failure and renderer teardown
+//! therefore never kill a spawned or reused daemon or unlink its socket. This can retain an empty
+//! or stalled daemon; only the separate explicit, identity-bound recovery flow may stop it after
+//! foreground confirmation. Tests own their private fixture cleanup outside this product policy.
 //!
 //! Output contract: this process's stdout carries EXACTLY ONE structured JSON value on success, and
 //! its stderr carries exactly one structured JSON value on failure. To keep that contract
@@ -83,6 +78,9 @@
     clippy::too_many_arguments
 )]
 
+#[cfg(test)]
+mod bin_test_transport;
+mod custom_launch_command;
 mod history_discovery;
 mod launch_mutation;
 mod launch_preflight;
@@ -95,9 +93,11 @@ mod window_order_projection_tests;
 mod window_order_requests;
 #[cfg(test)]
 mod window_rename_tests;
+#[cfg(windows)]
+mod windows_process_stdio;
 
+#[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcCommand, Stdio};
 #[cfg(target_os = "macos")]
@@ -118,10 +118,9 @@ use maestro_app::{
     build_dashboard_panel_lines, build_dashboard_view_model, build_dock_model,
     build_orphan_candidates, build_picker_overlay_model, build_picker_projection,
     build_settings_panel_lines, build_tab_strip_model, build_tab_strip_model_from_window_view,
-    child_log_path, classify_new_tab_foreground_failure, cleanup_owned_socket,
-    dashboard_panel_to_renderer, dashboard_status_suffix, dashboard_ui_asset_candidates,
-    dashboard_ui_file_url, dashboard_ui_host_preload_script, default_base_dir, dev_socket_path,
-    effective_session_argv, effective_settings, effective_window_title,
+    child_log_path, classify_new_tab_foreground_failure, dashboard_panel_to_renderer,
+    dashboard_status_suffix, dashboard_ui_asset_candidates, dashboard_ui_host_preload_script,
+    default_base_dir, effective_session_argv, effective_settings, effective_window_title,
     execute_production_new_tab_recovery, find_palette_action, foreground_new_tab_recovery_context,
     inherited_project_launch_inputs, orphan_counts, plan_worktree_cleanup, project_active_tasks,
     project_task_results, read_file_preview, render_resolved_recovery_execution_log_line,
@@ -154,6 +153,8 @@ use maestro_app::{
     SYSTEM_TERMINAL_PROJECT_ID, SYSTEM_TERMINAL_SESSION_ID, SYSTEM_TERMINAL_TAB_ID,
     SYSTEM_TERMINAL_WINDOW_ID, SYSTEM_TERMINAL_WORKSPACE_ID,
 };
+#[cfg(unix)]
+use maestro_app::{dashboard_ui_file_url, dev_socket_path};
 use maestro_shell::agent_task_reconcile::AgentTaskReconciler;
 use maestro_shell::agent_task_runtime::{
     AgentTaskRuntime, PreparedAgentTaskRuntimeError, PreparedAgentTaskSettlementError,
@@ -715,7 +716,13 @@ fn react_chrome_allowed_fields(intent_type: &str) -> Option<&'static [&'static s
         | "unhideFolderSession" => &["request_id", "agent", "cwd", "session_id"],
         "setFolderSessionName" => &["request_id", "agent", "cwd", "session_id", "name"],
         "openWorkspace" => &["project_id", "workspace_id"],
-        "preflightLaunch" => &["request_id", "agent", "resolved_launch_command", "cwd"],
+        "preflightLaunch" => &[
+            "request_id",
+            "agent",
+            "resolved_launch_command",
+            "custom_command",
+            "cwd",
+        ],
         "createProject" => &[
             "name",
             "root",
@@ -939,6 +946,7 @@ enum ReactChromeIntent {
         request_id: String,
         agent: Option<String>,
         resolved_launch_command: Option<String>,
+        custom_command: Option<String>,
         #[serde(default)]
         cwd: Option<String>,
     },
@@ -1318,6 +1326,51 @@ fn react_chrome_intent_requires_window_context(intent: &ReactChromeIntent) -> bo
     }
 }
 
+/// Neutral terminal pixels are not a reason to disable the independent dashboard. Existing global
+/// intents still use their typed validation; explicit durable navigation/reopen/create requests
+/// resolve fresh records through the ordinary handlers. Pane-relative topology does not cross this
+/// boundary, even if a different viewport has published since the event was queued.
+fn react_chrome_intent_allowed_from_neutral_viewport(intent: &ReactChromeIntent) -> bool {
+    !react_chrome_intent_requires_window_context(intent)
+        || matches!(
+            intent,
+            ReactChromeIntent::CreateWindow { .. }
+                | ReactChromeIntent::FocusWindow { .. }
+                | ReactChromeIntent::FocusSessionOrPane { .. }
+                | ReactChromeIntent::ReviveSession { .. }
+                | ReactChromeIntent::ReviveWindow { .. }
+        )
+}
+
+fn react_chrome_intent_needs_terminal_connection(intent: &ReactChromeIntent) -> bool {
+    matches!(
+        intent,
+        ReactChromeIntent::CreateProject {
+            create_initial_session: None | Some(true),
+            ..
+        } | ReactChromeIntent::CreateWindow { .. }
+            | ReactChromeIntent::OpenWorkspace { .. }
+            | ReactChromeIntent::FocusWindow { .. }
+            | ReactChromeIntent::FocusSessionOrPane { .. }
+            | ReactChromeIntent::ReviveSession { .. }
+            | ReactChromeIntent::ReviveWindow { .. }
+    )
+}
+
+fn reject_neutral_chrome_intent(
+    runtime: &mut RendererTabRuntime,
+    intent: &ReactChromeIntent,
+    message: &str,
+) {
+    launch_mutation::reject(runtime, launch_mutation::request_id(intent), message.into());
+    // Focus/Reopen and project creation predate correlated launch replies. Keep their refusal
+    // visible in the persistent chrome too, without interpolating text as executable JavaScript.
+    let message = serde_json::to_string(message).expect("fixed dashboard error serializes");
+    let _ = runtime.evaluate_react_chrome_script(format!(
+        "window.__HYDRA_DASHBOARD_SHOW_ERROR__?.({message});"
+    ));
+}
+
 /// The recovery renderer may navigate into ordinary user topology, but the fixed internal
 /// project/window/pane itself is not an editable desktop object. This pure gate is applied before
 /// the shared React dispatcher; once focus has moved to a real window, ordinary mutations resume.
@@ -1668,6 +1721,20 @@ fn active_window_is_product_recovery(active_window_id: &str) -> bool {
 }
 
 fn main() {
+    #[cfg(windows)]
+    if let Err(error) = windows_process_stdio::detach_capture_pipe_inheritance() {
+        let failure = LaunchFailure::new(
+            "native_stdio_environment",
+            format!(
+                "could not detach caller capture pipes from retained child inheritance: {error}"
+            ),
+        );
+        eprintln!(
+            "{}",
+            serde_json::to_string(&failure).expect("LaunchFailure serializes")
+        );
+        std::process::exit(1);
+    }
     #[cfg(target_os = "macos")]
     if let Err(error) = macos_process_context::ensure_clean_start() {
         let failure = LaunchFailure::new(
@@ -1683,6 +1750,26 @@ fn main() {
     // DB-write log net: attribute every store mutation this process makes to "desktop-app" (the agent tags its own).
     maestro_shell::write_trace::set_writer_tag("desktop-app");
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Explorer opens the same product startup/dispatcher used by the installed Unix launcher.
+    // This is an entrypoint default, not a second Windows product implementation.
+    #[cfg(windows)]
+    let args = if args.is_empty() {
+        [
+            "launch",
+            "--top-tab-bar",
+            "--no-dashboard-panel",
+            "--new-tab-default-shell",
+            "--product-startup",
+            "--keep-daemon",
+            "--title",
+            "Hydra",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    } else {
+        args
+    };
     match maestro_app::parse_args(&args) {
         Ok(Command::Plugin(command)) => match run_plugin_command(command) {
             Ok(code) => std::process::exit(code),
@@ -3336,6 +3423,100 @@ fn dashboard_react_project_detail(
     })
 }
 
+#[cfg(test)]
+mod custom_launch_command_contract_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_raw_custom_is_carried_by_each_form_intent() {
+        let raw = r#""C:\Tools 日本語\claude.cmd" --version"#;
+        for mut payload in [
+            serde_json::json!({"type":"preflightLaunch", "request_id":"p", "agent":"claude"}),
+            serde_json::json!({"type":"createProject", "name":"fixture", "root":"C:\\fixture", "create_initial_session":false}),
+        ] {
+            payload["custom_command"] = serde_json::json!(raw);
+            let intent = parse_react_chrome_intent(&payload.to_string()).unwrap();
+            let custom = match intent {
+                ReactChromeIntent::PreflightLaunch { custom_command, .. } => custom_command,
+                ReactChromeIntent::CreateProject {
+                    custom_command,
+                    create_initial_session,
+                    ..
+                } => {
+                    assert_eq!(create_initial_session, Some(false));
+                    custom_command
+                }
+                _ => panic!("wrong intent"),
+            };
+            assert_eq!(custom.as_deref(), Some(raw));
+            payload["custom_command"] = serde_json::json!([raw]);
+            assert!(parse_react_chrome_intent(&payload.to_string()).is_err());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_custom_preflight_persistence_and_inherited_create_agree() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = dir.path().join("Tools O'Brien 日本語");
+        std::fs::create_dir(&tools).unwrap();
+        let executable = tools.join("claude.cmd");
+        std::fs::write(&executable, "@exit /b 0\r\n").unwrap();
+        let raw = format!("\"{}\" --version \"\"", executable.display());
+        let canonical = custom_launch_command::normalize_custom_command(Some(&raw))
+            .unwrap()
+            .unwrap();
+        let prepared =
+            launch_preflight::prepare_with_provider(Some(&canonical), Some("claude"), dir.path())
+                .unwrap();
+        assert_eq!(
+            prepared.explicit_argv.as_ref().unwrap(),
+            &[
+                executable.to_str().unwrap().to_owned(),
+                "--version".into(),
+                "".into(),
+            ]
+        );
+        let defaults = maestro_shell::ProjectLaunchDefaults {
+            agent: Some("claude".into()),
+            model: None,
+            resume_mode: None,
+            dangerous_skip_permissions: None,
+            custom_command: Some(canonical.clone()),
+        };
+        let persisted = serde_json::to_value(&defaults).unwrap();
+        let reloaded: maestro_shell::ProjectLaunchDefaults =
+            serde_json::from_value(persisted).unwrap();
+        let project = maestro_shell::records::Project {
+            project_id: "custom-fixture".into(),
+            name: "Custom fixture".into(),
+            root: dir.path().to_str().unwrap().into(),
+            default_workspace_policy: maestro_shell::WorkspacePolicy::ScratchCwd,
+            created_at_ms: 1,
+            last_active_at_ms: 1,
+            icon: None,
+            accent_color: None,
+            launch_defaults: Some(reloaded),
+            directories: Vec::new(),
+            window_order: Vec::new(),
+            system: false,
+            hidden: false,
+        };
+        let inherited = inherited_project_launch_inputs(Some(&project), None, None);
+        let restored = inherited.resolved_launch_command.as_deref().unwrap();
+        assert_eq!(restored, canonical);
+        let create =
+            launch_preflight::prepare_with_provider(Some(restored), Some("claude"), dir.path())
+                .unwrap();
+        assert_eq!(create.explicit_argv, prepared.explicit_argv);
+        assert!(custom_launch_command::normalize_custom_command(Some("\"unfinished")).is_err());
+        // A malformed explicit custom command must not select a valid generated fallback.
+        let result = custom_launch_command::normalize_custom_command(Some("\"unfinished"))
+            .map(|custom| custom.or(Some("claude".into())));
+        assert!(result.is_err());
+    }
+}
+
 fn dashboard_react_window(
     window: &maestro_shell::DashboardWindow,
     session_agents: &std::collections::HashMap<String, &'static str>,
@@ -3488,20 +3669,36 @@ fn renderer_react_chrome(paths: &AppPaths) -> Option<maestro_renderer::RendererR
             // (its WKWebView IPC already delivered, so the fallback never ran there either).
             "(function (intent) { var message = JSON.stringify(intent); var delivered = false; try { if (window.ipc && window.ipc.postMessage) { window.ipc.postMessage(message); delivered = true; } } catch (_) {} try { if (!delivered && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ipc) { window.webkit.messageHandlers.ipc.postMessage(message); delivered = true; } } catch (_) {} if (!delivered) { try { var base = String(window.location.href || '').split('#')[0]; window.location.href = base + '#hydra-intent:' + encodeURIComponent(message); delivered = true; } catch (_) {} } if (!delivered) { (window.__HYDRA_DASHBOARD_INTENTS__ = window.__HYDRA_DASHBOARD_INTENTS__ || []).push(intent); } })",
         );
-        let url = dashboard_ui_file_url(&asset.index_html, Some("chrome=sidebar"));
-        let top_url = dashboard_ui_file_url(&asset.index_html, Some("chrome=topbar"));
-        let overlay_url = dashboard_ui_file_url(&asset.index_html, Some("chrome=overlay"));
-        eprintln!(
+        #[cfg(windows)]
+        return match maestro_renderer::RendererReactChrome::from_native_asset(
+            &asset.index_html,
+            initialization_script,
+            460,
+            46,
+        ) {
+            Ok(chrome) => Some(chrome),
+            Err(error) => {
+                eprintln!("hydra-dashboard native asset failed: {error}");
+                None
+            }
+        };
+        #[cfg(not(windows))]
+        {
+            let url = dashboard_ui_file_url(&asset.index_html, Some("chrome=sidebar"));
+            let top_url = dashboard_ui_file_url(&asset.index_html, Some("chrome=topbar"));
+            let overlay_url = dashboard_ui_file_url(&asset.index_html, Some("chrome=overlay"));
+            eprintln!(
             "hydra-dashboard react chrome enabled url={url} top_url={top_url} overlay_url={overlay_url}"
         );
-        Some(maestro_renderer::RendererReactChrome {
-            url,
-            top_url,
-            overlay_url,
-            initialization_script,
-            width_logical_px: 460,
-            top_height_logical_px: 46,
-        })
+            Some(maestro_renderer::RendererReactChrome {
+                url,
+                top_url,
+                overlay_url,
+                initialization_script,
+                width_logical_px: 460,
+                top_height_logical_px: 46,
+            })
+        }
     }
 }
 
@@ -3822,11 +4019,13 @@ fn project_id_from_name(name: &str, now_ms: u64) -> String {
 fn normalize_project_root(root: &str) -> String {
     let trimmed = root.trim();
     if trimmed == "~" {
-        std::env::var("HOME").unwrap_or_else(|_| trimmed.to_string())
+        desktop_home_dir()
+            .and_then(|home| home.into_os_string().into_string().ok())
+            .unwrap_or_else(|| trimmed.to_string())
     } else if let Some(rest) = trimmed.strip_prefix("~/") {
-        match std::env::var("HOME") {
-            Ok(home) => format!("{home}/{rest}"),
-            Err(_) => trimmed.to_string(),
+        match desktop_home_dir() {
+            Some(home) => home.join(rest).to_string_lossy().into_owned(),
+            None => trimmed.to_string(),
         }
     } else {
         trimmed.to_string()
@@ -4097,6 +4296,9 @@ fn react_selected_directory_workspace(
 }
 
 enum PreparedReactFreshLaunch {
+    DefaultShell {
+        source_argv: Vec<String>,
+    },
     AdHoc {
         kind: SessionKind,
         source_argv: Vec<String>,
@@ -4115,6 +4317,8 @@ enum PreparedReactFreshLaunch {
 impl PreparedReactFreshLaunch {
     fn select_executable(&mut self, selected: Option<maestro_shell::ProviderExecutable>) {
         match self {
+            // The Terminal choice never consumes provider-locator authority.
+            Self::DefaultShell { .. } => {}
             Self::AdHoc {
                 provider_executable,
                 ..
@@ -4132,6 +4336,7 @@ impl PreparedReactFreshLaunch {
         now_ms: u64,
     ) -> Result<maestro_shell::PreparedSessionSpec, String> {
         let (source_argv, selected_agent, executable) = match self {
+            Self::DefaultShell { source_argv } => (source_argv.as_slice(), None, None),
             Self::AdHoc {
                 source_argv,
                 selected_agent,
@@ -4164,6 +4369,9 @@ impl PreparedReactFreshLaunch {
             selected: executable,
         };
         match self {
+            Self::DefaultShell { source_argv } => prepared
+                .default_shell_session_spec(source_argv, DEFAULT_COLS, DEFAULT_ROWS, now_ms)
+                .map_err(|error| error.to_string()),
             Self::AdHoc {
                 kind, source_argv, ..
             } => prepared
@@ -4212,6 +4420,10 @@ impl PreparedReactFreshLaunch {
         maestro_app::NewTabForegroundLaunch,
     )> {
         match self {
+            Self::DefaultShell { source_argv } => Some((
+                maestro_app::NewTabLaunchSource::DefaultShellDev,
+                maestro_app::NewTabForegroundLaunch::default_shell(&source_argv),
+            )),
             Self::AdHoc {
                 kind,
                 source_argv,
@@ -4310,7 +4522,10 @@ fn prepared_react_fresh_launch(
             restart_requires_user: true,
         } if argv == &source_argv
     );
-    if source_is_adhoc || (kind == SessionKind::Shell && matches!(launch, LaunchSpec::OptOut)) {
+    if kind == SessionKind::Shell && matches!(launch, LaunchSpec::OptOut) {
+        return Some(PreparedReactFreshLaunch::DefaultShell { source_argv });
+    }
+    if source_is_adhoc {
         return Some(PreparedReactFreshLaunch::AdHoc {
             kind,
             source_argv,
@@ -4632,10 +4847,7 @@ fn product_startup_cwd(paths: &AppPaths, target: &ProductStartupTarget) -> Resul
         }
     }
 
-    if let Some(path) = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .and_then(existing_directory)
-    {
+    if let Some(path) = desktop_home_dir().and_then(existing_directory) {
         return Ok(path);
     }
     if let Ok(current) = std::env::current_dir() {
@@ -4686,8 +4898,7 @@ fn new_system_terminal_project(
 /// recipe. A stable-id collision with unrelated data fails closed instead of taking ownership of it.
 fn ensure_stable_product_seed(paths: &AppPaths, now_ms: u64) -> Result<(), String> {
     let projects = maestro_shell::ProjectService::new(paths);
-    let default_root = std::env::var_os("HOME")
-        .map(PathBuf::from)
+    let default_root = desktop_home_dir()
         .and_then(existing_directory)
         .or_else(|| std::env::current_dir().ok().and_then(existing_directory))
         .unwrap_or_else(|| PathBuf::from("/"))
@@ -5008,9 +5219,15 @@ fn stable_product_seed_repairable(paths: &AppPaths) -> Result<bool, String> {
     Ok(true)
 }
 
+fn desktop_home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    return std::env::var_os("USERPROFILE").map(PathBuf::from);
+    #[cfg(not(windows))]
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
 fn product_default_root() -> String {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
+    desktop_home_dir()
         .and_then(existing_directory)
         .or_else(|| std::env::current_dir().ok().and_then(existing_directory))
         .unwrap_or_else(|| PathBuf::from("/"))
@@ -6939,7 +7156,7 @@ fn is_canonical_fresh_copilot_source(argv: &[String]) -> bool {
 /// defaults, and tool config come from the environment the user actually maintains), falling
 /// back to the platform default. A hardcoded `/bin/zsh` would silently break on Linux hosts
 /// without zsh — and would ignore a user's bash/fish PATH setup everywhere.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn login_shell_program() -> String {
     maestro_shell::login_shell_program(&maestro_shell::ProcessLaunchEnv)
 }
@@ -7131,6 +7348,7 @@ fn retain_started_provider_restart_recipe(
 #[cfg(test)]
 mod recorded_session_live_argv_tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     fn record_with(launch: LaunchSpec) -> SessionRecord {
@@ -7155,22 +7373,30 @@ mod recorded_session_live_argv_tests {
             params: vec!["--model".into(), "opus".into()],
         });
         let argv = recorded_session_live_argv(&s, &["bash".into()]);
-        // The wrap uses the user's $SHELL (or the platform fallback) — assert the shape, not a
-        // hardcoded shell path.
-        assert_eq!(argv[0], login_shell_program());
-        assert_eq!(argv[1], launch_preflight::LOGIN_SHELL_COMMAND_FLAGS);
-        assert!(argv[2].contains("claude") && argv[2].contains("--model"));
-        // COLOR FIX: the wrapped command forces color AFTER the login profile so claude/codex aren't left
-        // colorless by a profile that strips TERM/COLORTERM or sets NO_COLOR. Run as the shell's child (no
-        // `exec` — that changed job control enough to make interactive claude exit on start).
-        assert!(argv[2].contains("COLORTERM=truecolor"));
-        assert!(argv[2].contains("TERM=xterm-256color"));
-        assert!(argv[2].contains("FORCE_COLOR=1"));
-        assert!(argv[2].contains("unset NO_COLOR"));
-        assert!(
-            !argv[2].contains("exec "),
-            "must NOT exec — it made interactive agents exit"
-        );
+        #[cfg(windows)]
+        {
+            assert_eq!(&argv[1..], ["--model", "opus"]);
+            assert!(argv[0] == "claude" || Path::new(&argv[0]).is_absolute());
+        }
+        #[cfg(unix)]
+        {
+            // The wrap uses the user's $SHELL (or the platform fallback) — assert the shape, not a
+            // hardcoded shell path.
+            assert_eq!(argv[0], login_shell_program());
+            assert_eq!(argv[1], launch_preflight::LOGIN_SHELL_COMMAND_FLAGS);
+            assert!(argv[2].contains("claude") && argv[2].contains("--model"));
+            // COLOR FIX: the wrapped command forces color AFTER the login profile so claude/codex aren't left
+            // colorless by a profile that strips TERM/COLORTERM or sets NO_COLOR. Run as the shell's child (no
+            // `exec` — that changed job control enough to make interactive claude exit on start).
+            assert!(argv[2].contains("COLORTERM=truecolor"));
+            assert!(argv[2].contains("TERM=xterm-256color"));
+            assert!(argv[2].contains("FORCE_COLOR=1"));
+            assert!(argv[2].contains("unset NO_COLOR"));
+            assert!(
+                !argv[2].contains("exec "),
+                "must NOT exec — it made interactive agents exit"
+            );
+        }
     }
 
     #[test]
@@ -7184,16 +7410,25 @@ mod recorded_session_live_argv_tests {
                 params: Vec::new(),
             });
             let argv = recorded_session_live_argv(&session, &["bash".into()]);
-            assert_eq!(argv[0], login_shell_program(), "agent={agent}");
-            assert_eq!(
-                argv[1],
-                launch_preflight::LOGIN_SHELL_COMMAND_FLAGS,
-                "agent={agent}"
-            );
-            assert!(argv[2].contains(agent), "agent={agent}");
+            #[cfg(windows)]
+            {
+                assert_eq!(argv.len(), 1, "agent={agent}");
+                assert!(argv[0] == agent || Path::new(&argv[0]).is_absolute());
+            }
+            #[cfg(unix)]
+            {
+                assert_eq!(argv[0], login_shell_program(), "agent={agent}");
+                assert_eq!(
+                    argv[1],
+                    launch_preflight::LOGIN_SHELL_COMMAND_FLAGS,
+                    "agent={agent}"
+                );
+                assert!(argv[2].contains(agent), "agent={agent}");
+            }
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn agent_launch_uses_interactive_profile_even_when_daemon_path_is_stale() {
         let temp = tempfile::tempdir().unwrap();
@@ -7229,6 +7464,58 @@ mod recorded_session_live_argv_tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "child process argv capture; invoked by windows_literal_argv_survives_stale_path"]
+    fn windows_literal_argv_capture_child() {
+        let capture = std::env::var_os("HYDRA_BIN_TEST_ARGV_CAPTURE").expect("parent fixture");
+        std::fs::write(
+            capture,
+            serde_json::to_vec(&std::env::args().collect::<Vec<_>>()).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_literal_argv_survives_stale_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let capture = temp.path().join("captured.json");
+        let marker = temp.path().join("must-not-exist");
+        let hostile = format!(
+            "$(touch {0}); `touch {0}`; quote's & echo %PATH% \\\"value\\\"",
+            marker.display()
+        );
+        let source = vec![
+            std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            "--exact".into(),
+            "recorded_session_live_argv_tests::windows_literal_argv_capture_child".into(),
+            "--ignored".into(),
+            "--nocapture".into(),
+            "--skip".into(),
+            hostile.clone(),
+        ];
+        // An absolute selected native executable must not consult the stale PATH or run a shell.
+        let argv = login_shell_argv_with_program(&source, "not-a-shell.exe");
+        assert_eq!(argv, source);
+        let status = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .env("PATH", temp.path())
+            .env("HYDRA_BIN_TEST_ARGV_CAPTURE", &capture)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let observed: Vec<String> =
+            serde_json::from_slice(&std::fs::read(capture).unwrap()).unwrap();
+        assert_eq!(observed, source);
+        assert_eq!(observed.last(), Some(&hostile));
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
     #[test]
     fn shared_shell_mode_preserves_agent_arguments_without_shell_evaluation() {
         let temp = tempfile::tempdir().unwrap();
@@ -7276,21 +7563,23 @@ mod recorded_session_live_argv_tests {
     #[test]
     fn project_default_model_punctuation_remains_one_argv_through_login_shell() {
         let temp = tempfile::tempdir().unwrap();
-        let bin = temp.path().join("bin");
-        std::fs::create_dir(&bin).unwrap();
-        let capture = temp.path().join("captured-model");
-        let injected_marker = PathBuf::from(format!("/tmp/hm{}", std::process::id()));
-        let _ = std::fs::remove_file(&injected_marker);
-        let executable = bin.join("agy");
-        std::fs::write(
-            &executable,
-            b"#!/bin/sh\nprintf '%s' \"$2\" > \"$HYDRA_TEST_CAPTURE\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        #[cfg(unix)]
+        let (bin, capture, fake_shell, injected_marker) = {
+            let bin = temp.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            let capture = temp.path().join("captured-model");
+            let injected_marker = PathBuf::from(format!("/tmp/hm{}", std::process::id()));
+            let _ = std::fs::remove_file(&injected_marker);
+            let executable = bin.join("agy");
+            std::fs::write(
+                &executable,
+                b"#!/bin/sh\nprintf '%s' \"$2\" > \"$HYDRA_TEST_CAPTURE\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-        let fake_shell = temp.path().join("fake-shell");
-        std::fs::write(
+            let fake_shell = temp.path().join("fake-shell");
+            std::fs::write(
             &fake_shell,
             format!(
                 "#!/bin/sh\n[ \"$1\" = '{}' ] || exit 97\nPATH=\"$HYDRA_TEST_INTERACTIVE_BIN:$PATH\"\nexport PATH\nexec /bin/sh -c \"$2\"\n",
@@ -7298,8 +7587,11 @@ mod recorded_session_live_argv_tests {
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&fake_shell, std::fs::Permissions::from_mode(0o700)).unwrap();
-
+            std::fs::set_permissions(&fake_shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+            (bin, capture, fake_shell, injected_marker)
+        };
+        #[cfg(windows)]
+        let injected_marker = PathBuf::from(format!("C:\\hm{}", std::process::id()));
         let hostile = format!(
             "$(touch {0}); `touch {0}`; quote's \\\"value\\\"",
             injected_marker.display()
@@ -7329,17 +7621,26 @@ mod recorded_session_live_argv_tests {
         let command = inherited.resolved_launch_command.as_deref().unwrap();
         let parsed = launch_preflight::split_command_line(command).unwrap();
         assert_eq!(parsed, vec!["agy", "--model", hostile.as_str()]);
-        let argv = login_shell_argv_with_program(&parsed, fake_shell.to_str().unwrap());
-        let status = std::process::Command::new(&argv[0])
-            .args(&argv[1..])
-            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-            .env("HYDRA_TEST_INTERACTIVE_BIN", &bin)
-            .env("HYDRA_TEST_CAPTURE", &capture)
-            .status()
-            .unwrap();
-        assert!(status.success());
-        assert_eq!(std::fs::read_to_string(capture).unwrap(), hostile);
-        assert!(!injected_marker.exists());
+        #[cfg(windows)]
+        {
+            let argv = login_shell_argv_with_program(&parsed, "not-a-shell.exe");
+            assert_eq!(&argv[1..], ["--model", hostile.as_str()]);
+            assert!(argv[0] == "agy" || Path::new(&argv[0]).is_absolute());
+        }
+        #[cfg(unix)]
+        {
+            let argv = login_shell_argv_with_program(&parsed, fake_shell.to_str().unwrap());
+            let status = std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+                .env("HYDRA_TEST_INTERACTIVE_BIN", &bin)
+                .env("HYDRA_TEST_CAPTURE", &capture)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            assert_eq!(std::fs::read_to_string(capture).unwrap(), hostile);
+            assert!(!injected_marker.exists());
+        }
     }
 
     #[test]
@@ -7415,7 +7716,10 @@ mod recorded_session_live_argv_tests {
                 params: params.into_iter().map(String::from).collect(),
             });
             let argv = recorded_session_live_argv(&s, &["bash".into()]);
+            #[cfg(unix)]
             let command = &argv[2];
+            #[cfg(windows)]
+            let command = &argv.join(" ");
 
             assert!(command.contains(agent), "{agent} command was not preserved");
             for token in forbidden {
@@ -9412,9 +9716,16 @@ fn resolve_agent_common(
     let cwd = cwd.to_string_lossy().into_owned();
 
     // 3. Socket: explicit wins, else a PRIVATE dev socket under the runtime base (as launch).
+    #[cfg(unix)]
     let socket_path = socket
         .map(Path::to_path_buf)
         .unwrap_or_else(|| dev_socket_path(&runtime_base));
+    #[cfg(windows)]
+    let socket_path =
+        maestro_shell::resolve_socket_path(&paths, socket.map(Path::to_path_buf), &ProcessEnv)
+            .map_err(|error| {
+                AgentFailure::new(command, "daemon_endpoint_failed", error.to_string())
+            })?;
 
     // 4. The daemon binary is always required (we may need to spawn it).
     let current_exe = std::env::current_exe().ok();
@@ -9594,7 +9905,7 @@ fn execute_prepared_agent_task_start(
     runtime: &AgentTaskRuntime<'_>,
     prepared: maestro_shell::window_layout::PreparedAgentTaskSessionStart,
 ) -> Result<(maestro_shell::StartAgentTaskOutcome, bool, bool), AgentFailure> {
-    let (mut spawned, _, _) = match ensure_daemon(
+    let (spawned, _, _) = match ensure_daemon(
         &resolved.socket_path,
         &resolved.daemon_bin,
         resolved.log_dir.as_deref(),
@@ -9648,9 +9959,6 @@ fn execute_prepared_agent_task_start(
                     // A Start may own a PTY. Keep a daemon spawned by this command alive, do not
                     // compensate, and leave the journal as the process-independent recovery
                     // authority after this opaque in-memory authority goes out of scope.
-                    if let Some(daemon) = spawned.as_mut() {
-                        daemon.keep();
-                    }
                     let detail = error
                         .map(|source| format!("; settlement error: {source}"))
                         .unwrap_or_default();
@@ -9662,9 +9970,6 @@ fn execute_prepared_agent_task_start(
                     return Err(AgentFailure::new(command, "agent_task_pending", message));
                 }
                 Err(PreparedAgentTaskSettlementError::Changed { recovery, error }) => {
-                    if let Some(daemon) = spawned.as_mut() {
-                        daemon.keep();
-                    }
                     let message = format!(
                         "agent task {:?} session {:?} needs forward-only recovery after its durable graph changed: {error}; durable recovery was preserved",
                         recovery.agent_task_id(),
@@ -9687,7 +9992,7 @@ fn execute_prepared_agent_task_start(
         }
     };
 
-    let (daemon_started, daemon_kept) = keep_daemon_on_success(&mut spawned);
+    let (daemon_started, daemon_kept) = (spawned.is_some(), true);
     drop(spawned);
     Ok((outcome, daemon_started, daemon_kept))
 }
@@ -10232,10 +10537,16 @@ fn run_layout_preset_restore(
         .unwrap_or_else(|| default_base_dir(|k| std::env::var(k).ok(), &runtime_base));
     let paths = AppPaths::with_base(&base);
 
+    #[cfg(unix)]
     let socket_path = args
         .socket
         .clone()
         .unwrap_or_else(|| dev_socket_path(&runtime_base));
+    #[cfg(windows)]
+    let socket_path = maestro_shell::resolve_socket_path(&paths, args.socket.clone(), &ProcessEnv)
+        .map_err(|error| {
+            LayoutPresetFailure::new(CMD, "daemon_endpoint_failed", error.to_string())
+        })?;
 
     // 1. Derive the complete restore plan using read-only store snapshots only.
     let preset = maestro_shell::LayoutPresetService::new(&paths)
@@ -10315,8 +10626,8 @@ fn run_layout_preset_restore(
         .map_err(|e| LayoutPresetFailure::new(CMD, "store", e.to_string()))?;
 
     // 4. Ensure a connectable daemon (reuse an already-reachable socket, else spawn).
-    let (mut spawned, _, _) = ensure_daemon(&socket_path, &daemon_bin, log_dir.as_deref())
-        .map_err(|f| {
+    let (spawned, _, _) =
+        ensure_daemon(&socket_path, &daemon_bin, log_dir.as_deref()).map_err(|f| {
             LayoutPresetFailure::new(CMD, "daemon", format!("{}: {}", f.error_kind, f.message))
         })?;
 
@@ -10356,7 +10667,7 @@ fn run_layout_preset_restore(
     .map_err(|e| LayoutPresetFailure::new(CMD, "restore", e.to_string()))?;
 
     // 7. Restore succeeded: keep any daemon we spawned (the launched PTYs must survive).
-    let (daemon_started, daemon_kept) = keep_daemon_on_success(&mut spawned);
+    let (daemon_started, daemon_kept) = (spawned.is_some(), true);
 
     let slots: Vec<_> = outcomes
         .iter()
@@ -11190,19 +11501,6 @@ fn run_worktree_cleanup(args: WorktreeCleanupArgs) -> Result<String, WorktreeCle
     Ok(serde_json::to_string(&json).expect("worktree-cleanup confirmed JSON serializes"))
 }
 
-/// Lifecycle for the agent commands on SUCCESS: there is no renderer to wait on, so a daemon THIS
-/// command spawned must be kept running unconditionally — the task PTY lives inside it. A reused
-/// daemon (`None`) is never touched. Returns `(daemon_started, daemon_kept)` for the success JSON.
-fn keep_daemon_on_success(spawned: &mut Option<SpawnedDaemon>) -> (bool, bool) {
-    match spawned.as_mut() {
-        Some(d) => {
-            d.keep();
-            (true, true)
-        }
-        None => (false, true),
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReusedDaemonProtocol {
     NotReused,
@@ -11217,49 +11515,19 @@ impl ReusedDaemonProtocol {
     }
 }
 
-/// A daemon child this process spawned, plus the socket path it owns. On drop — UNLESS
-/// [`SpawnedDaemon::keep`] was called — it kills the daemon AND applies the owned-socket cleanup
-/// policy. Tying cleanup to this guard (not to the final success branch) means EVERY normal Rust
-/// error path after spawn — a failed session start, a renderer runtime error — stops the daemon and
-/// removes the now-stale socket, exactly as the success path does. A daemon we merely reused is
-/// represented as `None`, so it is never killed and its socket is never touched.
+/// A spawned daemon's process/readiness witness, not a termination lease. Even before readiness,
+/// another authenticated client can adopt its public endpoint. Deliberately has no kill-on-drop:
+/// `Child` drop closes our process handle but never stops the independently retained daemon.
 struct SpawnedDaemon {
     child: Child,
-    socket_path: PathBuf,
     conditional_start_peer: Option<maestro_shell::ConditionalStartPeerIdentity>,
-    keep: bool,
 }
 
 impl SpawnedDaemon {
-    fn keep(&mut self) {
-        self.keep = true;
-    }
-
     fn conditional_start_peer(&self) -> &maestro_shell::ConditionalStartPeerIdentity {
         self.conditional_start_peer
             .as_ref()
             .expect("spawned daemon readiness captured conditional-start identity")
-    }
-}
-
-impl Drop for SpawnedDaemon {
-    fn drop(&mut self) {
-        if self.keep {
-            // Kept (detach/--keep-daemon): the daemon is still serving on its socket; leave both.
-            return;
-        }
-        // Stop the daemon we spawned, THEN remove its now-stale socket file. Order matters: the
-        // socket only becomes stale once the daemon is gone, and `cleanup_owned_socket` refuses to
-        // remove a socket that still accepts connections. Cleanup is best-effort and never fatal —
-        // stderr carries only the JSON contract, so all outcomes are silently acceptable here.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = cleanup_owned_socket(
-            &self.socket_path,
-            can_connect,
-            |p| p.exists(),
-            |p| std::fs::remove_file(p),
-        );
     }
 }
 
@@ -11718,6 +11986,21 @@ fn active_renderer_owns_window_cohort(
     requested_window_id: &str,
 ) -> bool {
     active_window_id == Some(requested_window_id)
+}
+
+/// Every visible pane belongs to the renderer's exact window cohort, not only its primary
+/// storage session. An exited secondary still has a daemon attachment and fences replacement.
+/// Reuse the window-reopen detach/reproject path: this clears subscriptions, never kills PTYs.
+fn clear_renderer_cohort_for_pane_revive(
+    runtime: &mut RendererTabRuntime,
+    active_window_id: Option<&str>,
+    requested_window_id: &str,
+) -> Result<bool, maestro_app::TabSwitchError> {
+    if !active_renderer_owns_window_cohort(active_window_id, requested_window_id) {
+        return Ok(false);
+    }
+    runtime.clear_viewport()?;
+    Ok(true)
 }
 
 /// Validate the complete product-owned Shell+OptOut trust boundary before granting the sole OptOut
@@ -12455,10 +12738,14 @@ fn run_launch(launch: LaunchArgs) -> Result<LaunchSuccess, LaunchFailure> {
         };
 
     // 3. Resolve the socket: explicit wins, else a PRIVATE dev socket under the runtime base.
+    #[cfg(not(windows))]
     let socket_path = launch
         .socket
         .clone()
         .unwrap_or_else(|| dev_socket_path(&runtime_base));
+    #[cfg(windows)]
+    let socket_path = maestro_shell::resolve_socket_path(&paths, launch.socket.clone(), &env)
+        .map_err(|error| LaunchFailure::new("daemon_endpoint_failed", error.to_string()))?;
 
     // 4. Decide the renderer mode up front — it governs whether the renderer BINARY is required.
     //    Foreground runs the renderer in-process (no binary needed); Detached spawns a child binary
@@ -12498,6 +12785,13 @@ fn run_launch(launch: LaunchArgs) -> Result<LaunchSuccess, LaunchFailure> {
     } else {
         None
     };
+    #[cfg(windows)]
+    if mode == RendererMode::Foreground && launch_react_chrome.is_none() {
+        return Err(LaunchFailure::new(
+            "dashboard_assets_missing",
+            "Hydra's bundled dashboard could not be loaded. Keep the dashboard-ui directory beside maestro-app.exe and reinstall the complete application if it is missing.",
+        ));
+    }
     eprintln!(
         "hydra-dashboard launch react_chrome={} mode={mode:?} record_window={} product_startup={} top_tab_bar={}",
         launch_react_chrome.is_some(),
@@ -12600,8 +12894,8 @@ fn run_launch(launch: LaunchArgs) -> Result<LaunchSuccess, LaunchFailure> {
     };
 
     // 5b. Ensure a connectable daemon at `socket_path`: reuse if already up, else spawn + wait.
-    //     `spawned` (if any) is killed on drop unless we `keep()` it after a clean launch. When a
-    //     `--log-dir` is set, a daemon WE spawn has its stdout/stderr captured to files there.
+    //     A spawned daemon is independently retained from creation, including readiness failure.
+    //     With `--log-dir`, its stdout/stderr are captured to files there.
     let recovery_allowed =
         launch.product_startup && !launch.no_run_renderer && !launch.detach_renderer;
     let mut recovery_presented = false;
@@ -12891,14 +13185,8 @@ fn run_launch(launch: LaunchArgs) -> Result<LaunchSuccess, LaunchFailure> {
         AttachmentHandoffCancelGuard::new(outcome.record.session_id.clone(), authority)
     });
 
-    // `--keep-daemon` is a lifecycle promise made once the session is proven attachable/started.
-    // Arm it before service reconciliation: a replaceable connectivity-agent failure must never
-    // take the independently retained PTY daemon down through guard cleanup.
-    if launch.keep_daemon {
-        if let Some(daemon) = spawned.as_mut() {
-            daemon.keep();
-        }
-    }
+    // Daemon retention starts at spawn, not at this session proof. A connectivity-agent or
+    // renderer failure cannot acquire termination authority over another client's retained PTY.
 
     // Visible-cohort daemon-loss recovery may not race the initial exact renderer snapshot. Until
     // the prepared multi-session start transaction exists, startup below accepts only a one-route
@@ -12937,8 +13225,7 @@ fn run_launch(launch: LaunchArgs) -> Result<LaunchSuccess, LaunchFailure> {
     // 6a. Opt-in window-layout recording. This is POST-ATTACH metadata work: the session is now
     //     grid-proven live (start_session returned Ok above), so a failed daemon/session start could
     //     never have reached here and left a tab for a session that never launched. A recording
-    //     failure returns via `?` BEFORE the renderer block; dropping `spawned` on that path applies
-    //     the same owned-daemon kill-then-clean-socket policy as any other launch failure.
+    //     failure returns via `?` BEFORE the renderer block and leaves the retained daemon intact.
     let window_record = if let Some(target) = &product_startup_target {
         Some((target.layout.window_id.clone(), target.tab_id.clone()))
     } else if retained_attach_only {
@@ -13256,21 +13543,9 @@ fn run_launch(launch: LaunchArgs) -> Result<LaunchSuccess, LaunchFailure> {
         }
     }
 
-    // Apply the daemon lifecycle policy. We only ever decide the fate of a daemon THIS process
-    // spawned; a reused daemon is left untouched (`spawned` is `None`).
+    // Report the shared retention policy; closing our witness never stops the daemon.
     let daemon_started = spawned.is_some();
     let daemon_kept = should_keep_spawned_daemon(daemon_started, mode, launch.keep_daemon);
-    if let Some(d) = spawned.as_mut() {
-        if daemon_kept {
-            // Leave it running: detach mode, --keep-daemon, or it is serving an ongoing session.
-            d.keep();
-        }
-        // Otherwise leave `keep == false` so dropping `spawned` BOTH terminates the daemon we
-        // spawned AND removes its now-stale owned socket (see `SpawnedDaemon::drop`).
-    }
-    // Dropping `spawned` here applies the same kill-then-clean-socket policy that any earlier `?`
-    // error path would have applied: a not-kept spawned daemon is stopped and its socket removed; a
-    // kept (detach/--keep-daemon) or reused daemon is left serving with its socket intact.
     drop(spawned);
 
     let mut success = LaunchSuccess::new(
@@ -13925,6 +14200,12 @@ struct PendingListenerReviveHandoff {
     previous_active: Option<maestro_app::ActiveRendererViewport>,
     previous_strip_tabs: Vec<WindowTabJson>,
     retry_authority: maestro_shell::AttachmentHandoffAuthority,
+}
+
+/// Mirror a proven revived primary pane in the listener's subsequent command target.
+/// Pending or rejected publications must retain their previous focus cache.
+fn adopt_published_revive_listener_focus(focused_tab_id: &mut Option<String>, tab_id: &str) {
+    *focused_tab_id = Some(tab_id.to_owned());
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -15146,6 +15427,13 @@ fn spawn_window_event_listener(
                     }
                 };
 
+                let neutral_transport_closed = matches!(
+                    &event,
+                    maestro_renderer::RendererEvent::NeutralReactChromeIntent {
+                        terminal_connection_closed: true,
+                        ..
+                    }
+                );
                 let disposition = match event {
                     // Lifecycle facts are generation-bound by the renderer and remain durable while
                     // the viewport is neutral. Route them before the intent gate, but defer all UI
@@ -15219,7 +15507,19 @@ fn spawn_window_event_listener(
                     maestro_renderer::RendererEvent::ReactChromeIntent {
                         json,
                         dialog_focus_ticket,
+                    }
+                    | maestro_renderer::RendererEvent::NeutralReactChromeIntent {
+                        json,
+                        dialog_focus_ticket,
+                        ..
                     } => {
+                        if neutral_transport_closed {
+                            if let Ok(intent) = parse_react_chrome_intent(&json) {
+                                reject_neutral_chrome_intent(&mut tab_runtime, &intent,
+                                    "Terminal connection was lost. Close and reopen this Hydra window, then retry.");
+                            }
+                            continue;
+                        }
                         launch_mutation::reject_inactive_json(
                             &mut tab_runtime,
                             &json,
@@ -15230,6 +15530,9 @@ fn spawn_window_event_listener(
                             &json,
                             "The viewport is still changing. The window was not renamed.",
                         );
+                        // This queue accepts only explicit durable FocusWindow/FocusSessionOrPane,
+                        // never pane-relative split/drag. Closed-transport provenance was refused
+                        // above; an eligible navigation still revalidates the destination on use.
                         pending_navigation.retain_pending_json(
                             &json,
                             dialog_focus_ticket,
@@ -15697,6 +16000,10 @@ fn spawn_window_event_listener(
                         && tab_runtime.adopt_claimed_handoff_disposition(&disposition)
                     {
                         listener_window_id = pending.window_id;
+                        adopt_published_revive_listener_focus(
+                            &mut listener_focused_tab_id,
+                            &pending.tab_id,
+                        );
                         listener_strip_tabs = pending.strip_tabs;
                         listener_selection = pending.selection;
                         last_sent_strip = build_tab_strip_model(
@@ -15838,7 +16145,10 @@ fn spawn_window_event_listener(
                     Ok(maestro_renderer::RendererEvent::ExactViewportDisposition(disposition)) => {
                         let _ = tab_runtime.settle_exact_viewport_disposition(&disposition);
                     }
-                    Ok(maestro_renderer::RendererEvent::ReactChromeIntent { json, .. }) => {
+                    Ok(
+                        maestro_renderer::RendererEvent::ReactChromeIntent { json, .. }
+                        | maestro_renderer::RendererEvent::NeutralReactChromeIntent { json, .. },
+                    ) => {
                         launch_mutation::reject_inactive_json(
                             &mut tab_runtime,
                             &json,
@@ -16465,6 +16775,13 @@ fn spawn_window_event_listener(
                     }
                 }
             };
+            let neutral_connection_closed = match &event {
+                maestro_renderer::RendererEvent::NeutralReactChromeIntent {
+                    terminal_connection_closed,
+                    ..
+                } => Some(*terminal_connection_closed),
+                _ => None,
+            };
             if product_recovery_blocks_renderer_event(&event, &listener_window_id) {
                 eprintln!(
                     "product recovery: ignored renderer topology mutation for reserved window"
@@ -16683,21 +17000,21 @@ fn spawn_window_event_listener(
                             );
                             let previous_active = tab_runtime.active_viewport().cloned();
                             let previous_strip_tabs = listener_strip_tabs.clone();
-                            let clear_same_id = previous_active
-                                .as_ref()
-                                .is_some_and(|active| active.target().session_id == session_id);
                             let recoverable_previous_active = previous_active
                                 .clone()
-                                .filter(|active| active.target().session_id != session_id);
-                            // Only an attachment to the exited same-id A fences the daemon replacement.
-                            // Preserve an unrelated active X so the atomic B handoff records it as the
-                            // exact fallback coordinate.
-                            if clear_same_id {
-                                tab_runtime.clear_viewport().map_err(|error| {
-                                    RecordedPaneReviveError::definitely_unpublished(format!(
-                                        "clear same-id renderer before revive: {error}"
-                                    ))
-                                })?;
+                                .filter(|active| active.target().window_id != revive_window_id);
+                            if clear_renderer_cohort_for_pane_revive(
+                                &mut tab_runtime,
+                                previous_active
+                                    .as_ref()
+                                    .map(|active| active.target().window_id.as_str()),
+                                &revive_window_id,
+                            )
+                            .map_err(|error| {
+                                RecordedPaneReviveError::definitely_unpublished(format!(
+                                    "clear same-window renderer cohort before pane revive: {error}"
+                                ))
+                            })? {
                                 cleared_previous = previous_active
                                     .map(|active| (active, previous_strip_tabs.clone()));
                             }
@@ -16763,6 +17080,10 @@ fn spawn_window_event_listener(
                                 );
                             }
                             Ok(RecordedPaneReviveProjection::AlreadyPublished(projection)) => {
+                                adopt_published_revive_listener_focus(
+                                    &mut listener_focused_tab_id,
+                                    &projection.target().tab_id,
+                                );
                                 adopt_compatible_renderer_projection(
                                     &mut listener_window_id,
                                     &mut listener_selection,
@@ -16844,6 +17165,11 @@ fn spawn_window_event_listener(
                 maestro_renderer::RendererEvent::ReactChromeIntent {
                     json,
                     dialog_focus_ticket,
+                }
+                | maestro_renderer::RendererEvent::NeutralReactChromeIntent {
+                    json,
+                    dialog_focus_ticket,
+                    ..
                 } => {
                     let intent = match parse_react_chrome_intent(&json) {
                         Ok(intent) => intent,
@@ -16856,6 +17182,22 @@ fn spawn_window_event_listener(
                             continue;
                         }
                     };
+                    if let Some(connection_closed) = neutral_connection_closed {
+                        let reason = if !react_chrome_intent_allowed_from_neutral_viewport(&intent)
+                        {
+                            Some("This pane is no longer active. Open or reopen a window before changing its layout.")
+                        } else if connection_closed
+                            && react_chrome_intent_needs_terminal_connection(&intent)
+                        {
+                            Some("Terminal connection was lost. Close and reopen this Hydra window, then retry.")
+                        } else {
+                            None
+                        };
+                        if let Some(reason) = reason {
+                            reject_neutral_chrome_intent(&mut tab_runtime, &intent, reason);
+                            continue;
+                        }
+                    }
                     // Stamp every DB write this intent causes with its CAUSE — "local:<type>" (content-
                     // blind: the intent's op name from the raw JSON, no payload) — so db-write.jsonl rows
                     // attribute to the UI action, mirroring the agent's "remote:<op> rid=<id>" stamp.
@@ -17163,6 +17505,7 @@ fn spawn_window_event_listener(
                             request_id,
                             agent,
                             resolved_launch_command,
+                            custom_command,
                             cwd,
                         } => {
                             let cwd = cwd
@@ -17172,11 +17515,18 @@ fn spawn_window_event_listener(
                                 .map(PathBuf::from)
                                 .or_else(|| std::env::current_dir().ok())
                                 .unwrap_or_else(|| PathBuf::from("/"));
-                            let result = validate_react_agent_launch(
+                            let result = custom_launch_command::preflight_custom_or_generated(
+                                custom_command.as_deref(),
                                 resolved_launch_command.as_deref(),
                                 agent.as_deref(),
-                                &cwd,
-                                &listener_socket_path,
+                                |command| {
+                                    validate_react_agent_launch(
+                                        command,
+                                        agent.as_deref(),
+                                        &cwd,
+                                        &listener_socket_path,
+                                    )
+                                },
                             );
                             if let Err(error) = &result {
                                 eprintln!(
@@ -17233,6 +17583,20 @@ fn spawn_window_event_listener(
                             let now = now_ms();
                             let project_id = project_id_from_name(&name, now);
                             let root = normalize_project_root(&root);
+                            // Only explicit UI text has native syntax. Persist the existing canonical
+                            // argv representation so saved defaults and old readers do not change.
+                            let custom_command =
+                                match custom_launch_command::normalize_custom_command(
+                                    custom_command.as_deref(),
+                                ) {
+                                    Ok(command) => command,
+                                    Err(error) => {
+                                        eprintln!("attach-tab: React createProject invalid custom command before mutation code={}", error.code());
+                                        continue;
+                                    }
+                                };
+                            let resolved_launch_command =
+                                custom_command.clone().or(resolved_launch_command);
                             // Strict no-ghost ordering: validate the canonical provider executable
                             // before Project/Workspace/Session/Window/Tab records are written. A
                             // project without an initial session deliberately skips launch
@@ -18982,6 +19346,10 @@ fn spawn_window_event_listener(
                                     );
                                 }
                                 Ok(RecordedPaneReviveProjection::AlreadyPublished(projection)) => {
+                                    adopt_published_revive_listener_focus(
+                                        &mut listener_focused_tab_id,
+                                        &projection.target().tab_id,
+                                    );
                                     adopt_compatible_renderer_projection(
                                         &mut listener_window_id,
                                         &mut listener_selection,
@@ -19011,20 +19379,20 @@ fn spawn_window_event_listener(
                             );
                             let previous_active = tab_runtime.active_viewport().cloned();
                             let previous_strip_tabs = listener_strip_tabs.clone();
-                            let clear_same_id = previous_active
-                                .as_ref()
-                                .is_some_and(|active| active.target().session_id == session_id);
                             let recoverable_previous_active = previous_active
                                 .clone()
-                                .filter(|active| active.target().session_id != session_id);
+                                .filter(|active| active.target().window_id != window_id);
                             let mut cleared_previous = None;
                             let revive_result = (|| -> Result<_, RecordedPaneReviveError> {
-                                if clear_same_id {
-                                    tab_runtime.clear_viewport().map_err(|error| {
+                                if clear_renderer_cohort_for_pane_revive(
+                                    &mut tab_runtime,
+                                    previous_active.as_ref().map(|active| active.target().window_id.as_str()),
+                                    &window_id,
+                                ).map_err(|error| {
                                         RecordedPaneReviveError::definitely_unpublished(format!(
-                                            "clear same-id renderer before revive: {error}"
+                                            "clear same-window renderer cohort before pane revive: {error}"
                                         ))
-                                    })?;
+                                    })? {
                                     cleared_previous = previous_active
                                         .clone()
                                         .map(|active| (active, previous_strip_tabs.clone()));
@@ -19091,6 +19459,10 @@ fn spawn_window_event_listener(
                                     );
                                 }
                                 Ok(RecordedPaneReviveProjection::AlreadyPublished(projection)) => {
+                                    adopt_published_revive_listener_focus(
+                                        &mut listener_focused_tab_id,
+                                        &projection.target().tab_id,
+                                    );
                                     adopt_compatible_renderer_projection(
                                         &mut listener_window_id,
                                         &mut listener_selection,
@@ -22319,10 +22691,14 @@ fn run_attach_tab(args: AttachTabArgs) -> Result<AttachTabSuccess, AttachTabFail
     })?;
 
     // 4. Resolve the socket: explicit wins, else a PRIVATE dev socket under the runtime base.
+    #[cfg(unix)]
     let socket_path = args
         .socket
         .clone()
         .unwrap_or_else(|| dev_socket_path(&runtime_base));
+    #[cfg(windows)]
+    let socket_path = maestro_shell::resolve_socket_path(&paths, args.socket.clone(), &ProcessEnv)
+        .map_err(|error| AttachTabFailure::new("daemon_endpoint_failed", error.to_string()))?;
 
     // 5. Decide the renderer mode — it governs whether the renderer BINARY is required.
     // 5b. Resolve the effective app-owned chrome. Foreground/no-run default the top tab bar and the
@@ -22395,9 +22771,9 @@ fn run_attach_tab(args: AttachTabArgs) -> Result<AttachTabSuccess, AttachTabFail
         prepare_log_dir(dir).map_err(launch_to_attach_failure)?;
     }
 
-    // 6b. Ensure a connectable daemon: reuse if up, else spawn + wait. `spawned` is killed on drop
-    //     unless we `keep()` it after a clean attach.
-    let (mut spawned, reused_daemon_protocol, mut retained_daemon_client) =
+    // 6b. Ensure a connectable daemon: reuse if up, else spawn + wait. No cleanup authority is
+    //     acquired by spawning: another client can adopt before this caller's readiness proof.
+    let (spawned, reused_daemon_protocol, mut retained_daemon_client) =
         ensure_daemon(&socket_path, &daemon_bin, log_dir.as_deref())
             .map_err(launch_to_attach_failure)?;
     let retained_attach_only = spawned.is_none() && reused_daemon_protocol.is_attach_only();
@@ -22834,15 +23210,9 @@ fn run_attach_tab(args: AttachTabArgs) -> Result<AttachTabSuccess, AttachTabFail
         }
     }
 
-    // 10. Apply the daemon lifecycle policy: a reused daemon is never touched; a daemon WE spawned is
-    //     kept for detach/--keep-daemon, otherwise dropping `spawned` kills it and removes its socket.
+    // 10. Report independent retention, including headless and failed launches.
     let daemon_started = spawned.is_some();
     let daemon_kept = should_keep_spawned_daemon(daemon_started, mode, args.keep_daemon);
-    if let Some(d) = spawned.as_mut() {
-        if daemon_kept {
-            d.keep();
-        }
-    }
     drop(spawned);
 
     let mut success = AttachTabSuccess::new(
@@ -22984,26 +23354,21 @@ fn record_session_in_window(
 mod daemon_startup;
 use daemon_startup::ensure_daemon;
 
-/// Existing owned-daemon cleanup predicate. Startup probes use the bounded client instead.
-fn can_connect(socket_path: &Path) -> bool {
-    UnixStream::connect(socket_path).is_ok()
-}
-
 /// Prepare the opt-in child-log directory: create `dir` (and parents) if missing, using owner-only
 /// `0700` permissions for any directory components this call creates. Idempotent — an existing
 /// directory is accepted as-is. Returns a structured failure if the directory cannot be created or
 /// is not a directory, so a bad `--log-dir` fails before any child is spawned.
 fn prepare_log_dir(dir: &Path) -> Result<(), LaunchFailure> {
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .map_err(|e| {
-            LaunchFailure::new(
-                "log_dir_unusable",
-                format!("could not create --log-dir {}: {e}", dir.display()),
-            )
-        })?;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(dir).map_err(|e| {
+        LaunchFailure::new(
+            "log_dir_unusable",
+            format!("could not create --log-dir {}: {e}", dir.display()),
+        )
+    })?;
     if !dir.is_dir() {
         return Err(LaunchFailure::new(
             "log_dir_unusable",
@@ -23845,6 +24210,7 @@ mod react_session_insert_only_tests {
 
     #[test]
     fn prepared_react_provider_carrier_preserves_exact_executable_and_conversation() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         struct OwnedEnv(PathBuf);
         impl maestro_shell::LaunchEnvLookup for OwnedEnv {
@@ -23855,11 +24221,15 @@ mod react_session_insert_only_tests {
                 Some(self.0.as_os_str().to_owned())
             }
             fn path_os(&self) -> Option<std::ffi::OsString> {
-                Some("/usr/bin:/bin".into())
+                Some(self.0.join(".local/bin").into_os_string())
             }
         }
         let root = tempfile::tempdir().unwrap();
-        let executable = root.path().join(".local/bin/claude");
+        let executable = root.path().join(if cfg!(windows) {
+            ".local/bin/claude.cmd"
+        } else {
+            ".local/bin/claude"
+        });
         std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
         for (path, text) in [
             (&executable, "#!/bin/sh\nexit 0\n"),
@@ -23869,6 +24239,7 @@ mod react_session_insert_only_tests {
             ),
         ] {
             std::fs::write(path, text).unwrap();
+            #[cfg(unix)]
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         let Some(maestro_shell::ProviderResolution::Executable(selected)) =
@@ -23986,11 +24357,133 @@ mod react_session_insert_only_tests {
     }
 
     fn prepared_test_shell_launch() -> PreparedReactFreshLaunch {
+        #[cfg(unix)]
+        let source_argv = vec!["/bin/sh".into(), "-l".into()];
+        #[cfg(windows)]
+        let source_argv = {
+            let shell = std::env::var("COMSPEC").expect("Windows native command interpreter");
+            assert!(Path::new(&shell).is_absolute() && Path::new(&shell).is_file());
+            vec![shell, "/D".into(), "/K".into()]
+        };
         PreparedReactFreshLaunch::AdHoc {
             kind: SessionKind::Shell,
-            source_argv: vec!["/bin/sh".into(), "-l".into()],
+            source_argv,
             selected_agent: None,
             provider_executable: None,
+        }
+    }
+
+    #[test]
+    fn default_shell_provenance_survives_react_project_graph() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::with_base(tmp.path().join("Maestro"));
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let PreparedReactFreshLaunch::AdHoc { source_argv, .. } = prepared_test_shell_launch()
+        else {
+            unreachable!()
+        };
+        let (kind, metadata, argv) =
+            prepared_react_session_launch(None, Some("terminal"), None, None, &source_argv, None);
+        assert_eq!(metadata, LaunchSpec::OptOut);
+        let launch = prepared_react_fresh_launch(kind, &metadata, argv, Some("terminal"), false)
+            .expect("reviewed default Terminal choice");
+        let allocation = prepare_react_project_with_default_window_graph(
+            &paths,
+            "default-shell-provenance",
+            "Terminal",
+            &root.to_string_lossy(),
+            maestro_shell::NewProject::default(),
+            &launch,
+            &std::collections::HashSet::new(),
+            7,
+        )
+        .unwrap();
+        let Some(LoadOutcome::Loaded(stored)) = load_one::<SessionRecord>(
+            &paths,
+            RecordKind::Session,
+            allocation.created.start.session_id(),
+        )
+        .unwrap() else {
+            panic!("prepared Session missing")
+        };
+        assert_eq!(stored.kind, SessionKind::Shell);
+        assert_eq!(
+            stored.launch,
+            LaunchSpec::OptOut,
+            "default Terminal must not be demoted to arbitrary custom argv"
+        );
+        cancel_prepared_react_graph(&paths, allocation);
+    }
+
+    #[test]
+    fn default_shell_provenance_survives_react_window_but_custom_shell_stays_adhoc() {
+        let (tmp, paths, _, _, _) = fixture();
+        let PreparedReactFreshLaunch::AdHoc { source_argv, .. } = prepared_test_shell_launch()
+        else {
+            unreachable!()
+        };
+        for (custom, session_id) in [
+            (false, "default-window-session"),
+            (true, "custom-window-session"),
+        ] {
+            let metadata = if custom {
+                LaunchSpec::AdHocRedacted {
+                    argv: source_argv.clone(),
+                    redacted: false,
+                    restart_requires_user: true,
+                }
+            } else {
+                LaunchSpec::OptOut
+            };
+            let launch = prepared_react_fresh_launch(
+                SessionKind::Shell,
+                &metadata,
+                source_argv.clone(),
+                Some("terminal"),
+                custom,
+            )
+            .unwrap();
+            assert_eq!(
+                matches!(launch, PreparedReactFreshLaunch::DefaultShell { .. }),
+                !custom
+            );
+            let expected = WindowLayoutService::new(&paths)
+                .load_project_window_graph_snapshot("react-insert-project")
+                .unwrap()
+                .unwrap();
+            let allocation = prepare_fresh_react_window_graph(
+                &paths,
+                &expected,
+                &tmp.path().to_string_lossy(),
+                "Terminal",
+                "Pane",
+                &launch,
+                12,
+                |_| {
+                    (
+                        format!("{session_id}-ws"),
+                        format!("{session_id}-window"),
+                        session_id.into(),
+                    )
+                },
+                |_| true,
+            )
+            .unwrap();
+            let Some(LoadOutcome::Loaded(stored)) =
+                load_one::<SessionRecord>(&paths, RecordKind::Session, session_id).unwrap()
+            else {
+                panic!("new window Session missing")
+            };
+            let expected_metadata = if custom {
+                maestro_shell::redact::adhoc_launch_spec(&source_argv)
+            } else {
+                LaunchSpec::OptOut
+            };
+            assert_eq!(stored.launch, expected_metadata);
+            // Both variants use the real split/new-tab conversion, never an argv-name classifier.
+            assert!(launch.into_new_tab_launch().is_some());
+            cancel_prepared_react_graph(&paths, allocation);
         }
     }
 
@@ -25011,12 +25504,12 @@ mod react_create_daemon_preflight_tests {
         prepare_react_agent_launch, react_launch_preflight_response_fields,
         validate_react_daemon_mutation_protocol,
     };
+    use crate::bin_test_transport::Listener as UnixListener;
     use maestro_shell::{
         store, AppPaths, LaunchSpec, NewProject, ProjectService, RecordKind, SessionKind,
         SessionRecord, WindowLayoutService, Workspace,
     };
     use std::io::{BufRead, Read, Write};
-    use std::os::unix::net::UnixListener;
 
     #[test]
     fn react_preflight_response_preserves_the_stable_error_code() {
@@ -25035,7 +25528,7 @@ mod react_create_daemon_preflight_tests {
     #[test]
     fn retained_v1_is_rejected_after_only_a_non_mutating_identity_request() {
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("daemon.sock");
+        let socket = crate::bin_test_transport::endpoint(dir.path(), "daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -25050,6 +25543,7 @@ mod react_create_daemon_preflight_tests {
             stream.flush().unwrap();
             let mut remainder = String::new();
             reader.read_to_string(&mut remainder).unwrap();
+            let _ = stream.shutdown(std::net::Shutdown::Both);
             (first, remainder)
         });
 
@@ -25072,7 +25566,7 @@ mod react_create_daemon_preflight_tests {
         let paths = AppPaths::with_base(dir.path().join("Maestro"));
         let project_id = "react-preflight-daemon-project";
         let daemon_session_id = default_project_pane_session_id(project_id);
-        let socket = dir.path().join("daemon.sock");
+        let socket = crate::bin_test_transport::endpoint(dir.path(), "daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let daemon_session_id_for_server = daemon_session_id.clone();
         let server = std::thread::spawn(move || {
@@ -25084,7 +25578,7 @@ mod react_create_daemon_preflight_tests {
             requests.push(request.trim().to_string());
             writeln!(
                 stream,
-                "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"daemon_instance_id\":\"22222222222242228222222222222222\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"generation_conditional_attach\":true,\"start_operation_ledger\":true}}",
+                "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"daemon_instance_id\":\"22222222222242228222222222222222\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"generation_conditional_attach\":true,\"start_operation_ledger\":true,\"windows_start_operation_retirement_barrier\":true}}",
                 maestro_protocol::DAEMON_PROTOCOL_VERSION
             )
             .unwrap();
@@ -25156,7 +25650,7 @@ mod react_create_daemon_preflight_tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = AppPaths::with_base(dir.path().join("Maestro"));
         let project_id = "react-preflight-list-error-project";
-        let socket = dir.path().join("daemon.sock");
+        let socket = crate::bin_test_transport::endpoint(dir.path(), "daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -25166,7 +25660,7 @@ mod react_create_daemon_preflight_tests {
             assert_eq!(request.trim(), r#"{"op":"daemon_info"}"#);
             writeln!(
                 stream,
-                "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"daemon_instance_id\":\"33333333333343339333333333333333\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"generation_conditional_attach\":true,\"start_operation_ledger\":true}}",
+                "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"daemon_instance_id\":\"33333333333343339333333333333333\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"generation_conditional_attach\":true,\"start_operation_ledger\":true,\"windows_start_operation_retirement_barrier\":true}}",
                 maestro_protocol::DAEMON_PROTOCOL_VERSION
             )
             .unwrap();
@@ -25208,6 +25702,7 @@ mod react_create_daemon_preflight_tests {
 #[cfg(test)]
 mod revive_preflight_atomicity_tests {
     use super::{revive_recorded_pane_after_preflight, RecordedPaneOpenPolicy};
+    use crate::bin_test_transport::Listener as UnixListener;
     use maestro_shell::paths::{AppPaths, RecordKind};
     use maestro_shell::records::{
         AttentionState, LaunchSpec, SessionKind, SessionRecord, SessionStatus, TabRecord,
@@ -25215,7 +25710,6 @@ mod revive_preflight_atomicity_tests {
     };
     use maestro_shell::store::{self, LoadOutcome};
     use std::io::{BufRead, Read, Write};
-    use std::os::unix::net::UnixListener;
 
     fn pane(tab_id: &str, session_id: &str, index: u32, stashed: bool) -> TabRecord {
         TabRecord {
@@ -25249,7 +25743,7 @@ mod revive_preflight_atomicity_tests {
         };
         store::write_record(&paths, RecordKind::WindowLayout, "window", 1, &before).unwrap();
 
-        let socket = dir.path().join("daemon.sock");
+        let socket = crate::bin_test_transport::endpoint(dir.path(), "daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let (observed_tx, observed_rx) = std::sync::mpsc::channel();
@@ -25397,7 +25891,7 @@ mod revive_preflight_atomicity_tests {
         };
         store::write_record(&paths, RecordKind::WindowLayout, "window", 1, &before).unwrap();
 
-        let socket = dir.path().join("daemon.sock");
+        let socket = crate::bin_test_transport::endpoint(dir.path(), "daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -25791,6 +26285,7 @@ mod external_active_pane_projection_tests {
         spawn_window_event_listener, AttentionJson, ListenerWindowContext, RecordedPaneOpenPolicy,
         WindowEventListenerShutdown, WindowTabJson, DEFAULT_WINDOW_ID,
     };
+    use crate::bin_test_transport::Listener as UnixListener;
     use maestro_app::RendererTabRuntime;
     use maestro_shell::paths::AppPaths;
     use maestro_shell::project::NewProject;
@@ -25801,10 +26296,132 @@ mod external_active_pane_projection_tests {
     use maestro_shell::store;
     use maestro_shell::window_layout::WindowLayoutService;
     use maestro_shell::{ProjectService, RecordKind, SplitAxis, WorkspacePolicy};
-    use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn neutral_chrome_dialog_reaches_dispatch_but_split_and_closed_launch_do_not_mutate() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        let paths = AppPaths::with_base(&base);
+        seed_exact_viewport_session(&paths, "session", "generation");
+        let windows = WindowLayoutService::new(&paths);
+        windows.create_empty("window", 1).unwrap();
+        let layout = windows
+            .open_tab(
+                "window",
+                "pane",
+                "session",
+                "Pane",
+                false,
+                Default::default(),
+                1,
+            )
+            .unwrap();
+        store::set_window_project(&paths, "window", "external-projection-fixture-project").unwrap();
+        let tabs = maestro_app::live_tab_records_json(&layout.tabs);
+        let selection = maestro_app::selection_from_strip_tabs(&tabs);
+        let strip = maestro_app::build_tab_strip_model("window", &tabs, Some("pane")).unwrap();
+        let (mut runtime, commands) = RendererTabRuntime::new();
+        runtime.seed_active_tab("window", "pane", "session");
+        let (events, receiver) = mpsc::channel();
+        let listener = spawn_window_event_listener(
+            runtime,
+            receiver,
+            maestro_app::update_check::spawn_update_check(),
+            "window".into(),
+            selection,
+            tabs,
+            paths.clone(),
+            base,
+            crate::bin_test_transport::endpoint(temp.path(), "unused.sock"),
+            None,
+            strip,
+            "test".into(),
+            None,
+            None,
+            false,
+            RecordedPaneOpenPolicy::Ordinary,
+            ListenerWindowContext::PublishedForTest,
+        );
+        for (json, terminal_connection_closed) in [
+            ("{", false),
+            (r#"{"type":"unknownIntent"}"#, false),
+            (
+                r#"{"type":"openWindowDialog","project_id":"p","unknown":true}"#,
+                false,
+            ),
+            (
+                r#"{"type":"openSplitDialog","project_id":"p","window_id":"window","tab_id":"pane","dir":"h"}"#,
+                false,
+            ),
+            (
+                r#"{"type":"splitPane","request_id":"split-request","project_id":"p","window_id":"window","tab_id":"pane","dir":"h"}"#,
+                false,
+            ),
+            (
+                r#"{"type":"createWindow","request_id":"create-request","project_id":"p"}"#,
+                true,
+            ),
+            (r#"{"type":"reviveWindow","window_id":"window"}"#, true),
+            (
+                r#"{"type":"createProject","name":"Must not create","root":"missing"}"#,
+                true,
+            ),
+            // Even a dead terminal connection must not disable the global form itself.
+            (r#"{"type":"openWindowDialog","project_id":"p"}"#, true),
+        ] {
+            events
+                .send(maestro_renderer::RendererEvent::NeutralReactChromeIntent {
+                    json: json.into(),
+                    dialog_focus_ticket: None,
+                    terminal_connection_closed,
+                })
+                .unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut refusal_count = 0;
+        let mut script = None;
+        loop {
+            match commands
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap()
+            {
+                maestro_renderer::RendererCommand::EvaluateReactChromeScript {
+                    script: value,
+                    kind,
+                } => {
+                    if value.contains("__HYDRA_DASHBOARD_SHOW_ERROR__") {
+                        refusal_count += 1;
+                    }
+                    if kind == maestro_renderer::ReactChromeScriptKind::Modal {
+                        script = Some(value);
+                    }
+                }
+                maestro_renderer::RendererCommand::SetReactChromeOverlayVisible {
+                    visible: true,
+                } => break,
+                _ => {}
+            }
+        }
+        drop(events);
+        assert_eq!(
+            listener.shutdown_and_join_with_timeout(Duration::from_secs(2)),
+            WindowEventListenerShutdown::Completed
+        );
+        assert_eq!(
+            refusal_count, 5,
+            "pane-relative and known-closed mutations get visible refusals"
+        );
+        assert_eq!(
+            script.unwrap(),
+            super::react_chrome_overlay_modal_script(
+                &serde_json::json!({"kind":"newWindow","project_id":"p"})
+            )
+        );
+        assert_eq!(windows.load("window").unwrap().unwrap(), layout);
+    }
 
     fn shared_hardening_store() -> (MutexGuard<'static, ()>, AppPaths, PathBuf) {
         static SERIAL: Mutex<()> = Mutex::new(());
@@ -25961,6 +26578,15 @@ mod external_active_pane_projection_tests {
 
     #[test]
     fn claimed_new_tab_cache_targets_next_split_dialog_at_new_right_pane() {
+        assert_published_cache_targets_next_split_at_right(false);
+    }
+
+    #[test]
+    fn published_revive_cache_targets_next_split_dialog_at_reopened_right_pane() {
+        assert_published_cache_targets_next_split_at_right(true);
+    }
+
+    fn assert_published_cache_targets_next_split_at_right(revived: bool) {
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path().join("base");
         let paths = AppPaths::with_base(&base);
@@ -25996,17 +26622,24 @@ mod external_active_pane_projection_tests {
         let mut selection = maestro_app::selection_from_strip_tabs(&tabs);
         let right_tabs = maestro_app::live_tab_records_json(&right.tabs);
         let right_selection = maestro_app::selection_from_strip_tabs(&right_tabs);
-        let active = super::adopt_claimed_new_tab_listener_cache(
-            maestro_app::NewTabForegroundAdoption {
-                tab_id: "right".into(),
-                session_id: "session-right".into(),
-                strip_tabs: right_tabs.clone(),
-                selection: right_selection.clone(),
-            },
-            &mut focused,
-            &mut tabs,
-            &mut selection,
-        );
+        let active = if revived {
+            super::adopt_published_revive_listener_focus(&mut focused, "right");
+            tabs = right_tabs.clone();
+            selection = right_selection.clone();
+            "right".to_string()
+        } else {
+            super::adopt_claimed_new_tab_listener_cache(
+                maestro_app::NewTabForegroundAdoption {
+                    tab_id: "right".into(),
+                    session_id: "session-right".into(),
+                    strip_tabs: right_tabs.clone(),
+                    selection: right_selection.clone(),
+                },
+                &mut focused,
+                &mut tabs,
+                &mut selection,
+            )
+        };
         assert_eq!(active, "right");
         assert_eq!(
             focused.as_deref(),
@@ -26032,7 +26665,7 @@ mod external_active_pane_projection_tests {
             tabs,
             paths,
             base,
-            temp.path().join("unused-daemon.sock"),
+            crate::bin_test_transport::endpoint(temp.path(), "unused-daemon.sock"),
             None,
             strip,
             "test".into(),
@@ -26083,6 +26716,58 @@ mod external_active_pane_projection_tests {
             script, expected,
             "next dialog uses the published right pane, not the previous left pane"
         );
+    }
+
+    #[test]
+    fn published_revive_focus_cache_changes_only_after_exact_publication() {
+        let source = include_str!("main.rs");
+        let listener = source
+            .split("mod external_active_pane_projection_tests {")
+            .next()
+            .unwrap();
+        let branch = listener
+            .split("if let Some(pending) = pending_revive_handoff.take() {")
+            .find(|branch| {
+                branch.trim_start().starts_with(
+                    "let Some(installed) = tab_runtime.pending_handoff().cloned() else {",
+                )
+            })
+            .unwrap()
+            .split("let Some(installed) = tab_runtime.pending_handoff().cloned() else {")
+            .nth(1)
+            .unwrap();
+        let claimed = branch
+            .find("== maestro_renderer::RendererAttachmentHandoffOutcome::Claimed")
+            .unwrap();
+        let adopted = branch
+            .find("&& tab_runtime.adopt_claimed_handoff_disposition(&disposition)")
+            .unwrap();
+        let cache = branch
+            .find("adopt_published_revive_listener_focus(")
+            .unwrap();
+        let nonclaimed = branch.find(".take_nonclaimed_handoff(").unwrap();
+        assert!(claimed < adopted && adopted < cache && cache < nonclaimed);
+        assert_eq!(
+            branch
+                .matches("adopt_published_revive_listener_focus(")
+                .count(),
+            1
+        );
+        let handlers = listener
+            .split("Ok(RecordedPaneReviveProjection::AlreadyPublished(projection)) => {")
+            .skip(1)
+            .collect::<Vec<_>>();
+        assert_eq!(handlers.len(), 3);
+        for handler in handlers {
+            let cache = handler
+                .find("adopt_published_revive_listener_focus(")
+                .unwrap();
+            let publication = handler
+                .find("adopt_compatible_renderer_projection(")
+                .unwrap();
+            assert!(cache < publication);
+            assert!(handler[..publication].contains("&projection.target().tab_id"));
+        }
     }
 
     #[test]
@@ -26286,7 +26971,7 @@ mod external_active_pane_projection_tests {
             }
         }
 
-        let socket_path = temp.path().join("must-stay-unused.sock");
+        let socket_path = crate::bin_test_transport::endpoint(temp.path(), "must-stay-unused.sock");
         let daemon = UnixListener::bind(&socket_path).expect("bind fake daemon");
         let (stop_daemon_tx, daemon_connections_rx, daemon_thread) =
             monitor_daemon_connections(daemon);
@@ -26455,7 +27140,7 @@ mod external_active_pane_projection_tests {
             strip_tabs,
             paths,
             base,
-            temp.path().join("absent-daemon.sock"),
+            crate::bin_test_transport::endpoint(temp.path(), "absent-daemon.sock"),
             None,
             initial_strip,
             "test".into(),
@@ -26526,7 +27211,7 @@ mod external_active_pane_projection_tests {
             strip_tabs,
             paths,
             base,
-            temp.path().join("absent-daemon.sock"),
+            crate::bin_test_transport::endpoint(temp.path(), "absent-daemon.sock"),
             None,
             initial_strip,
             "test".into(),
@@ -26595,7 +27280,7 @@ mod external_active_pane_projection_tests {
             strip_tabs,
             paths,
             base,
-            temp.path().join("absent-daemon.sock"),
+            crate::bin_test_transport::endpoint(temp.path(), "absent-daemon.sock"),
             None,
             initial_strip,
             "test".into(),
@@ -26723,7 +27408,7 @@ mod external_active_pane_projection_tests {
             strip_tabs,
             paths.clone(),
             base,
-            temp.path().join("absent-daemon.sock"),
+            crate::bin_test_transport::endpoint(temp.path(), "absent-daemon.sock"),
             None,
             initial_strip,
             "test".into(),
@@ -26887,7 +27572,7 @@ mod external_active_pane_projection_tests {
             strip_tabs,
             paths.clone(),
             base,
-            temp.path().join("absent-daemon.sock"),
+            crate::bin_test_transport::endpoint(temp.path(), "absent-daemon.sock"),
             None,
             initial_strip,
             "test".into(),
@@ -27034,7 +27719,7 @@ mod external_active_pane_projection_tests {
         // The fallback pane deliberately has no SessionRecord. Its focus path therefore connects
         // to the daemon to prove whether that potentially blocking work happens before or after the
         // renderer command. Hold the accepted connection open until the assertion releases it.
-        let socket_path = temp.path().join("blocked-fallback.sock");
+        let socket_path = crate::bin_test_transport::endpoint(temp.path(), "blocked-fallback.sock");
         let daemon = UnixListener::bind(&socket_path).expect("bind fake daemon");
         let (accepted_tx, accepted_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -27178,7 +27863,7 @@ mod external_active_pane_projection_tests {
             strip_tabs,
             paths.clone(),
             base,
-            temp.path().join("absent-daemon.sock"),
+            crate::bin_test_transport::endpoint(temp.path(), "absent-daemon.sock"),
             None,
             initial_strip,
             "test".into(),
@@ -27359,7 +28044,7 @@ mod external_active_pane_projection_tests {
             strip_tabs,
             paths.clone(),
             base,
-            temp.path().join("absent-daemon.sock"),
+            crate::bin_test_transport::endpoint(temp.path(), "absent-daemon.sock"),
             None,
             initial_strip,
             "test".into(),
@@ -27567,7 +28252,7 @@ mod external_active_pane_projection_tests {
             strip_tabs,
             paths.clone(),
             base,
-            temp.path().join("absent-daemon.sock"),
+            crate::bin_test_transport::endpoint(temp.path(), "absent-daemon.sock"),
             None,
             initial_strip,
             "test".into(),
@@ -27691,7 +28376,7 @@ mod external_active_pane_projection_tests {
             strip_tabs,
             paths.clone(),
             base.clone(),
-            base.join("stash-private-daemon.sock"),
+            crate::bin_test_transport::endpoint(&base, "stash-private-daemon.sock"),
             None,
             initial_strip,
             "test".into(),
@@ -27780,7 +28465,7 @@ mod external_active_pane_projection_tests {
             strip_tabs,
             paths.clone(),
             base.clone(),
-            base.join("retarget-private-daemon.sock"),
+            crate::bin_test_transport::endpoint(&base, "retarget-private-daemon.sock"),
             None,
             initial_strip,
             "test".into(),
@@ -27908,7 +28593,7 @@ mod external_active_pane_projection_tests {
             strip_tabs,
             paths.clone(),
             base.clone(),
-            base.join("fallback-private-daemon.sock"),
+            crate::bin_test_transport::endpoint(&base, "fallback-private-daemon.sock"),
             None,
             initial_strip,
             "test".into(),
@@ -28000,7 +28685,7 @@ mod external_active_pane_projection_tests {
             strip_tabs,
             paths.clone(),
             base.clone(),
-            base.join("queued-private-daemon.sock"),
+            crate::bin_test_transport::endpoint(&base, "queued-private-daemon.sock"),
             None,
             initial_strip,
             "test".into(),
@@ -28099,7 +28784,7 @@ mod external_active_pane_projection_tests {
             strip_tabs,
             paths.clone(),
             base.clone(),
-            base.join("drop-private-daemon.sock"),
+            crate::bin_test_transport::endpoint(&base, "drop-private-daemon.sock"),
             None,
             initial_strip,
             "test".into(),
@@ -28195,6 +28880,44 @@ mod foreground_react_chrome_listener_invariant {
 
     fn parse(json: &str) -> ReactChromeIntent {
         parse_react_chrome_intent(json).expect("intent JSON must parse")
+    }
+
+    #[test]
+    fn neutral_chrome_admission_preserves_explicit_recovery_and_rejects_pane_relative_aba() {
+        for json in [
+            r#"{"type":"openWindowDialog","project_id":"p"}"#,
+            r#"{"type":"createWindow","project_id":"p"}"#,
+            r#"{"type":"reviveWindow","window_id":"w"}"#,
+            r#"{"type":"reviveSession","window_id":"w","tab_id":"t","session_id":"s"}"#,
+            r#"{"type":"focusWindow","project_id":"p","window_id":"w"}"#,
+            r#"{"type":"focusSessionOrPane","project_id":"p","window_id":"w","tab_id":"t","session_id":"s"}"#,
+            r#"{"type":"setSidebarWidth","width":460}"#,
+            r#"{"type":"listFolderSessions","request_id":"r","agent":"claude","cwd":"fixture"}"#,
+        ] {
+            assert!(
+                super::react_chrome_intent_allowed_from_neutral_viewport(&parse(json)),
+                "{json}"
+            );
+        }
+        for json in [
+            r#"{"type":"splitPane","project_id":"p","window_id":"w","tab_id":"t","dir":"h"}"#,
+            r#"{"type":"openSplitDialog","project_id":"p","window_id":"w","tab_id":"t","dir":"h"}"#,
+            r#"{"type":"moveStashedPaneDrag","x":2,"y":3}"#,
+            r#"{"type":"completeStashedPaneDrop","x":2,"y":3}"#,
+        ] {
+            assert!(
+                !super::react_chrome_intent_allowed_from_neutral_viewport(&parse(json)),
+                "{json}"
+            );
+        }
+        assert!(!super::react_chrome_intent_needs_terminal_connection(
+            &parse(
+                r#"{"type":"createProject","name":"Saved only","root":"fixture","create_initial_session":false}"#,
+            )
+        ));
+        assert!(super::react_chrome_intent_needs_terminal_connection(
+            &parse(r#"{"type":"createProject","name":"Launch","root":"fixture"}"#,)
+        ));
     }
 
     #[test]
@@ -28947,6 +29670,7 @@ mod renderer_control_channel_reachability {
             | maestro_renderer::RendererEvent::PaneSwallowRequested { .. }
             | maestro_renderer::RendererEvent::CloseFocusedPaneRequested { .. }
             | maestro_renderer::RendererEvent::ReactChromeIntent { .. }
+            | maestro_renderer::RendererEvent::NeutralReactChromeIntent { .. }
             | maestro_renderer::RendererEvent::DividerRatioPersisted { .. }
             | maestro_renderer::RendererEvent::RemoteAccessToggleRequested { .. }
             | maestro_renderer::RendererEvent::WinsizeOwnerToggleRequested { .. }
@@ -29009,6 +29733,7 @@ mod renderer_control_channel_reachability {
             | maestro_renderer::RendererEvent::PaneSwallowRequested { .. }
             | maestro_renderer::RendererEvent::CloseFocusedPaneRequested { .. }
             | maestro_renderer::RendererEvent::ReactChromeIntent { .. }
+            | maestro_renderer::RendererEvent::NeutralReactChromeIntent { .. }
             | maestro_renderer::RendererEvent::DividerRatioPersisted { .. }
             | maestro_renderer::RendererEvent::RemoteAccessToggleRequested { .. }
             | maestro_renderer::RendererEvent::WinsizeOwnerToggleRequested { .. }
@@ -31961,6 +32686,7 @@ mod deletion_fallback_window_tests {
 #[cfg(all(test, unix))]
 mod project_delete_daemon_regression_tests {
     use super::run_project;
+    use crate::bin_test_transport::Listener as UnixListener;
     use maestro_app::{ProjectCommand, ProjectRefArgs};
     use maestro_protocol::{ClientRequest, SessionId};
     use maestro_shell::{
@@ -31972,7 +32698,6 @@ mod project_delete_daemon_regression_tests {
         WorkspacePolicy,
     };
     use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixListener;
 
     fn seed_tabless_project(paths: &AppPaths, generation: Option<&str>) {
         ProjectService::new(paths)
@@ -32074,7 +32799,7 @@ mod project_delete_daemon_regression_tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = AppPaths::with_base(tmp.path().join("Maestro"));
         seed_tabless_project(&paths, Some("gen-a"));
-        let socket_path = tmp.path().join("daemon.sock");
+        let socket_path = crate::bin_test_transport::endpoint(tmp.path(), "daemon.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
         let server = serve_one_confirmed_kill(listener);
         store_endpoint(
@@ -32109,7 +32834,7 @@ mod project_delete_daemon_regression_tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = AppPaths::with_base(tmp.path().join("Maestro"));
         seed_tabless_project(&paths, Some("gen-a"));
-        let missing_socket = tmp.path().join("missing-daemon.sock");
+        let missing_socket = crate::bin_test_transport::endpoint(tmp.path(), "missing-daemon.sock");
         store_endpoint(
             &paths,
             &DaemonEndpoint::new(missing_socket.to_string_lossy().into_owned(), None, 1),
@@ -32149,7 +32874,7 @@ mod project_delete_daemon_regression_tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = AppPaths::with_base(tmp.path().join("Maestro"));
         seed_tabless_project(&paths, None);
-        let missing_socket = tmp.path().join("missing-daemon.sock");
+        let missing_socket = crate::bin_test_transport::endpoint(tmp.path(), "missing-daemon.sock");
         store_endpoint(
             &paths,
             &DaemonEndpoint::new(missing_socket.to_string_lossy().into_owned(), None, 1),
@@ -32182,6 +32907,7 @@ mod automatic_unrepresented_cleanup_tests {
         dashboard_snapshot_is_complete_for_release, enqueue_stably_unrepresented_sessions,
         listener_has_durable_release_fence, ListenerWindowContext,
     };
+    use crate::bin_test_transport::Listener as UnixListener;
     use maestro_shell::{
         records::{
             LaunchSpec, SessionKind, SessionRecord, SessionStatus, Workspace, WorkspaceConsent,
@@ -32192,12 +32918,11 @@ mod automatic_unrepresented_cleanup_tests {
     };
     use std::collections::BTreeSet;
     use std::io::{BufRead, BufReader, Read, Write};
-    use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
 
     fn strict_report(paths: &AppPaths, sessions: &[(&str, &str)]) -> ReconcileReport {
         let socket_dir = tempfile::tempdir().unwrap();
-        let socket_path = socket_dir.path().join("daemon.sock");
+        let socket_path = crate::bin_test_transport::endpoint(socket_dir.path(), "daemon.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
         let sessions: Vec<(String, String)> = sessions
             .iter()
@@ -32497,6 +33222,7 @@ mod product_startup_target_tests {
         PRODUCT_RECOVERY_PROJECT_ID, PRODUCT_RECOVERY_SESSION_ID, PRODUCT_RECOVERY_TAB_ID,
         PRODUCT_RECOVERY_WINDOW_ID, PRODUCT_RECOVERY_WORKSPACE_ID,
     };
+    use crate::bin_test_transport::Listener as UnixListener;
     use maestro_app::{
         NewTabCwdBasis, NewTabLaunchPolicy, NewTabLaunchSource, SYSTEM_TERMINAL_PROJECT_ID,
         SYSTEM_TERMINAL_SESSION_ID, SYSTEM_TERMINAL_TAB_ID, SYSTEM_TERMINAL_WINDOW_ID,
@@ -32512,7 +33238,8 @@ mod product_startup_target_tests {
         DaemonClient, NewProject, ProjectService, RecoveredSession, WindowLayoutService,
     };
     use std::io::{BufRead, Read, Write};
-    use std::os::unix::net::UnixListener;
+    #[cfg(windows)]
+    use std::path::Path;
 
     fn loaded<T: serde::de::DeserializeOwned>(paths: &AppPaths, kind: RecordKind, id: &str) -> T {
         match store::load_one(paths, kind, id).unwrap() {
@@ -32708,7 +33435,7 @@ mod product_startup_target_tests {
         let sibling = add_visible_retained_sibling(&paths, &selected);
         let selected_before: SessionRecord =
             loaded(&paths, RecordKind::Session, &selected.session.session_id);
-        let socket = tmp.path().join("retained-v2-next-live.sock");
+        let socket = crate::bin_test_transport::endpoint(tmp.path(), "retained-v2-next-live.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let sibling_id = sibling.session.session_id.clone();
         let expected_attach =
@@ -32802,7 +33529,7 @@ mod product_startup_target_tests {
             .load(&selected.project_id)
             .unwrap()
             .unwrap();
-        let socket = tmp.path().join("retained-v2-no-live.sock");
+        let socket = crate::bin_test_transport::endpoint(tmp.path(), "retained-v2-no-live.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -33386,8 +34113,16 @@ mod product_startup_target_tests {
         )
         .unwrap()
         .expect("explicit reopen authorizes exited KnownSafe");
-        assert_eq!(known_safe[0], super::login_shell_program());
-        assert!(known_safe[2].contains("codex") && known_safe[2].contains("session-one"));
+        #[cfg(unix)]
+        {
+            assert_eq!(known_safe[0], super::login_shell_program());
+            assert!(known_safe[2].contains("codex") && known_safe[2].contains("session-one"));
+        }
+        #[cfg(windows)]
+        {
+            assert!(known_safe[0] == "codex" || Path::new(&known_safe[0]).is_absolute());
+            assert_eq!(&known_safe[1..], ["resume", "session-one"]);
+        }
 
         target.session.launch = LaunchSpec::AdHocRedacted {
             argv: vec![
@@ -33409,12 +34144,26 @@ mod product_startup_target_tests {
         )
         .unwrap()
         .expect("exact legacy provider is reduced to a canonical recipe");
-        assert_eq!(legacy_provider[0], super::login_shell_program());
-        assert!(
-            legacy_provider[2].contains("codex")
-                && legacy_provider[2].contains("20000000-0000-4000-8000-000000000001")
-        );
-        assert!(!legacy_provider[2].contains("secret-token"));
+        #[cfg(unix)]
+        {
+            assert_eq!(legacy_provider[0], super::login_shell_program());
+            assert!(
+                legacy_provider[2].contains("codex")
+                    && legacy_provider[2].contains("20000000-0000-4000-8000-000000000001")
+            );
+            assert!(!legacy_provider[2].contains("secret-token"));
+        }
+        #[cfg(windows)]
+        {
+            assert!(legacy_provider[0] == "codex" || Path::new(&legacy_provider[0]).is_absolute());
+            assert_eq!(
+                &legacy_provider[1..],
+                ["resume", "20000000-0000-4000-8000-000000000001"]
+            );
+            assert!(legacy_provider
+                .iter()
+                .all(|arg| !arg.contains("secret-token")));
+        }
 
         for argv in [
             vec!["custom-command".into(), "safe-argument".into()],
@@ -33594,7 +34343,7 @@ mod product_startup_target_tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = AppPaths::with_base(tmp.path().join("base"));
         let target = seed_exited_exact_claude_target(&paths, tmp.path());
-        let socket = tmp.path().join("fresh-recovery.sock");
+        let socket = crate::bin_test_transport::endpoint(tmp.path(), "fresh-recovery.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let session_id = target.session.session_id.clone();
         let expected_id = session_id.clone();
@@ -33611,7 +34360,7 @@ mod product_startup_target_tests {
                 "attachment_aware_conditional_kill": true,
                 "generation_conditional_start": true,
                 "generation_conditional_attach": true,
-                "start_operation_ledger": true,
+                "start_operation_ledger": true, "windows_start_operation_retirement_barrier": true,
             });
             // Capture the same process identity the production fresh-daemon readiness path carries
             // into the later Absent mutation.
@@ -33666,14 +34415,25 @@ mod product_startup_target_tests {
             let start: serde_json::Value = serde_json::from_str(&request).unwrap();
             assert_eq!(start["op"], "start_session");
             assert_eq!(start["id"], expected_id);
-            let command_line = start["args"]
-                .as_array()
-                .and_then(|args| args.last())
-                .and_then(serde_json::Value::as_str)
-                .expect("login-shell command line");
-            assert!(
-                command_line.contains("'claude' '--resume' '10000000-0000-4000-8000-000000000001'")
-            );
+            #[cfg(unix)]
+            {
+                let command_line = start["args"]
+                    .as_array()
+                    .and_then(|args| args.last())
+                    .and_then(serde_json::Value::as_str)
+                    .expect("login-shell command line");
+                assert!(command_line
+                    .contains("'claude' '--resume' '10000000-0000-4000-8000-000000000001'"));
+            }
+            #[cfg(windows)]
+            {
+                let command = start["command"].as_str().unwrap();
+                assert!(command == "claude" || Path::new(command).is_absolute());
+                assert_eq!(
+                    start["args"],
+                    serde_json::json!(["--resume", "10000000-0000-4000-8000-000000000001"])
+                );
+            }
             assert!(
                 start.get("restart_exited").is_none(),
                 "v3 conditional absence replaces the retired restart_exited bit"
@@ -33843,7 +34603,7 @@ mod product_startup_target_tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = AppPaths::with_base(tmp.path().join("base"));
         let endpoint = maestro_shell::daemon_endpoint::DaemonEndpoint::new(
-            tmp.path().join("stale.sock").to_string_lossy(),
+            crate::bin_test_transport::endpoint(tmp.path(), "stale.sock").to_string_lossy(),
             None,
             1,
         );
@@ -33869,7 +34629,7 @@ mod product_startup_target_tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = AppPaths::with_base(tmp.path().join("base"));
         let endpoint = maestro_shell::daemon_endpoint::DaemonEndpoint::new(
-            tmp.path().join("stale.sock").to_string_lossy(),
+            crate::bin_test_transport::endpoint(tmp.path(), "stale.sock").to_string_lossy(),
             None,
             1,
         );
@@ -34318,7 +35078,7 @@ mod product_startup_target_tests {
                     20,
                 )
                 .unwrap();
-            let socket = tmp.path().join("revive-focus.sock");
+            let socket = crate::bin_test_transport::endpoint(tmp.path(), "revive-focus.sock");
             let daemon = UnixListener::bind(&socket).unwrap();
             let session_id = target.session.session_id.clone();
             let server = std::thread::spawn(move || {
@@ -34335,7 +35095,7 @@ mod product_startup_target_tests {
                     "build_version": "test", "daemon_instance_id": "7777777777774777a777777777777777",
                     "output_generation_echo": true, "generation_conditional_mutations": true,
                     "attachment_aware_conditional_kill": true, "generation_conditional_start": true,
-                    "generation_conditional_attach": true, "start_operation_ledger": true,
+                    "generation_conditional_attach": true, "start_operation_ledger": true, "windows_start_operation_retirement_barrier": true,
                 })).unwrap();
                 line.clear();
                 reader.read_line(&mut line).unwrap();
@@ -34469,7 +35229,7 @@ mod product_startup_target_tests {
             .set_tab_stashed(&target.layout.window_id, &target.tab_id, true, 20)
             .unwrap();
 
-        let socket = tmp.path().join("revive.sock");
+        let socket = crate::bin_test_transport::endpoint(tmp.path(), "revive.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let session_id = target.session.session_id.clone();
         let server = std::thread::spawn(move || {
@@ -34480,7 +35240,7 @@ mod product_startup_target_tests {
             assert_eq!(request.trim(), r#"{"op":"daemon_info"}"#);
             writeln!(
                 stream,
-                "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"daemon_instance_id\":\"7777777777774777a777777777777777\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"generation_conditional_attach\":true,\"start_operation_ledger\":true}}",
+                "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"daemon_instance_id\":\"7777777777774777a777777777777777\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"generation_conditional_attach\":true,\"start_operation_ledger\":true,\"windows_start_operation_retirement_barrier\":true}}",
                 maestro_protocol::DAEMON_PROTOCOL_VERSION
             )
             .unwrap();
@@ -34596,7 +35356,7 @@ mod product_startup_target_tests {
         store::set_window_project(&paths, &target.layout.window_id, "unrelated-owner").unwrap();
         let error = match super::preflight_recorded_pane_revive(
             &paths,
-            &tmp.path().join("must-not-connect.sock"),
+            &crate::bin_test_transport::endpoint(tmp.path(), "must-not-connect.sock"),
             &target.layout.window_id,
             &target.tab_id,
             &target.session.session_id,
@@ -34634,7 +35394,7 @@ mod product_startup_target_tests {
             &target.session,
         )
         .unwrap();
-        let socket = tmp.path().join("explicit-reopen.sock");
+        let socket = crate::bin_test_transport::endpoint(tmp.path(), "explicit-reopen.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let expected_id = target.session.session_id.clone();
         let (release_server_tx, release_server_rx) = std::sync::mpsc::channel();
@@ -34646,7 +35406,7 @@ mod product_startup_target_tests {
             assert_eq!(request.trim(), r#"{"op":"daemon_info"}"#);
             writeln!(
                 stream,
-                "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"daemon_instance_id\":\"6666666666664666a666666666666666\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"generation_conditional_attach\":true,\"start_operation_ledger\":true}}",
+                "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"daemon_instance_id\":\"6666666666664666a666666666666666\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"generation_conditional_attach\":true,\"start_operation_ledger\":true,\"windows_start_operation_retirement_barrier\":true}}",
                 maestro_protocol::DAEMON_PROTOCOL_VERSION
             )
             .unwrap();
@@ -34680,17 +35440,29 @@ mod product_startup_target_tests {
             let start: serde_json::Value = serde_json::from_str(&request).unwrap();
             assert_eq!(start["op"], "start_session");
             assert_eq!(start["id"], expected_id);
-            assert!(start["command"]
-                .as_str()
-                .is_some_and(|command| { command == super::login_shell_program() }));
-            assert!(start["args"]
-                .as_array()
-                .and_then(|args| args.last())
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|command| {
-                    command.contains("'claude' '--continue'")
-                        && command.contains("'--dangerously-skip-permissions'")
-                }));
+            #[cfg(unix)]
+            {
+                assert!(start["command"]
+                    .as_str()
+                    .is_some_and(|command| { command == super::login_shell_program() }));
+                assert!(start["args"]
+                    .as_array()
+                    .and_then(|args| args.last())
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|command| {
+                        command.contains("'claude' '--continue'")
+                            && command.contains("'--dangerously-skip-permissions'")
+                    }));
+            }
+            #[cfg(windows)]
+            {
+                let command = start["command"].as_str().unwrap();
+                assert!(command == "claude" || Path::new(command).is_absolute());
+                assert_eq!(
+                    start["args"],
+                    serde_json::json!(["--continue", "--dangerously-skip-permissions"])
+                );
+            }
             assert_eq!(
                 start["conditional_start"]["precondition"]["kind"],
                 "exited_generation"
@@ -34801,6 +35573,109 @@ mod product_startup_target_tests {
             "mixed-window"
         ));
         assert!(!active_renderer_owns_window_cohort(None, "mixed-window"));
+    }
+
+    #[test]
+    fn pane_reopen_detaches_owned_cohort_without_stopping_sessions() {
+        let (mut runtime, commands) = super::RendererTabRuntime::new();
+        assert!(super::clear_renderer_cohort_for_pane_revive(
+            &mut runtime,
+            Some("three-pane-window"),
+            "three-pane-window",
+        )
+        .unwrap());
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            maestro_renderer::RendererCommand::ClearViewport
+        ));
+        assert!(
+            commands.try_recv().is_err(),
+            "no session stop, extra strip mutation or speculative reattach"
+        );
+    }
+
+    #[test]
+    fn pane_reopen_preserves_unrelated_or_neutral_renderer_cohort() {
+        for active in [None, Some("other-window")] {
+            let (mut runtime, commands) = super::RendererTabRuntime::new();
+            assert!(!super::clear_renderer_cohort_for_pane_revive(
+                &mut runtime,
+                active,
+                "target-window",
+            )
+            .unwrap());
+            assert!(
+                commands.try_recv().is_err(),
+                "other-window fallback must stay attached"
+            );
+        }
+    }
+
+    #[test]
+    fn pane_reopen_does_not_start_after_failed_cohort_clear() {
+        let (mut runtime, commands) = super::RendererTabRuntime::new();
+        drop(commands);
+        assert!(super::clear_renderer_cohort_for_pane_revive(
+            &mut runtime,
+            Some("window"),
+            "window",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn pane_reopen_definite_preflight_refusal_keeps_exact_restore_authority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::with_base(tmp.path().join("base"));
+        let target = seed_exited_exact_claude_target(&paths, tmp.path());
+        let prior = super::load_renderer_viewport_projection(
+            &paths,
+            &target.layout.window_id,
+            &target.tab_id,
+        )
+        .unwrap();
+        let (mut runtime, commands) = super::RendererTabRuntime::new();
+        let (events, _received) = std::sync::mpsc::channel();
+        runtime.bind_renderer_events(events);
+        super::clear_renderer_cohort_for_pane_revive(
+            &mut runtime,
+            Some(&target.layout.window_id),
+            &target.layout.window_id,
+        )
+        .unwrap();
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            maestro_renderer::RendererCommand::ClearViewport
+        ));
+        let error = revive_recorded_pane_after_preflight(
+            &paths,
+            &tmp.path().join("no-daemon"),
+            &target.layout.window_id,
+            &target.tab_id,
+            "wrong-requested-session",
+            &["sh".into()],
+            RecordedPaneOpenPolicy::Product,
+            21,
+        )
+        .expect_err("exact identity mismatch is refused before daemon contact");
+        assert!(error.allows_previous_renderer_restore());
+        // Exercise the same reload/fence and typed reattach used by the listener's refusal branch.
+        let restored =
+            super::load_current_exact_previous_renderer_projection(&paths, &prior).unwrap();
+        assert_eq!(restored.exact_viewport(), prior.exact_viewport());
+        runtime.switch_to_exact(restored).unwrap();
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            maestro_renderer::RendererCommand::AttachExactViewport { .. }
+        ));
+        assert!(commands.try_recv().is_err());
+        assert!(
+            !super::RecordedPaneReviveError::Preflight(
+                super::RecordedPanePreflightError::PossiblyApplied("uncertain mutation".into())
+            )
+            .allows_previous_renderer_restore(),
+            "uncertain mutation must stay neutral"
+        );
     }
 
     #[test]
@@ -34943,7 +35818,7 @@ mod product_startup_target_tests {
             )
             .unwrap();
 
-        let socket = tmp.path().join("window-reopen-cohort.sock");
+        let socket = crate::bin_test_transport::endpoint(tmp.path(), "window-reopen-cohort.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let primary_id = target.session.session_id.clone();
         let sibling_id = sibling.session_id.clone();
@@ -34951,7 +35826,7 @@ mod product_startup_target_tests {
         let server = std::thread::spawn(move || {
             const DAEMON_INSTANCE: &str = "6666666666664666a666666666666666";
             fn serve_restart(
-                mut stream: std::os::unix::net::UnixStream,
+                mut stream: crate::bin_test_transport::Stream,
                 expected_id: &str,
                 expected_old_generation: &str,
                 published_generation: &str,
@@ -34964,7 +35839,7 @@ mod product_startup_target_tests {
                 assert_eq!(request.trim(), r#"{"op":"daemon_info"}"#);
                 writeln!(
                     stream,
-                    "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"window-reopen-test\",\"daemon_instance_id\":\"{}\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"generation_conditional_attach\":true,\"start_operation_ledger\":true}}",
+                    "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"window-reopen-test\",\"daemon_instance_id\":\"{}\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"generation_conditional_attach\":true,\"start_operation_ledger\":true,\"windows_start_operation_retirement_barrier\":true}}",
                     maestro_protocol::DAEMON_PROTOCOL_VERSION,
                     DAEMON_INSTANCE,
                 )
@@ -35165,7 +36040,10 @@ mod product_startup_target_tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = AppPaths::with_base(tmp.path().join("base"));
         let target = seed_exited_exact_claude_target(&paths, tmp.path());
-        let socket = tmp.path().join("explicit-reopen-after-daemon-loss.sock");
+        let socket = crate::bin_test_transport::endpoint(
+            tmp.path(),
+            "explicit-reopen-after-daemon-loss.sock",
+        );
         let listener = UnixListener::bind(&socket).unwrap();
         let expected_id = target.session.session_id.clone();
         let (release_server_tx, release_server_rx) = std::sync::mpsc::channel();
@@ -35181,7 +36059,7 @@ mod product_startup_target_tests {
                 "attachment_aware_conditional_kill": true,
                 "generation_conditional_start": true,
                 "generation_conditional_attach": true,
-                "start_operation_ledger": true,
+                "start_operation_ledger": true, "windows_start_operation_retirement_barrier": true,
             });
 
             // The durable row still names the old exited generation, but this daemon no longer
@@ -35462,7 +36340,7 @@ mod product_startup_target_tests {
             .find(|tab| tab.tab_id == target.tab_id)
             .unwrap()
             .clone();
-        let socket = tmp.path().join("reserved-focus-missing.sock");
+        let socket = crate::bin_test_transport::endpoint(tmp.path(), "reserved-focus-missing.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let expected_id = target.session.session_id.clone();
         let server = std::thread::spawn(move || {
@@ -35476,7 +36354,7 @@ mod product_startup_target_tests {
                 "attachment_aware_conditional_kill": true,
                 "generation_conditional_start": true,
                 "generation_conditional_attach": true,
-                "start_operation_ledger": true,
+                "start_operation_ledger": true, "windows_start_operation_retirement_barrier": true,
             });
             let (mut stream, _) = listener.accept().unwrap();
             let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
@@ -35660,7 +36538,8 @@ mod product_startup_target_tests {
             .find(|tab| tab.tab_id == target.tab_id)
             .unwrap()
             .clone();
-        let socket = tmp.path().join("reserved-explicit-reopen.sock");
+        let socket =
+            crate::bin_test_transport::endpoint(tmp.path(), "reserved-explicit-reopen.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let expected_id = target.session.session_id.clone();
         let server = std::thread::spawn(move || {
@@ -35671,7 +36550,7 @@ mod product_startup_target_tests {
             assert_eq!(request.trim(), r#"{"op":"daemon_info"}"#);
             writeln!(
                 stream,
-                "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"reserved-restart-test\",\"daemon_instance_id\":\"cccccccccccc4cccbccccccccccccccc\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"generation_conditional_attach\":true,\"start_operation_ledger\":true}}",
+                "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"reserved-restart-test\",\"daemon_instance_id\":\"cccccccccccc4cccbccccccccccccccc\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"generation_conditional_attach\":true,\"start_operation_ledger\":true,\"windows_start_operation_retirement_barrier\":true}}",
                 maestro_protocol::DAEMON_PROTOCOL_VERSION
             )
             .unwrap();
@@ -35841,7 +36720,8 @@ mod product_startup_target_tests {
         .unwrap()
         .is_none());
 
-        let socket = tmp.path().join("plain-shell-explicit-reopen.sock");
+        let socket =
+            crate::bin_test_transport::endpoint(tmp.path(), "plain-shell-explicit-reopen.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let expected_id = target.session.session_id.clone();
         let server = std::thread::spawn(move || {
@@ -35853,7 +36733,7 @@ mod product_startup_target_tests {
             assert_eq!(request.trim(), r#"{"op":"daemon_info"}"#);
             writeln!(
                 stream,
-                "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"plain-shell-restart-test\",\"daemon_instance_id\":\"{}\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"generation_conditional_attach\":true,\"start_operation_ledger\":true}}",
+                "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"plain-shell-restart-test\",\"daemon_instance_id\":\"{}\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"generation_conditional_attach\":true,\"start_operation_ledger\":true,\"windows_start_operation_retirement_barrier\":true}}",
                 maestro_protocol::DAEMON_PROTOCOL_VERSION,
                 DAEMON_INSTANCE,
             )
@@ -36003,7 +36883,7 @@ mod product_startup_target_tests {
             &target.session,
         )
         .unwrap();
-        let socket = tmp.path().join("focus.sock");
+        let socket = crate::bin_test_transport::endpoint(tmp.path(), "focus.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let session_id = target.session.session_id.clone();
         let server = std::thread::spawn(move || {
@@ -36014,7 +36894,7 @@ mod product_startup_target_tests {
             assert_eq!(request.trim(), r#"{"op":"daemon_info"}"#);
             writeln!(
                 stream,
-                "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"daemon_instance_id\":\"8888888888884888a888888888888888\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"generation_conditional_attach\":true,\"start_operation_ledger\":true}}",
+                "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"daemon_instance_id\":\"8888888888884888a888888888888888\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"generation_conditional_attach\":true,\"start_operation_ledger\":true,\"windows_start_operation_retirement_barrier\":true}}",
                 maestro_protocol::DAEMON_PROTOCOL_VERSION
             )
             .unwrap();
@@ -36048,7 +36928,7 @@ mod product_startup_target_tests {
             assert_eq!(request.trim(), r#"{"op":"daemon_info"}"#);
             writeln!(
                 stream,
-                "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"daemon_instance_id\":\"8888888888884888a888888888888888\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"generation_conditional_attach\":true,\"start_operation_ledger\":true}}",
+                "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"daemon_instance_id\":\"8888888888884888a888888888888888\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"generation_conditional_attach\":true,\"start_operation_ledger\":true,\"windows_start_operation_retirement_barrier\":true}}",
                 maestro_protocol::DAEMON_PROTOCOL_VERSION
             )
             .unwrap();

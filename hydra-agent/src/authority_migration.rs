@@ -68,6 +68,7 @@ struct Receipt {
 }
 
 impl Receipt {
+    #[cfg(unix)]
     fn from_plan(plan: ReceiptPlan, receipt_device: u64, receipt_inode: u64) -> io::Result<Self> {
         let notice_id = plan_notice_id(&plan)?;
         Ok(Self {
@@ -108,6 +109,7 @@ impl ApplyFailure {
         }
     }
 
+    #[cfg(unix)]
     fn after_receipt(source: io::Error, receipt: &Receipt, home: &Path) -> Self {
         let notice =
             notice_from_receipt(receipt, home, FilesystemModeMigrationPhase::Interrupted).ok();

@@ -71,6 +71,102 @@ impl SecureAppSupport {
     }
 }
 
+/// Pinned Windows private authority. Existing objects are inspected, never ACL-repaired.
+/// This is deliberately distinct from SQLite's explicitly repair-capable store boundary.
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct WindowsPrivateDirectory(SecureAppSupport);
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowsPrivateFileIdentity {
+    pub volume: u64,
+    pub file_index: u64,
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct WindowsPrivateLock {
+    _lock: crate::windows_file_lock::WindowsFileLock,
+    _directory: SecureAppSupport,
+}
+
+#[cfg(windows)]
+impl WindowsPrivateDirectory {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        windows::private_authority(path, false).map(Self)
+    }
+    pub fn ensure(path: &Path) -> io::Result<Self> {
+        windows::private_authority(path, true).map(Self)
+    }
+    pub fn path(&self) -> io::Result<std::path::PathBuf> {
+        windows::directory_path(&self.0.dir)
+    }
+    pub fn identity(&self) -> io::Result<WindowsPrivateFileIdentity> {
+        let (volume, file_index) = windows::require_private(&self.0.dir, true)?;
+        Ok(WindowsPrivateFileIdentity { volume, file_index })
+    }
+    pub fn open_file(&self, name: &OsStr, create_new: bool) -> io::Result<File> {
+        windows::open_private_file_at(&self.0.dir, name, create_new)
+    }
+    pub fn validate_file(file: &File) -> io::Result<WindowsPrivateFileIdentity> {
+        let (volume, file_index) = windows::require_private(file, false)?;
+        Ok(WindowsPrivateFileIdentity { volume, file_index })
+    }
+    pub fn publish(&self, name: &OsStr, bytes: &[u8], replace: bool) -> io::Result<()> {
+        windows::publish_private_at(&self.0.dir, name, bytes, replace)
+    }
+    pub fn remove_opened_file(&self, file: File) -> io::Result<()> {
+        self.identity()?;
+        windows::remove_private_file_at(&self.0.dir, &file)
+    }
+    /// Remove one verified empty child directory by its open handle. False means absent or
+    /// nonempty; no recursive deletion or namespace durability guarantee is implied.
+    pub fn remove_empty_child(&self, name: &OsStr) -> io::Result<bool> {
+        windows::remove_empty_private_directory_at(&self.0.dir, name)
+    }
+    pub fn try_lock(&self, name: &OsStr) -> io::Result<WindowsPrivateLock> {
+        self.acquire_lock(name, true)
+    }
+    pub fn lock(&self, name: &OsStr) -> io::Result<WindowsPrivateLock> {
+        self.acquire_lock(name, false)
+    }
+    fn acquire_lock(&self, name: &OsStr, nonblocking: bool) -> io::Result<WindowsPrivateLock> {
+        let file = match self.open_file(name, false) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match self.open_file(name, true) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        self.open_file(name, false)?
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        let lock = crate::windows_file_lock::WindowsFileLock::from_owner_file(file)?;
+        if nonblocking {
+            lock.try_lock_exclusive()?;
+        } else {
+            lock.lock_exclusive()?;
+        }
+        let directory = SecureAppSupport {
+            dir: self.0.dir.try_clone()?,
+            _ancestors: self
+                .0
+                ._ancestors
+                .iter()
+                .map(File::try_clone)
+                .collect::<io::Result<_>>()?,
+        };
+        Ok(WindowsPrivateLock {
+            _lock: lock,
+            _directory: directory,
+        })
+    }
+}
+
 #[cfg(unix)]
 fn secure_app_support(base: &Path) -> io::Result<SecureAppSupport> {
     if !base.is_absolute() {

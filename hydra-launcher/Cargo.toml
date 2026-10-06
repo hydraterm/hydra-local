@@ -1,6 +1,6 @@
 [package]
 name = "hydra-launcher"
-version = "0.2.15"
+version = "0.2.16"
 publish = false
 edition.workspace = true
 license.workspace = true
@@ -10,6 +10,17 @@ rust-version.workspace = true
 name = "hydra-launcher"
 path = "src/main.rs"
 
+[features]
+default = []
+windows-local-qa = []
+
 [dependencies]
 libc = { workspace = true }
 maestro-protocol = { path = "../maestro-protocol" }
+
+[target.'cfg(windows)'.dependencies]
+maestro-shell = { path = "../maestro-shell" }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_Threading"] }

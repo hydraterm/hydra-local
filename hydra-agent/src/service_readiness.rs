@@ -5,8 +5,12 @@
 //! usable. This avoids a permanent heartbeat, polling timer, or 2Hz disk writes.
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs;
+#[cfg(unix)]
+use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::io::Write;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -172,6 +176,10 @@ pub enum ServiceReadinessError {
 struct ReadinessLock {
     #[cfg(unix)]
     file: fs::File,
+    #[cfg(windows)]
+    _windows_lock: maestro_shell::WindowsPrivateLock,
+    #[cfg(windows)]
+    _windows_root: maestro_shell::WindowsPrivateDirectory,
 }
 
 impl ReadinessLock {
@@ -196,8 +204,15 @@ impl ReadinessLock {
             }
             Ok(Self { file })
         }
-        #[cfg(not(unix))]
-        Ok(Self {})
+        #[cfg(windows)]
+        {
+            let root = maestro_shell::WindowsPrivateDirectory::open(agent_dir)?;
+            let lock = root.lock(std::ffi::OsStr::new("service-readiness.lock"))?;
+            Ok(Self {
+                _windows_lock: lock,
+                _windows_root: root,
+            })
+        }
     }
 }
 
@@ -220,6 +235,7 @@ pub fn service_readiness_request_path(agent_dir: &Path) -> PathBuf {
     agent_dir.join(SERVICE_READINESS_REQUEST_FILE)
 }
 
+#[cfg(unix)]
 fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<(), ServiceReadinessError> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     crate::agent_dir::ensure_owned_safe_authority_directory(dir)?;
@@ -263,6 +279,19 @@ fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<(), ServiceReadin
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+#[cfg(windows)]
+fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<(), ServiceReadinessError> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let _root = maestro_shell::WindowsPrivateDirectory::ensure(dir)?;
+    let mut bytes = serde_json::to_vec(value)?;
+    bytes.push(b'\n');
+    crate::windows_private_authority::publish(path, &bytes, true)?;
+    if crate::windows_private_authority::read(path, bytes.len())?.0 != bytes {
+        return Err(io::Error::other("service readiness record readback differs").into());
+    }
+    Ok(())
 }
 
 fn load_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, ServiceReadinessError> {
@@ -417,8 +446,17 @@ fn remove_if_exists(path: &Path) -> io::Result<()> {
             ));
         }
     }
-    fs::remove_file(path)?;
-    sync_directory(dir)?;
+    #[cfg(unix)]
+    {
+        fs::remove_file(path)?;
+        sync_directory(dir)?;
+    }
+    #[cfg(windows)]
+    {
+        let identity = maestro_shell::WindowsPrivateDirectory::validate_file(&file)?;
+        drop(file);
+        crate::windows_private_authority::remove(path, Some(identity))?;
+    }
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
@@ -428,6 +466,7 @@ fn remove_if_exists(path: &Path) -> io::Result<()> {
     }
 }
 
+#[cfg(unix)]
 fn open_existing_private(path: &Path, label: &str) -> io::Result<Option<fs::File>> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -445,6 +484,16 @@ fn open_existing_private(path: &Path, label: &str) -> io::Result<Option<fs::File
     Ok(Some(file))
 }
 
+#[cfg(windows)]
+fn open_existing_private(path: &Path, _label: &str) -> io::Result<Option<fs::File>> {
+    match crate::windows_private_authority::open(path, false) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
 fn validate_private_regular(
     file: &fs::File,
     label: &str,
@@ -477,6 +526,7 @@ fn validate_private_regular(
     Ok(())
 }
 
+#[cfg(unix)]
 fn sync_directory(path: &Path) -> io::Result<()> {
     fs::File::open(path)?.sync_all()
 }
@@ -546,16 +596,7 @@ mod tests {
     use super::*;
 
     fn test_dir(label: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = std::fs::canonicalize("/tmp").unwrap().join(format!(
-            "hydra-readiness-{label}-{}-{}",
-            std::process::id(),
-            SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        dir
+        crate::agent_dir::secure_authority_test_dir(&format!("hydra-readiness-{label}-")).keep()
     }
 
     fn request() -> ServiceReadinessRequest {
@@ -665,6 +706,16 @@ mod tests {
         let request_inode = fs::metadata(service_readiness_request_path(&dir))
             .unwrap()
             .ino();
+        #[cfg(windows)]
+        let (request_file, request_identity) = {
+            let file = crate::windows_private_authority::open(
+                &service_readiness_request_path(&dir),
+                false,
+            )
+            .unwrap();
+            let identity = maestro_shell::WindowsPrivateDirectory::validate_file(&file).unwrap();
+            (file, identity)
+        };
         assert!(!restore_service_readiness_request_if_empty(&dir, &request).unwrap());
         #[cfg(unix)]
         assert_eq!(
@@ -674,6 +725,20 @@ mod tests {
             request_inode,
             "an existing exact request must not be rewritten"
         );
+        #[cfg(windows)]
+        {
+            let current = crate::windows_private_authority::open(
+                &service_readiness_request_path(&dir),
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                maestro_shell::WindowsPrivateDirectory::validate_file(&current).unwrap(),
+                request_identity,
+                "an existing exact request must not be replaced"
+            );
+            drop(request_file);
+        }
 
         let record = ServiceReadinessRecord::answer(&request, 101, 202, 1_100);
         write_service_readiness(&dir, &record).unwrap();
@@ -700,8 +765,6 @@ mod tests {
 
     #[test]
     fn request_repair_never_overwrites_foreign_or_unsafe_handshake_bytes() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let dir = test_dir("request-repair-conflict");
         let expected = request();
         let mut foreign = request();
@@ -728,7 +791,7 @@ mod tests {
         remove_all_service_readiness(&dir).unwrap();
         write_service_readiness_request(&dir, &expected).unwrap();
         let path = service_readiness_request_path(&dir);
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        crate::agent_dir::set_authority_test_mode(&path, 0o644).unwrap();
         let before = fs::read(&path).unwrap();
         assert!(restore_service_readiness_request_if_empty(&dir, &expected).is_err());
         assert_eq!(fs::read(&path).unwrap(), before);
@@ -737,7 +800,7 @@ mod tests {
         let malformed_dir = test_dir("request-repair-malformed");
         let malformed_path = service_readiness_request_path(&malformed_dir);
         fs::write(&malformed_path, b"{not-json\n").unwrap();
-        fs::set_permissions(&malformed_path, fs::Permissions::from_mode(0o600)).unwrap();
+        crate::agent_dir::set_authority_test_mode(&malformed_path, 0o600).unwrap();
         let malformed = fs::read(&malformed_path).unwrap();
         assert!(restore_service_readiness_request_if_empty(&malformed_dir, &expected).is_err());
         assert_eq!(fs::read(&malformed_path).unwrap(), malformed);

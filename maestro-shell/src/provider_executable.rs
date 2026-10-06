@@ -25,20 +25,18 @@ use std::process::{Command, Stdio};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
+use crate::launch_environment::is_executable_file;
 #[cfg(unix)]
-use crate::launch_environment::{is_executable_file, LOGIN_SHELL_COMMAND_FLAGS};
+use crate::launch_environment::LOGIN_SHELL_COMMAND_FLAGS;
 use crate::provider_launch_selection::LaunchEnvLookup;
-#[cfg(unix)]
 use crate::provider_launch_selection::ProviderExecutable;
 
-#[cfg(unix)]
 impl ProviderExecutable {
     pub fn remains_executable_for(&self, provider: &str) -> bool {
         self.path_for(provider).is_some_and(is_executable_file)
     }
 }
 
-#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProviderResolution {
     Executable(ProviderExecutable),
@@ -46,7 +44,6 @@ pub enum ProviderResolution {
     ShellCommand,
 }
 
-#[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderLookupError {
     Unavailable,
@@ -92,8 +89,15 @@ pub fn provider_executable_override_variable(provider: &str) -> Option<&'static 
     })
 }
 
+#[cfg(windows)]
+#[path = "provider_executable_windows.rs"]
+mod windows;
+#[cfg(windows)]
+pub use windows::resolve_provider_executable;
+
 /// Conventional stable launch roots, not physical version directories. Nix's documented profile
 /// symlink follows upgrades; keep it lexical rather than pinning a /nix/store generation.
+#[cfg(unix)]
 pub(crate) fn provider_fallback(
     provider: &str,
     env: &impl LaunchEnvLookup,

@@ -783,8 +783,9 @@ mod tests {
     #[test]
     fn real_worker_completes_latest_list_without_delivering_replaced_request() {
         const CHILD_MARKER: &str = "HYDRA_HISTORY_REAL_WORKER_CHILD";
+        const HOME_ENV: &str = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
 
-        // HOME is process-global, while Rust runs tests in parallel. Isolate the provider fixture
+        // The platform home is process-global, while Rust runs tests in parallel. Isolate the provider fixture
         // in an exact-test child process instead of mutating this test process and relying on a
         // mutex that unrelated HOME readers do not share.
         if std::env::var_os(CHILD_MARKER).is_none() {
@@ -822,7 +823,7 @@ mod tests {
             .arg("--exact")
             .arg(test_name)
             .arg("--nocapture")
-            .env("HOME", temp.path())
+            .env(HOME_ENV, temp.path())
             .env(CHILD_MARKER, "1")
             .status()
             .expect("run isolated real-worker test child");
@@ -830,7 +831,7 @@ mod tests {
             return;
         }
 
-        let home = PathBuf::from(std::env::var_os("HOME").expect("isolated HOME"));
+        let home = PathBuf::from(std::env::var_os(HOME_ENV).expect("isolated platform home"));
         let project = home.join("project");
         let paths = AppPaths::with_base(home.join("app-state"));
         let mut discovery = HistoryDiscovery::spawn();

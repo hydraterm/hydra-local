@@ -1674,6 +1674,12 @@ fn canonical_prepared_unknown_with_agent_task(
     live_argv.push(params.command.clone());
     live_argv.extend(params.args.iter().cloned());
     let launch_is_bound = match binding {
+        PreparedSessionBinding::DefaultShell => {
+            params.kind == SessionKind::Shell
+                && params.agent_task_id.is_none()
+                && params.launch == crate::LaunchSpec::OptOut
+                && publication_launch == &crate::LaunchSpec::OptOut
+        }
         PreparedSessionBinding::LegacyShellAdHoc => {
             params.kind == SessionKind::Shell
                 && publication_launch == &params.launch
@@ -1785,6 +1791,12 @@ fn prepared_params_match_unknown(
         && unknown.status == SessionStatus::Unknown
         && !params.command.trim().is_empty()
         && match binding {
+            PreparedSessionBinding::DefaultShell => {
+                params.kind == SessionKind::Shell
+                    && params.agent_task_id.is_none()
+                    && params.launch == crate::LaunchSpec::OptOut
+                    && publication_launch == &crate::LaunchSpec::OptOut
+            }
             PreparedSessionBinding::LegacyShellAdHoc => {
                 params.kind == SessionKind::Shell
                     && publication_launch == &params.launch
@@ -10201,6 +10213,49 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let paths = AppPaths::with_base(tmp.path().join("Maestro"));
         (tmp, paths)
+    }
+
+    #[test]
+    fn default_shell_binding_requires_sealed_opt_out_and_rejects_adhoc_substitution() {
+        let tmp = TempDir::new().unwrap();
+        let prepared = crate::PreparedWorkspace::unsealed(
+            crate::WorkspacePolicy::ScratchCwd,
+            "workspace",
+            "session",
+            tmp.path(),
+        );
+        let (params, launch, binding, _) = prepared
+            .default_shell_session_spec(&["fixture-shell".into(), "-l".into()], 80, 24, 1)
+            .unwrap()
+            .into_parts();
+        let row = canonical_prepared_unknown(&params, &launch, binding).unwrap();
+        assert_eq!(row.launch, crate::LaunchSpec::OptOut);
+        assert!(prepared_params_match_unknown(
+            &params, &row, &launch, binding, None
+        ));
+        assert!(
+            canonical_prepared_unknown(&params, &launch, PreparedSessionBinding::ExactAdHoc)
+                .is_err()
+        );
+        for variant in 0..3 {
+            let mut changed = params.clone();
+            match variant {
+                0 => changed.kind = SessionKind::Agent,
+                1 => changed.agent_task_id = Some("task".into()),
+                _ => {
+                    changed.launch =
+                        crate::redact::adhoc_launch_spec(&["fixture-shell".into(), "-l".into()])
+                }
+            }
+            assert!(canonical_prepared_unknown(&changed, &launch, binding).is_err());
+            assert!(!prepared_params_match_unknown(
+                &changed, &row, &launch, binding, None
+            ));
+        }
+        assert!(prepared.default_shell_session_spec(&[], 80, 24, 1).is_err());
+        assert!(prepared
+            .default_shell_session_spec(&[" ".into()], 80, 24, 1)
+            .is_err());
     }
 
     fn svc(paths: &AppPaths) -> WindowLayoutService<'_> {

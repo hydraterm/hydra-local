@@ -578,10 +578,12 @@ pub struct Renderer {
     // so terminal padding never widens app chrome or moves its collapse button/rows.
     dock_width_x: f32,
     // The left-dock rows to paint inside the reserved column (in draw order), and whether the dock is in
-    // its collapsed icon-rail variant. Empty `dock_rows` draws only the dock fill. Set by
+    // its collapsed icon-rail variant. React owns its own controls; native controls
+    // must not show through a transparent/repainting child WebView. Set by
     // the App each frame via `set_dock_rows` alongside `set_grid_origin_x`.
     dock_rows: Vec<crate::RendererDockRow>,
     dock_collapsed: bool,
+    native_dock_controls: bool,
     // The visible top tab the cursor is hovering, or `None`. Display-only chrome state set by the App
     // each frame alongside `top_bar`; it shifts a hovered INACTIVE tab's fill/label without changing
     // the active tab. Ignored when `top_bar` is `None`.
@@ -723,6 +725,77 @@ struct FrameStats {
     submit_present_cpu_us: u128,
     /// Total microseconds for the whole `render` call.
     frame_total_us: u128,
+}
+
+fn native_dock_button_paint(
+    native_controls: bool,
+    collapsed: bool,
+    dock_width: f32,
+    dock_top: f32,
+    cell_height: f32,
+) -> Option<([f32; 4], &'static str)> {
+    if !native_controls {
+        return None;
+    }
+    crate::dock_collapse_button_rect(dock_width, dock_top, cell_height)
+        .map(|rect| (rect, if collapsed { "»" } else { "«" }))
+}
+
+#[cfg(test)]
+mod native_dock_control_tests {
+    use super::{native_dock_button_paint, resolved_horizontal_origins};
+
+    #[test]
+    fn react_dock_never_paints_native_button_or_glyph() {
+        for collapsed in [false, true] {
+            for width in [24.0, 220.0, 460.0, 720.0] {
+                for top in [0.0, 20.0] {
+                    assert_eq!(
+                        native_dock_button_paint(false, collapsed, width, top, 20.0),
+                        None
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_empty_dock_keeps_both_toggle_variants_and_existing_geometry() {
+        // A native dock can have no rows and still needs its collapse/expand control.
+        // No row count or terminal origin enters the paint decision.
+        for (collapsed, glyph) in [(false, "«"), (true, "»")] {
+            for width in [24.0, 220.0, 460.0] {
+                for top in [0.0, 20.0] {
+                    assert_eq!(
+                        native_dock_button_paint(true, collapsed, width, top, 20.0),
+                        Some(([width - 20.0, top, 20.0, 20.0], glyph))
+                    );
+                }
+            }
+            assert_eq!(
+                native_dock_button_paint(true, collapsed, 20.0, 0.0, 20.0),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn native_dock_button_uses_surface_clamped_width_without_moving_terminal_origin() {
+        let (width, origin) = resolved_horizontal_origins(460.0, 470.0, 200.0);
+        assert_eq!((width, origin), (200.0, 200.0));
+        assert_eq!(
+            native_dock_button_paint(true, false, width, 0.0, 20.0),
+            Some(([180.0, 0.0, 20.0, 20.0], "«"))
+        );
+        assert_eq!(
+            native_dock_button_paint(false, false, width, 0.0, 20.0),
+            None
+        );
+        assert_eq!(
+            resolved_horizontal_origins(460.0, 470.0, 200.0),
+            (width, origin)
+        );
+    }
 }
 
 impl Renderer {
@@ -1031,6 +1104,7 @@ impl Renderer {
             dock_width_x: 0.0,
             dock_rows: Vec::new(),
             dock_collapsed: false,
+            native_dock_controls: false,
             top_bar_hover: None,
             dashboard_panel: Vec::new(),
             remote_controls_available: false,
@@ -1113,11 +1187,17 @@ impl Renderer {
 
     /// Hand the renderer the left-dock rows (in draw order) and the collapsed flag for subsequent
     /// frames. Independent of `set_grid_origin_x`; actual chrome width comes from `set_dock_width_x`,
-    /// while a larger grid origin may include terminal-only padding. An empty `rows` vec draws only the
-    /// dock fill. Display-only: the renderer paints, never mutates, these rows.
-    pub fn set_dock_rows(&mut self, rows: Vec<crate::RendererDockRow>, collapsed: bool) {
+    /// while a larger grid origin may include terminal-only padding. Native-only docks keep their
+    /// toggle even with no rows; React docks keep only the backing fill. Display-only.
+    pub fn set_dock_rows(
+        &mut self,
+        rows: Vec<crate::RendererDockRow>,
+        collapsed: bool,
+        native_controls: bool,
+    ) {
         self.dock_rows = rows;
         self.dock_collapsed = collapsed;
+        self.native_dock_controls = native_controls;
     }
 
     /// The configured surface size in physical pixels (`width`, `height`). Lets the App derive the
@@ -1376,6 +1456,17 @@ impl Renderer {
         );
     }
 
+    /// The Windows child browser can start layout while the GPU reallocates.
+    /// Keep this preflight identical to resize's rejection conditions: a rejected
+    /// GPU extent must never move chrome away from the last accepted allocation.
+    #[cfg(windows)]
+    pub(crate) fn accepts_surface_extent(&self, width: u32, height: u32) -> bool {
+        crate::windows_chrome_geometry::surface_extent_is_valid(
+            (width, height),
+            self.max_surface_dim,
+        )
+    }
+
     /// Paint one frame. `grid` is the latest authoritative snapshot (None ->
     /// clear to background). `overlay` is an optional status-line text. `selection`
     /// is the optional `(anchor, focus)` cell range to highlight (order independent).
@@ -1437,6 +1528,16 @@ impl Renderer {
         let sib_off_y = sibling.map_or(0.0, |p| p.row as f32 * ch);
         let sibling_pixel_clip = sibling.map(|pane| pane_pixel_rect(pane, cw, ch, ox, oy));
         let sibling_text_clip = sibling.map(|pane| pane_text_clip(pane, 0, cw, ch, ox, oy));
+
+        // One ownership decision feeds both the button backing and its glyph.
+        // Keep reserved geometry independent of whether React paints the controls.
+        let dock_button = native_dock_button_paint(
+            self.native_dock_controls,
+            self.dock_collapsed,
+            dock_w,
+            if self.top_bar.is_some() { ch } else { 0.0 },
+            ch,
+        );
 
         // --- build background + cursor quads ---
         let mut quads: Vec<QuadInstance> = Vec::new();
@@ -1661,11 +1762,12 @@ impl Renderer {
             // Region-local clip: the cached grid's cells are (0,0)-based and sized to the region MINUS
             // the header row, so we bound to the content rows (matching the sibling's
             // `cell_in_pane(.., 0,0-pane)`).
+            let content = crate::pane_content_region_with_header(region, header_rows);
             let local = crate::RendererPaneRegion {
                 col: 0,
                 row: 0,
-                cols: region.cols,
-                rows: region.rows.saturating_sub(header_rows),
+                cols: content.cols,
+                rows: content.rows,
             };
             let content_pixel_clip = Some([
                 off_x,
@@ -1912,14 +2014,11 @@ impl Renderer {
             // aligned with the first row band. Geometry matches `dock_collapse_button_rect` in lib.rs
             // (the hit-test), so the painted button and the click target cannot drift. The `«`/`»`
             // glyph is drawn in the text pass below.
-            {
-                let btn_top = if self.top_bar.is_some() { ch } else { 0.0 };
-                if dock_w > ch {
-                    quads.push(QuadInstance {
-                        rect: [dock_w - ch, btn_top, ch, ch],
-                        color: rgba(DOCK_ROW_HEADER, 1.0),
-                    });
-                }
+            if let Some((rect, _)) = dock_button {
+                quads.push(QuadInstance {
+                    rect,
+                    color: rgba(DOCK_ROW_HEADER, 1.0),
+                });
             }
 
             // Per-row styling quads: backing fill, left accent bar, status dot, count-badge pill.
@@ -2400,11 +2499,12 @@ impl Renderer {
             let off_x = region.col as f32 * cw + ox;
             let header_rows = pane_header_rows_for(ep, cw, ch, oy);
             let off_y = (region.row + header_rows) as f32 * ch;
+            let content = crate::pane_content_region_with_header(region, header_rows);
             let local = crate::RendererPaneRegion {
                 col: 0,
                 row: 0,
-                cols: region.cols,
-                rows: region.rows.saturating_sub(header_rows),
+                cols: content.cols,
+                rows: content.rows,
             };
             let content_text_clip = Some(pane_text_clip(region, header_rows, cw, ch, ox, oy));
             for (row, cells) in g.rows_cells.iter().enumerate() {
@@ -2719,8 +2819,7 @@ impl Renderer {
         // Collapse-button glyph: (buffer, left_x, top_y). `»` when collapsed (click to expand), `«`
         // when expanded (click to collapse). Drawn over the button quad in the dock's top-right corner.
         let mut dock_button_buf: Option<(Buffer, f32, f32)> = None;
-        if dock_w > ch {
-            let glyph = if self.dock_collapsed { "»" } else { "«" };
+        if let Some((rect, glyph)) = dock_button {
             let mut bbuf = Buffer::new(&mut self.font_system, metrics);
             bbuf.set_size(&mut self.font_system, Some(ch), Some(ch));
             bbuf.set_text(
@@ -2730,7 +2829,7 @@ impl Renderer {
                 Shaping::Advanced,
             );
             bbuf.shape_until_scroll(&mut self.font_system, false);
-            dock_button_buf = Some((bbuf, dock_w - ch, dock_rows_top));
+            dock_button_buf = Some((bbuf, rect[0], rect[1]));
         }
         if dock_w > 0.0 && !self.dock_rows.is_empty() {
             for (i, row) in self.dock_rows.iter().enumerate() {
@@ -3784,8 +3883,8 @@ fn cell_text_bounds(
 /// Convert a pane's absolute grid edges to glyphon's integer clipping coordinates. Every edge uses
 /// the same nearest-physical-pixel rule and is computed from the absolute cell coordinate, never as
 /// `left + width`. Adjacent panes therefore quantize a shared fractional edge to the identical i32:
-/// one pane's `right` is exactly its neighbor's `left` (and likewise bottom/top), with no overlap or
-/// gap. `header_rows` shifts only the content top; the right/bottom remain the pane's outer edges.
+/// adjacent edges cannot overlap through rounding. Header-bearing panes use the same trailing gutter
+/// as PTY sizing and pointer routing, so the separator never covers the last visible character.
 fn pane_text_clip(
     pane: crate::RendererPaneRegion,
     header_rows: u16,
@@ -3794,11 +3893,11 @@ fn pane_text_clip(
     ox: f32,
     oy: f32,
 ) -> [i32; 4] {
-    let col_start = pane.col as u32;
-    let col_end = col_start + pane.cols as u32;
-    let row_start = pane.row as u32;
-    let row_end = row_start + pane.rows as u32;
-    let content_row_start = row_start + header_rows.min(pane.rows) as u32;
+    let content = crate::pane_content_region_with_header(pane, header_rows);
+    let col_start = content.col as u32;
+    let col_end = col_start + content.cols as u32;
+    let content_row_start = content.row as u32;
+    let row_end = content_row_start + content.rows as u32;
     let edge = |cell: u32, metric: f32, origin: f32| (origin + cell as f32 * metric).round() as i32;
     [
         edge(col_start, cw, ox),
@@ -6146,8 +6245,8 @@ mod pane_clip_tests {
             .expect("extra top cell");
         assert_eq!(active_bottom.bottom, extra_first.top);
 
-        // Real extra-pane terminal content commonly starts below a one-row header. Two adjacent
-        // header-bearing extras must still share one canonical horizontal clip edge.
+        // Header-bearing extras reserve a trailing divider gutter. Text must stop before it,
+        // even with fractional cell metrics and a wide final glyph.
         let extra_left = RendererPaneRegion {
             col: 0,
             row: 5,
@@ -6162,11 +6261,12 @@ mod pane_clip_tests {
         };
         let extra_left_clip = pane_text_clip(extra_left, 1, cw, ch, ox, oy);
         let extra_right_clip = pane_text_clip(extra_right, 1, cw, ch, ox, oy);
-        assert_eq!(extra_left_clip[2], extra_right_clip[0]);
+        assert!(extra_left_clip[2] < extra_right_clip[0]);
+        assert_eq!(extra_left_clip[2], (ox + 6.0 * cw).round() as i32);
         assert_eq!(extra_left_clip[1], extra_right_clip[1]);
         let content_y = oy + 6.0 * ch;
         let extra_left_last = cell_text_bounds(
-            ox + 6.0 * cw,
+            ox + 5.0 * cw,
             content_y,
             2.0 * cw,
             ch,
@@ -6185,7 +6285,7 @@ mod pane_clip_tests {
             300,
         )
         .expect("right extra edge cell");
-        assert_eq!(extra_left_last.right, extra_right_first.left);
+        assert!(extra_left_last.right < extra_right_first.left);
     }
 
     #[test]

@@ -4,8 +4,10 @@
 //! authority and ordinary App launches must derive byte-identical argv without accepting caller-
 //! supplied live command bytes. Environment and executable lookup are injectable for tests.
 
+#[cfg(unix)]
 use std::ffi::CString;
 use std::ffi::OsString;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -26,15 +28,26 @@ pub struct ProcessLaunchEnv;
 
 impl LaunchEnvLookup for ProcessLaunchEnv {
     fn shell_utf8(&self) -> Option<String> {
+        #[cfg(windows)]
+        return std::env::var("COMSPEC").ok();
+        #[cfg(unix)]
         std::env::var("SHELL").ok()
     }
 
     fn home_os(&self) -> Option<OsString> {
+        #[cfg(windows)]
+        return std::env::var_os("USERPROFILE");
+        #[cfg(unix)]
         std::env::var_os("HOME")
     }
 
     fn path_os(&self) -> Option<OsString> {
         std::env::var_os("PATH")
+    }
+
+    #[cfg(windows)]
+    fn roaming_app_data_os(&self) -> Option<OsString> {
+        std::env::var_os("APPDATA")
     }
 
     fn configured_provider_path(&self, provider: &str) -> Option<PathBuf> {
@@ -49,7 +62,9 @@ pub fn login_shell_program(env: &impl LaunchEnvLookup) -> String {
     env.shell_utf8()
         .filter(|shell| !shell.trim().is_empty())
         .unwrap_or_else(|| {
-            if cfg!(target_os = "macos") {
+            if cfg!(windows) {
+                "cmd.exe".to_string()
+            } else if cfg!(target_os = "macos") {
                 "/bin/zsh".to_string()
             } else {
                 "/bin/sh".to_string()
@@ -65,6 +80,7 @@ pub fn shell_quote_login_arg(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
+#[cfg(unix)]
 pub(crate) fn is_executable_file(path: &Path) -> bool {
     if !path.metadata().map(|meta| meta.is_file()).unwrap_or(false) {
         return false;
@@ -74,6 +90,19 @@ pub(crate) fn is_executable_file(path: &Path) -> bool {
     };
     // SAFETY: `path` is a live NUL-terminated C string and `access` does not retain it.
     unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 }
+}
+
+#[cfg(windows)]
+pub(crate) fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                ["exe", "com", "cmd", "bat"]
+                    .iter()
+                    .any(|known| extension.eq_ignore_ascii_case(known))
+            })
 }
 
 /// Build the exact login-shell argv used by both fresh App launches and durable KnownSafe replay.
@@ -87,6 +116,7 @@ pub fn login_shell_argv(argv: &[String], env: &impl LaunchEnvLookup) -> Vec<Stri
 
 /// Explicit-program test seam used by preflight/parity tests. The executable predicate is injected
 /// so tests never need to mutate permissions or the real HOME.
+#[cfg(unix)]
 pub fn login_shell_argv_with(
     argv: &[String],
     login_shell: &str,
@@ -196,11 +226,38 @@ pub fn known_safe_provider_login_shell_argv(
     }
 }
 
-#[cfg(test)]
+#[cfg(windows)]
+pub fn login_shell_argv_with(
+    argv: &[String],
+    _login_shell: &str,
+    env: &impl LaunchEnvLookup,
+    _executable: impl Fn(&Path) -> bool,
+) -> Vec<String> {
+    // ConPTY's native command adapter already handles executable argv and npm .cmd shims.
+    // Never feed POSIX -lic/export/unset syntax into cmd.exe or PowerShell.
+    let mut resolved = argv.to_vec();
+    if let Some(provider) = argv.first() {
+        let selected =
+            env.selected_provider_path(provider).or_else(
+                || match crate::resolve_provider_executable(provider, Path::new("."), env) {
+                    Ok(Some(crate::ProviderResolution::Executable(selected))) => {
+                        selected.path_for(provider).map(Path::to_path_buf)
+                    }
+                    _ => None,
+                },
+            );
+        if let Some(path) = selected.as_ref().and_then(|path| path.to_str()) {
+            resolved[0] = path.to_owned();
+        }
+    }
+    resolved
+}
+
+#[cfg(all(test, unix))]
 #[path = "bound_provider_tests.rs"]
 mod bound_provider_tests;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;

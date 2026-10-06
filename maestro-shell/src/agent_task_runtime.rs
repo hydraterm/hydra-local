@@ -574,9 +574,11 @@ mod tests {
     use crate::records::{AgentTaskState, LaunchSpec, SessionStatus};
     use crate::session_service::SessionServiceError;
     use crate::store::{self, LoadOutcome};
+    use crate::test_daemon_transport::{
+        endpoint, Listener as UnixListener, Stream as StdUnixStream,
+    };
     use std::collections::HashMap;
     use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::{UnixListener, UnixStream as StdUnixStream};
     use std::sync::mpsc;
     use std::thread::JoinHandle;
     use tempfile::TempDir;
@@ -665,6 +667,7 @@ mod tests {
                 "generation_conditional_start": true,
                 "start_operation_ledger": true,
                 "generation_conditional_attach": true,
+                "windows_start_operation_retirement_barrier": true,
             })
         )
         .unwrap();
@@ -895,7 +898,7 @@ mod tests {
 
     fn stub_socket_path() -> (TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("stub.sock");
+        let path = endpoint(dir.path(), "stub.sock");
         (dir, path)
     }
 
@@ -1000,7 +1003,7 @@ mod tests {
     fn shell_kind_is_rejected_before_any_side_effect() {
         let tmp = TempDir::new().unwrap();
         let paths = paths_in(&tmp);
-        let missing = tmp.path().join("nope.sock");
+        let missing = endpoint(tmp.path(), "nope.sock");
 
         let mut params = agent_params("s1", "/tmp");
         params.kind = SessionKind::Shell;
@@ -1033,7 +1036,7 @@ mod tests {
     fn mismatched_agent_task_id_is_rejected_before_any_side_effect() {
         let tmp = TempDir::new().unwrap();
         let paths = paths_in(&tmp);
-        let missing = tmp.path().join("nope.sock");
+        let missing = endpoint(tmp.path(), "nope.sock");
 
         let mut params = agent_params("s1", "/tmp");
         params.agent_task_id = Some("task-OTHER".into());
@@ -1066,7 +1069,7 @@ mod tests {
     fn existing_task_id_fails_without_connecting_or_writing_a_session() {
         let tmp = TempDir::new().unwrap();
         let paths = paths_in(&tmp);
-        let missing = tmp.path().join("nope.sock");
+        let missing = endpoint(tmp.path(), "nope.sock");
 
         let existing = AgentTaskService::new(&paths)
             .create_draft("task-1", "proj-0", "original goal", 5)
@@ -1105,7 +1108,7 @@ mod tests {
     fn connect_failure_after_draft_leaves_the_task_draft() {
         let tmp = TempDir::new().unwrap();
         let paths = paths_in(&tmp);
-        let missing = tmp.path().join("nope.sock");
+        let missing = endpoint(tmp.path(), "nope.sock");
 
         let rt = AgentTaskRuntime::new(&paths);
         let err = rt
@@ -1426,7 +1429,7 @@ mod tests {
     fn resume_shell_kind_is_rejected_before_task_mutation_or_connect() {
         let tmp = TempDir::new().unwrap();
         let paths = paths_in(&tmp);
-        let missing = tmp.path().join("nope.sock");
+        let missing = endpoint(tmp.path(), "nope.sock");
 
         let before = AgentTaskService::new(&paths)
             .create_draft("task-1", "proj-1", "goal", 5)
@@ -1458,7 +1461,7 @@ mod tests {
     fn resume_mismatched_agent_task_id_is_rejected_before_side_effects() {
         let tmp = TempDir::new().unwrap();
         let paths = paths_in(&tmp);
-        let missing = tmp.path().join("nope.sock");
+        let missing = endpoint(tmp.path(), "nope.sock");
 
         let before = AgentTaskService::new(&paths)
             .create_draft("task-1", "proj-1", "goal", 5)
@@ -1489,7 +1492,7 @@ mod tests {
     fn resume_missing_task_is_task_not_found_before_connect() {
         let tmp = TempDir::new().unwrap();
         let paths = paths_in(&tmp);
-        let missing = tmp.path().join("nope.sock");
+        let missing = endpoint(tmp.path(), "nope.sock");
 
         let rt = AgentTaskRuntime::new(&paths);
         let err = rt
@@ -1527,7 +1530,7 @@ mod tests {
     fn resume_connect_failure_leaves_the_task_record_equal_and_writes_no_session() {
         let tmp = TempDir::new().unwrap();
         let paths = paths_in(&tmp);
-        let missing = tmp.path().join("nope.sock");
+        let missing = endpoint(tmp.path(), "nope.sock");
 
         let tasks = AgentTaskService::new(&paths);
         tasks.create_draft("task-1", "proj-1", "goal", 5).unwrap();

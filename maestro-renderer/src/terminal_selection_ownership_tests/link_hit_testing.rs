@@ -98,7 +98,8 @@ fn modifier_click_uses_complete_wrapped_url_from_painted_history() {
 
 #[test]
 fn modifier_click_uses_pointer_pane_and_keeps_highlight_inside_its_content() {
-    let (mut app, shared, origin) = app_with_right_child();
+    // Retain enough content rows for the full wrapped URL after header/gutter reservation.
+    let (mut app, shared, origin) = app_with_right_child_rows(8);
     let opened = install_host(&mut app);
     let child = app.focused_pane_grid("child").unwrap();
     let cols = child.cols;

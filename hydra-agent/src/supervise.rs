@@ -400,9 +400,9 @@ pub fn service_binding_stamp() -> String {
 
 // ---- runtime (I/O; the pure pieces above carry the logic + tests) ----
 
+use crate::daemon_transport::connect_sync;
 use anyhow::{anyhow, Context, Result};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
 use std::process::{Child, Command};
 use std::time::Duration;
 
@@ -602,10 +602,17 @@ fn live_daemon_socket() -> Option<String> {
 }
 
 fn daemon_responds(socket_path: &str) -> bool {
-    let Ok(mut stream) = UnixStream::connect(socket_path) else {
+    let Ok(mut stream) = connect_sync(Path::new(socket_path)) else {
         return false;
     };
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    #[cfg(windows)]
+    if stream
+        .set_write_timeout(Some(Duration::from_millis(500)))
+        .is_err()
+    {
+        return false;
+    }
     if stream.write_all(b"{\"op\":\"list_sessions\"}\n").is_err() {
         return false;
     }
@@ -615,6 +622,7 @@ fn daemon_responds(socket_path: &str) -> bool {
 
 /// Resolve socket handling, removing a stale socket file. Returns whether we should start our own daemon
 /// (false = a healthy daemon is already there to reuse).
+#[cfg(unix)]
 fn prepare_socket(socket_path: &str) -> Result<bool> {
     let exists = Path::new(socket_path).exists();
     match socket_decision(exists, exists && daemon_responds(socket_path)) {
@@ -631,10 +639,30 @@ fn prepare_socket(socket_path: &str) -> Result<bool> {
     }
 }
 
+#[cfg(windows)]
+fn prepare_socket(socket_path: &str) -> Result<bool> {
+    // Pipe names are not filesystem leaves. Only a freshly absent endpoint permits a new
+    // owner; busy, untrusted, malformed and nonresponsive peers must stay untouched.
+    match connect_sync(Path::new(socket_path)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error).context("probe retained Windows daemon without replacing it"),
+        Ok(mut stream) => {
+            stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+            stream.set_write_timeout(Some(Duration::from_millis(500)))?;
+            stream.write_all(b"{\"op\":\"list_sessions\"}\n")?;
+            let mut buf = [0; 64];
+            if stream.read(&mut buf)? == 0 {
+                anyhow::bail!("retained Windows daemon closed its readiness probe");
+            }
+            Ok(false)
+        }
+    }
+}
+
 /// Wait until the socket accepts a daemon connection (bounded). Returns Err on timeout.
 fn wait_for_socket(socket_path: &str, attempts: u32) -> Result<()> {
     for _ in 0..attempts {
-        if UnixStream::connect(socket_path).is_ok() {
+        if connect_sync(Path::new(socket_path)).is_ok() {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(150));
@@ -646,7 +674,7 @@ fn wait_for_socket(socket_path: &str, attempts: u32) -> Result<()> {
 /// we write the control line and do NOT log the daemon's response.
 fn ensure_session(socket_path: &str, session_id: &str, home: &str) -> Result<()> {
     let mut stream =
-        UnixStream::connect(socket_path).context("connect daemon for start_session")?;
+        connect_sync(Path::new(socket_path)).context("connect daemon for start_session")?;
     stream
         .set_read_timeout(Some(Duration::from_millis(300)))
         .context("set configured-session probe timeout")?;
@@ -733,6 +761,13 @@ fn daemon_lists_session(line: &str, session_id: &str) -> Option<bool> {
 
 fn daemon_protocol_from_info(line: &str) -> Option<u32> {
     let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    #[cfg(windows)]
+    if !value
+        .get("windows_start_operation_retirement_barrier")?
+        .as_bool()?
+    {
+        return None;
+    }
     (value.get("ev")?.as_str()? == "daemon_info"
         && value
             .get("generation_conditional_mutations")
@@ -747,8 +782,14 @@ fn daemon_protocol_from_info(line: &str) -> Option<u32> {
 }
 
 fn spawn(cmd: &ChildCommand) -> Result<Child> {
-    Command::new(&cmd.program)
-        .args(&cmd.args)
+    let mut command = Command::new(&cmd.program);
+    command.args(&cmd.args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW: background connectivity only.
+    }
+    command
         .spawn()
         .with_context(|| format!("spawn {}", cmd.program))
 }
@@ -873,6 +914,11 @@ fn wait_for_external_daemon_with(
 pub fn run(opts: &SuperviseOptions, home: &str) -> Result<()> {
     if opts.fixed_external_daemon && opts.own_daemon {
         anyhow::bail!("a fixed external daemon cannot also be supervisor-owned")
+    }
+    #[cfg(windows)]
+    if !opts.own_daemon {
+        crate::windows_service::contain_attach_only_supervisor()
+            .context("contain replaceable Windows connectivity without owning the daemon")?;
     }
     match run_active(opts, home) {
         Err(error) if error.downcast_ref::<EnrollmentWithdrawn>().is_some() => {
@@ -1146,11 +1192,17 @@ fn run_active(opts: &SuperviseOptions, home: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote_daemon_backend::test_daemon_transport::{endpoint, Listener};
 
     fn unique_temp(label: &str) -> PathBuf {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt as _;
 
-        let path = std::fs::canonicalize("/tmp").unwrap().join(format!(
+        #[cfg(unix)]
+        let temporary_root = PathBuf::from("/tmp");
+        #[cfg(windows)]
+        let temporary_root = std::env::temp_dir();
+        let path = std::fs::canonicalize(temporary_root).unwrap().join(format!(
             "hydra-supervise-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -1158,7 +1210,11 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        #[cfg(unix)]
         std::fs::create_dir(&path).unwrap();
+        #[cfg(windows)]
+        let _private = maestro_shell::WindowsPrivateDirectory::ensure(&path).unwrap();
+        #[cfg(unix)]
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         path
     }
@@ -1211,6 +1267,49 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    fn owned_lifetime_child(wait: bool) -> Child {
+        use std::process::Stdio;
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args(["-c", if wait { "sleep 30" } else { "exit 0" }]);
+            command
+        };
+        #[cfg(windows)]
+        let mut command = {
+            use std::os::windows::process::CommandExt as _;
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.creation_flags(0x08000000);
+            command.args([
+                "--exact",
+                "supervise::tests::owned_lifetime_child_fixture",
+                "--ignored",
+            ]);
+            command.env(
+                "HYDRA_TEST_OWNED_LIFETIME",
+                if wait { "sleep" } else { "exit" },
+            );
+            command
+        };
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "owned child entrypoint, invoked explicitly by lifetime tests"]
+    fn owned_lifetime_child_fixture() {
+        match std::env::var("HYDRA_TEST_OWNED_LIFETIME").as_deref() {
+            Ok("sleep") => std::thread::sleep(std::time::Duration::from_secs(30)),
+            Ok("exit") => (),
+            _ => panic!("owned fixture requires explicit invocation"),
+        }
     }
 
     fn opts() -> SuperviseOptions {
@@ -1470,7 +1569,7 @@ mod tests {
                 _ => unreachable!(),
             }
 
-            let mut child = Command::new("sh").args(["-c", "sleep 30"]).spawn().unwrap();
+            let mut child = owned_lifetime_child(true);
             let error = validate_running_enrollment_or_withdraw(&dir, &mut child)
                 .expect_err("invalid authority must withdraw the running peer");
             assert!(
@@ -1504,7 +1603,7 @@ mod tests {
         )
         .unwrap();
         write_stale_readiness(&dir, 999_011, 999_012);
-        let mut exited_peer = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let mut exited_peer = owned_lifetime_child(false);
         exited_peer.wait().unwrap();
         crate::device_identity::remove_record(&dir).unwrap();
 
@@ -1816,7 +1915,7 @@ mod tests {
         let current = maestro_protocol::DAEMON_PROTOCOL_VERSION;
         assert_eq!(
             daemon_protocol_from_info(&format!(
-                "{{\"ev\":\"daemon_info\",\"protocol_version\":{current},\"build_version\":\"x\",\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true}}"
+                "{{\"ev\":\"daemon_info\",\"protocol_version\":{current},\"build_version\":\"x\",\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"windows_start_operation_retirement_barrier\":true}}"
             )),
             Some(current)
         );
@@ -1845,6 +1944,19 @@ mod tests {
             None
         );
         assert_eq!(daemon_protocol_from_info("not-json"), None);
+        for barrier in [None, Some(false)] {
+            let mut info = serde_json::json!({
+                "ev": "daemon_info", "protocol_version": current,
+                "generation_conditional_mutations": true, "attachment_aware_conditional_kill": true
+            });
+            if let Some(barrier) = barrier {
+                info["windows_start_operation_retirement_barrier"] = barrier.into();
+            }
+            assert_eq!(
+                daemon_protocol_from_info(&info.to_string()),
+                (!cfg!(windows)).then_some(current)
+            );
+        }
     }
 
     #[test]
@@ -1858,12 +1970,10 @@ mod tests {
 
     #[test]
     fn existing_configured_session_on_v1_needs_no_mutation_probe() {
-        let socket = std::path::PathBuf::from("/tmp").join(format!(
-            "hydra-supervise-v1-existing-{}.sock",
-            std::process::id()
-        ));
+        let dir = tempfile::tempdir().unwrap();
+        let socket = endpoint(dir.path(), "supervise-v1-existing.sock");
         let _ = std::fs::remove_file(&socket);
-        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let listener = Listener::bind(&socket).unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -1885,12 +1995,10 @@ mod tests {
 
     #[test]
     fn missing_configured_session_on_v1_fails_before_start_session() {
-        let socket = std::path::PathBuf::from("/tmp").join(format!(
-            "hydra-supervise-v1-missing-{}.sock",
-            std::process::id()
-        ));
+        let dir = tempfile::tempdir().unwrap();
+        let socket = endpoint(dir.path(), "supervise-v1-missing.sock");
         let _ = std::fs::remove_file(&socket);
-        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let listener = Listener::bind(&socket).unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());

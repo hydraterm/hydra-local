@@ -1,3 +1,6 @@
+// This wire fixture uses Unix domain sockets and POSIX child commands.
+#![cfg(unix)]
+
 //! Session environment baseline: a session spawned by a daemon that was
 //! itself launched from a THIN environment must still get a usable terminal env.
 //! We start the daemon binary with a stripped env (no TERM, empty PATH), open a

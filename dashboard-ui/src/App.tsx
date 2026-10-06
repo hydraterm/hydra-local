@@ -53,7 +53,7 @@ type OverlayHostWindow = Window & {
 }
 
 const SIDEBAR_MIN = 220
-const SIDEBAR_MAX = 560
+const SIDEBAR_MAX = 720
 const SIDEBAR_HOST_MAX = 720
 const SIDEBAR_DEFAULT = 460
 const SIDEBAR_COLLAPSED = 24
@@ -272,7 +272,8 @@ function rotateHexColor(hex: string, degrees: number): string {
 }
 
 function folderName(path: string): string {
-  const parts = path.split('/').filter(Boolean)
+  const windowsPath = /^(?:[A-Za-z]:[\\/]|\\\\)/.test(path)
+  const parts = path.split(windowsPath ? /[\\/]/ : '/').filter(Boolean)
   return parts[parts.length - 1] ?? path
 }
 
@@ -401,6 +402,8 @@ function actionableFilesystemMigrationNoticeKey(model: DashboardModel): string |
 
 export function App(): JSX.Element {
   const [state, setState] = useState<LoadState>({ kind: 'loading' })
+  const [dashboardError, setDashboardError] = useState<string | null>(null)
+  useEffect(() => bridge.subscribeDashboardError(setDashboardError), [])
   const latestModelRef = useRef<DashboardModel | null>(null)
   const focusedWindowByProjectRef = useRef<Map<string, string>>(new Map())
   const [selectedId, setSelectedId] = useState<string | null>(null)
@@ -418,6 +421,9 @@ export function App(): JSX.Element {
   } | null>(null)
   const chromeMode = new URLSearchParams(window.location.search).get('chrome')
   const sidebarOnly = chromeMode === 'sidebar'
+  const sidebarViewportCss = sidebarOnly &&
+    (window as Window & { __HYDRA_WINDOWS_SIDEBAR_CSS__?: boolean })
+      .__HYDRA_WINDOWS_SIDEBAR_CSS__ === true
   const topbarOnly = chromeMode === 'topbar'
   const overlayOnly = chromeMode === 'overlay'
 
@@ -623,7 +629,11 @@ export function App(): JSX.Element {
   }
 
   const toggleSidebarRail = (event: React.MouseEvent<HTMLButtonElement>): void => {
-    const collapse = !sidebarCollapsed
+    // CSS and admission consult the same native child viewport. A delayed host
+    // state still updates the saved width, but cannot invert the visible action.
+    const collapse = !(sidebarViewportCss
+      ? window.matchMedia('(max-width: 25px)').matches
+      : sidebarCollapsed)
     setSidebarRailCollapsed(collapse)
     // A pointer click into WebKit moves focus away from the native terminal.
     // Restore it only after mouse collapse, when the user's next keystroke is
@@ -633,7 +643,10 @@ export function App(): JSX.Element {
   }
 
   const startSidebarResize = (e: React.PointerEvent<HTMLDivElement>): void => {
-    if (sidebarCollapsed || !e.isPrimary || e.button !== 0) return
+    const collapsed = sidebarViewportCss
+      ? window.matchMedia('(max-width: 25px)').matches
+      : sidebarCollapsed
+    if (collapsed || !e.isPrimary || e.button !== 0) return
     e.preventDefault()
     finishSidebarResize()
     try {
@@ -641,11 +654,12 @@ export function App(): JSX.Element {
     } catch {
       return
     }
+    const startWidth = sidebarViewportCss ? window.innerWidth : sidebarWidth
     sidebarResize.current = {
       pointerId: e.pointerId,
       startScreenX: e.screenX,
-      startWidth: sidebarWidth,
-      lastWidth: clampResizableSidebarWidth(sidebarWidth),
+      startWidth,
+      lastWidth: clampResizableSidebarWidth(startWidth),
       target: e.currentTarget,
     }
     document.body.classList.add('is-resizing-sidebar')
@@ -680,9 +694,11 @@ export function App(): JSX.Element {
   }
 
   const resizeSidebarFromKeyboard = (event: React.KeyboardEvent<HTMLDivElement>): void => {
+    if (sidebarViewportCss && window.matchMedia('(max-width: 25px)').matches) return
+    const currentWidth = sidebarViewportCss ? window.innerWidth : sidebarWidth
     let next: number | null = null
-    if (event.key === 'ArrowLeft') next = sidebarWidth - 16
-    if (event.key === 'ArrowRight') next = sidebarWidth + 16
+    if (event.key === 'ArrowLeft') next = currentWidth - 16
+    if (event.key === 'ArrowRight') next = currentWidth + 16
     if (event.key === 'Home') next = SIDEBAR_MIN
     if (event.key === 'End') next = SIDEBAR_MAX
     if (next === null) return
@@ -693,14 +709,15 @@ export function App(): JSX.Element {
   if (sidebarOnly) {
     return (
       <div
-        className={`shell shell--sidebar-only ${sidebarCollapsed ? 'is-sidebar-collapsed' : ''}`}
+        className={`shell shell--sidebar-only ${sidebarViewportCss ? 'shell--sidebar-viewport' : sidebarCollapsed ? 'is-sidebar-collapsed' : ''}`}
         style={accentStyle}
       >
         <Sidebar
           model={model}
           selectedId={selected?.project_id ?? null}
           focusedWindowId={focusedWindow?.window_id ?? null}
-          collapsed={sidebarCollapsed}
+          collapsed={sidebarViewportCss ? false : sidebarCollapsed}
+          viewportCollapse={sidebarViewportCss}
           onToggleCollapsed={toggleSidebarRail}
           onSelect={selectProject}
           onReorder={(ids) => bridge.updateProjectOrder(ids)}
@@ -708,7 +725,7 @@ export function App(): JSX.Element {
           onFocusWindow={focusWindow}
           onFocusPane={focusPane}
         />
-        {!sidebarCollapsed && (
+        {(sidebarViewportCss || !sidebarCollapsed) && (
           <div
             className="sidebar-resizer sidebar-resizer--embedded"
             role="separator"
@@ -733,6 +750,7 @@ export function App(): JSX.Element {
   if (topbarOnly) {
     return (
       <div className="shell shell--topbar-only" style={accentStyle}>
+        <DashboardError message={dashboardError} onDismiss={() => setDashboardError(null)} />
         {!selected ? (
           <div className="window-tabs window-tabs--empty" />
         ) : (
@@ -752,7 +770,10 @@ export function App(): JSX.Element {
   }
 
   if (overlayOnly) {
-    return <OverlayChrome model={model} latestModelRef={latestModelRef} />
+    return <>
+      <OverlayChrome model={model} latestModelRef={latestModelRef} />
+      <DashboardError message={dashboardError} onDismiss={() => setDashboardError(null)} />
+    </>
   }
 
   return (
@@ -796,6 +817,7 @@ export function App(): JSX.Element {
         />
       )}
       <div className="workspace">
+        <DashboardError message={dashboardError} onDismiss={() => setDashboardError(null)} />
         {!selected ? (
           <EmptyState
             title="No projects yet"
@@ -817,6 +839,25 @@ export function App(): JSX.Element {
           </>
         )}
       </div>
+    </div>
+  )
+}
+
+function DashboardError({ message, onDismiss }: {
+  message: string | null
+  onDismiss: () => void
+}): JSX.Element | null {
+  if (!message) return null
+  return (
+    <div role="alert" style={{
+      position: 'absolute', inset: '2px 8px auto', zIndex: 130,
+      display: 'flex', alignItems: 'center', gap: 8, padding: '4px 8px',
+      background: '#301a1a', color: '#ffe4e4', border: '1px solid #b86464',
+      borderRadius: 6, fontSize: 12, maxHeight: 'calc(100% - 4px)',
+      boxSizing: 'border-box', overflow: 'auto',
+    }}>
+      <span style={{ flex: 1 }}>{message}</span>
+      <button type="button" aria-label="Dismiss dashboard error" onClick={onDismiss}>×</button>
     </div>
   )
 }
@@ -1221,6 +1262,38 @@ function OverlayChrome({
   const selectWindowModel = (value: string): void => {
     setWindowDraft((draft) => ({ ...draft, model: value }))
   }
+  // Native select events can arrive twice, and their target remains a mutable DOM node. Never
+  // read it from a deferred updater, or let a transient empty selection poison the agent lookup.
+  const selectWindowAgent = (value: string): void => {
+    if (!isOverlayAgent(value)) return
+    setWindowDraft((draft) => draft.agent === value ? draft : ({
+      ...draft,
+      agent: value,
+      model: 'default',
+      session_mode: 'none',
+      resume_session_id: null,
+      resume_session_title: null,
+      resume_session_file: null,
+    }))
+  }
+  const selectProjectAgent = (value: string): void => {
+    if (!isOverlayAgent(value)) return
+    setProjectDraft((draft) => draft.default_agent === value ? draft : ({
+      ...draft,
+      default_agent: value,
+      default_model: 'default',
+      ...(defaultsFreshWithoutProviderHistory(value) ? { resume_mode: 'none' as const } : {}),
+      resume_session_id: null,
+      resume_session_title: null,
+      resume_session_file: null,
+    }))
+  }
+  const selectSplitAgent = (value: string): void => {
+    if (!isOverlayAgent(value)) return
+    setAgent(value)
+    setSplitModel('default')
+    setSessionId(null)
+  }
   const selectProjectMoreIcon = (value: string): void => {
     if (value) setProjectDraft((draft) => ({ ...draft, icon: value }))
   }
@@ -1253,15 +1326,14 @@ function OverlayChrome({
   }
 
   const preflightThenMutate = async (
-    input: { agent?: string; resolved_launch_command?: string; cwd?: string },
+    input: { agent?: string; resolved_launch_command?: string; custom_command?: string; cwd?: string },
     mutate: (requestId?: string) => void,
     awaitNativeAcceptance = false,
   ): Promise<void> => {
     const selectedAgent = input.agent?.trim().toLowerCase()
-    // A project intentionally created without an initial session has nothing
-    // to check. Terminal launches still reach native preflight so their cwd is
-    // validated before durable topology is written.
-    if (!input.resolved_launch_command?.trim() && !selectedAgent && !awaitNativeAcceptance) {
+    // Saving a project without a session only checks explicit custom syntax, not installation.
+    // Terminal launches still validate cwd before durable topology is written.
+    if (!input.resolved_launch_command?.trim() && !input.custom_command?.trim() && !selectedAgent && !awaitNativeAcceptance) {
       mutate()
       close()
       return
@@ -1843,6 +1915,8 @@ function OverlayChrome({
     await preflightThenMutate(
       {
         agent: projectDraft.create_initial_session ? projectDraft.default_agent : undefined,
+        custom_command: projectDraft.default_agent !== 'terminal'
+          ? projectDraft.custom_command.trim() || undefined : undefined,
         resolved_launch_command:
           projectDraft.create_initial_session && projectDraft.default_agent !== 'terminal'
             ? resolvedProjectCommand
@@ -2042,11 +2116,8 @@ function OverlayChrome({
                 className="overlay-select"
                 aria-label="Split agent"
                 value={agent}
-                onChange={(e) => {
-                  setAgent(e.target.value as OverlayAgent)
-                  setSplitModel('default')
-                  setSessionId(null)
-                }}
+                onInput={(e) => selectSplitAgent(e.currentTarget.value)}
+                onChange={(e) => selectSplitAgent(e.target.value)}
               >
                 {isLegacyAgentKind(agent) && (
                   <option value={agent} disabled>Gemini (legacy)</option>
@@ -2295,20 +2366,8 @@ function OverlayChrome({
                     className="overlay-select"
                     aria-label="Default agent"
                     value={projectDraft.default_agent}
-                    onChange={(e) => {
-                      const nextAgent = e.target.value as OverlayAgent
-                      setProjectDraft((draft) => ({
-                        ...draft,
-                        default_agent: nextAgent,
-                        default_model: 'default',
-                        ...(defaultsFreshWithoutProviderHistory(nextAgent)
-                          ? { resume_mode: 'none' as const }
-                          : {}),
-                        resume_session_id: null,
-                        resume_session_title: null,
-                        resume_session_file: null,
-                      }))
-                    }}
+                    onInput={(e) => selectProjectAgent(e.currentTarget.value)}
+                    onChange={(e) => selectProjectAgent(e.target.value)}
                   >
                     {isLegacyAgentKind(projectDraft.default_agent) && (
                       <option value={projectDraft.default_agent} disabled>Gemini (legacy)</option>
@@ -2746,17 +2805,8 @@ function OverlayChrome({
                 className="overlay-select"
                 aria-label="Window agent"
                 value={windowDraft.agent}
-                onChange={(e) =>
-                  setWindowDraft((draft) => ({
-                    ...draft,
-                    agent: e.target.value as OverlayAgent,
-                    model: 'default',
-                    session_mode: 'none',
-                    resume_session_id: null,
-                    resume_session_title: null,
-                    resume_session_file: null,
-                  }))
-                }
+                onInput={(e) => selectWindowAgent(e.currentTarget.value)}
+                onChange={(e) => selectWindowAgent(e.target.value)}
               >
                 {isLegacyAgentKind(windowDraft.agent) && (
                   <option value={windowDraft.agent} disabled>Gemini (legacy)</option>

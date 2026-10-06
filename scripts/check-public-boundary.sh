@@ -61,6 +61,7 @@ root = pathlib.Path(sys.argv[1]).resolve()
 reviewed_demo = sys.argv[2]
 reviewed_demo_sha256 = sys.argv[3]
 reviewed_binary_files = {
+    "packaging/windows/Hydra.ico": "ff9631753bf566816fde906073496e19ade34563c9d8d02b13481248397b7a1a",
     reviewed_demo: reviewed_demo_sha256,
     sys.argv[4]: sys.argv[5],
 }
@@ -175,6 +176,16 @@ for path in sorted(candidate for candidate in source_paths if candidate.is_file(
 # Only the reviewed reusable library leaves belong here; hosted composition stays private.
 # Source eligibility and exact runtime/test bytes are bound by the separate sync manifest.
 remote_core_files = {
+    "hydra-agent/src/agent_dir/test_permissions.rs",
+    "hydra-agent/src/daemon_transport.rs",
+    "hydra-agent/src/main_windows_service.rs",
+    "hydra-agent/src/test_daemon_transport.rs",
+    "hydra-agent/src/viewport_control_windows.rs",
+    "hydra-agent/src/windows_private_authority.rs",
+    "hydra-agent/src/windows_service.rs",
+    "hydra-agent/src/windows_service/native.rs",
+    "hydra-agent/src/windows_service_main.rs",
+    "hydra-agent/tests/private_lifecycle.rs",
     "hydra-agent/Cargo.lock",
     "hydra-agent/Cargo.toml",
     "hydra-agent/README.md",
@@ -399,11 +410,11 @@ if actual_remote_files != remote_core_files:
 # Exact bytes close exports, runtime dependencies, tooling, locks and build callers together.
 # Build outputs and package LICENSE copies are generated, not additional source leaves.
 remote_core_metadata = {
-    "Cargo.lock": "26d6dd5cfd23c9af278ebe66eeb3dd882aef87a20572ccbc9351fbf8f7c7fce1",
+    "Cargo.lock": "41dd12bb69aaf7bb8b76599a00e75c11e938eab458bc37e18ce8035ebd56ac27",
     "Cargo.toml": "6864ad0639702ca59042634585776e3cbb77128b77f04e9e055c755fb8e05ab2",
     "LICENSE": "763a6e17187e1e6998d6d1af0d323c276e89fd54eff401bea96f20ba55d7828b",
-    "hydra-agent/Cargo.lock": "7975a2d18916737df32457a372eedfb1f60c19217841999ec8671b022beb88d4",
-    "hydra-agent/Cargo.toml": "c7d3b6f18fc647f9343c34beb602802d1f850b6aeef2e5bc4533c26100e048cc",
+    "hydra-agent/Cargo.lock": "a4b46be4a19da396312c00caa831cdaa4d74e001ed92102525df0fff2cb4b40b",
+    "hydra-agent/Cargo.toml": "3117a7181df7cd93fa728534bd54fa1c296949e6eacc5f5ccfcd048dafd8f89f",
     "hydra-cloud/package-lock.json": "3c158e0d7471a62118fb7b156c9b5dc462da702732059076bd3c988ffb98fd57",
     "hydra-cloud/package.json": "6a180d37a1c4eb42feed061f4b86d1efcdfd0c196aa702c66af76f169ec3a66c",
     "hydra-cloud/tsconfig.core-build.json": "14dac3664fc66ea4bfd2459158c2f9e0f7569975ff8b2cdb91253b07793b9ac4",

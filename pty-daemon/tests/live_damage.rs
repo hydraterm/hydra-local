@@ -1,3 +1,6 @@
+// This wire fixture uses Unix domain sockets and POSIX child commands.
+#![cfg(unix)]
+
 //! Daemon live damage emission, observed over the wire.
 //!
 //! The forwarder, after optionally shipping a raw `Output` frame, diffs the held

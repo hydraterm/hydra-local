@@ -14,9 +14,9 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::daemon_transport::AsyncDaemonStream;
 use serde::Deserialize as _;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 use crate::remote_bridge::{
@@ -973,6 +973,14 @@ struct DaemonOutputSender {
 }
 
 impl DaemonOutputSender {
+    /// Output ownership ends even when the daemon is idle or raw mode filters every event.
+    /// Waiting on receiver closure is cancellation-safe and does not retain a request producer.
+    async fn closed(&self) {
+        if let Some(tx) = &self.tx {
+            tx.closed().await;
+        }
+    }
+
     /// Observe every session-bearing daemon line, including a structured Grid that raw mode will
     /// intentionally filter. An echoed Attach baseline changes ownership at this exact FIFO point.
     #[cfg(test)]
@@ -2749,10 +2757,12 @@ fn load_unmodified_remote_session_for_exact_start(
     }
 }
 
+#[cfg(not(windows))]
 fn shell_quote_arg(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
+#[cfg(not(windows))]
 fn resolve_login_shell_command_from_homes(
     command: &str,
     headless_server: bool,
@@ -2781,6 +2791,7 @@ fn resolve_login_shell_command_from_homes(
     command.to_string()
 }
 
+#[cfg(not(windows))]
 fn resolve_login_shell_command(command: &str, headless_server: bool) -> String {
     let ambient_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     #[cfg(target_os = "linux")]
@@ -2830,20 +2841,34 @@ fn login_shell_launch_with_program(
     login_shell: &str,
     headless_server: bool,
 ) -> crate::resume_launch::ResumeLaunch {
-    let mut argv = Vec::with_capacity(1 + args.len());
-    argv.push(resolve_login_shell_command(command, headless_server));
-    argv.extend(args.iter().cloned());
-    let command_line = argv
-        .iter()
-        .map(|arg| shell_quote_arg(arg))
-        .collect::<Vec<_>>()
-        .join(" ");
-    crate::resume_launch::ResumeLaunch {
-        command: login_shell.to_string(),
-        args: vec![
-            maestro_local_services::LOGIN_SHELL_COMMAND_FLAGS.to_string(),
-            command_line,
-        ],
+    #[cfg(windows)]
+    {
+        let _ = (login_shell, headless_server);
+        let mut source = vec![command.to_string()];
+        source.extend_from_slice(args);
+        let argv = maestro_shell::login_shell_argv(&source, &maestro_shell::ProcessLaunchEnv);
+        return crate::resume_launch::ResumeLaunch {
+            command: argv[0].clone(),
+            args: argv[1..].to_vec(),
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        let mut argv = Vec::with_capacity(1 + args.len());
+        argv.push(resolve_login_shell_command(command, headless_server));
+        argv.extend(args.iter().cloned());
+        let command_line = argv
+            .iter()
+            .map(|arg| shell_quote_arg(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        crate::resume_launch::ResumeLaunch {
+            command: login_shell.to_string(),
+            args: vec![
+                maestro_local_services::LOGIN_SHELL_COMMAND_FLAGS.to_string(),
+                command_line,
+            ],
+        }
     }
 }
 
@@ -4283,10 +4308,13 @@ pub fn current_daemon_socket(fallback: &std::path::Path) -> PathBuf {
 
 const DAEMON_INFO_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
+#[cfg_attr(not(windows), derive(PartialEq, Eq))]
 struct ReviewedDaemonAuthority {
     socket_path: PathBuf,
     server_pid: Option<u32>,
+    #[cfg(windows)]
+    process_witness: Option<maestro_shell::WindowsDaemonProcessWitness>,
 }
 
 /// Open an auxiliary synchronous client only against the exact daemon already reviewed for the
@@ -4301,6 +4329,20 @@ fn connect_reviewed_daemon_client(
         }
     })?;
     let client = maestro_shell::DaemonClient::connect(&authority.socket_path)?;
+    #[cfg(windows)]
+    {
+        // PID equality alone cannot authorize a new pipe after process exit/PID reuse.
+        let matches = authority.process_witness.as_ref().is_some_and(|reviewed| {
+            reviewed
+                .matches_live(&client.daemon_process_witness())
+                .unwrap_or(false)
+        });
+        if !matches {
+            return Err(maestro_shell::DaemonClientError::Protocol {
+                detail: "remote daemon lifetime changed after operational peer review".into(),
+            });
+        }
+    }
     if authority
         .server_pid
         .is_some_and(|expected| client.server_pid() != Some(expected))
@@ -4332,9 +4374,10 @@ fn remote_launch_environment(
     tx: &DaemonRequestSender,
 ) -> Result<RemoteLaunchEnvironment, maestro_shell::DaemonClientError> {
     if !tx.headless_server() {
+        use maestro_shell::LaunchEnvLookup;
         return Ok(RemoteLaunchEnvironment {
-            shell: std::env::var("SHELL").ok(),
-            home: std::env::var_os("HOME"),
+            shell: maestro_shell::ProcessLaunchEnv.shell_utf8(),
+            home: maestro_shell::ProcessLaunchEnv.home_os(),
             child_environment: None,
         });
     }
@@ -4728,7 +4771,7 @@ fn validate_daemon_peer_identity(
 }
 
 #[cfg(target_os = "linux")]
-fn linux_daemon_peer_identity(stream: &UnixStream) -> std::io::Result<DaemonPeerIdentity> {
+fn linux_daemon_peer_identity(stream: &AsyncDaemonStream) -> std::io::Result<DaemonPeerIdentity> {
     use std::os::fd::AsRawFd as _;
 
     let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
@@ -4835,7 +4878,7 @@ async fn headless_daemon_main_pid() -> std::io::Result<u32> {
 /// during a daemon restart. Kernel credentials close that replacement window; fixed headless mode additionally
 /// binds the peer PID to the currently reviewed systemd user unit.
 async fn verify_connected_daemon_peer(
-    stream: &UnixStream,
+    stream: &AsyncDaemonStream,
     headless_server: bool,
 ) -> std::io::Result<()> {
     // The explicit return is part of the durable peer-binding contract: the validated
@@ -4871,8 +4914,8 @@ async fn verify_connected_daemon_peer(
 async fn connect_reviewed_daemon(
     sock_path: &std::path::Path,
     headless_server: bool,
-) -> std::io::Result<UnixStream> {
-    let stream = UnixStream::connect(sock_path).await?;
+) -> std::io::Result<AsyncDaemonStream> {
+    let stream = crate::daemon_transport::connect_async(sock_path).await?;
     verify_connected_daemon_peer(&stream, headless_server).await?;
     Ok(stream)
 }
@@ -4887,7 +4930,7 @@ async fn connect_daemon_with_protocol(
     sock_path: &std::path::Path,
     headless_server: bool,
 ) -> std::io::Result<(
-    UnixStream,
+    AsyncDaemonStream,
     Option<u32>,
     bool,
     bool,
@@ -4949,8 +4992,8 @@ async fn connect_daemon_with_protocol(
         })
 }
 
-async fn request_daemon_protocol(
-    stream: &mut UnixStream,
+async fn request_daemon_protocol<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
 ) -> std::io::Result<(Option<u32>, bool, bool, bool, bool, bool, bool, bool)> {
     let request = serde_json::to_string(&maestro_protocol::ClientRequest::DaemonInfo)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
@@ -4958,8 +5001,8 @@ async fn request_daemon_protocol(
     stream.write_all(b"\n").await?;
     stream.flush().await?;
 
-    // Read exactly one line without a buffered over-read: on an exact match this same stream is
-    // handed to the operational reader, so bytes beyond the DaemonInfo reply must stay untouched.
+    // Consume exactly one line. This same stream (including the Windows adapter's bounded input
+    // queue) is handed to the operational reader; bytes after DaemonInfo must remain available.
     let mut line = Vec::new();
     let mut byte = [0_u8; 1];
     loop {
@@ -4990,6 +5033,8 @@ async fn request_daemon_protocol(
             generation_conditional_start,
             start_operation_ledger,
             generation_conditional_attach,
+            #[cfg(windows)]
+            windows_start_operation_retirement_barrier,
             ..
         }) => Ok((
             Some(protocol_version),
@@ -4997,7 +5042,16 @@ async fn request_daemon_protocol(
             child_environment,
             generation_conditional_mutations,
             attachment_aware_conditional_kill,
-            generation_conditional_start,
+            {
+                #[cfg(windows)]
+                {
+                    generation_conditional_start && windows_start_operation_retirement_barrier
+                }
+                #[cfg(not(windows))]
+                {
+                    generation_conditional_start
+                }
+            },
             start_operation_ledger,
             generation_conditional_attach,
         )),
@@ -5062,7 +5116,11 @@ pub async fn spawn_daemon_task_with_policy(
     ) = connect_daemon_with_protocol(&sock_path, headless_server).await?;
     #[cfg(target_os = "linux")]
     let daemon_server_pid = Some(linux_daemon_peer_identity(&stream)?.pid);
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    let daemon_server_pid = Some(stream.server_pid());
+    #[cfg(windows)]
+    let daemon_process_witness = stream.daemon_process_witness();
+    #[cfg(not(any(target_os = "linux", windows)))]
     let daemon_server_pid = None;
     let mutation_protocol_version = (generation_conditional_mutations
         && attachment_aware_conditional_kill)
@@ -5092,6 +5150,8 @@ pub async fn spawn_daemon_task_with_policy(
     req_tx.set_reviewed_daemon_authority(ReviewedDaemonAuthority {
         socket_path: sock_path.clone(),
         server_pid: daemon_server_pid,
+        #[cfg(windows)]
+        process_witness: Some(daemon_process_witness),
     });
     let mut request_failure_for_writer = req_rx.failure_receiver();
     let request_failure_for_output = req_rx.failure_receiver();
@@ -5233,6 +5293,7 @@ pub async fn spawn_daemon_task_with_policy(
         loop {
             let line = tokio::select! {
                 biased;
+                _ = out_tx.closed() => break,
                 _ = request_failure_for_reader.changed() => break,
                 line = lines.next_line() => match line {
                     Ok(Some(line)) => line,
@@ -5759,8 +5820,51 @@ fn daemon_line_metadata(line: &str) -> Option<DaemonLineMetadata> {
 }
 
 #[cfg(test)]
+#[path = "test_daemon_transport.rs"]
+pub(crate) mod test_daemon_transport;
+
+#[cfg(test)]
 mod tests {
+    use super::test_daemon_transport::{endpoint, AsyncListener as UnixListener, Listener};
     use super::*;
+
+    #[tokio::test]
+    async fn protocol_probe_preserves_following_bytes_and_requires_windows_retirement_barrier() {
+        for barrier in [None, Some(false), Some(true)] {
+            let (mut client, server) = tokio::io::duplex(4096);
+            let fixture = tokio::spawn(async move {
+                let mut server = BufReader::new(server);
+                let mut request = String::new();
+                server.read_line(&mut request).await.unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&request).unwrap()["op"],
+                    "daemon_info"
+                );
+                let mut reply = serde_json::json!({
+                    "ev": "daemon_info", "protocol_version": maestro_protocol::DAEMON_PROTOCOL_VERSION,
+                    "build_version": "fixture", "generation_conditional_mutations": true,
+                    "attachment_aware_conditional_kill": true, "generation_conditional_start": true,
+                    "start_operation_ledger": true, "generation_conditional_attach": true
+                });
+                if let Some(barrier) = barrier {
+                    reply["windows_start_operation_retirement_barrier"] = barrier.into();
+                }
+                server
+                    .get_mut()
+                    .write_all(format!("{reply}\nnext-event\n").as_bytes())
+                    .await
+                    .unwrap();
+            });
+            let handshake = request_daemon_protocol(&mut client).await.unwrap();
+            assert_eq!(handshake.0, Some(maestro_protocol::DAEMON_PROTOCOL_VERSION));
+            assert_eq!(handshake.5, !cfg!(windows) || barrier == Some(true));
+            let mut next = String::new();
+            BufReader::new(client).read_line(&mut next).await.unwrap();
+            assert_eq!(next, "next-event\n");
+            fixture.await.unwrap();
+        }
+    }
+
     use crate::remote_control::{
         PaneRemover, PaneStasher, ProjectEditor, Renamer, WindowCloser, WindowFocuser, WindowOpener,
     };
@@ -5768,9 +5872,9 @@ mod tests {
     use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc, Mutex};
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixListener;
 
     struct ConditionalStartTestDaemon {
+        #[cfg(unix)]
         socket_path: std::path::PathBuf,
         _dir: tempfile::TempDir,
         stop: Arc<AtomicBool>,
@@ -5837,9 +5941,15 @@ mod tests {
     impl Drop for ConditionalStartTestDaemon {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::SeqCst);
+            #[cfg(unix)]
             let _ = std::os::unix::net::UnixStream::connect(&self.socket_path);
             if let Some(handle) = self.handle.take() {
-                handle.join().unwrap();
+                let result = handle.join();
+                // Keep fixture-thread failures fatal, but never abort the entire test process
+                // with a second panic while the owning test is already reporting its failure.
+                if !std::thread::panicking() {
+                    result.unwrap();
+                }
             }
         }
     }
@@ -5875,8 +5985,9 @@ mod tests {
         use std::io::{BufRead as _, Write as _};
 
         let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("conditional-start.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let socket_path = endpoint(dir.path(), "conditional-start.sock");
+        let listener = Listener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop);
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -5887,10 +5998,16 @@ mod tests {
         let handle = std::thread::spawn(move || {
             const INSTANCE: &str = "22222222222242228222222222222222";
             let mut next_generation = 1_u64;
-            while let Ok((mut stream, _)) = listener.accept() {
-                if stop_for_thread.load(Ordering::SeqCst) {
-                    break;
-                }
+            while !stop_for_thread.load(Ordering::SeqCst) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("conditional start fixture accept: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
                 let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
                 loop {
                     let mut line = String::new();
@@ -5909,6 +6026,7 @@ mod tests {
                                     "ev": "daemon_info",
                                     "protocol_version": maestro_protocol::DAEMON_PROTOCOL_VERSION,
                                     "build_version": "hydra-test-ledger",
+                                    "windows_start_operation_retirement_barrier": true,
                                     "daemon_instance_id": INSTANCE,
                                     "output_generation_echo": true,
                                     "child_environment": true,
@@ -6052,21 +6170,57 @@ mod tests {
                 }
             }
         });
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         let server_pid = Some(std::process::id());
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", windows)))]
         let server_pid = None;
+        #[cfg(windows)]
+        let process_witness = {
+            // Match the operational bridge: authority comes from an authenticated pipe's
+            // retained process handle, not just its name or a caller-supplied PID. Dropping
+            // this probe releases the single-threaded fixture for the mutation connection.
+            let client = maestro_shell::DaemonClient::connect(&socket_path).unwrap();
+            assert_eq!(client.server_pid(), server_pid);
+            Some(client.daemon_process_witness())
+        };
         tx.set_reviewed_daemon_authority(ReviewedDaemonAuthority {
             socket_path: socket_path.clone(),
             server_pid,
+            #[cfg(windows)]
+            process_witness,
         });
         ConditionalStartTestDaemon {
+            #[cfg(unix)]
             socket_path,
             _dir: dir,
             stop,
             requests,
             handle: Some(handle),
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn conditional_start_fixture_captures_live_windows_daemon_authority() {
+        let (tx, _rx) =
+            daemon_request_channel(DAEMON_REQUEST_QUEUE_CAP, DAEMON_REQUEST_QUEUE_BYTE_CAP);
+        let _daemon = install_conditional_start_test_daemon(&tx);
+        let (client, _peer) = connect_reviewed_conditional_start_client(&tx).unwrap();
+        assert_eq!(client.server_pid(), Some(std::process::id()));
+        drop(client);
+
+        // The same live endpoint and PID are insufficient without the reviewed process
+        // witness. Keep the production lifetime check exercised, not bypassed by the fixture.
+        let mut authority = tx.reviewed_daemon_authority().unwrap();
+        authority.process_witness = None;
+        let (unreviewed_tx, _unreviewed_rx) =
+            daemon_request_channel(DAEMON_REQUEST_QUEUE_CAP, DAEMON_REQUEST_QUEUE_BYTE_CAP);
+        unreviewed_tx.set_reviewed_daemon_authority(authority);
+        assert!(matches!(
+            connect_reviewed_daemon_client(&unreviewed_tx),
+            Err(maestro_shell::DaemonClientError::Protocol { detail })
+                if detail == "remote daemon lifetime changed after operational peer review"
+        ));
     }
 
     struct TestPaneCreationLease {
@@ -6324,7 +6478,9 @@ mod tests {
             "/bin/bash",
             false,
         );
+        #[cfg(unix)]
         assert_eq!(launch.command, "/bin/bash");
+        #[cfg(unix)]
         assert_eq!(
             launch.args,
             vec![
@@ -6332,6 +6488,13 @@ mod tests {
                 "'codex' '--model' 'gpt-5.2-codex'".to_string(),
             ]
         );
+        #[cfg(windows)]
+        {
+            assert!(
+                launch.command == "codex" || std::path::Path::new(&launch.command).is_absolute()
+            );
+            assert_eq!(launch.args, ["--model", "gpt-5.2-codex"]);
+        }
         assert_eq!(login_shell_program_from(Some(" /bin/bash ")), "/bin/bash");
     }
 
@@ -6565,17 +6728,25 @@ mod tests {
                 args: vec!["--model".into(), "value with spaces".into()],
             };
             let runtime = runtime_remote_session_launch(Some(&launch), false);
-            assert_eq!(runtime.command, login_shell_program(), "provider={command}");
-            assert_eq!(
-                runtime.args[0],
-                maestro_local_services::LOGIN_SHELL_COMMAND_FLAGS,
-                "provider={command}"
-            );
-            let command_line = &runtime.args[1];
-            assert!(
-                command_line.contains("'--model' 'value with spaces'"),
-                "provider={command}: {command_line}"
-            );
+            #[cfg(windows)]
+            {
+                assert!(runtime.command == command || Path::new(&runtime.command).is_absolute());
+                assert_eq!(runtime.args, launch.args, "provider={command}");
+            }
+            #[cfg(unix)]
+            {
+                assert_eq!(runtime.command, login_shell_program(), "provider={command}");
+                assert_eq!(
+                    runtime.args[0],
+                    maestro_local_services::LOGIN_SHELL_COMMAND_FLAGS,
+                    "provider={command}"
+                );
+                let command_line = &runtime.args[1];
+                assert!(
+                    command_line.contains("'--model' 'value with spaces'"),
+                    "provider={command}: {command_line}"
+                );
+            }
         }
     }
 
@@ -6596,10 +6767,16 @@ mod tests {
 
     #[test]
     fn bound_provider_restart_derivation_preserves_remote_environment_and_fresh_child_identity() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
-        let locator = tmp.path().join("stable-codex");
+        let locator = tmp.path().join(if cfg!(windows) {
+            "stable-codex.cmd"
+        } else {
+            "stable-codex"
+        });
         std::fs::write(&locator, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
         std::fs::set_permissions(&locator, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut session = maestro_shell::SessionRecord {
             session_id: "bound-provider".into(),
@@ -6661,7 +6838,10 @@ mod tests {
             let argv =
                 maestro_shell::known_safe_provider_login_shell_argv(&session.launch, &environment)
                     .unwrap();
+            #[cfg(unix)]
             assert_eq!(argv[0], shell);
+            #[cfg(windows)]
+            assert_eq!(argv[0], locator.to_str().unwrap());
             assert!(argv
                 .iter()
                 .any(|arg| arg.contains(locator.to_str().unwrap())));
@@ -6716,6 +6896,7 @@ mod tests {
 
     #[test]
     fn inherited_remote_wrapper_is_sealed_with_current_environment_and_audit_only_child() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let paths = maestro_shell::AppPaths::with_base(tmp.path().join("profile"));
@@ -6748,8 +6929,13 @@ mod tests {
             &workspace,
         )
         .unwrap();
-        let locator = tmp.path().join("renamed-stable-wrapper");
+        let locator = tmp.path().join(if cfg!(windows) {
+            "renamed-stable-wrapper.cmd"
+        } else {
+            "renamed-stable-wrapper"
+        });
         std::fs::write(&locator, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
         std::fs::set_permissions(&locator, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut source = maestro_shell::SessionRecord {
             session_id: "source".into(),
@@ -6955,7 +7141,13 @@ mod tests {
             false,
         );
         let runtime = runtime_remote_session_launch(Some(&wrapped), false);
+        assert_eq!(
+            runtime, wrapped,
+            "preparing a provider twice must preserve its argv"
+        );
+        #[cfg(unix)]
         assert_eq!(runtime.command, "/bin/zsh");
+        #[cfg(unix)]
         assert_eq!(
             runtime.args,
             vec![
@@ -6963,6 +7155,11 @@ mod tests {
                 "'claude' '--dangerously-skip-permissions'"
             ]
         );
+        #[cfg(windows)]
+        {
+            assert!(runtime.command == "claude" || Path::new(&runtime.command).is_absolute());
+            assert_eq!(runtime.args, ["--dangerously-skip-permissions"]);
+        }
     }
 
     #[test]
@@ -7084,7 +7281,9 @@ mod tests {
             "/bin/bash",
             false,
         );
+        #[cfg(unix)]
         assert_eq!(launch.command, "/bin/bash");
+        #[cfg(unix)]
         assert_eq!(
             launch.args,
             vec![
@@ -7092,6 +7291,14 @@ mod tests {
                 "'agy' '--model' 'Gemini 3.5 Flash (High) / preview'".to_string(),
             ]
         );
+        #[cfg(windows)]
+        {
+            assert!(launch.command == "agy" || std::path::Path::new(&launch.command).is_absolute());
+            assert_eq!(
+                launch.args,
+                ["--model", "Gemini 3.5 Flash (High) / preview"]
+            );
+        }
     }
 
     #[test]
@@ -9614,13 +9821,29 @@ mod tests {
         let first_start = only_conditional_start(&daemon);
         assert_eq!(first_start["op"], "start_session");
         assert_eq!(first_start["id"], created.session_id);
-        assert_eq!(first_start["command"], login_shell_program());
+        #[cfg(unix)]
         let command_line = first_start["args"][1].as_str().unwrap();
-        assert!(command_line.contains("'claude'"));
-        assert!(
-            !command_line.contains("--continue"),
-            "a fresh New Pane must not resume unrelated Claude history: {command_line}"
-        );
+        #[cfg(windows)]
+        let command_line = first_start["args"].to_string();
+        #[cfg(unix)]
+        {
+            assert_eq!(first_start["command"], login_shell_program());
+            assert!(command_line.contains("'claude'"));
+            assert!(
+                !command_line.contains("--continue"),
+                "a fresh New Pane must not resume unrelated Claude history: {command_line}"
+            );
+        }
+        #[cfg(windows)]
+        {
+            let command = first_start["command"].as_str().unwrap();
+            assert!(command == "claude" || Path::new(command).is_absolute());
+            let args = first_start["args"].as_array().unwrap();
+            assert_eq!(args.len(), 2);
+            assert_eq!(args[0], "--session-id");
+            assert!(uuid::Uuid::parse_str(args[1].as_str().unwrap()).is_ok());
+            assert!(!args.iter().any(|arg| arg == "--continue"));
+        }
 
         let before = match maestro_shell::load_one::<maestro_shell::SessionRecord>(
             &paths,
@@ -9809,19 +10032,30 @@ mod tests {
     #[test]
     fn daemon_new_pane_inherited_wrapper_reaches_wire_and_executes_without_path_fallback() {
         use crate::remote_control::PaneSplitter;
+        #[cfg(unix)]
         use std::os::unix::fs::{symlink, PermissionsExt};
         const SOURCE_ID: &str = "10000000-0000-4000-8000-000000000001";
         for fresh_parent in [false, true] {
-            let dir = tempfile::Builder::new()
-                .permissions(std::fs::Permissions::from_mode(0o700))
-                .tempdir()
-                .unwrap();
+            #[cfg(unix)]
+            let mut builder = tempfile::Builder::new();
+            #[cfg(windows)]
+            let builder = tempfile::Builder::new();
+            #[cfg(unix)]
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+            let dir = builder.tempdir().unwrap();
             let paths = seed_split_fixture(dir.path());
-            let locator = dir.path().join("stable renamed 'provider'");
+            let locator = dir.path().join(if cfg!(windows) {
+                "stable renamed 'provider'.exe"
+            } else {
+                "stable renamed 'provider'"
+            });
             let old = dir.path().join("version-one");
             let upgraded = dir.path().join("version-two");
-            let trap = dir.path().join("codex");
+            let trap = dir
+                .path()
+                .join(if cfg!(windows) { "codex.exe" } else { "codex" });
             let receipt = dir.path().join("wrapper-receipt");
+            #[cfg(unix)]
             for (path, body) in [
                 (&old, "#!/bin/sh\nprintf OLD\n"),
                 (&upgraded, "#!/bin/sh\nprintf 'UPGRADED:%s' \"$#\" > \"$HYDRA_QA_RECEIPT\"\nprintf 'UPGRADED:%s' \"$#\"\n"),
@@ -9830,7 +10064,24 @@ mod tests {
                 std::fs::write(path, body).unwrap();
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
             }
+            #[cfg(unix)]
             symlink(&old, &locator).unwrap();
+            #[cfg(windows)]
+            {
+                // Native executables need no developer-mode symlink privilege. An updater may
+                // replace the stable executable's contents while preserving the recorded locator.
+                let system =
+                    PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
+                std::fs::copy(system.join("where.exe"), &old).unwrap();
+                std::fs::copy(system.join("sort.exe"), &upgraded).unwrap();
+                std::fs::copy(&old, &trap).unwrap();
+                std::fs::copy(&old, &locator).unwrap();
+                let before = std::process::Command::new(&locator).output().unwrap();
+                assert!(
+                    !before.status.success(),
+                    "old/PATH-trap fixture must fail without arguments"
+                );
+            }
             let Some(maestro_shell::LoadOutcome::Loaded(mut source)) =
                 maestro_shell::load_one::<maestro_shell::SessionRecord>(
                     &paths,
@@ -9898,11 +10149,17 @@ mod tests {
             );
             assert!(child.launch.provider_recipe().is_none());
             assert!(!start["args"].to_string().contains(SOURCE_ID));
+            #[cfg(unix)]
             assert_eq!(start["command"], login_shell_program());
+            #[cfg(windows)]
+            assert_eq!(start["command"], locator.to_str().unwrap());
             // Execute the actual production caller's captured StartSession wire, not a rebuilt
             // test-only launch helper. An updater may retarget the stable link after preparation.
             std::fs::remove_file(&locator).unwrap();
+            #[cfg(unix)]
             symlink(&upgraded, &locator).unwrap();
+            #[cfg(windows)]
+            std::fs::copy(&upgraded, &locator).unwrap();
             let output = std::process::Command::new(start["command"].as_str().unwrap())
                 .args(
                     start["args"]
@@ -9928,8 +10185,22 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
             // Real login shells may print a distribution welcome banner before executing argv.
-            assert_eq!(std::fs::read(&receipt).unwrap(), b"UPGRADED:0");
-            assert!(output.stdout.ends_with(b"UPGRADED:0"));
+            #[cfg(unix)]
+            {
+                assert_eq!(std::fs::read(&receipt).unwrap(), b"UPGRADED:0");
+                assert!(output.stdout.ends_with(b"UPGRADED:0"));
+            }
+            #[cfg(windows)]
+            {
+                assert_eq!(
+                    std::fs::read(&locator).unwrap(),
+                    std::fs::read(&upgraded).unwrap()
+                );
+                assert!(
+                    output.stdout.is_empty(),
+                    "native sort fixture with empty stdin"
+                );
+            }
             std::fs::remove_file(&locator).unwrap();
             assert!(splitter.new_pane(request()).is_err());
             assert_eq!(
@@ -10277,11 +10548,21 @@ mod tests {
         );
         assert_eq!(start["cols"], 135);
         assert_eq!(start["rows"], 46);
+        #[cfg(unix)]
         assert_eq!(
             start["command"],
             login_shell_program(),
             "agent pane revive must use the user's login shell: {line}"
         );
+        #[cfg(windows)]
+        {
+            let command = start["command"].as_str().unwrap();
+            assert!(command == "claude" || std::path::Path::new(command).is_absolute());
+            assert_eq!(
+                start["args"],
+                serde_json::json!(["--resume", "70000000-0000-4000-8000-000000000001"])
+            );
+        }
         assert!(
             line.contains("claude"),
             "recorded KnownSafe claude session should revive claude, got: {line}"
@@ -10586,16 +10867,19 @@ mod tests {
                 "expected_generation": "generation-a",
             })
         );
-        assert!(start["command"]
-            .as_str()
-            .is_some_and(|command| !command.is_empty()));
-        assert!(start["args"]
-            .as_array()
-            .is_some_and(
-                |args| args.iter().any(|arg| arg.as_str().is_some_and(|arg| {
-                    arg.contains("claude") && arg.contains("70000000-0000-4000-8000-000000000002")
-                }))
-            ));
+        // Unix wraps the provider argv in its login shell; Windows sends literal argv.
+        // Check the complete platform launch, not substrings inside one shell argument.
+        assert_provider_start_executes_exact_source(
+            start,
+            "s-a",
+            &session.cwd_resolved,
+            &[
+                "claude".into(),
+                "--resume".into(),
+                "70000000-0000-4000-8000-000000000002".into(),
+            ],
+            InitialTerminalSize::from_optional_pair(Some(136), Some(47)),
+        );
         assert_eq!(layouts.load("win-main").unwrap().unwrap(), layout_before);
         let published = match maestro_shell::load_one::<maestro_shell::SessionRecord>(
             &paths,
@@ -12444,13 +12728,17 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::create_dir_all("/tmp/hydra-test-work").unwrap();
+        #[cfg(unix)]
+        let project_root = PathBuf::from("/tmp/hydra-test-work");
+        #[cfg(windows)]
+        let project_root = dir.join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
         let paths = maestro_shell::AppPaths::with_base(dir.join("Maestro"));
         let project = maestro_shell::ProjectService::new(&paths)
             .create(
                 "proj-rb",
                 "rollback",
-                "/tmp/hydra-test-work",
+                project_root.to_string_lossy().as_ref(),
                 maestro_shell::NewProject::default(),
                 1,
             )
@@ -13513,17 +13801,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_output_owner_before_reader_poll_closes_daemon_with_live_request_facades() {
+        assert_output_owner_drop_closes_idle_daemon(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_output_owner_closes_idle_daemon_with_live_request_facades() {
+        assert_output_owner_drop_closes_idle_daemon(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_output_owner_closes_raw_filtered_daemon_with_live_request_facades() {
+        assert_output_owner_drop_closes_idle_daemon(true, false).await;
+    }
+
+    async fn assert_output_owner_drop_closes_idle_daemon(raw_grid: bool, before_reader_poll: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = endpoint(dir.path(), "daemon.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let (idle_tx, idle_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = tokio::io::split(stream);
+            let mut reader = BufReader::new(read);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&request).unwrap()["op"],
+                "daemon_info"
+            );
+            let info = serde_json::json!({
+                "ev": "daemon_info",
+                "protocol_version": maestro_protocol::DAEMON_PROTOCOL_VERSION,
+                "build_version": "test",
+                "output_generation_echo": true,
+                "generation_conditional_mutations": true,
+                "attachment_aware_conditional_kill": true,
+                "generation_conditional_start": true,
+                "start_operation_ledger": true,
+                "windows_start_operation_retirement_barrier": true,
+                "generation_conditional_attach": true,
+            });
+            write
+                .write_all(format!("{info}\n").as_bytes())
+                .await
+                .unwrap();
+            if !before_reader_poll {
+                request.clear();
+                reader.read_line(&mut request).await.unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&request).unwrap()["op"],
+                    "list_sessions"
+                );
+            }
+            if raw_grid {
+                request.clear();
+                reader.read_line(&mut request).await.unwrap();
+                let attach: serde_json::Value = serde_json::from_str(&request).unwrap();
+                assert_eq!(attach["op"], "attach");
+                assert_eq!(attach["want_raw_output"], true);
+                assert_eq!(attach["output_generation"], 7);
+                write
+                    .write_all(
+                        b"{\"ev\":\"grid\",\"id\":\"s\",\"output_generation\":7,\"grid\":{}}\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+            write.flush().await.unwrap();
+            idle_tx.send(()).unwrap();
+            // Send no terminal output, EOF, or later event that could reveal receiver closure.
+            let mut remaining_requests = Vec::new();
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                reader.read_to_end(&mut remaining_requests),
+            )
+            .await
+            .expect("output owner drop must reclaim the idle daemon socket")
+            .unwrap();
+        });
+
+        let (mut backend, daemon_output) = spawn_daemon_task(sock, Vec::new()).await.unwrap();
+        if raw_grid {
+            backend
+                .attach_with_output_generation("s", 80, 24, true, 7, None)
+                .unwrap();
+        }
+        let mut idle_rx = Some(idle_rx);
+        if !before_reader_poll {
+            idle_rx.take().unwrap().await.unwrap();
+        }
+        if raw_grid {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let confirmed = matches!(
+                        backend.output_routes.lock().unwrap().sessions.get("s"),
+                        Some(DaemonSessionOutputRoute::Confirmed(7))
+                    );
+                    if confirmed {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("raw reader must consume and filter the Attach Grid");
+            assert!(
+                daemon_output.rx.is_empty(),
+                "raw Grid must not be forwarded"
+            );
+        }
+        // Dropping an ordinary request clone is not owner cancellation. Keep both the backend and
+        // another facade alive so output closure, not request-channel EOF, must drive teardown.
+        drop(backend.tx.clone());
+        let retained_facade = backend.tx.clone();
+        retained_facade
+            .send(r#"{"op":"list_sessions"}"#.into())
+            .unwrap();
+        let pending_request = retained_facade
+            .prepare_batch(vec![r#"{"op":"list_sessions"}"#.into()])
+            .unwrap()
+            .unwrap();
+        // Current-thread Tokio has not polled any spawned connection task in the immediate case.
+        drop(daemon_output);
+        if let Some(idle_rx) = idle_rx {
+            idle_rx.await.unwrap();
+        }
+        server.await.unwrap();
+        assert_eq!(
+            pending_request.commit(),
+            Err(DaemonRequestEnqueueError::ProducerStopped)
+        );
+        assert_eq!(
+            retained_facade.send(r#"{"op":"list_sessions"}"#.into()),
+            Err(DaemonRequestEnqueueError::ProducerStopped)
+        );
+    }
+
+    #[tokio::test]
     async fn spawn_daemon_task_primes_sessions_from_daemon_authority() {
         let dir =
             std::env::temp_dir().join(format!("hydra-daemon-backend-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let sock = dir.join("daemon.sock");
+        let sock = endpoint(&dir, "daemon.sock");
         let listener = UnixListener::bind(&sock).unwrap();
 
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let (read, mut write) = stream.into_split();
+            let (read, mut write) = tokio::io::split(stream);
             let mut lines = BufReader::new(read).lines();
             let probe = lines.next_line().await.unwrap().unwrap();
             let probe: serde_json::Value = serde_json::from_str(&probe).unwrap();
@@ -13531,7 +13957,7 @@ mod tests {
             write
                 .write_all(
                     format!(
-                        "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"generation_conditional_attach\":true}}\n",
+                        "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"windows_start_operation_retirement_barrier\":true,\"generation_conditional_attach\":true}}\n",
                         maestro_protocol::DAEMON_PROTOCOL_VERSION
                     )
                     .as_bytes(),
@@ -13578,13 +14004,13 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let sock = dir.join("daemon.sock");
+        let sock = endpoint(&dir, "daemon.sock");
         let listener = UnixListener::bind(&sock).unwrap();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
 
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let (read, mut write) = stream.into_split();
+            let (read, mut write) = tokio::io::split(stream);
             let mut lines = BufReader::new(read).lines();
 
             let probe: serde_json::Value =
@@ -13593,7 +14019,7 @@ mod tests {
             write
                 .write_all(
                     format!(
-                        "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"generation_conditional_attach\":true}}\n",
+                        "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"windows_start_operation_retirement_barrier\":true,\"generation_conditional_attach\":true}}\n",
                         maestro_protocol::DAEMON_PROTOCOL_VERSION
                     )
                     .as_bytes(),
@@ -13682,13 +14108,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hydra-raw-gen-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let sock = dir.join("daemon.sock");
+        let sock = endpoint(&dir, "daemon.sock");
         let listener = UnixListener::bind(&sock).unwrap();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
 
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let (read, mut write) = stream.into_split();
+            let (read, mut write) = tokio::io::split(stream);
             let mut lines = BufReader::new(read).lines();
             let probe: serde_json::Value =
                 serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
@@ -13696,7 +14122,7 @@ mod tests {
             write
                 .write_all(
                     format!(
-                        "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"generation_conditional_attach\":true}}\n",
+                        "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"test\",\"output_generation_echo\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"windows_start_operation_retirement_barrier\":true,\"generation_conditional_attach\":true}}\n",
                         maestro_protocol::DAEMON_PROTOCOL_VERSION
                     )
                     .as_bytes(),
@@ -13750,7 +14176,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let sock = dir.join("daemon.sock");
+        let sock = endpoint(&dir, "daemon.sock");
         let listener = UnixListener::bind(&sock).unwrap();
         let (inspect_tx, inspect_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -13825,14 +14251,14 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let sock = dir.join("daemon.sock");
+        let sock = endpoint(&dir, "daemon.sock");
         let listener = UnixListener::bind(&sock).unwrap();
 
         let server = tokio::spawn(async move {
             // Connection 1 is the operational candidate. Simulate a retained v1 daemon rejecting
             // the unknown probe; the client must discard this connection.
             let (probe_stream, _) = listener.accept().await.unwrap();
-            let (probe_read, mut probe_write) = probe_stream.into_split();
+            let (probe_read, mut probe_write) = tokio::io::split(probe_stream);
             let mut probe_lines = BufReader::new(probe_read).lines();
             let probe = probe_lines.next_line().await.unwrap().unwrap();
             assert_eq!(
@@ -13848,7 +14274,7 @@ mod tests {
             // Connection 2 is clean and attach-only. It must receive the read-only cache prime and
             // attach, with no StartSession inserted between them.
             let (stream, _) = listener.accept().await.unwrap();
-            let (read, mut write) = stream.into_split();
+            let (read, mut write) = tokio::io::split(stream);
             let mut lines = BufReader::new(read).lines();
             let list = lines.next_line().await.unwrap().unwrap();
             assert_eq!(
@@ -13893,12 +14319,12 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let sock = dir.join("daemon.sock");
+        let sock = endpoint(&dir, "daemon.sock");
         let listener = UnixListener::bind(&sock).unwrap();
 
         let server = tokio::spawn(async move {
             let (probe_stream, _) = listener.accept().await.unwrap();
-            let (probe_read, mut probe_write) = probe_stream.into_split();
+            let (probe_read, mut probe_write) = tokio::io::split(probe_stream);
             let mut probe_lines = BufReader::new(probe_read).lines();
             let probe: serde_json::Value =
                 serde_json::from_str(&probe_lines.next_line().await.unwrap().unwrap()).unwrap();
@@ -13916,7 +14342,7 @@ mod tests {
             drop(probe_write);
 
             let (stream, _) = listener.accept().await.unwrap();
-            let (read, mut write) = stream.into_split();
+            let (read, mut write) = tokio::io::split(stream);
             let mut lines = BufReader::new(read).lines();
             let list: serde_json::Value =
                 serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();

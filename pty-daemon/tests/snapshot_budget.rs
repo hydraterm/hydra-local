@@ -1,3 +1,6 @@
+// This wire fixture uses Unix domain sockets and POSIX child commands.
+#![cfg(unix)]
+
 //! Snapshot cell-budget contract:
 //! - a grid sized to the LARGEST supported snapshot actually crosses the socket as one
 //!   newline-delimited JSON line (proving the budget keeps snapshots wire-shippable);

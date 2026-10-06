@@ -35,9 +35,10 @@ const MAX_SESSIONS: usize = 64;
 /// ceiling rather than inheriting the session limit accidentally.
 const MAX_CHANNELS: usize = 64;
 const MAX_CHANNEL_ID_BYTES: usize = 512;
-/// Operation entries have no TTL/LRU and are removed only by exact CAS retirement. Once this cap
-/// is full, only a brand-new reservation is refused; lookup, exact Start replay, and retirement of
-/// existing entries remain admitted so callers can safely recover capacity.
+/// Operation entries have no TTL/LRU. Unix removes them after exact CAS retirement; Windows keeps
+/// content-blind terminal tombstones for the daemon lifetime because an older named-pipe handler
+/// may still publish a delayed Reserve. Once this cap is full, only a brand-new reservation is
+/// refused; lookup, exact Start replay, and retirement of existing entries remain admitted.
 pub(crate) const MAX_START_OPERATION_LEDGER_ENTRIES: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,14 +54,29 @@ enum StartOperationLedgerEntry {
         id: SessionId,
         reason: ConditionalSessionStartRefusal,
     },
+    /// A named-pipe retirement acknowledgement must remain a barrier against an older handler's
+    /// delayed Reserve/Start publication. This state is intentionally reported as Unknown so the
+    /// public protocol stays content-blind and Unix behavior remains unchanged.
+    #[cfg(windows)]
+    Retired {
+        id: SessionId,
+    },
 }
 
 impl StartOperationLedgerEntry {
     fn id(&self) -> &SessionId {
         match self {
             Self::Reserved { id } | Self::Applied { id, .. } | Self::Refused { id, .. } => id,
+            #[cfg(windows)]
+            Self::Retired { id } => id,
         }
     }
+}
+
+fn valid_start_operation_id(id: &SessionId) -> bool {
+    !id.0.is_empty()
+        && id.0.len() <= MAX_START_OPERATION_SESSION_ID_BYTES
+        && !id.0.chars().any(char::is_control)
 }
 
 pub struct Daemon {
@@ -70,6 +86,8 @@ pub struct Daemon {
     /// generation identities, and enum state—never cwd, argv, environment, grid, or output.
     start_operations: HashMap<SessionStartOperationToken, StartOperationLedgerEntry>,
     instance_id: DaemonInstanceId,
+    #[cfg(windows)]
+    closing: bool,
     #[cfg(test)]
     force_next_conditional_generation_collision: bool,
 }
@@ -92,6 +110,8 @@ impl Default for Daemon {
             channels: HashMap::new(),
             start_operations: HashMap::new(),
             instance_id,
+            #[cfg(windows)]
+            closing: false,
             #[cfg(test)]
             force_next_conditional_generation_collision: false,
         }
@@ -126,6 +146,7 @@ pub type SharedDaemon = Arc<Mutex<Daemon>>;
 /// an exact match, removing that one Session from the map. The caller kills the returned Session
 /// after releasing the daemon mutex, so a blocking child operation cannot stall unrelated ids and
 /// can never retarget a replacement inserted after removal.
+#[cfg(not(windows))]
 pub enum ConditionalSessionTake {
     Absent,
     GenerationMismatch,
@@ -223,6 +244,17 @@ impl Daemon {
         rows: u16,
         restart_exited: bool,
     ) -> Result<()> {
+        #[cfg(windows)]
+        if self.closing
+            || self
+                .sessions
+                .get(&id)
+                .is_some_and(|s| s.retirement.is_some())
+        {
+            return Err(anyhow!(
+                "daemon shutdown or exact session retirement is in progress"
+            ));
+        }
         // Reattach semantics: a live same-id session is never respawned. An exited same-id entry is
         // replaced only by an explicit restart request; an ordinary StartSession preserves its
         // final grid, scrollback, and exit latch even if the durable status update is still racing.
@@ -278,12 +310,7 @@ impl Daemon {
         // if spawn fails, every retained terminal remains untouched.
         let needs_capacity_eviction =
             !replacing_exited_same_id && self.sessions.len() >= MAX_SESSIONS;
-        if needs_capacity_eviction
-            && !self
-                .sessions
-                .values()
-                .any(|session| session.exit_state().is_some() && !session.attachment_in_use())
-        {
+        if needs_capacity_eviction && !self.sessions.values().any(Session::can_reclaim) {
             return Err(anyhow!(
                 "session limit reached ({MAX_SESSIONS}); kill a session before starting another"
             ));
@@ -307,8 +334,7 @@ impl Daemon {
                 .sessions
                 .iter()
                 .find_map(|(candidate_id, candidate)| {
-                    (candidate.exit_state().is_some() && !candidate.attachment_in_use())
-                        .then(|| candidate_id.clone())
+                    candidate.can_reclaim().then(|| candidate_id.clone())
                 })
                 .expect("capacity eviction candidate remains installed under daemon lock");
             self.sessions.remove(&exited_id);
@@ -361,6 +387,20 @@ impl Daemon {
                     reason: ConditionalSessionStartRefusal::PreconditionFailed,
                 }
             }
+        }
+
+        #[cfg(windows)]
+        if self.closing
+            || self
+                .sessions
+                .get(&id)
+                .is_some_and(|s| s.retirement.is_some())
+        {
+            return self.refuse_reserved_start(
+                &id,
+                &conditional.operation_token,
+                ConditionalSessionStartRefusal::PreconditionFailed,
+            );
         }
 
         let restart_exited = match &conditional.precondition {
@@ -544,10 +584,7 @@ impl Daemon {
         id: SessionId,
         operation_token: SessionStartOperationToken,
     ) -> SessionStartOperationReserveOutcome {
-        if id.0.is_empty()
-            || id.0.len() > MAX_START_OPERATION_SESSION_ID_BYTES
-            || id.0.chars().any(char::is_control)
-        {
+        if !valid_start_operation_id(&id) {
             return SessionStartOperationReserveOutcome::Refused {
                 reason: SessionStartOperationReserveRefusal::InvalidSessionId,
             };
@@ -561,6 +598,12 @@ impl Daemon {
                 | StartOperationLedgerEntry::Refused { id: applied_id, .. }
                     if applied_id == &id =>
                 {
+                    SessionStartOperationReserveOutcome::Refused {
+                        reason: SessionStartOperationReserveRefusal::AlreadyTerminal,
+                    }
+                }
+                #[cfg(windows)]
+                StartOperationLedgerEntry::Retired { id: retired_id } if retired_id == &id => {
                     SessionStartOperationReserveOutcome::Refused {
                         reason: SessionStartOperationReserveRefusal::AlreadyTerminal,
                     }
@@ -617,9 +660,11 @@ impl Daemon {
         }
     }
 
-    /// Exact CAS retirement. The daemon mutex held by the caller makes removal a barrier with
+    /// Exact CAS retirement. The daemon mutex held by the caller makes retirement a barrier with
     /// Start: either Start observes Reserved first and publishes Applied(G), or the later Start
-    /// observes Missing and refuses without spawning.
+    /// observes Missing/Retired and refuses without spawning. Windows retains a terminal tombstone
+    /// because separately queued named-pipe handlers can outlive the request that triggered
+    /// recovery; Unix preserves its existing removal/capacity-recovery behavior.
     pub fn retire_start_operation(
         &mut self,
         id: &SessionId,
@@ -646,10 +691,53 @@ impl Daemon {
                 .get(operation_token)
                 .expect("retirable exact operation remains present under daemon lock");
             debug_assert_eq!(entry.id(), id);
+            #[cfg(windows)]
+            self.start_operations.insert(
+                operation_token.clone(),
+                StartOperationLedgerEntry::Retired { id: id.clone() },
+            );
+            #[cfg(not(windows))]
             self.start_operations.remove(operation_token);
             return SessionStartOperationRetireOutcome::Retired;
         }
         if current == SessionStartOperationStatus::Unknown {
+            #[cfg(windows)]
+            {
+                match self.start_operations.get(operation_token) {
+                    Some(StartOperationLedgerEntry::Retired { id: retired_id })
+                        if retired_id == id =>
+                    {
+                        return SessionStartOperationRetireOutcome::AlreadyRetired;
+                    }
+                    // A foreign tuple stays content-blind and untouched. Its retained entry (or
+                    // eventual Windows tombstone) already prevents this token being reopened.
+                    Some(_) => return SessionStartOperationRetireOutcome::AlreadyRetired,
+                    // Invalid ids can never reserve or start, so no tombstone is needed and an
+                    // attacker cannot turn maximum-sized request strings into permanent storage.
+                    None if !valid_start_operation_id(id) => {
+                        return SessionStartOperationRetireOutcome::AlreadyRetired;
+                    }
+                    None if self.start_operations.len() < MAX_START_OPERATION_LEDGER_ENTRIES => {
+                        self.start_operations.insert(
+                            operation_token.clone(),
+                            StartOperationLedgerEntry::Retired { id: id.clone() },
+                        );
+                        return SessionStartOperationRetireOutcome::AlreadyRetired;
+                    }
+                    // Windows never removes an entry during this daemon lifetime. A full ledger
+                    // is therefore itself a global barrier: no delayed absent-token Reserve can
+                    // ever pass the cap, and Start independently requires an exact Reserved entry.
+                    // Any future Windows reclamation must replace this proof before changing it.
+                    None => {
+                        debug_assert_eq!(
+                            self.start_operations.len(),
+                            MAX_START_OPERATION_LEDGER_ENTRIES
+                        );
+                        return SessionStartOperationRetireOutcome::AlreadyRetired;
+                    }
+                }
+            }
+            #[cfg(not(windows))]
             return SessionStartOperationRetireOutcome::AlreadyRetired;
         }
         SessionStartOperationRetireOutcome::Conflict { current }
@@ -675,6 +763,10 @@ impl Daemon {
         handoff: Option<&AttachmentHandoff>,
         owner_nonce: u64,
     ) -> Result<AttachmentGuard> {
+        #[cfg(windows)]
+        if self.closing {
+            return Err(anyhow!("daemon shutdown is in progress"));
+        }
         self.session(id)?.acquire_attachment(handoff, owner_nonce)
     }
 
@@ -688,6 +780,12 @@ impl Daemon {
         handoff: Option<&AttachmentHandoff>,
         owner_nonce: u64,
     ) -> std::result::Result<AttachmentGuard, SessionAttachmentAcquireError> {
+        #[cfg(windows)]
+        if self.closing {
+            return Err(SessionAttachmentAcquireError::Invalid(anyhow!(
+                "daemon shutdown is in progress"
+            )));
+        }
         let session = self
             .sessions
             .get(id)
@@ -716,15 +814,30 @@ impl Daemon {
 
     #[cfg(test)]
     pub fn kill_session(&mut self, id: &SessionId) {
-        // Terminate the child explicitly first — dropping the Session closes the
-        // PTY, but a child sitting in its own read loop may not exit on PTY
-        // close alone. kill_child guarantees it goes away.
-        if let Some(s) = self.sessions.get(id) {
-            s.kill_child();
+        #[cfg(windows)]
+        {
+            let Some(generation) = self.sessions.get(id).map(Session::generation) else {
+                return;
+            };
+            assert_eq!(
+                crate::test_child::conditional_kill(self, id, &generation),
+                crate::test_child::KillOutcome::Retired,
+                "fixture cleanup must respect exact Windows retirement ownership"
+            );
         }
-        self.sessions.remove(id);
+        #[cfg(not(windows))]
+        {
+            // Terminate the child explicitly first — dropping the Session closes the
+            // PTY, but a child sitting in its own read loop may not exit on PTY
+            // close alone. kill_child guarantees it goes away.
+            if let Some(s) = self.sessions.get(id) {
+                s.kill_child();
+            }
+            self.sessions.remove(id);
+        }
     }
 
+    #[cfg(not(windows))]
     pub fn take_session_if_generation(
         &mut self,
         id: &SessionId,
@@ -779,8 +892,75 @@ impl Daemon {
     /// and frees its grid/scrollback buffers.
     #[cfg(test)]
     pub fn reap_exited_sessions(&mut self) {
+        self.sessions.retain(|_, s| !s.can_reclaim());
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn retirement_target(
+        &mut self,
+        id: &SessionId,
+        generation: &str,
+        shutdown: bool,
+    ) -> std::result::Result<Option<&mut Session>, String> {
+        let Some(session) = self.sessions.get_mut(id) else {
+            return Ok(None);
+        };
+        if session.generation() != generation {
+            return Err("session generation changed before retirement".into());
+        }
+        if !shutdown && session.attachment_in_use() {
+            return Err("session has an active attachment or pending handoff".into());
+        }
+        Ok(Some(session))
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn finish_retirement(
+        &mut self,
+        id: &SessionId,
+        generation: &str,
+        owner: &Arc<crate::windows_session_retirement::Retirement>,
+        result: std::result::Result<(), String>,
+    ) -> std::result::Result<Session, String> {
+        let Some(session) = self.sessions.get_mut(id) else {
+            return Err("retiring session mapping disappeared before completion".into());
+        };
+        if session.generation() != generation
+            || !session
+                .retirement
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, owner))
+        {
+            return Err("retiring session lifetime or owner changed before completion".into());
+        }
+        if session.exit_state().is_some() {
+            let retired = self
+                .sessions
+                .remove(id)
+                .expect("proved exact Session remains mapped");
+            if self.closing && self.sessions.is_empty() {
+                self.channels.clear();
+            }
+            return Ok(retired);
+        }
+        // A finished failed attempt releases only its admission fence. The same Session/Job
+        // stays mapped; input cancellation and other native side effects are not rolled back.
+        session.retirement = None;
+        Err(result
+            .err()
+            .unwrap_or_else(|| "session retirement was not confirmed".into()))
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn begin_shutdown(&mut self) -> Vec<(SessionId, String)> {
+        self.closing = true;
+        if self.sessions.is_empty() {
+            self.channels.clear();
+        }
         self.sessions
-            .retain(|_, s| s.exit_state().is_none() || s.attachment_in_use());
+            .values()
+            .map(|session| (session.id.clone(), session.generation()))
+            .collect()
     }
 
     /// Terminate and reap every owned child, then drop all sessions. Without
@@ -796,6 +976,7 @@ impl Daemon {
     /// was collected. State is cleared regardless — a child that didn't confirm
     /// is still dropped (its PTY closes); we just report that it was unconfirmed
     /// instead of overstating "all reaped".
+    #[cfg(not(windows))]
     pub fn shutdown(&mut self) -> ShutdownReport {
         const PER_CHILD_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
         self.shutdown_with_timeout(PER_CHILD_REAP_TIMEOUT)
@@ -805,6 +986,7 @@ impl Daemon {
     /// force the timeout branch deterministically (a `Duration::ZERO` budget makes
     /// every still-running child report unconfirmed) without waiting on a real
     /// stuck child.
+    #[cfg(not(windows))]
     fn shutdown_with_timeout(&mut self, per_child: std::time::Duration) -> ShutdownReport {
         let total = self.sessions.len();
         let mut reaped = 0usize;
@@ -930,7 +1112,7 @@ fn validate_child_environment(
                 matches!(
                     component,
                     std::path::Component::RootDir | std::path::Component::Normal(_)
-                )
+                ) || (cfg!(windows) && matches!(component, std::path::Component::Prefix(_)))
             })
     };
     if environment.home.is_empty()
@@ -968,7 +1150,36 @@ fn validate_child_environment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_child::{exits, idle, KillOutcome};
     use std::time::{Duration, Instant};
+
+    #[cfg(windows)]
+    #[test]
+    fn explicit_child_environment_accepts_native_absolute_paths_only() {
+        let home = std::env::temp_dir();
+        let shell = std::env::current_exe().unwrap();
+        let valid = maestro_protocol::ChildEnvironment {
+            home: home.to_str().unwrap().to_owned(),
+            shell: shell.to_str().unwrap().to_owned(),
+        };
+        validate_child_environment(Some(&valid)).unwrap();
+        for invalid in [
+            maestro_protocol::ChildEnvironment {
+                home: "relative-home".into(),
+                ..valid.clone()
+            },
+            maestro_protocol::ChildEnvironment {
+                shell: "relative-shell.exe".into(),
+                ..valid.clone()
+            },
+            maestro_protocol::ChildEnvironment {
+                home: home.join("..").to_str().unwrap().to_owned(),
+                ..valid
+            },
+        ] {
+            assert!(validate_child_environment(Some(&invalid)).is_err());
+        }
+    }
 
     fn sid(s: &str) -> SessionId {
         SessionId(s.to_string())
@@ -1020,8 +1231,8 @@ mod tests {
             daemon.start_session_conditionally(
                 id.clone(),
                 ".",
-                "sleep",
-                &["30".into()],
+                idle().program(),
+                idle().args(),
                 None,
                 80,
                 24,
@@ -1055,8 +1266,8 @@ mod tests {
         let applied = daemon.start_session_conditionally(
             id.clone(),
             ".",
-            "true",
-            &[],
+            exits().program(),
+            exits().args(),
             None,
             80,
             24,
@@ -1087,8 +1298,8 @@ mod tests {
             daemon.start_session_conditionally(
                 id.clone(),
                 ".",
-                "sleep",
-                &["30".into()],
+                idle().program(),
+                idle().args(),
                 None,
                 80,
                 24,
@@ -1114,8 +1325,8 @@ mod tests {
         let generation = match daemon.start_session_conditionally(
             id.clone(),
             ".",
-            "sleep",
-            &["30".into()],
+            idle().program(),
+            idle().args(),
             None,
             80,
             24,
@@ -1134,7 +1345,7 @@ mod tests {
 
         daemon.kill_session(&id);
         daemon
-            .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+            .start_session(id.clone(), ".", idle().program(), idle().args(), 80, 24)
             .unwrap();
         let replacement_generation = daemon.session(&id).unwrap().generation();
         assert_ne!(replacement_generation, generation);
@@ -1149,8 +1360,8 @@ mod tests {
             daemon.start_session_conditionally(
                 id.clone(),
                 ".",
-                "sleep",
-                &["30".into()],
+                idle().program(),
+                idle().args(),
                 None,
                 80,
                 24,
@@ -1201,8 +1412,8 @@ mod tests {
             daemon.start_session_conditionally(
                 id.clone(),
                 ".",
-                "sleep",
-                &["30".into()],
+                idle().program(),
+                idle().args(),
                 None,
                 80,
                 24,
@@ -1214,6 +1425,70 @@ mod tests {
             "a delayed Start after the retire barrier sees Missing and cannot spawn"
         );
         assert!(daemon.session(&id).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unknown_windows_retirement_installs_a_permanent_exact_tuple_barrier() {
+        let mut daemon = Daemon::default();
+        let id = sid("unknown-retirement");
+        let foreign_id = sid("foreign-retirement");
+        let operation_token = start_token(30_001);
+
+        assert_eq!(
+            daemon.retire_start_operation(
+                &id,
+                &operation_token,
+                &SessionStartOperationRetireExpectation::Unapplied,
+            ),
+            SessionStartOperationRetireOutcome::AlreadyRetired
+        );
+        assert_eq!(
+            daemon.lookup_start_operation(&id, &operation_token),
+            SessionStartOperationStatus::Unknown,
+            "the retained barrier must remain content-blind"
+        );
+        assert_eq!(
+            daemon.reserve_start_operation(id, operation_token.clone()),
+            SessionStartOperationReserveOutcome::Refused {
+                reason: SessionStartOperationReserveRefusal::AlreadyTerminal,
+            },
+            "a delayed exact Reserve cannot reopen an acknowledged retirement"
+        );
+        assert_eq!(
+            daemon.reserve_start_operation(foreign_id, operation_token),
+            SessionStartOperationReserveOutcome::Refused {
+                reason: SessionStartOperationReserveRefusal::TokenInUse,
+            },
+            "a wrong tuple cannot learn or replace the retained identity"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn invalid_unknown_windows_retirement_never_consumes_tombstone_capacity() {
+        let mut daemon = Daemon::default();
+        for (index, id) in [
+            sid(""),
+            sid("bad\nidentity"),
+            sid(&"x".repeat(MAX_START_OPERATION_SESSION_ID_BYTES + 1)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                daemon.retire_start_operation(
+                    &id,
+                    &start_token(31_000 + index),
+                    &SessionStartOperationRetireExpectation::Unapplied,
+                ),
+                SessionStartOperationRetireOutcome::AlreadyRetired
+            );
+        }
+        assert!(
+            daemon.start_operations.is_empty(),
+            "malformed retirement identities must not become permanent tombstones"
+        );
     }
 
     #[test]
@@ -1250,8 +1525,8 @@ mod tests {
                 start_shared.lock().await.start_session_conditionally(
                     start_id,
                     ".",
-                    "sleep",
-                    &["30".into()],
+                    idle().program(),
+                    idle().args(),
                     None,
                     80,
                     24,
@@ -1318,8 +1593,8 @@ mod tests {
         let generation = match daemon.start_session_conditionally(
             id.clone(),
             ".",
-            "sleep",
-            &["30".into()],
+            idle().program(),
+            idle().args(),
             None,
             80,
             24,
@@ -1369,7 +1644,7 @@ mod tests {
     }
 
     #[test]
-    fn operation_cap_blocks_only_new_reservations_and_exact_retire_recovers_capacity() {
+    fn windows_and_unix_operation_cap_honors_platform_retirement_policy() {
         let mut daemon = Daemon::default();
         let id = sid("ledger-cap");
         for index in 0..MAX_START_OPERATION_LEDGER_ENTRIES {
@@ -1395,6 +1670,41 @@ mod tests {
                 reason: SessionStartOperationReserveRefusal::LedgerFull,
             }
         );
+        #[cfg(windows)]
+        {
+            let full_len = daemon.start_operations.len();
+            assert_eq!(
+                daemon.retire_start_operation(
+                    &id,
+                    &overflow,
+                    &SessionStartOperationRetireExpectation::Unapplied,
+                ),
+                SessionStartOperationRetireOutcome::AlreadyRetired,
+                "a monotonic full Windows ledger is itself a retirement barrier"
+            );
+            assert_eq!(daemon.start_operations.len(), full_len);
+            assert_eq!(
+                daemon.reserve_start_operation(id.clone(), overflow.clone()),
+                SessionStartOperationReserveOutcome::Refused {
+                    reason: SessionStartOperationReserveRefusal::LedgerFull,
+                }
+            );
+            assert_eq!(
+                daemon.start_session_conditionally(
+                    id.clone(),
+                    ".",
+                    idle().program(),
+                    idle().args(),
+                    None,
+                    80,
+                    24,
+                    &absent_start(overflow.clone()),
+                ),
+                ConditionalSessionStartOutcome::Refused {
+                    reason: ConditionalSessionStartRefusal::PreconditionFailed,
+                }
+            );
+        }
 
         // Start and replay remain admitted at cap. A deterministic input refusal is retained and
         // replayed without a spawn or a new entry.
@@ -1423,8 +1733,8 @@ mod tests {
             daemon.start_session_conditionally(
                 id.clone(),
                 ".",
-                "sleep",
-                &["30".into()],
+                idle().program(),
+                idle().args(),
                 None,
                 80,
                 24,
@@ -1441,10 +1751,27 @@ mod tests {
             ),
             SessionStartOperationRetireOutcome::Retired
         );
+        #[cfg(windows)]
+        assert_eq!(
+            daemon.reserve_start_operation(id.clone(), existing.clone()),
+            SessionStartOperationReserveOutcome::Refused {
+                reason: SessionStartOperationReserveRefusal::AlreadyTerminal,
+            },
+            "Windows retirement remains a barrier against a delayed Reserve"
+        );
+        #[cfg(not(windows))]
         assert_eq!(
             daemon.reserve_start_operation(id, overflow),
             SessionStartOperationReserveOutcome::Reserved,
-            "only an explicit exact retire frees one ledger slot"
+            "Unix exact retirement reclaims one ledger slot"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            daemon.reserve_start_operation(id, overflow),
+            SessionStartOperationReserveOutcome::Refused {
+                reason: SessionStartOperationReserveRefusal::LedgerFull,
+            },
+            "Windows retains the process-lifetime retirement barrier"
         );
     }
 
@@ -1479,15 +1806,15 @@ mod tests {
         let mut daemon = Daemon::default();
         let id = sid("attachment-owners");
         daemon
-            .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+            .start_session(id.clone(), ".", idle().program(), idle().args(), 80, 24)
             .unwrap();
         let generation = daemon.session(&id).unwrap().generation();
 
         let first = daemon.acquire_session_attachment(&id, None, 1).unwrap();
         let second = daemon.acquire_session_attachment(&id, None, 2).unwrap();
         assert!(matches!(
-            daemon.take_session_if_generation(&id, &generation),
-            ConditionalSessionTake::AttachmentInUse
+            crate::test_child::conditional_kill(&mut daemon, &id, &generation),
+            KillOutcome::AttachmentInUse
         ));
 
         first.detach();
@@ -1497,17 +1824,16 @@ mod tests {
             "one detach must not erase the other exact owner"
         );
         assert!(matches!(
-            daemon.take_session_if_generation(&id, &generation),
-            ConditionalSessionTake::AttachmentInUse
+            crate::test_child::conditional_kill(&mut daemon, &id, &generation),
+            KillOutcome::AttachmentInUse
         ));
 
         second.detach();
-        let ConditionalSessionTake::Taken(session) =
-            daemon.take_session_if_generation(&id, &generation)
+        let KillOutcome::Retired =
+            crate::test_child::conditional_kill(&mut daemon, &id, &generation)
         else {
             panic!("last detach must make the exact lifetime conditionally removable");
         };
-        session.kill_child();
     }
 
     #[test]
@@ -1515,7 +1841,7 @@ mod tests {
         let mut daemon = Daemon::default();
         let id = sid("handoff-starter-first");
         daemon
-            .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+            .start_session(id.clone(), ".", idle().program(), idle().args(), 80, 24)
             .unwrap();
         let exact = token("00000000000000000000000000000001");
         let wrong = token("00000000000000000000000000000002");
@@ -1593,7 +1919,7 @@ mod tests {
         ));
 
         daemon
-            .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+            .start_session(id.clone(), ".", idle().program(), idle().args(), 80, 24)
             .unwrap();
         let actual = daemon.session(&id).unwrap().generation();
         assert_ne!(actual, "generation-a");
@@ -1623,7 +1949,7 @@ mod tests {
         let mut daemon = Daemon::default();
         let id = sid("handoff-renderer-first");
         daemon
-            .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+            .start_session(id.clone(), ".", idle().program(), idle().args(), 80, 24)
             .unwrap();
         let value = token("00000000000000000000000000000003");
         let offer = AttachmentHandoff::Offer {
@@ -1648,8 +1974,8 @@ mod tests {
         );
         let generation = daemon.session(&id).unwrap().generation();
         assert!(matches!(
-            daemon.take_session_if_generation(&id, &generation),
-            ConditionalSessionTake::AttachmentInUse
+            crate::test_child::conditional_kill(&mut daemon, &id, &generation),
+            KillOutcome::AttachmentInUse
         ));
         drop(renderer);
         daemon.kill_session(&id);
@@ -1660,7 +1986,7 @@ mod tests {
         let mut daemon = Daemon::default();
         let id = sid("handoff-cancel");
         daemon
-            .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+            .start_session(id.clone(), ".", idle().program(), idle().args(), 80, 24)
             .unwrap();
         let exact = token("00000000000000000000000000000004");
         let wrong = token("00000000000000000000000000000005");
@@ -1690,7 +2016,7 @@ mod tests {
         let mut daemon = Daemon::default();
         let id = sid("handoff-bound");
         daemon
-            .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+            .start_session(id.clone(), ".", idle().program(), idle().args(), 80, 24)
             .unwrap();
         let mut tokens = Vec::new();
         for index in 0..MAX_ATTACHMENT_HANDOFF_TOKENS {
@@ -1753,7 +2079,7 @@ mod tests {
         let mut daemon = Daemon::default();
         let id = sid("handoff-retired-bound");
         daemon
-            .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+            .start_session(id.clone(), ".", idle().program(), idle().args(), 80, 24)
             .unwrap();
 
         for index in 0..(MAX_RETIRED_ATTACHMENT_HANDOFF_TOKENS + 32) {
@@ -1824,19 +2150,18 @@ mod tests {
                 .expect("the bounded LRU has evicted the oldest retired value"),
         );
         assert!(matches!(
-            daemon.take_session_if_generation(&id, &generation_a),
-            ConditionalSessionTake::AttachmentInUse
+            crate::test_child::conditional_kill(&mut daemon, &id, &generation_a),
+            KillOutcome::AttachmentInUse
         ));
         daemon.cancel_session_attachment_handoff(&id, &evicted_oldest);
-        let ConditionalSessionTake::Taken(session_a) =
-            daemon.take_session_if_generation(&id, &generation_a)
+        let KillOutcome::Retired =
+            crate::test_child::conditional_kill(&mut daemon, &id, &generation_a)
         else {
             panic!("exact cancel must reopen conditional Kill for A");
         };
-        session_a.kill_child();
 
         daemon
-            .start_session(id.clone(), ".", "sleep", &["30".into()], 80, 24)
+            .start_session(id.clone(), ".", idle().program(), idle().args(), 80, 24)
             .unwrap();
         let generation_b = daemon.session(&id).unwrap().generation();
         assert_ne!(generation_a, generation_b);
@@ -1852,12 +2177,11 @@ mod tests {
                 .is_err(),
             "A's pending token never transfers to same-id replacement B"
         );
-        let ConditionalSessionTake::Taken(session_b) =
-            daemon.take_session_if_generation(&id, &generation_b)
+        let KillOutcome::Retired =
+            crate::test_child::conditional_kill(&mut daemon, &id, &generation_b)
         else {
             panic!("unrelated replacement B must remain conditionally killable");
         };
-        session_b.kill_child();
     }
 
     #[test]
@@ -1865,7 +2189,7 @@ mod tests {
         let mut daemon = Daemon::default();
         let id = sid("handoff-generation-a");
         daemon
-            .start_session(id.clone(), ".", "true", &[], 80, 24)
+            .start_session(id.clone(), ".", exits().program(), exits().args(), 80, 24)
             .unwrap();
         wait_for_exit(&daemon, &id);
         let generation_a = daemon.session(&id).unwrap().generation();
@@ -1886,7 +2210,15 @@ mod tests {
         );
         assert!(
             daemon
-                .start_session_with_restart(id.clone(), ".", "sleep", &["30".into()], 80, 24, true,)
+                .start_session_with_restart(
+                    id.clone(),
+                    ".",
+                    idle().program(),
+                    idle().args(),
+                    80,
+                    24,
+                    true,
+                )
                 .is_err(),
             "pending exited A cannot be bypassed by explicit restart"
         );
@@ -1894,7 +2226,15 @@ mod tests {
 
         daemon.cancel_session_attachment_handoff(&id, &value);
         daemon
-            .start_session_with_restart(id.clone(), ".", "sleep", &["30".into()], 80, 24, true)
+            .start_session_with_restart(
+                id.clone(),
+                ".",
+                idle().program(),
+                idle().args(),
+                80,
+                24,
+                true,
+            )
             .unwrap();
         assert_ne!(daemon.session(&id).unwrap().generation(), generation_a);
         let stale_claim = AttachmentHandoff::Claim { token: value };
@@ -1916,7 +2256,7 @@ mod tests {
         for index in 0..MAX_SESSIONS {
             let id = sid(&format!("protected-capacity-{index}"));
             daemon
-                .start_session(id.clone(), ".", "true", &[], 80, 24)
+                .start_session(id.clone(), ".", exits().program(), exits().args(), 80, 24)
                 .unwrap();
             wait_for_exit(&daemon, &id);
             if index % 2 == 0 {
@@ -1947,8 +2287,8 @@ mod tests {
             .start_session(
                 sid("must-not-evict-protected"),
                 ".",
-                "sleep",
-                &["30".into()],
+                idle().program(),
+                idle().args(),
                 80,
                 24,
             )
@@ -1997,7 +2337,7 @@ mod tests {
         // Spawn a long-lived session and grab its PTY write handle.
         let handle = rt.block_on(async {
             let mut d = shared.lock().await;
-            d.start_session(sid("writer"), ".", "sleep", &["30".to_string()], 80, 24)
+            d.start_session(sid("writer"), ".", idle().program(), idle().args(), 80, 24)
                 .expect("spawn session");
             d.session(&sid("writer")).unwrap().pty_handle()
         });
@@ -2045,14 +2385,21 @@ mod tests {
 
         // A child that exits on its own the instant it starts. Nobody calls
         // kill_session for it, so only the reap path can reclaim its slot.
-        d.start_session(sid("ephemeral"), ".", "true", &[], 80, 24)
-            .expect("spawn the short-lived session");
+        d.start_session(
+            sid("ephemeral"),
+            ".",
+            exits().program(),
+            exits().args(),
+            80,
+            24,
+        )
+        .expect("spawn the short-lived session");
         assert_eq!(d.sessions.len(), 1, "session is in the map while/after run");
 
         wait_for_exit(&d, &sid("ephemeral"));
 
         // Starting another session below capacity preserves the final snapshot for inspection.
-        d.start_session(sid("live"), ".", "sleep", &["30".to_string()], 80, 24)
+        d.start_session(sid("live"), ".", idle().program(), idle().args(), 80, 24)
             .expect("spawn the long-lived session");
         assert!(
             d.sessions.contains_key(&sid("ephemeral")),
@@ -2078,7 +2425,7 @@ mod tests {
     fn exit_latched_session_is_not_listed_live_but_remains_late_attachable() {
         let mut d = Daemon::default();
         let id = sid("latched-exit");
-        d.start_session(id.clone(), ".", "true", &[], 80, 24)
+        d.start_session(id.clone(), ".", exits().program(), exits().args(), 80, 24)
             .expect("spawn the short-lived session");
         wait_for_exit(&d, &id);
 
@@ -2114,7 +2461,7 @@ mod tests {
 
         // A long-lived child. A second StartSession with the same id is a
         // reattach (the UI reconnected) and must NOT respawn it.
-        d.start_session(sid("agent"), ".", "sleep", &["30".to_string()], 80, 24)
+        d.start_session(sid("agent"), ".", idle().program(), idle().args(), 80, 24)
             .expect("spawn the long-lived session");
         assert!(
             d.sessions
@@ -2127,7 +2474,7 @@ mod tests {
 
         // Reattach: same id, still alive. Returns Ok, leaves the live session
         // untouched (no respawn), and never grows the map.
-        d.start_session(sid("agent"), ".", "sleep", &["30".to_string()], 80, 24)
+        d.start_session(sid("agent"), ".", idle().program(), idle().args(), 80, 24)
             .expect("reattach to a live session is Ok");
         assert_eq!(d.sessions.len(), 1, "reattach must not add a session");
         assert!(
@@ -2146,7 +2493,7 @@ mod tests {
     fn exited_same_id_start_is_an_explicit_new_generation() {
         let mut d = Daemon::default();
         let id = sid("restart-ended");
-        d.start_session(id.clone(), ".", "true", &[], 80, 24)
+        d.start_session(id.clone(), ".", exits().program(), exits().args(), 80, 24)
             .expect("spawn short-lived session");
         wait_for_exit(&d, &id);
         let ended_generation = d
@@ -2156,8 +2503,16 @@ mod tests {
             .snapshot
             .generation;
 
-        d.start_session_with_restart(id.clone(), ".", "sleep", &["30".to_string()], 80, 24, true)
-            .expect("same-id start explicitly restarts an ended session");
+        d.start_session_with_restart(
+            id.clone(),
+            ".",
+            idle().program(),
+            idle().args(),
+            80,
+            24,
+            true,
+        )
+        .expect("same-id start explicitly restarts an ended session");
 
         let restarted = d.session(&id).expect("new session generation");
         assert!(restarted.exit_state().is_none());
@@ -2173,7 +2528,7 @@ mod tests {
     fn failed_same_id_restart_preserves_the_retained_final_snapshot() {
         let mut d = Daemon::default();
         let id = sid("restart-failure-retains-final-output");
-        d.start_session(id.clone(), ".", "true", &[], 80, 24)
+        d.start_session(id.clone(), ".", exits().program(), exits().args(), 80, 24)
             .expect("spawn short-lived session");
         wait_for_exit(&d, &id);
         let ended_generation = d
@@ -2212,7 +2567,7 @@ mod tests {
         let mut daemon = Daemon::default();
         let id = sid("invalid-child-environment-retains-snapshot");
         daemon
-            .start_session(id.clone(), ".", "true", &[], 80, 24)
+            .start_session(id.clone(), ".", exits().program(), exits().args(), 80, 24)
             .expect("spawn short-lived session");
         wait_for_exit(&daemon, &id);
         let ended_generation = daemon
@@ -2251,11 +2606,12 @@ mod tests {
     /// Targeted: killed session reaps its child without leaving a zombie. The
     /// reader thread sets the exit latch ONLY after `child.wait()` returns, so a
     /// set latch proves the kernel process-table entry was collected (no zombie).
-    /// `kill_and_wait` blocks until that latch is set.
+    /// Unix `kill_and_wait` proves reaping; Windows exercises async exact-Job retirement and
+    /// verifies the same final-exit latch before its mapped owner is removed.
     #[test]
     fn killed_session_reaps_child_without_zombie() {
         let mut d = Daemon::default();
-        d.start_session(sid("victim"), ".", "sleep", &["30".to_string()], 80, 24)
+        d.start_session(sid("victim"), ".", idle().program(), idle().args(), 80, 24)
             .expect("spawn a long-lived session");
         assert!(
             d.sessions
@@ -2266,7 +2622,15 @@ mod tests {
             "precondition: the child is alive (not yet reaped)"
         );
 
-        // Kill and confirm the reader thread reaped it (latch set) within budget.
+        let final_grid = d.session(&sid("victim")).unwrap().grid_handle();
+        // Kill and confirm the reader thread published final exit within budget.
+        #[cfg(windows)]
+        let reaped = {
+            let generation = d.session(&sid("victim")).unwrap().generation();
+            crate::test_child::conditional_kill(&mut d, &sid("victim"), &generation)
+                == KillOutcome::Retired
+        };
+        #[cfg(not(windows))]
         let reaped = d
             .sessions
             .get(&sid("victim"))
@@ -2277,11 +2641,7 @@ mod tests {
             "the killed child must be reaped (exit latch set) — a zombie would leave it None"
         );
         assert!(
-            d.sessions
-                .get(&sid("victim"))
-                .unwrap()
-                .exit_state()
-                .is_some(),
+            final_grid.exit_state().is_some(),
             "exit_state must be Some after the child is reaped"
         );
 
@@ -2294,7 +2654,7 @@ mod tests {
     #[test]
     fn killed_session_releases_capacity() {
         let mut d = Daemon::default();
-        d.start_session(sid("k"), ".", "sleep", &["30".to_string()], 80, 24)
+        d.start_session(sid("k"), ".", idle().program(), idle().args(), 80, 24)
             .expect("spawn");
         assert_eq!(d.sessions.len(), 1);
 
@@ -2315,7 +2675,7 @@ mod tests {
     #[test]
     fn detach_does_not_kill_live_session() {
         let mut d = Daemon::default();
-        d.start_session(sid("persist"), ".", "sleep", &["30".to_string()], 80, 24)
+        d.start_session(sid("persist"), ".", idle().program(), idle().args(), 80, 24)
             .expect("spawn");
 
         // The daemon exposes no detach mutation — detach lives entirely in the
@@ -2340,21 +2700,40 @@ mod tests {
     }
 
     /// Targeted: a successful shutdown reports every child reaped. Each child's
-    /// reaping is confirmed via its exit latch inside `kill_and_wait`, so a report
-    /// of `all_reaped()` with `reaped == total` means every process-table entry
-    /// was collected (no orphans/zombies), and state is cleared.
+    /// reaping is confirmed via its final exit latch (and exact Job retirement on
+    /// Windows), so `all_reaped()` with `reaped == total` proves no unconfirmed
+    /// children remain and state is cleared.
     #[test]
     fn successful_shutdown_reports_all_children_reaped() {
         let mut d = Daemon::default();
-        d.start_session(sid("a"), ".", "sleep", &["30".to_string()], 80, 24)
+        d.start_session(sid("a"), ".", idle().program(), idle().args(), 80, 24)
             .expect("spawn a");
-        d.start_session(sid("b"), ".", "sleep", &["30".to_string()], 80, 24)
+        d.start_session(sid("b"), ".", idle().program(), idle().args(), 80, 24)
             .expect("spawn b");
-        d.start_session(sid("c"), ".", "sleep", &["30".to_string()], 80, 24)
+        d.start_session(sid("c"), ".", idle().program(), idle().args(), 80, 24)
             .expect("spawn c");
         assert_eq!(d.sessions.len(), 3, "three live children before shutdown");
 
+        #[cfg(windows)]
+        let retirement_proofs: Vec<_> = ["a", "b", "c"]
+            .into_iter()
+            .map(|name| {
+                let id = sid(name);
+                // This is the successful-retirement case, not a native executable/ConPTY
+                // startup deadline. Keep the production shutdown budget unchanged, but prove
+                // all three live children and their real output pumps are ready first.
+                crate::test_child::wait_idle_ready(&d, &id);
+                let session = d.session(&id).unwrap();
+                (id, session.grid_handle(), session.native_lifetime())
+            })
+            .collect();
+
+        #[cfg(not(windows))]
         let report = d.shutdown();
+        #[cfg(windows)]
+        let report = crate::test_child::with_daemon(&mut d, |shared| async move {
+            crate::windows_session_retirement::shutdown(&shared).await
+        });
 
         assert!(
             report.all_reaped(),
@@ -2363,6 +2742,17 @@ mod tests {
         assert_eq!(report.total, 3, "report counts all pre-shutdown sessions");
         assert_eq!(report.reaped, 3, "all three confirmed reaped");
         assert!(report.unconfirmed.is_empty(), "no unconfirmed children");
+        #[cfg(windows)]
+        for (id, grid, lifetime) in retirement_proofs {
+            assert!(
+                grid.exit_state().is_some(),
+                "shutdown must publish final exit for {id:?}"
+            );
+            assert!(
+                lifetime.is_retired().expect("query exact fixture Job"),
+                "shutdown must confirm exact Job retirement for {id:?}"
+            );
+        }
         assert_eq!(
             d.sessions.len(),
             0,
@@ -2375,17 +2765,61 @@ mod tests {
     /// reaped within the budget — it must not overstate "all reaped". We force the
     /// branch deterministically with a zero per-child budget: kill_and_wait checks
     /// the exit latch once and, since the reader thread cannot have run `wait()`
-    /// in zero time, reports the child unconfirmed. State is still cleared.
+    /// in zero time, reports the child unconfirmed. Unix clears state immediately; Windows
+    /// must retain exact owners until their gated retirement worker really completes.
     #[test]
     fn shutdown_reports_unconfirmed_when_child_does_not_confirm_in_time() {
         let mut d = Daemon::default();
-        d.start_session(sid("slow"), ".", "sleep", &["30".to_string()], 80, 24)
+        d.start_session(sid("slow"), ".", idle().program(), idle().args(), 80, 24)
             .expect("spawn");
-        d.start_session(sid("slow2"), ".", "sleep", &["30".to_string()], 80, 24)
+        d.start_session(sid("slow2"), ".", idle().program(), idle().args(), 80, 24)
             .expect("spawn");
 
         // Zero budget: no child can confirm reaped, so every one is unconfirmed.
+        #[cfg(not(windows))]
         let report = d.shutdown_with_timeout(std::time::Duration::ZERO);
+        #[cfg(windows)]
+        let report = crate::test_child::with_daemon(&mut d, |shared| async move {
+            let generations: Vec<_> = {
+                let daemon = shared.lock().await;
+                daemon
+                    .sessions
+                    .iter()
+                    .map(|(id, session)| (id.clone(), session.generation()))
+                    .collect()
+            };
+            crate::windows_session_retirement::shutdown_held_for_test(&shared, |daemon, report| {
+                assert_eq!(report.reaped, 0);
+                assert_eq!(report.unconfirmed.len(), 2);
+                assert!(
+                    daemon.closing,
+                    "unconfirmed shutdown must close new admission"
+                );
+                assert_eq!(
+                    daemon.sessions.len(),
+                    2,
+                    "unconfirmed owners cannot disappear"
+                );
+                for (id, generation) in generations {
+                    let session = daemon.session(&id).unwrap();
+                    assert_eq!(session.generation(), generation);
+                    assert!(session.retirement.is_some());
+                    assert!(session.exit_state().is_none());
+                    assert!(daemon.acquire_session_attachment(&id, None, 991).is_err());
+                }
+                assert!(daemon
+                    .start_session(
+                        sid("forbidden-after-shutdown"),
+                        ".",
+                        idle().program(),
+                        idle().args(),
+                        80,
+                        24
+                    )
+                    .is_err());
+            })
+            .await
+        });
 
         assert!(
             !report.all_reaped(),
@@ -2401,7 +2835,7 @@ mod tests {
         assert_eq!(
             d.sessions.len(),
             0,
-            "state is cleared even on a degraded shutdown (PTYs still closed)"
+            "state is cleared after cleanup; Windows first proved retained unconfirmed owners"
         );
     }
 
@@ -2459,7 +2893,7 @@ mod tests {
         let channel = ChannelId("members-only".into());
         let sender = sid("sender");
         d.open_channel(channel.clone()).unwrap();
-        d.start_session(sender.clone(), ".", "sleep", &["30".to_string()], 80, 24)
+        d.start_session(sender.clone(), ".", idle().program(), idle().args(), 80, 24)
             .expect("spawn sender session");
 
         let event_from = |from: Option<SessionId>, ts| ChannelEvent {
@@ -2501,7 +2935,7 @@ mod tests {
 
         // A child that exits the instant it starts. Nobody kills it, so its dead
         // Session lingers in the map under id "slot".
-        d.start_session(sid("slot"), ".", "true", &[], 80, 24)
+        d.start_session(sid("slot"), ".", exits().program(), exits().args(), 80, 24)
             .expect("spawn the short-lived session");
         wait_for_exit(&d, &sid("slot"));
         assert!(
@@ -2517,7 +2951,7 @@ mod tests {
         // status has not landed yet, it must preserve the retained final grid rather than infer
         // restart authority merely from a same-id command.
         let error = d
-            .start_session(sid("slot"), ".", "sleep", &["30".to_string()], 80, 24)
+            .start_session(sid("slot"), ".", idle().program(), idle().args(), 80, 24)
             .expect_err("ordinary same-id start must refuse ambiguous restart authority");
         assert!(
             error.to_string().contains("explicit restart authority"),
@@ -2534,8 +2968,16 @@ mod tests {
 
         // A future explicit Restart action carries the separate authority bit and replaces the
         // corpse only after the new child has spawned successfully.
-        d.start_session_with_restart(sid("slot"), ".", "sleep", &["30".to_string()], 80, 24, true)
-            .expect("explicit restart respawns a fresh session");
+        d.start_session_with_restart(
+            sid("slot"),
+            ".",
+            idle().program(),
+            idle().args(),
+            80,
+            24,
+            true,
+        )
+        .expect("explicit restart respawns a fresh session");
         assert!(
             d.sessions
                 .get(&sid("slot"))

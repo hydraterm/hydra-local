@@ -9,8 +9,10 @@
 //! is never deleted by this raw planner; the journaled lifecycle engine owns that operation.
 
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(unix)]
 static SERVICE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
@@ -38,6 +40,12 @@ pub fn is_lifecycle_lock_contention(error: &std::io::Error) -> bool {
 /// ensure cannot reinstall a job halfway through Remove Remote.
 pub struct LifecycleLock {
     root: PathBuf,
+    #[cfg(windows)]
+    windows_root: maestro_shell::WindowsPrivateDirectory,
+    #[cfg(windows)]
+    windows_identity: maestro_shell::WindowsPrivateFileIdentity,
+    #[cfg(windows)]
+    _windows_lock: maestro_shell::WindowsPrivateLock,
     #[cfg(unix)]
     file: std::fs::File,
     #[cfg(unix)]
@@ -69,9 +77,10 @@ impl LifecycleLock {
         };
         #[cfg(not(unix))]
         let root = {
-            std::fs::create_dir_all(agent_dir)?;
+            crate::agent_dir::ensure_owned_safe_authority_directory(agent_dir)?;
             std::fs::canonicalize(agent_dir)?
         };
+        #[cfg(unix)]
         let path = root.join("lifecycle.lock");
         #[cfg(unix)]
         {
@@ -142,10 +151,27 @@ impl LifecycleLock {
             value.revalidate_root()?;
             Ok(value)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            let _ = path;
-            Ok(Self { root })
+            let windows_root = maestro_shell::WindowsPrivateDirectory::open(&root)?;
+            let windows_identity = windows_root.identity()?;
+            let lock = windows_root
+                .try_lock(std::ffi::OsStr::new("lifecycle.lock"))
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::WouldBlock {
+                        std::io::Error::new(std::io::ErrorKind::WouldBlock, LifecycleLockContention)
+                    } else {
+                        error
+                    }
+                })?;
+            let value = Self {
+                root,
+                windows_root,
+                windows_identity,
+                _windows_lock: lock,
+            };
+            value.revalidate_root()?;
+            Ok(value)
         }
     }
 
@@ -165,14 +191,7 @@ impl LifecycleLock {
                 "lifecycle lock belongs to a different agent directory",
             ));
         }
-        #[cfg(unix)]
-        {
-            self.revalidate_root()
-        }
-        #[cfg(not(unix))]
-        {
-            Ok(())
-        }
+        self.revalidate_root()
     }
 
     #[cfg(unix)]
@@ -196,6 +215,20 @@ impl LifecycleLock {
         } else {
             Ok(())
         }
+    }
+
+    #[cfg(windows)]
+    fn revalidate_root(&self) -> std::io::Result<()> {
+        let named = maestro_shell::WindowsPrivateDirectory::open(&self.root)?;
+        if self.windows_root.identity()? != self.windows_identity
+            || named.identity()? != self.windows_identity
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Hydra lifecycle root identity changed",
+            ));
+        }
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -273,7 +306,6 @@ impl LifecycleLockSet {
         &self,
         expected: &std::collections::BTreeSet<PathBuf>,
     ) -> std::io::Result<()> {
-        #[cfg(unix)]
         for lock in &self.locks {
             lock.revalidate_root()?;
         }
@@ -824,17 +856,114 @@ fn manager_output_bounded_with_limits(
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn manager_output_bounded_with_limits(
     program: &str,
     args: &[String],
-    _timeout: std::time::Duration,
-    _stream_limit: usize,
+    timeout: std::time::Duration,
+    stream_limit: usize,
 ) -> std::io::Result<std::process::Output> {
-    std::process::Command::new(program)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .output()
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    manager_output_bounded_command_with_limits(command, timeout, stream_limit)
+}
+
+#[cfg(windows)]
+pub(crate) fn manager_output_bounded_command_with_limits(
+    mut command: std::process::Command,
+    timeout: std::time::Duration,
+    stream_limit: usize,
+) -> std::io::Result<std::process::Output> {
+    use std::os::windows::{io::AsRawHandle, process::CommandExt};
+    use std::process::Stdio;
+    fn drain<R: std::io::Read + AsRawHandle>(
+        stream: &mut Option<R>,
+        bytes: &mut Vec<u8>,
+        limit: usize,
+    ) -> std::io::Result<()> {
+        let Some(reader) = stream.as_mut() else {
+            return Ok(());
+        };
+        let mut available = 0;
+        if unsafe {
+            windows_sys::Win32::System::Pipes::PeekNamedPipe(
+                reader.as_raw_handle(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error()
+                == Some(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE as i32)
+            {
+                *stream = None;
+                return Ok(());
+            }
+            return Err(error);
+        }
+        if available == 0 {
+            return Ok(());
+        }
+        let count = (available as usize)
+            .min(16 * 1024)
+            .min(limit.saturating_sub(bytes.len()).saturating_add(1));
+        let mut buffer = vec![0; count];
+        let count = reader.read(&mut buffer)?;
+        bytes.extend_from_slice(&buffer[..count]);
+        if bytes.len() > limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows manager output exceeded its bound",
+            ));
+        }
+        if count == 0 {
+            *stream = None;
+        }
+        Ok(())
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(0x08000000)
+        .spawn()?;
+    let (mut stdout, mut stderr) = (child.stdout.take(), child.stderr.take());
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let deadline = std::time::Instant::now() + timeout;
+    let result = loop {
+        if let Err(error) = drain(&mut stdout, &mut out, stream_limit)
+            .and_then(|()| drain(&mut stderr, &mut err, stream_limit))
+        {
+            break Err(error);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) if stdout.is_none() && stderr.is_none() => {
+                break Ok(std::process::Output {
+                    status,
+                    stdout: out,
+                    stderr: err,
+                })
+            }
+            Err(error) => break Err(error),
+            _ => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            break Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Windows manager exceeded its lifecycle deadline",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
 }
 
 impl ActionRunner for SystemRunner {
@@ -931,6 +1060,42 @@ pub fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
     atomic_write_for_home(path, contents, &home)
 }
 
+#[cfg(windows)]
+fn atomic_write_for_home(path: &Path, contents: &str, _trusted_home: &Path) -> std::io::Result<()> {
+    use crate::windows_private_authority::Directory;
+    use std::io::Read as _;
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "service definition has no parent",
+        )
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "service definition has no name",
+        )
+    })?;
+    // Existing ACLs are observed, never repaired. Publication is source-handle-bound and flushes
+    // the file; Windows does not promise the Unix directory-fsync power-loss guarantee.
+    let directory = Directory::ensure(parent)?;
+    directory.publish(name, contents.as_bytes(), true)?;
+    let mut file = directory.open_file(name, false)?;
+    let identity = Directory::validate_file(&file)?;
+    let mut actual = Vec::new();
+    file.by_ref()
+        .take(contents.len() as u64 + 1)
+        .read_to_end(&mut actual)?;
+    if actual != contents.as_bytes() || Directory::validate_file(&file)? != identity {
+        return Err(std::io::Error::other(
+            "service definition changed after publication",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn atomic_write_for_home(path: &Path, contents: &str, trusted_home: &Path) -> std::io::Result<()> {
     use std::io::Write as _;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -1032,6 +1197,19 @@ fn ensure_owned_safe_shared_service_directory_for_home(
     crate::agent_dir::require_owned_safe_directory(path)
 }
 
+#[cfg(windows)]
+fn open_existing_service_file(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    match crate::windows_private_authority::open(path, false) {
+        Ok(file) => {
+            validate_service_file(&file, "existing service definition", None)?;
+            Ok(Some(file))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
 fn open_existing_service_file(path: &Path) -> std::io::Result<Option<std::fs::File>> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -1232,6 +1410,16 @@ fn read_legacy_028_service_candidate_for_home_and_uid(
     Ok(Some(bytes))
 }
 
+#[cfg(windows)]
+fn validate_existing_service_definition_for_home_and_uid(
+    path: &Path,
+    _trusted_home: &Path,
+    _expected_uid: u32,
+) -> std::io::Result<()> {
+    open_existing_service_file(path).map(|_| ())
+}
+
+#[cfg(unix)]
 fn validate_existing_service_definition_for_home_and_uid(
     path: &Path,
     trusted_home: &Path,
@@ -1377,8 +1565,11 @@ fn validate_service_file(
             ));
         }
     }
-    #[cfg(not(unix))]
-    let _ = (label, exact_mode);
+    #[cfg(windows)]
+    {
+        let _ = exact_mode;
+        crate::windows_private_authority::Directory::validate_file(file)?;
+    }
     Ok(())
 }
 
@@ -1412,7 +1603,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!("svc-test-{}", std::process::id()));
         ServicePaths {
             launch_agents_dir: base.join("LaunchAgents"),
-            log_dir: base.join("Logs/Hydra"),
+            log_dir: base.join("Logs").join("Hydra"),
             agent_dir: base.join("agent"),
             label: "com.hydra.agent".to_string(),
             uid: "501".to_string(),
@@ -1590,7 +1781,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         ServicePaths {
             launch_agents_dir: base.join("LaunchAgents"),
-            log_dir: base.join("Logs/Hydra"),
+            log_dir: base.join("Logs").join("Hydra"),
             agent_dir: base.join("agent"),
             label: "com.hydra.agent".to_string(),
             uid: "501".to_string(),
@@ -1614,9 +1805,9 @@ mod tests {
                 builder.recursive(true).mode(0o700);
                 builder.create(path)
             }
-            #[cfg(not(unix))]
+            #[cfg(windows)]
             {
-                std::fs::create_dir_all(path)
+                crate::windows_private_authority::Directory::ensure(path).map(|_| ())
             }
         }
         fn write_file(&mut self, path: &Path, contents: &str) -> std::io::Result<()> {

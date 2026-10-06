@@ -1,3 +1,6 @@
+// This wire fixture uses Unix domain sockets and POSIX child commands.
+#![cfg(unix)]
+
 //! Lifecycle, attach-identity and socket-guard hardening.
 
 mod common;

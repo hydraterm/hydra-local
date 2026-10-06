@@ -3334,9 +3334,11 @@ impl<'a> SessionService<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_daemon_transport::{
+        endpoint, Listener as UnixListener, Stream as StdUnixStream,
+    };
     use maestro_protocol::SessionId;
     use std::io::{BufRead, BufReader, Read, Write};
-    use std::os::unix::net::{UnixListener, UnixStream as StdUnixStream};
     use std::path::PathBuf;
     use std::sync::mpsc;
     use std::thread::JoinHandle;
@@ -3360,11 +3362,15 @@ mod tests {
             F: FnOnce(&mpsc::Sender<String>, &mut StdUnixStream) + Send + 'static,
         {
             let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("stub.sock");
+            let path = endpoint(dir.path(), "stub.sock");
             let listener = UnixListener::bind(&path).unwrap();
+            listener.set_nonblocking(false).unwrap();
             let (req_tx, req_rx) = mpsc::channel::<String>();
             let handle = std::thread::spawn(move || {
                 if let Ok((mut stream, _)) = listener.accept() {
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                        .unwrap();
                     // This fixture models one exact reviewed daemon connection. Recovery tests
                     // must not accidentally reconnect into a still-listening but unserviced
                     // backlog and wait for a timeout instead of observing the intended peer loss.
@@ -3560,6 +3566,7 @@ mod tests {
                 "generation_conditional_start": true,
                 "start_operation_ledger": true,
                 "generation_conditional_attach": true,
+                "windows_start_operation_retirement_barrier": true,
             })
         )
         .unwrap();
@@ -4400,14 +4407,27 @@ mod tests {
                     _ => None,
                 })
                 .expect("one provider StartSession request");
-            assert_eq!(wire.0, "/bin/prepared-provider-shell");
-            let packed = wire.1.last().expect("login-shell provider command");
-            assert!(packed.contains(provider));
-            assert!(packed.contains("--session-id"));
-            assert!(
-                !packed.contains("--resume"),
-                "{provider} first wire launch must create, not resume"
-            );
+            #[cfg(unix)]
+            {
+                assert_eq!(wire.0, "/bin/prepared-provider-shell");
+                let packed = wire.1.last().expect("login-shell provider command");
+                assert!(packed.contains(provider));
+                assert!(packed.contains("--session-id"));
+                assert!(
+                    !packed.contains("--resume"),
+                    "{provider} first wire launch must create, not resume"
+                );
+            }
+            #[cfg(windows)]
+            {
+                assert_eq!(wire.0, provider);
+                assert_eq!(
+                    wire.1,
+                    source[1..],
+                    "exact first-create identity and model args"
+                );
+                assert!(!wire.1.iter().any(|arg| arg.starts_with("--resume")));
+            }
 
             let (_, compensation) = started.into_parts();
             assert!(matches!(
@@ -5745,9 +5765,20 @@ mod tests {
         .expect("strict current-provider latest recipe is authorized only by explicit Reopen");
         assert_eq!(explicit.session, session);
         assert_eq!(explicit.workspace, workspace);
-        assert_eq!(explicit.params.command, "/bin/prepared-provider-shell");
-        assert_eq!(explicit.params.args[0], crate::LOGIN_SHELL_COMMAND_FLAGS);
-        assert!(explicit.params.args[1].contains("'claude' '--continue'"));
+        #[cfg(unix)]
+        {
+            assert_eq!(explicit.params.command, "/bin/prepared-provider-shell");
+            assert_eq!(explicit.params.args[0], crate::LOGIN_SHELL_COMMAND_FLAGS);
+            assert!(explicit.params.args[1].contains("'claude' '--continue'"));
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(explicit.params.command, "claude");
+            assert_eq!(
+                explicit.params.args,
+                ["--continue", "--dangerously-skip-permissions"]
+            );
+        }
         assert!(matches!(
             SessionService::new(&paths).ensure_fresh_daemon_start_row(
                 explicit.params(),
@@ -5819,7 +5850,7 @@ mod tests {
             workspace_id: workspace.workspace_id.clone(),
             kind: SessionKind::Shell,
             launch: LaunchSpec::OptOut,
-            cwd_resolved: "/tmp".into(),
+            cwd_resolved: tmp.path().to_string_lossy().into_owned(),
             agent_task_id: None,
             created_at_ms: 7,
             last_attached_at_ms: 8,
@@ -6036,7 +6067,7 @@ mod tests {
                     "60000000-0000-4000-8000-000000000001".into(),
                 ],
             },
-            cwd_resolved: "/tmp".into(),
+            cwd_resolved: tmp.path().to_string_lossy().into_owned(),
             agent_task_id: None,
             created_at_ms: 7,
             last_attached_at_ms: 8,
@@ -6098,10 +6129,18 @@ mod tests {
                         }),
                     ..
                 } if expected_generation == "generation-a"
-                    && environment == expected_child_environment
-                    && command == "/bin/prepared-provider-shell"
-                    && args.first().map(String::as_str) == Some("-lic") =>
+                    && environment == expected_child_environment =>
                 {
+                    #[cfg(unix)]
+                    {
+                        assert_eq!(command, "/bin/prepared-provider-shell");
+                        assert_eq!(args.first().map(String::as_str), Some("-lic"));
+                    }
+                    #[cfg(windows)]
+                    {
+                        assert_eq!(command, "codex");
+                        assert_eq!(args, ["resume", "60000000-0000-4000-8000-000000000001"]);
+                    }
                     (id, operation_token)
                 }
                 other => panic!("expected reviewed exited headless Start, got {other:?}"),

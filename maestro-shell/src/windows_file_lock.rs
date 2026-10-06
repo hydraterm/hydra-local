@@ -26,12 +26,26 @@ enum Mode {
 }
 
 #[derive(Debug)]
-pub(crate) struct WindowsFileLock {
+pub struct WindowsFileLock {
     file: File,
     mode: Mutex<Mode>,
+    _owner_directory: Option<crate::local_store_security::SecureAppSupport>,
 }
 
 impl WindowsFileLock {
+    /// Secure the existing owner-local store boundary and retain its complete pinned walk
+    /// while serializing a cooperating writer. This is not the observe-only identity API.
+    pub fn open_owner_exclusive(
+        directory: &std::path::Path,
+        name: &std::ffi::OsStr,
+    ) -> io::Result<Self> {
+        let directory = crate::local_store_security::SecureAppSupport::open(directory)?;
+        let file = directory.open_owner_file(name, false)?;
+        let mut lock = Self::from_owner_file(file)?;
+        lock.lock_exclusive()?;
+        lock._owner_directory = Some(directory);
+        Ok(lock)
+    }
     /// Consume a file obtained from SecureAppSupport::open_owner_file. ReOpenFile addresses that
     /// exact kernel object, not a fresh pathname; omit delete sharing to pin its authority name.
     /// Reopen without FILE_FLAG_OVERLAPPED so no locking operation can outlive its stack context.
@@ -57,6 +71,7 @@ impl WindowsFileLock {
         Ok(Self {
             file: pinned,
             mode: Mutex::new(Mode::Unlocked),
+            _owner_directory: None,
         })
     }
 

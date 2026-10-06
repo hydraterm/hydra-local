@@ -2566,6 +2566,10 @@ fn dashboard_success_json(outcome: &DashboardOutcome) -> serde_json::Value {
 }
 
 #[cfg(test)]
+#[path = "../../../maestro-app/src/bin_test_transport.rs"]
+mod test_daemon_transport;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use maestro_shell::{AgentTask, ReconciledSession, SessionRecord, SessionStatus};
@@ -4923,8 +4927,8 @@ mod tests {
 
         // -- opt-in daemon reconcile (local stub socket, no real pty-daemon) --
 
+        use crate::test_daemon_transport::{endpoint, Listener as UnixListener, Stream};
         use std::io::{BufRead, BufReader, Write};
-        use std::os::unix::net::UnixListener;
         use std::path::PathBuf;
 
         /// A loopback protocol-v3 stub daemon: answer the read-only capability probe and then one
@@ -4932,9 +4936,13 @@ mod tests {
         /// flow used by `ShellRuntime::reconcile_sessions`; no mutation request is accepted.
         fn spawn_sessions_stub(path: PathBuf, ids: Vec<String>) -> std::thread::JoinHandle<()> {
             let listener = UnixListener::bind(&path).unwrap();
+            listener.set_nonblocking(false).unwrap();
             std::thread::spawn(move || {
                 if let Ok((mut stream, _)) = listener.accept() {
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                        .unwrap();
+                    let mut reader: BufReader<Stream> = BufReader::new(stream.try_clone().unwrap());
                     let mut line = String::new();
                     reader.read_line(&mut line).unwrap();
                     assert_eq!(line.trim(), r#"{"op":"daemon_info"}"#);
@@ -4953,6 +4961,8 @@ mod tests {
                             "generation_conditional_start": true,
                             "start_operation_ledger": true,
                             "generation_conditional_attach": true,
+                            // This read-only stub accepts no Start/Reserve mutation.
+                            "windows_start_operation_retirement_barrier": cfg!(windows),
                         })
                     )
                     .unwrap();
@@ -4985,13 +4995,14 @@ mod tests {
                     // the runtime drops the connection before `run_dashboard` returns.
                     line.clear();
                     let _ = reader.read_line(&mut line);
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
                 }
             })
         }
 
         fn stub_socket() -> (TempDir, PathBuf) {
             let dir = TempDir::new().unwrap();
-            let path = dir.path().join("stub.sock");
+            let path = endpoint(dir.path(), "stub.sock");
             (dir, path)
         }
 

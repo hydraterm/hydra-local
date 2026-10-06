@@ -1,9 +1,9 @@
 //! Binary-level smoke coverage for the `maestro-app` process wiring.
 //!
 //! These tests run under `cargo test -p maestro-app`. They invoke the real `maestro-app` binary
-//! (resolved via `CARGO_BIN_EXE_maestro-app`) and assert its NON-GUI output and socket-cleanup
+//! (resolved via `CARGO_BIN_EXE_maestro-app`) and assert its NON-GUI output and retention
 //! contracts: the help/bad-usage output contract, pre-serve failure, a successful headless launch,
-//! the failure-after-spawn owned-socket cleanup regression, and reused-daemon safety.
+//! creator failure after daemon adoption, and reused-daemon safety. Only fixtures own cleanup.
 //!
 //! Daemon behavior is driven by a fake daemon that is PRIVATE TO THIS TEST BINARY — there is no
 //! separate `fake-daemon` package binary, so a normal `cargo build --workspace --release` never
@@ -17,637 +17,46 @@
 //! fake daemon through its normal `--daemon <path> <socket>` code path. Everything stays deterministic
 //! and depends on neither a real `pty-daemon` nor any user-local paths or prebuilt release artifacts.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+#[path = "../src/bin_test_transport.rs"]
+mod test_transport;
+#[cfg(windows)]
+#[path = "../src/windows_process_stdio.rs"]
+mod windows_process_stdio;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use test_transport::{Listener as UnixListener, Stream as UnixStream};
 
 use tempfile::TempDir;
 
 const APP_BIN: &str = env!("CARGO_BIN_EXE_maestro-app");
 
-/// Env var that switches THIS test binary into fake-daemon mode. Its value is the socket path to
-/// bind. Set only by the wrapper script (and the reused-daemon test), never during normal test runs.
-const FAKE_DAEMON_ENV: &str = "MAESTRO_FAKE_DAEMON_SOCKET";
-/// Optional stable session id that switches the fake into a protocol-v1 attach-only fixture.
-const FAKE_DAEMON_LEGACY_SESSION_ENV: &str = "MAESTRO_FAKE_DAEMON_LEGACY_SESSION";
-/// Optional append-only request transcript for the protocol-v1 fixture.
-const FAKE_DAEMON_REQUEST_LOG_ENV: &str = "MAESTRO_FAKE_DAEMON_REQUEST_LOG";
-/// Opt into a modern fake whose session set survives across connections. Product-startup tests use
-/// this to prove that the first open starts one stable session and the second open only reattaches.
-const FAKE_DAEMON_STATEFUL_ENV: &str = "MAESTRO_FAKE_DAEMON_STATEFUL";
-/// Optional marker file: while present, the stateful fixture omits retained ids from its
-/// live-only ListSessions response but continues serving exact Attach requests for them.
-const FAKE_DAEMON_OMIT_LIST_FILE_ENV: &str = "MAESTRO_FAKE_DAEMON_OMIT_LIST_FILE";
-
-/// Optional env var: a file path the fake daemon writes its own PID to once bound. The agent-command
-/// smokes use it to kill the daemon they intentionally KEEP alive on success, so a kept-daemon test
-/// never leaks a process. Threaded through the wrapper script alongside the socket.
-const FAKE_DAEMON_PIDFILE_ENV: &str = "MAESTRO_FAKE_DAEMON_PIDFILE";
-/// Stable, valid protocol-v3 process identity for one re-execed fake-daemon process.
-const FAKE_DAEMON_INSTANCE_ID: &str = "77777777777747778777777777777777";
-/// Exact durable lifetime used by the retained-session loopback fixtures below.
-const FAKE_RETAINED_GENERATION: &str = "binary-smoke-retained";
-
-#[derive(Clone, Debug)]
-enum FakeStartOperationState {
-    Reserved,
-    Refused,
-    Applied { generation: String },
-}
-
-#[derive(Clone, Debug)]
-struct FakeStartOperation {
-    session_id: String,
-    state: FakeStartOperationState,
-}
-
-// ============================================================================================
-// Fake daemon (private to this test binary)
-// ============================================================================================
-
-/// If `MAESTRO_FAKE_DAEMON_SOCKET` is set, run the fake daemon on that socket and exit WITHOUT
-/// running any test body. Called as the first statement of every test so that whichever test the
-/// libtest harness happens to schedule first in a re-execed process becomes the daemon.
-fn maybe_run_fake_daemon() {
-    if let Some(socket) = std::env::var_os(FAKE_DAEMON_ENV) {
-        run_fake_daemon(Path::new(&socket));
-    }
-}
-
-/// Bind `socket`, then serve each accepted connection on its own thread: answer the read-only
-/// protocol identity probe, read the `StartSession` and `Attach` request lines, and reply with one
-/// lightweight `grid` event echoing the requested session id. No real terminal behavior — no
-/// resize/scrollback/damage. Serving each connection independently lets an already-bound instance
-/// be reused by a second `maestro-app` launch.
-fn run_fake_daemon(socket: &Path) -> ! {
-    let listener = UnixListener::bind(socket)
-        .unwrap_or_else(|e| panic!("fake daemon could not bind {}: {e}", socket.display()));
-    let legacy_session = std::env::var(FAKE_DAEMON_LEGACY_SESSION_ENV).ok();
-    let request_log = std::env::var_os(FAKE_DAEMON_REQUEST_LOG_ENV).map(PathBuf::from);
-    let stateful = std::env::var_os(FAKE_DAEMON_STATEFUL_ENV).is_some();
-    let omit_list_file = std::env::var_os(FAKE_DAEMON_OMIT_LIST_FILE_ENV).map(PathBuf::from);
-    let sessions = Arc::new(Mutex::new(HashMap::<String, String>::new()));
-    let start_operations = Arc::new(Mutex::new(HashMap::<String, FakeStartOperation>::new()));
-
-    // Once bound, record our PID if asked, so a test that keeps this daemon alive can kill it.
-    if let Some(pidfile) = std::env::var_os(FAKE_DAEMON_PIDFILE_ENV) {
-        let _ = std::fs::write(&pidfile, std::process::id().to_string());
-    }
-
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let legacy_session = legacy_session.clone();
-                let request_log = request_log.clone();
-                let sessions = Arc::clone(&sessions);
-                let start_operations = Arc::clone(&start_operations);
-                let omit_list_file = omit_list_file.clone();
-                std::thread::spawn(move || match legacy_session {
-                    Some(session_id) => {
-                        serve_one_legacy(stream, &session_id, request_log.as_deref())
-                    }
-                    None if stateful => serve_one_stateful(
-                        stream,
-                        &sessions,
-                        &start_operations,
-                        request_log.as_deref(),
-                        omit_list_file.as_deref(),
-                    ),
-                    None => serve_one(stream),
-                });
-            }
-            Err(_) => break,
-        }
-    }
-    std::process::exit(0);
-}
-
-fn append_fake_request(path: Option<&Path>, request: &str) {
-    let Some(path) = path else { return };
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(file, "{request}");
-    }
-}
-
-fn fake_start_operation_status(operation: Option<&FakeStartOperation>) -> serde_json::Value {
-    match operation.map(|operation| &operation.state) {
-        None => serde_json::json!({"status": "unknown"}),
-        Some(FakeStartOperationState::Reserved) => serde_json::json!({"status": "reserved"}),
-        Some(FakeStartOperationState::Refused) => serde_json::json!({"status": "refused"}),
-        Some(FakeStartOperationState::Applied { generation }) => serde_json::json!({
-            "status": "applied",
-            "generation": generation,
-            "lifecycle": "live",
-        }),
-    }
-}
-
-fn fake_reserve_start_operation(
-    operations: &Mutex<HashMap<String, FakeStartOperation>>,
-    value: &serde_json::Value,
-) -> Option<serde_json::Value> {
-    let id = value["id"].as_str()?;
-    let operation_token = value["operation_token"].as_str()?;
-    let mut operations = operations.lock().ok()?;
-    let outcome = match operations.get(operation_token) {
-        None => {
-            operations.insert(
-                operation_token.to_string(),
-                FakeStartOperation {
-                    session_id: id.to_string(),
-                    state: FakeStartOperationState::Reserved,
-                },
+/// Native qualification can copy this exact build to the limited user's installed cohort.
+/// Keep Cargo's artifact as the default; an explicit override is a literal path, never PATH lookup.
+fn app_bin() -> &'static Path {
+    static BINARY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BINARY
+        .get_or_init(|| {
+            let path = std::env::var_os("HYDRA_TEST_APP_BINARY")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(APP_BIN));
+            assert!(
+                path.is_absolute() && path.is_file(),
+                "HYDRA_TEST_APP_BINARY (or Cargo app artifact) must name an existing absolute file"
             );
-            serde_json::json!({"status": "reserved"})
-        }
-        Some(operation) if operation.session_id != id => {
-            serde_json::json!({"status": "refused", "reason": "token_in_use"})
-        }
-        Some(FakeStartOperation {
-            state: FakeStartOperationState::Reserved,
-            ..
-        }) => serde_json::json!({"status": "already_reserved"}),
-        Some(_) => serde_json::json!({"status": "refused", "reason": "already_terminal"}),
-    };
-    Some(serde_json::json!({
-        "ev": "start_operation_reserved",
-        "id": id,
-        "operation_token": operation_token,
-        "daemon_instance_id": FAKE_DAEMON_INSTANCE_ID,
-        "outcome": outcome,
-    }))
-}
-
-fn fake_lookup_start_operation(
-    operations: &Mutex<HashMap<String, FakeStartOperation>>,
-    value: &serde_json::Value,
-) -> Option<serde_json::Value> {
-    let id = value["id"].as_str()?;
-    let operation_token = value["operation_token"].as_str()?;
-    let operations = operations.lock().ok()?;
-    let operation = operations
-        .get(operation_token)
-        .filter(|operation| operation.session_id == id);
-    Some(serde_json::json!({
-        "ev": "start_operation_status",
-        "id": id,
-        "operation_token": operation_token,
-        "daemon_instance_id": FAKE_DAEMON_INSTANCE_ID,
-        "status": fake_start_operation_status(operation),
-    }))
-}
-
-fn fake_retire_start_operation(
-    operations: &Mutex<HashMap<String, FakeStartOperation>>,
-    value: &serde_json::Value,
-) -> Option<serde_json::Value> {
-    let id = value["id"].as_str()?;
-    let operation_token = value["operation_token"].as_str()?;
-    let expected = &value["expected"];
-    let mut operations = operations.lock().ok()?;
-    let current = operations
-        .get(operation_token)
-        .filter(|operation| operation.session_id == id)
-        .cloned();
-    let exact = match (&current, expected["state"].as_str()) {
-        (
-            Some(FakeStartOperation {
-                state: FakeStartOperationState::Reserved | FakeStartOperationState::Refused,
-                ..
-            }),
-            Some("unapplied"),
-        ) => true,
-        (
-            Some(FakeStartOperation {
-                state: FakeStartOperationState::Applied { generation },
-                ..
-            }),
-            Some("applied"),
-        ) => expected["generation"].as_str() == Some(generation.as_str()),
-        _ => false,
-    };
-    let outcome = if current.is_none() {
-        serde_json::json!({"status": "already_retired"})
-    } else if exact {
-        operations.remove(operation_token);
-        serde_json::json!({"status": "retired"})
-    } else {
-        serde_json::json!({
-            "status": "conflict",
-            "current": fake_start_operation_status(current.as_ref()),
+            path
         })
-    };
-    Some(serde_json::json!({
-        "ev": "start_operation_retired",
-        "id": id,
-        "operation_token": operation_token,
-        "daemon_instance_id": FAKE_DAEMON_INSTANCE_ID,
-        "outcome": outcome,
-    }))
+        .as_path()
 }
 
-fn fake_mark_start_operation(
-    operations: &Mutex<HashMap<String, FakeStartOperation>>,
-    id: &str,
-    operation_token: &str,
-    state: FakeStartOperationState,
-) -> bool {
-    let Ok(mut operations) = operations.lock() else {
-        return false;
-    };
-    let Some(operation) = operations.get_mut(operation_token) else {
-        return false;
-    };
-    if operation.session_id != id || !matches!(operation.state, FakeStartOperationState::Reserved) {
-        return false;
-    }
-    operation.state = state;
-    true
-}
-
-/// Protocol-v1 fixture: identity reports v1; list/attach remain available; every mutation is
-/// refused. It deliberately serves multiple connections so `ensure_daemon`, the v2 mutation probe,
-/// and the attach-only fallback exercise the same retained process.
-fn serve_one_legacy(mut stream: UnixStream, session_id: &str, request_log: Option<&Path>) {
-    let mut reader = BufReader::new(match stream.try_clone() {
-        Ok(stream) => stream,
-        Err(_) => return,
-    });
-    while let Some(request) = read_line(&mut reader) {
-        if request.is_empty() {
-            continue;
-        }
-        append_fake_request(request_log, &request);
-        if request.contains("daemon_info") {
-            let _ = stream.write_all(
-                b"{\"ev\":\"daemon_info\",\"protocol_version\":1,\"build_version\":\"legacy-fixture\"}\n",
-            );
-        } else if request.contains("list_sessions") {
-            let ids = serde_json::to_string(&[session_id]).expect("encode legacy session id");
-            let _ = writeln!(stream, "{{\"ev\":\"sessions\",\"ids\":{ids}}}");
-        } else if request.contains("\"op\":\"attach\"") {
-            let requested = extract_id(&request).unwrap_or_default();
-            if requested == session_id {
-                let _ = writeln!(
-                    stream,
-                    "{{\"ev\":\"grid\",\"id\":{},\"grid\":{{\"generation\":\"legacy-grid\",\"revision\":7}}}}",
-                    serde_json::to_string(session_id).expect("encode grid id")
-                );
-            } else {
-                let _ = stream.write_all(b"{\"ev\":\"error\",\"message\":\"not found\"}\n");
-            }
-        } else {
-            let _ = stream.write_all(b"{\"ev\":\"error\",\"message\":\"mutation refused\"}\n");
-        }
-        let _ = stream.flush();
-    }
-}
-
-/// Modern multi-connection fixture with one process-wide retained-session set. It implements only
-/// the protocol surface product startup needs: identity, list, start, and attach/grid.
-fn serve_one_stateful(
-    mut stream: UnixStream,
-    sessions: &Arc<Mutex<HashMap<String, String>>>,
-    start_operations: &Arc<Mutex<HashMap<String, FakeStartOperation>>>,
-    request_log: Option<&Path>,
-    omit_list_file: Option<&Path>,
-) {
-    let mut reader = BufReader::new(match stream.try_clone() {
-        Ok(stream) => stream,
-        Err(_) => return,
-    });
-    while let Some(request) = read_line(&mut reader) {
-        if request.is_empty() {
-            continue;
-        }
-        append_fake_request(request_log, &request);
-        if request.contains("daemon_info") {
-            let _ = writeln!(
-                stream,
-                "{{\"ev\":\"daemon_info\",\"protocol_version\":{},\"build_version\":\"stateful-binary-smoke\",\"daemon_instance_id\":\"{}\",\"output_generation_echo\":true,\"child_environment\":true,\"generation_conditional_mutations\":true,\"attachment_aware_conditional_kill\":true,\"generation_conditional_start\":true,\"start_operation_ledger\":true,\"generation_conditional_attach\":true}}",
-                maestro_protocol::DAEMON_PROTOCOL_VERSION,
-                FAKE_DAEMON_INSTANCE_ID,
-            );
-        } else if request.contains("reserve_start_operation") {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&request) {
-                if let Some(event) = fake_reserve_start_operation(start_operations, &value) {
-                    let _ = writeln!(stream, "{event}");
-                }
-            }
-        } else if request.contains("lookup_start_operation") {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&request) {
-                if let Some(event) = fake_lookup_start_operation(start_operations, &value) {
-                    let _ = writeln!(stream, "{event}");
-                }
-            }
-        } else if request.contains("retire_start_operation") {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&request) {
-                if let Some(event) = fake_retire_start_operation(start_operations, &value) {
-                    let _ = writeln!(stream, "{event}");
-                }
-            }
-        } else if request.contains("list_sessions") {
-            let (mut ids, mut metadata): (Vec<String>, Vec<serde_json::Value>) =
-                if omit_list_file.is_some_and(Path::exists) {
-                    (Vec::new(), Vec::new())
-                } else {
-                    let sessions = sessions.lock().expect("session lock");
-                    (
-                        sessions.keys().cloned().collect(),
-                        sessions
-                            .iter()
-                            .map(|(id, generation)| {
-                                serde_json::json!({"id": id, "generation": generation})
-                            })
-                            .collect(),
-                    )
-                };
-            ids.sort();
-            metadata.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
-            let _ = writeln!(
-                stream,
-                "{}",
-                serde_json::json!({"ev": "sessions", "ids": ids, "sessions": metadata})
-            );
-        } else if request.contains("start_session") {
-            let value: serde_json::Value = match serde_json::from_str(&request) {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            let Some(id) = value["id"].as_str() else {
-                continue;
-            };
-            // A daemon generation is process-lifetime identity. Reusing one literal after this
-            // fixture is killed/restarted would make an `Absent { excluded_generation: A }`
-            // replacement appear to return A again, which the production client correctly treats
-            // as an ambiguous protocol contradiction.
-            let generation = format!("stateful-grid-{}", std::process::id());
-            let existed = sessions.lock().expect("session lock").contains_key(id);
-            if let Some(conditional) = value.get("conditional_start") {
-                let Some(operation_token) = conditional["operation_token"].as_str() else {
-                    continue;
-                };
-                let refused =
-                    existed && conditional["precondition"]["kind"].as_str() == Some("absent");
-                let operation_state = if refused {
-                    FakeStartOperationState::Refused
-                } else {
-                    FakeStartOperationState::Applied {
-                        generation: generation.clone(),
-                    }
-                };
-                let reserved = fake_mark_start_operation(
-                    start_operations,
-                    id,
-                    operation_token,
-                    operation_state,
-                );
-                let outcome = if !reserved || refused {
-                    serde_json::json!({
-                        "status": "refused",
-                        "reason": "precondition_failed",
-                    })
-                } else {
-                    sessions
-                        .lock()
-                        .expect("session lock")
-                        .insert(id.to_string(), generation.clone());
-                    serde_json::json!({"status": "applied", "generation": generation})
-                };
-                let _ = writeln!(
-                    stream,
-                    "{}",
-                    serde_json::json!({
-                        "ev": "conditional_session_start",
-                        "id": id,
-                        "operation_token": operation_token,
-                        "daemon_instance_id": FAKE_DAEMON_INSTANCE_ID,
-                        "outcome": outcome,
-                    })
-                );
-            } else {
-                sessions
-                    .lock()
-                    .expect("session lock")
-                    .insert(id.to_string(), generation);
-            }
-        } else if request.contains("\"op\":\"attach\"") {
-            let value: serde_json::Value = match serde_json::from_str(&request) {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            let id = value["id"].as_str().unwrap_or_default();
-            let expected = value["expected_session_generation"].as_str();
-            let generation = sessions.lock().expect("session lock").get(id).cloned();
-            match (generation, expected) {
-                (None, Some(expected)) => {
-                    let _ = writeln!(
-                        stream,
-                        "{}",
-                        serde_json::json!({
-                            "ev": "session_attach_refused",
-                            "id": id,
-                            "expected_generation": expected,
-                            "daemon_instance_id": FAKE_DAEMON_INSTANCE_ID,
-                            "reason": "missing",
-                        })
-                    );
-                }
-                (Some(generation), Some(expected)) if generation != expected => {
-                    let _ = writeln!(
-                        stream,
-                        "{}",
-                        serde_json::json!({
-                            "ev": "session_attach_refused",
-                            "id": id,
-                            "expected_generation": expected,
-                            "daemon_instance_id": FAKE_DAEMON_INSTANCE_ID,
-                            "reason": "generation_mismatch",
-                        })
-                    );
-                }
-                (Some(generation), _) => {
-                    let _ = writeln!(
-                        stream,
-                        "{}",
-                        serde_json::json!({
-                            "ev": "grid",
-                            "id": id,
-                            "output_generation": value.get("output_generation").cloned(),
-                            "grid": {"generation": generation, "revision": 1},
-                        })
-                    );
-                }
-                (None, None) => {
-                    let message = format!("no such session: {id}");
-                    let _ = writeln!(
-                        stream,
-                        "{}",
-                        serde_json::json!({"ev": "error", "message": message})
-                    );
-                }
-            }
-        }
-        let _ = stream.flush();
-    }
-}
-
-/// Serve one connection for the stateless fake used by ordinary launch/agent command smoke tests.
-/// Readiness probes use a connection of their own; a mutation connection keeps the session
-/// generation it started so the following conditional Attach can be correlated exactly. An empty
-/// strict list still drives attach-tab's spawned-daemon not-live failure path.
-fn serve_one(mut stream: UnixStream) {
-    let mut reader = BufReader::new(match stream.try_clone() {
-        Ok(s) => s,
-        Err(_) => return,
-    });
-    let mut sessions = HashMap::<String, String>::new();
-    let start_operations = Mutex::new(HashMap::<String, FakeStartOperation>::new());
-    while let Some(request) = read_line(&mut reader) {
-        if request.is_empty() {
-            continue;
-        }
-        let value: serde_json::Value = match serde_json::from_str(&request) {
-            Ok(value) => value,
-            Err(_) => return,
-        };
-        match value["op"].as_str() {
-            Some("daemon_info") => {
-                let _ = writeln!(
-                    stream,
-                    "{}",
-                    serde_json::json!({
-                        "ev": "daemon_info",
-                        "protocol_version": maestro_protocol::DAEMON_PROTOCOL_VERSION,
-                        "build_version": "binary-smoke",
-                        "daemon_instance_id": FAKE_DAEMON_INSTANCE_ID,
-                        "output_generation_echo": true,
-                        "child_environment": true,
-                        "generation_conditional_mutations": true,
-                        "attachment_aware_conditional_kill": true,
-                        "generation_conditional_start": true,
-                        "start_operation_ledger": true,
-                        "generation_conditional_attach": true,
-                    })
-                );
-            }
-            Some("reserve_start_operation") => {
-                if let Some(event) = fake_reserve_start_operation(&start_operations, &value) {
-                    let _ = writeln!(stream, "{event}");
-                }
-            }
-            Some("lookup_start_operation") => {
-                if let Some(event) = fake_lookup_start_operation(&start_operations, &value) {
-                    let _ = writeln!(stream, "{event}");
-                }
-            }
-            Some("retire_start_operation") => {
-                if let Some(event) = fake_retire_start_operation(&start_operations, &value) {
-                    let _ = writeln!(stream, "{event}");
-                }
-            }
-            Some("list_sessions") => {
-                let _ = stream.write_all(b"{\"ev\":\"sessions\",\"ids\":[],\"sessions\":[]}\n");
-            }
-            Some("start_session") => {
-                let id = value["id"].as_str().unwrap_or("unknown");
-                let generation = "gen-fake";
-                if let Some(conditional) = value.get("conditional_start") {
-                    if let Some(operation_token) = conditional["operation_token"].as_str() {
-                        let applied = fake_mark_start_operation(
-                            &start_operations,
-                            id,
-                            operation_token,
-                            FakeStartOperationState::Applied {
-                                generation: generation.to_string(),
-                            },
-                        );
-                        let outcome = if applied {
-                            sessions.insert(id.to_string(), generation.to_string());
-                            serde_json::json!({"status": "applied", "generation": generation})
-                        } else {
-                            serde_json::json!({
-                                "status": "refused",
-                                "reason": "precondition_failed",
-                            })
-                        };
-                        let _ = writeln!(
-                            stream,
-                            "{}",
-                            serde_json::json!({
-                                "ev": "conditional_session_start",
-                                "id": id,
-                                "operation_token": operation_token,
-                                "daemon_instance_id": FAKE_DAEMON_INSTANCE_ID,
-                                "outcome": outcome,
-                            })
-                        );
-                    }
-                } else {
-                    sessions.insert(id.to_string(), generation.to_string());
-                }
-            }
-            Some("attach") => {
-                let id = value["id"].as_str().unwrap_or("unknown");
-                let generation = value["expected_session_generation"]
-                    .as_str()
-                    .map(str::to_string)
-                    .or_else(|| sessions.get(id).cloned())
-                    .unwrap_or_else(|| "gen-fake".to_string());
-                let _ = writeln!(
-                    stream,
-                    "{}",
-                    serde_json::json!({
-                        "ev": "grid",
-                        "id": id,
-                        "output_generation": value.get("output_generation").cloned(),
-                        "grid": {"generation": generation, "revision": 1},
-                    })
-                );
-            }
-            Some("cancel_attachment_handoff") => {
-                let _ = writeln!(
-                    stream,
-                    "{}",
-                    serde_json::json!({
-                        "ev": "attachment_handoff_cancelled",
-                        "id": value["id"],
-                        "token": value["token"],
-                        "daemon_instance_id": FAKE_DAEMON_INSTANCE_ID,
-                    })
-                );
-            }
-            _ => {}
-        }
-        let _ = stream.flush();
-    }
-}
-
-fn read_line(reader: &mut impl BufRead) -> Option<String> {
-    let mut line = String::new();
-    match reader.read_line(&mut line) {
-        Ok(0) | Err(_) => None,
-        Ok(_) => Some(line.trim().to_string()),
-    }
-}
-
-/// Pull the `"id":"..."` value out of a request line without a full JSON parser (test-only).
-fn extract_id(line: &str) -> Option<String> {
-    let key = "\"id\":\"";
-    let start = line.find(key)? + key.len();
-    let rest = &line[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
-}
+#[path = "binary_smoke/daemon.rs"]
+mod daemon;
+use daemon::*;
+const FAKE_RETAINED_GENERATION: &str = "binary-smoke-retained";
 
 /// Write an executable wrapper script that re-execs THIS test binary in fake-daemon mode. The app
 /// spawns the daemon as `<wrapper> <socket-path>`, so the wrapper forwards `$1` (the socket path)
@@ -659,6 +68,7 @@ fn write_fake_daemon_wrapper(dir: &Path) -> PathBuf {
 /// Like [`write_fake_daemon_wrapper`], but optionally also threads a pidfile env var through to the
 /// fake daemon so a test that KEEPS the spawned daemon alive (the agent commands on success) can
 /// kill it afterward and never leak the process.
+#[cfg(unix)]
 fn write_fake_daemon_wrapper_with_pidfile(dir: &Path, pidfile: Option<&Path>) -> PathBuf {
     let test_bin = std::env::current_exe().expect("current test exe");
     let wrapper = dir.join("fake-daemon-wrapper.sh");
@@ -671,8 +81,10 @@ fn write_fake_daemon_wrapper_with_pidfile(dir: &Path, pidfile: Option<&Path>) ->
         None => String::new(),
     };
     let script = format!(
-        "#!/bin/sh\nexec env {env}=\"$1\"{pid_env} {bin}\n",
+        "#!/bin/sh\nexec env {env}=\"$1\"{pid_env} {lease_env}={lease} {bin}\n",
         env = FAKE_DAEMON_ENV,
+        lease_env = FAKE_DAEMON_LEASE_ENV,
+        lease = shell_quote(&dir.join("fixture-owner.alive")),
         bin = shell_quote(&test_bin),
     );
     std::fs::write(&wrapper, script).expect("write wrapper script");
@@ -684,6 +96,7 @@ fn write_fake_daemon_wrapper_with_pidfile(dir: &Path, pidfile: Option<&Path>) ->
     wrapper
 }
 
+#[cfg(unix)]
 fn write_stateful_fake_daemon_wrapper(
     dir: &Path,
     pidfile: &Path,
@@ -693,7 +106,7 @@ fn write_stateful_fake_daemon_wrapper(
     let test_bin = std::env::current_exe().expect("current test exe");
     let wrapper = dir.join("stateful-fake-daemon-wrapper.sh");
     let script = format!(
-        "#!/bin/sh\nexec env {socket_env}=\"$1\" {stateful_env}=1 {pid_env}={pidfile} {log_env}={request_log} {omit_env}={omit_list_file} {bin}\n",
+        "#!/bin/sh\nexec env {socket_env}=\"$1\" {stateful_env}=1 {pid_env}={pidfile} {log_env}={request_log} {omit_env}={omit_list_file} {lease_env}={lease} {bin}\n",
         socket_env = FAKE_DAEMON_ENV,
         stateful_env = FAKE_DAEMON_STATEFUL_ENV,
         pid_env = FAKE_DAEMON_PIDFILE_ENV,
@@ -702,6 +115,8 @@ fn write_stateful_fake_daemon_wrapper(
         request_log = shell_quote(request_log),
         omit_env = FAKE_DAEMON_OMIT_LIST_FILE_ENV,
         omit_list_file = shell_quote(omit_list_file),
+        lease_env = FAKE_DAEMON_LEASE_ENV,
+        lease = shell_quote(&dir.join("fixture-owner.alive")),
         bin = shell_quote(&test_bin),
     );
     std::fs::write(&wrapper, script).expect("write stateful wrapper script");
@@ -714,9 +129,79 @@ fn write_stateful_fake_daemon_wrapper(
 }
 
 /// Minimal single-quote shell escaping for the test binary path (paths may contain spaces).
+#[cfg(unix)]
 fn shell_quote(path: &Path) -> String {
     let s = path.to_string_lossy();
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[cfg(windows)]
+fn write_native_fake_daemon(dir: &Path, values: &[(&str, String)]) -> PathBuf {
+    static FIXTURE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let fixture = FIXTURE.get_or_init(|| {
+        // Bind qualification to the exact compiled helper, never a stale wildcard artifact.
+        let path = PathBuf::from(std::env::var_os("HYDRA_TEST_BINARY_SMOKE_DAEMON").expect(
+            "set HYDRA_TEST_BINARY_SMOKE_DAEMON to the exact binary_smoke_daemon test artifact",
+        ));
+        assert!(
+            path.is_absolute() && path.is_file(),
+            "invalid native fixture override"
+        );
+        path
+    });
+    let wrapper = dir.join("fake-daemon-wrapper.exe");
+    if !wrapper.exists() {
+        std::fs::copy(fixture, &wrapper).expect("copy native fixture executable");
+    }
+    let mut config: std::collections::BTreeMap<_, _> = values.iter().cloned().collect();
+    config.insert(
+        FAKE_DAEMON_LEASE_ENV,
+        dir.join("fixture-owner.alive")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    std::fs::write(
+        wrapper.with_extension("json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .expect("write native fixture config");
+    wrapper
+}
+
+#[cfg(windows)]
+fn write_fake_daemon_wrapper_with_pidfile(dir: &Path, pidfile: Option<&Path>) -> PathBuf {
+    let values: Vec<_> = pidfile
+        .into_iter()
+        .map(|p| (FAKE_DAEMON_PIDFILE_ENV, p.to_string_lossy().into_owned()))
+        .collect();
+    write_native_fake_daemon(dir, &values)
+}
+
+#[cfg(windows)]
+fn write_stateful_fake_daemon_wrapper(
+    dir: &Path,
+    pidfile: &Path,
+    request_log: &Path,
+    omit_list_file: &Path,
+) -> PathBuf {
+    write_native_fake_daemon(
+        dir,
+        &[
+            (FAKE_DAEMON_STATEFUL_ENV, "1".into()),
+            (
+                FAKE_DAEMON_PIDFILE_ENV,
+                pidfile.to_string_lossy().into_owned(),
+            ),
+            (
+                FAKE_DAEMON_REQUEST_LOG_ENV,
+                request_log.to_string_lossy().into_owned(),
+            ),
+            (
+                FAKE_DAEMON_OMIT_LIST_FILE_ENV,
+                omit_list_file.to_string_lossy().into_owned(),
+            ),
+        ],
+    )
 }
 
 // ============================================================================================
@@ -735,10 +220,25 @@ struct Workspace {
 impl Workspace {
     fn new() -> Workspace {
         let dir = TempDir::new().expect("temp dir");
-        let socket = dir.path().join("d.sock");
+        let socket = test_transport::endpoint(dir.path(), "d.sock");
         let base = dir.path().join("base");
         std::fs::create_dir_all(&base).expect("base dir");
+        std::fs::write(
+            dir.path().join("fixture-owner.alive"),
+            b"owned smoke fixture",
+        )
+        .unwrap();
         Workspace { dir, socket, base }
+    }
+}
+
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.dir.path().join("fixture-owner.alive"));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while can_connect(&self.socket) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
@@ -845,7 +345,7 @@ fn assert_stderr_quiet(stderr: &[u8]) {
 fn headless_launch(ws: &Workspace) -> Command {
     seed_adhoc_launch_chain(&ws.base);
     let wrapper = write_fake_daemon_wrapper(ws.dir.path());
-    let mut cmd = Command::new(APP_BIN);
+    let mut cmd = Command::new(app_bin());
     cmd.arg("launch")
         .arg("--socket")
         .arg(&ws.socket)
@@ -860,7 +360,48 @@ fn headless_launch(ws: &Workspace) -> Command {
 
 /// True if a Unix-socket connection to `path` currently succeeds (a daemon is serving it).
 fn can_connect(path: &Path) -> bool {
-    UnixStream::connect(path).is_ok()
+    connect_fixture(path).is_ok()
+}
+
+/// Unix retains a filesystem socket whose cleanup is observable. Named pipes have no file:
+/// Windows must prove the private endpoint is actually unavailable instead of testing exists().
+fn endpoint_exists(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        path.exists()
+    }
+    #[cfg(windows)]
+    {
+        can_connect(path)
+    }
+}
+
+fn fixture_child_program() -> PathBuf {
+    #[cfg(unix)]
+    {
+        PathBuf::from("/bin/cat")
+    }
+    #[cfg(windows)]
+    {
+        PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"))
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe")
+    }
+}
+
+#[cfg(unix)]
+fn connect_fixture(path: &Path) -> std::io::Result<UnixStream> {
+    UnixStream::connect(path)
+}
+
+#[cfg(windows)]
+fn connect_fixture(path: &Path) -> std::io::Result<maestro_shell::WindowsPipeStream> {
+    maestro_shell::WindowsPipeStream::connect_until(
+        path,
+        Instant::now() + Duration::from_millis(250),
+    )
 }
 
 /// Block until `path` accepts connections, or panic after a bounded timeout (fail fast).
@@ -914,7 +455,7 @@ fn parse_single_json(bytes: &[u8]) -> serde_json::Value {
 #[test]
 fn help_exits_zero_with_usage_on_stdout_and_empty_stderr() {
     maybe_run_fake_daemon();
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("--help")
         .output()
         .expect("run maestro-app --help");
@@ -935,7 +476,7 @@ fn help_exits_zero_with_usage_on_stdout_and_empty_stderr() {
 #[test]
 fn bad_usage_exits_two_with_single_bad_usage_json_on_stderr() {
     maybe_run_fake_daemon();
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("--definitely-not-a-flag")
         .output()
         .expect("run maestro-app with bad flag");
@@ -964,7 +505,7 @@ fn unusable_daemon_binary_fails_before_serving_and_creates_no_socket() {
     let bogus = ws.dir.path().join("not-an-executable");
     std::fs::write(&bogus, b"this is not a binary\n").expect("write bogus daemon");
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("launch")
         .arg("--socket")
         .arg(&ws.socket)
@@ -984,7 +525,7 @@ fn unusable_daemon_binary_fails_before_serving_and_creates_no_socket() {
     assert_eq!(value["ok"], serde_json::json!(false));
 
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "no socket should be created on a pre-serve failure"
     );
 }
@@ -994,7 +535,7 @@ fn unusable_daemon_binary_fails_before_serving_and_creates_no_socket() {
 // ============================================================================================
 
 #[test]
-fn headless_launch_succeeds_emits_success_json_and_removes_socket() {
+fn headless_launch_succeeds_emits_success_json_and_retains_daemon() {
     maybe_run_fake_daemon();
     let ws = Workspace::new();
 
@@ -1011,12 +552,12 @@ fn headless_launch_succeeds_emits_success_json_and_removes_socket() {
     let value = parse_single_json(&out.stdout);
     assert_eq!(value["ok"], serde_json::json!(true));
     assert_eq!(value["daemon_started"], serde_json::json!(true));
-    assert_eq!(value["daemon_kept"], serde_json::json!(false));
+    assert_eq!(value["daemon_kept"], serde_json::json!(true));
     assert_eq!(value["renderer_started"], serde_json::json!(false));
 
     assert!(
-        !ws.socket.exists(),
-        "the app-spawned daemon's socket should be removed after exit"
+        can_connect(&ws.socket),
+        "the independently retained daemon must survive headless app exit"
     );
 }
 
@@ -1063,10 +604,10 @@ fn headless_launch_with_log_dir_creates_daemon_log_files_and_reports_log_dir() {
         "daemon stderr log file should be created under --log-dir"
     );
 
-    // Socket cleanup behavior is unchanged by --log-dir.
+    // Retention is unchanged by --log-dir.
     assert!(
-        !ws.socket.exists(),
-        "the app-spawned daemon's socket should still be removed after exit"
+        can_connect(&ws.socket),
+        "the independently retained daemon must survive headless app exit"
     );
 }
 
@@ -1079,7 +620,7 @@ fn dashboard_empty_base_emits_success_json_and_creates_no_socket() {
     maybe_run_fake_daemon();
     let ws = Workspace::new();
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("dashboard")
         .arg("--base")
         .arg(&ws.base)
@@ -1118,7 +659,7 @@ fn dashboard_empty_base_emits_success_json_and_creates_no_socket() {
 
     // The dashboard command connects to / spawns no daemon, so the workspace socket stays absent.
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "dashboard must not create a daemon socket"
     );
     assert!(
@@ -1132,7 +673,7 @@ fn settings_show_emits_effective_defaults_and_creates_no_socket() {
     maybe_run_fake_daemon();
     let ws = Workspace::new();
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("settings")
         .arg("show")
         .arg("--base")
@@ -1203,7 +744,7 @@ fn settings_show_emits_effective_defaults_and_creates_no_socket() {
 
     // The settings command connects to / spawns no daemon, so the workspace socket stays absent.
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "settings show must not create a daemon socket"
     );
     assert!(
@@ -1220,7 +761,7 @@ fn command_palette_list_emits_catalog_and_creates_no_side_effects() {
     maybe_run_fake_daemon();
     let ws = Workspace::new();
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("command-palette")
         .arg("--list")
         .arg("--base")
@@ -1286,7 +827,7 @@ fn command_palette_list_emits_catalog_and_creates_no_side_effects() {
 
     // Strictly read-only: no daemon socket, no daemon, and no settings file written under the base.
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "command-palette must not create a daemon socket"
     );
     assert!(
@@ -1307,7 +848,7 @@ fn command_palette_query_filters_catalog_and_creates_no_side_effects() {
     maybe_run_fake_daemon();
     let ws = Workspace::new();
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("command-palette")
         .arg("--list")
         .arg("--query")
@@ -1364,7 +905,7 @@ fn command_palette_query_filters_catalog_and_creates_no_side_effects() {
 
     // Strictly read-only: no daemon socket, no daemon, and no settings file written under the base.
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "command-palette --query must not create a daemon socket"
     );
     assert!(
@@ -1385,7 +926,7 @@ fn command_palette_preview_emits_preview_rows_and_creates_no_side_effects() {
     maybe_run_fake_daemon();
     let ws = Workspace::new();
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("command-palette")
         .arg("--list")
         .arg("--query")
@@ -1452,7 +993,7 @@ fn command_palette_preview_emits_preview_rows_and_creates_no_side_effects() {
 
     // Strictly read-only: no daemon socket, no daemon, and no settings file written under the base.
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "command-palette --preview must not create a daemon socket"
     );
     assert!(
@@ -1473,7 +1014,7 @@ fn command_palette_describe_emits_action_detail_and_creates_no_side_effects() {
     maybe_run_fake_daemon();
     let ws = Workspace::new();
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("command-palette")
         .arg("--describe")
         .arg("attach.settings_panel")
@@ -1533,7 +1074,7 @@ fn command_palette_describe_emits_action_detail_and_creates_no_side_effects() {
 
     // Strictly read-only: no daemon socket, no daemon, and no settings file written under the base.
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "command-palette --describe must not create a daemon socket"
     );
     assert!(
@@ -1553,7 +1094,7 @@ fn command_palette_describe_unknown_id_fails_and_creates_no_side_effects() {
     maybe_run_fake_daemon();
     let ws = Workspace::new();
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("command-palette")
         .arg("--describe")
         .arg("no.such.action")
@@ -1585,7 +1126,7 @@ fn command_palette_describe_unknown_id_fails_and_creates_no_side_effects() {
     );
 
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "failed describe must not create a daemon socket"
     );
     assert!(
@@ -1602,7 +1143,7 @@ fn settings_show_panel_lines_emits_panel_dto_and_creates_no_socket() {
     maybe_run_fake_daemon();
     let ws = Workspace::new();
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("settings")
         .arg("show")
         .arg("--panel-lines")
@@ -1677,7 +1218,7 @@ fn settings_show_panel_lines_emits_panel_dto_and_creates_no_socket() {
         "settings show --panel-lines must not write a settings file"
     );
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "settings show --panel-lines must not create a daemon socket"
     );
     assert!(
@@ -1691,7 +1232,7 @@ fn settings_set_persists_and_show_merges_override() {
     maybe_run_fake_daemon();
     let ws = Workspace::new();
 
-    let set_out = Command::new(APP_BIN)
+    let set_out = Command::new(app_bin())
         .arg("settings")
         .arg("set")
         .arg("appearance.font_size_px")
@@ -1738,7 +1279,7 @@ fn settings_set_persists_and_show_merges_override() {
         "settings set must persist settings.json"
     );
 
-    let show_out = Command::new(APP_BIN)
+    let show_out = Command::new(app_bin())
         .arg("settings")
         .arg("show")
         .arg("--base")
@@ -1765,7 +1306,7 @@ fn settings_set_persists_and_show_merges_override() {
     );
 
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "settings set/show must not create a daemon socket"
     );
     assert!(
@@ -1782,7 +1323,7 @@ fn settings_set_theme_persists_and_show_merges_override() {
     maybe_run_fake_daemon();
     let ws = Workspace::new();
 
-    let set_out = Command::new(APP_BIN)
+    let set_out = Command::new(app_bin())
         .arg("settings")
         .arg("set")
         .arg("appearance.theme")
@@ -1819,7 +1360,7 @@ fn settings_set_theme_persists_and_show_merges_override() {
         serde_json::json!(16)
     );
 
-    let show_out = Command::new(APP_BIN)
+    let show_out = Command::new(app_bin())
         .arg("settings")
         .arg("show")
         .arg("--base")
@@ -1846,7 +1387,7 @@ fn settings_set_theme_persists_and_show_merges_override() {
     );
 
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "settings set/show theme must not create a daemon socket"
     );
     assert!(
@@ -1863,7 +1404,7 @@ fn settings_reset_font_size_restores_default_and_show_reports_it() {
     maybe_run_fake_daemon();
     let ws = Workspace::new();
 
-    let set_out = Command::new(APP_BIN)
+    let set_out = Command::new(app_bin())
         .arg("settings")
         .arg("set")
         .arg("appearance.font_size_px")
@@ -1875,7 +1416,7 @@ fn settings_reset_font_size_restores_default_and_show_reports_it() {
         .expect("run maestro-app settings set");
     assert_eq!(set_out.status.code(), Some(0), "settings set should exit 0");
 
-    let reset_out = Command::new(APP_BIN)
+    let reset_out = Command::new(app_bin())
         .arg("settings")
         .arg("reset")
         .arg("appearance.font_size_px")
@@ -1905,7 +1446,7 @@ fn settings_reset_font_size_restores_default_and_show_reports_it() {
     assert_eq!(reset_value["value"], serde_json::json!(16));
     assert_eq!(reset_value["changed"], serde_json::json!(true));
 
-    let show_out = Command::new(APP_BIN)
+    let show_out = Command::new(app_bin())
         .arg("settings")
         .arg("show")
         .arg("--base")
@@ -1926,7 +1467,7 @@ fn settings_reset_font_size_restores_default_and_show_reports_it() {
     );
 
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "settings reset must not create a daemon socket"
     );
     assert!(
@@ -1949,7 +1490,7 @@ fn settings_reset_all_restores_defaults_and_show_reports_them() {
         &["settings", "set", "appearance.theme", "high_contrast_dark"][..],
         &["settings", "set", "chrome.top_tab_bar_default", "false"][..],
     ] {
-        let out = Command::new(APP_BIN)
+        let out = Command::new(app_bin())
             .args(args)
             .arg("--base")
             .arg(&ws.base)
@@ -1961,7 +1502,7 @@ fn settings_reset_all_restores_defaults_and_show_reports_them() {
     let settings_file = ws.base.join("settings").join("settings.json");
     assert!(settings_file.exists(), "overrides should persist a file");
 
-    let reset_out = Command::new(APP_BIN)
+    let reset_out = Command::new(app_bin())
         .arg("settings")
         .arg("reset")
         .arg("--all")
@@ -1991,7 +1532,7 @@ fn settings_reset_all_restores_defaults_and_show_reports_them() {
         "reset --all removes the settings file"
     );
 
-    let show_out = Command::new(APP_BIN)
+    let show_out = Command::new(app_bin())
         .arg("settings")
         .arg("show")
         .arg("--base")
@@ -2020,7 +1561,7 @@ fn settings_reset_all_restores_defaults_and_show_reports_them() {
     );
 
     // Repeat reset --all on the now-absent file is a no-op.
-    let repeat_out = Command::new(APP_BIN)
+    let repeat_out = Command::new(app_bin())
         .arg("settings")
         .arg("reset")
         .arg("--all")
@@ -2035,7 +1576,7 @@ fn settings_reset_all_restores_defaults_and_show_reports_them() {
     assert_eq!(repeat_value["changed"], serde_json::json!(false));
 
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "settings reset --all must not create a daemon socket"
     );
     assert!(
@@ -2052,7 +1593,7 @@ fn settings_reset_theme_restores_default_and_show_reports_it() {
     maybe_run_fake_daemon();
     let ws = Workspace::new();
 
-    let set_out = Command::new(APP_BIN)
+    let set_out = Command::new(app_bin())
         .arg("settings")
         .arg("set")
         .arg("appearance.theme")
@@ -2064,7 +1605,7 @@ fn settings_reset_theme_restores_default_and_show_reports_it() {
         .expect("run maestro-app settings set appearance.theme");
     assert_eq!(set_out.status.code(), Some(0), "settings set should exit 0");
 
-    let reset_out = Command::new(APP_BIN)
+    let reset_out = Command::new(app_bin())
         .arg("settings")
         .arg("reset")
         .arg("appearance.theme")
@@ -2085,7 +1626,7 @@ fn settings_reset_theme_restores_default_and_show_reports_it() {
     assert_eq!(reset_value["value"], serde_json::json!("built_in_dark"));
     assert_eq!(reset_value["changed"], serde_json::json!(true));
 
-    let show_out = Command::new(APP_BIN)
+    let show_out = Command::new(app_bin())
         .arg("settings")
         .arg("show")
         .arg("--base")
@@ -2106,7 +1647,7 @@ fn settings_reset_theme_restores_default_and_show_reports_it() {
     );
 
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "settings reset must not create a daemon socket"
     );
     assert!(
@@ -2237,7 +1778,7 @@ fn dashboard_projects_records_written_through_store_helpers() {
     )
     .expect("write window");
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("dashboard")
         .arg("--base")
         .arg(&ws.base)
@@ -2273,7 +1814,7 @@ fn dashboard_projects_records_written_through_store_helpers() {
     );
 
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "dashboard must not create a daemon socket"
     );
 }
@@ -2281,7 +1822,7 @@ fn dashboard_projects_records_written_through_store_helpers() {
 #[test]
 fn dashboard_unknown_flag_exits_two_with_bad_usage_json() {
     maybe_run_fake_daemon();
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("dashboard")
         .arg("--definitely-not-a-flag")
         .stdin(Stdio::null())
@@ -2304,7 +1845,7 @@ fn dashboard_unknown_flag_exits_two_with_bad_usage_json() {
 #[test]
 fn dashboard_socket_without_reconcile_exits_two_bad_usage() {
     maybe_run_fake_daemon();
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("dashboard")
         .arg("--socket")
         .arg("/run/does-not-matter.sock")
@@ -2340,6 +1881,9 @@ fn write_modern_daemon_info(stream: &mut UnixStream) -> std::io::Result<()> {
             "attachment_aware_conditional_kill": true,
             "generation_conditional_start": true,
             "generation_conditional_attach": true,
+            // This retained-only server never accepts Reserve/Start: no queued mutation can
+            // publish a child after retirement. The mutable fixture has a real tombstone ledger.
+            "windows_start_operation_retirement_barrier": cfg!(windows),
         })
     )
 }
@@ -2472,17 +2016,16 @@ fn spawn_sessions_stub(socket: PathBuf, ids: Vec<String>) -> std::thread::JoinHa
 /// and exits when `accept` errors after the socket file is gone.
 fn spawn_persistent_sessions_stub(socket: PathBuf, ids: Vec<String>) {
     let listener = UnixListener::bind(&socket).expect("bind persistent sessions stub");
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let mut stream = match stream {
-                Ok(s) => s,
-                Err(_) => break,
-            };
-            let ids = ids.clone();
-            std::thread::spawn(move || {
-                let _ = serve_retained_sessions_connection(&mut stream, &ids);
-            });
-        }
+    std::thread::spawn(move || loop {
+        let stream = listener.accept().map(|(stream, _)| stream);
+        let mut stream = match stream {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+        let ids = ids.clone();
+        std::thread::spawn(move || {
+            let _ = serve_retained_sessions_connection(&mut stream, &ids);
+        });
     });
 }
 
@@ -2663,7 +2206,7 @@ fn dashboard_with_reconcile_projects_live_exited_and_recovered() {
     // "ghost" is reported live but has no record -> recovered_sessions.
     let stub = spawn_sessions_stub(ws.socket.clone(), vec!["s-live".into(), "ghost".into()]);
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("dashboard")
         .arg("--with-session-reconcile")
         .arg("--socket")
@@ -2718,11 +2261,11 @@ fn dashboard_reconcile_missing_daemon_fails_with_dashboard_reconcile_failed() {
     maybe_run_fake_daemon();
     let ws = Workspace::new();
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "precondition: no daemon serving the socket"
     );
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("dashboard")
         .arg("--with-session-reconcile")
         .arg("--socket")
@@ -2751,7 +2294,7 @@ fn dashboard_reconcile_missing_daemon_fails_with_dashboard_reconcile_failed() {
         serde_json::json!("dashboard_reconcile_failed")
     );
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "a failed reconcile must not create the socket"
     );
 }
@@ -2760,14 +2303,27 @@ fn dashboard_reconcile_missing_daemon_fails_with_dashboard_reconcile_failed() {
 // 4d. Agent-task headless commands (agent-start / agent-resume)
 // ============================================================================================
 
-/// Kill a fake daemon whose PID was recorded to `pidfile`, then remove its `socket`. The agent
-/// commands KEEP a spawned daemon alive on success, so each agent smoke must clean it up itself.
+/// Ask only the exact private fake instance to exit itself, then remove its stale fixture socket.
+/// Its PID is observation only, never termination authority.
 fn kill_kept_daemon(pidfile: &Path, socket: &Path) {
-    if let Ok(text) = std::fs::read_to_string(pidfile) {
-        if let Ok(pid) = text.trim().parse::<i32>() {
-            // SIGKILL the kept daemon (a re-exec of this test binary in fake-daemon mode).
-            let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+    if pidfile.is_file() {
+        let stop = pidfile.with_extension("stop");
+        let instance = std::fs::read_to_string(pidfile.with_extension("instance")).unwrap();
+        assert!(
+            uuid::Uuid::parse_str(&instance).is_ok(),
+            "exact fixture instance required"
+        );
+        std::fs::write(&stop, instance).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while can_connect(socket) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
         }
+        assert!(
+            !can_connect(socket),
+            "private fixture did not honor its stop marker"
+        );
+        // Pipe unavailability is not process-exit proof. Leave the exact-instance stop marker
+        // armed; a deliberate replacement publishes a fresh UUID and cannot inherit this stop.
     }
     let _ = std::fs::remove_file(socket);
 }
@@ -2784,7 +2340,7 @@ fn agent_start_succeeds_creates_running_task_and_keeps_daemon() {
     std::fs::create_dir_all(&cwd).expect("cwd");
     let wrapper = write_fake_daemon_wrapper_with_pidfile(ws.dir.path(), Some(&pidfile));
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("agent-start")
         .arg("--agent-task-id")
         .arg("t-start")
@@ -2805,7 +2361,7 @@ fn agent_start_succeeds_creates_running_task_and_keeps_daemon() {
         .arg("--daemon")
         .arg(&wrapper)
         .arg("--")
-        .arg("/bin/cat")
+        .arg(fixture_child_program())
         .stdin(Stdio::null())
         .output()
         .expect("run agent-start");
@@ -2897,7 +2453,7 @@ fn agent_resume_attaches_new_session_and_pushes_history() {
     store::write_record(&paths, RecordKind::AgentTask, &task.agent_task_id, 1, &task)
         .expect("seed task");
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("agent-resume")
         .arg("--agent-task-id")
         .arg("t-resume")
@@ -2914,7 +2470,7 @@ fn agent_resume_attaches_new_session_and_pushes_history() {
         .arg("--daemon")
         .arg(&wrapper)
         .arg("--")
-        .arg("/bin/cat")
+        .arg(fixture_child_program())
         .stdin(Stdio::null())
         .output()
         .expect("run agent-resume");
@@ -2956,7 +2512,7 @@ fn agent_resume_attaches_new_session_and_pushes_history() {
 fn agent_start_bad_usage_exits_two_with_command_stamped_json() {
     maybe_run_fake_daemon();
     // Missing the required `-- <argv>` is a parse-time usage error: exit 2, stamped command.
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("agent-start")
         .arg("--agent-task-id")
         .arg("t-1")
@@ -2978,16 +2534,16 @@ fn agent_start_bad_usage_exits_two_with_command_stamped_json() {
 }
 
 #[test]
-fn agent_resume_missing_task_fails_and_cleans_owned_socket() {
+fn agent_resume_missing_task_fails_before_spawning_daemon() {
     maybe_run_fake_daemon();
     let ws = Workspace::new();
     let cwd = ws.dir.path().join("work");
     std::fs::create_dir_all(&cwd).expect("cwd");
-    // No pidfile: the daemon is spawned but the resume of a NON-EXISTENT task fails AFTER spawn, so
-    // the un-kept SpawnedDaemon drop must kill it and remove the owned socket.
+    // Missing task authority is refused before daemon creation. Workspace owns fixture cleanup
+    // if that ordering regresses; absence alone is not evidence of post-spawn cleanup.
     let wrapper = write_fake_daemon_wrapper(ws.dir.path());
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("agent-resume")
         .arg("--agent-task-id")
         .arg("does-not-exist")
@@ -3004,7 +2560,7 @@ fn agent_resume_missing_task_fails_and_cleans_owned_socket() {
         .arg("--daemon")
         .arg(&wrapper)
         .arg("--")
-        .arg("/bin/cat")
+        .arg(fixture_child_program())
         .stdin(Stdio::null())
         .output()
         .expect("run agent-resume on missing task");
@@ -3022,26 +2578,22 @@ fn agent_resume_missing_task_fails_and_cleans_owned_socket() {
     assert_eq!(value["error_kind"], serde_json::json!("agent_task_failed"));
 
     assert!(
-        !ws.socket.exists(),
-        "a failure-after-spawn must remove the owned socket"
-    );
-    assert!(
-        !can_connect(&ws.socket),
-        "no daemon should remain after a failure-after-spawn"
+        !endpoint_exists(&ws.socket),
+        "missing task authority must refuse before daemon creation"
     );
 }
 
 // ============================================================================================
-// 5. Failure-after-spawn cleanup regression
+// 5. Pre-spawn invalid session authority
 // ============================================================================================
 
 #[test]
-fn failure_after_spawn_removes_socket_and_leaves_no_daemon() {
+fn invalid_session_identity_refuses_before_spawning_daemon() {
     maybe_run_fake_daemon();
     let ws = Workspace::new();
 
-    // `--session-id ../bad` is rejected by the session store AFTER the daemon is spawned and
-    // connectable, exercising the post-spawn `?` error path (owned-socket cleanup via Drop).
+    // Invalid identity is refused before startup. This case must not be mistaken for proof that
+    // a spawned daemon was cleaned up; the synchronized adoption test exercises that boundary.
     let out = headless_launch(&ws)
         .arg("--session-id")
         .arg("../bad")
@@ -3055,12 +2607,12 @@ fn failure_after_spawn_removes_socket_and_leaves_no_daemon() {
     assert_eq!(value["ok"], serde_json::json!(false));
 
     assert!(
-        !ws.socket.exists(),
-        "the owned socket should be removed after a failure-after-spawn"
+        !endpoint_exists(&ws.socket),
+        "invalid identity must not create a daemon endpoint"
     );
     assert!(
         !can_connect(&ws.socket),
-        "no daemon should remain serving the socket after a failure-after-spawn"
+        "invalid identity must refuse before daemon creation"
     );
 }
 
@@ -3108,7 +2660,7 @@ fn prestart_legacy_daemon(
 
 fn packaged_headless_launch(ws: &Workspace) -> Command {
     seed_adhoc_launch_chain(&ws.base);
-    let mut cmd = Command::new(APP_BIN);
+    let mut cmd = Command::new(app_bin());
     cmd.arg("launch")
         .arg("--top-tab-bar")
         .arg("--no-dashboard-panel")
@@ -3130,7 +2682,7 @@ fn packaged_headless_launch(ws: &Workspace) -> Command {
 }
 
 fn product_headless_launch(ws: &Workspace, daemon_wrapper: &Path) -> Command {
-    let mut cmd = Command::new(APP_BIN);
+    let mut cmd = Command::new(app_bin());
     cmd.arg("launch")
         .arg("--top-tab-bar")
         .arg("--no-dashboard-panel")
@@ -3285,9 +2837,17 @@ fn product_startup_retained_v2_exited_target_keeps_probe_list_and_attach_on_one_
         .unwrap();
         stream.flush().unwrap();
 
+        #[cfg(unix)]
         std::fs::remove_file(&replacement_path).expect("unlink reviewed socket path");
+        #[cfg(unix)]
         let replacement = UnixListener::bind(&replacement_path)
             .expect("bind current-v3 replacement between probe and inventory");
+        // Windows cannot unlink an open named pipe. Keep the accepted stream and observe its
+        // listener's fresh instance instead: any forbidden reconnect is still detected exactly.
+        #[cfg(windows)]
+        let replacement = listener;
+        #[cfg(windows)]
+        let _ = replacement_path;
         replacement.set_nonblocking(true).unwrap();
 
         request.clear();
@@ -3379,6 +2939,15 @@ fn product_startup_retained_v2_exited_target_keeps_probe_list_and_attach_on_one_
 
 #[test]
 fn keep_daemon_survives_injected_post_session_setup_failure() {
+    assert_post_session_failure_retains_daemon(true);
+}
+
+#[test]
+fn no_keep_flag_survives_injected_post_session_setup_failure() {
+    assert_post_session_failure_retains_daemon(false);
+}
+
+fn assert_post_session_failure_retains_daemon(keep_flag: bool) {
     maybe_run_fake_daemon();
     let ws = Workspace::new();
     seed_adhoc_launch_chain(&ws.base);
@@ -3388,15 +2957,19 @@ fn keep_daemon_survives_injected_post_session_setup_failure() {
     let wrapper =
         write_stateful_fake_daemon_wrapper(ws.dir.path(), &pidfile, &request_log, &omit_list_file);
 
-    let output = Command::new(APP_BIN)
-        .arg("launch")
+    let mut command = Command::new(app_bin());
+    if keep_flag {
+        command.arg("launch").arg("--keep-daemon");
+    } else {
+        command.arg("launch");
+    }
+    let output = command
         .arg("--socket")
         .arg(&ws.socket)
         .arg("--base")
         .arg(&ws.base)
         .arg("--daemon")
         .arg(&wrapper)
-        .arg("--keep-daemon")
         .arg("--no-run-renderer")
         .env("HYDRA_TEST_FAIL_AFTER_SESSION_PROOF", "1")
         .stdin(Stdio::null())
@@ -3433,6 +3006,126 @@ fn keep_daemon_survives_injected_post_session_setup_failure() {
         "the proven generic session survives with the daemon"
     );
     assert!(transcript.contains(r#""op":"start_session""#));
+}
+
+#[test]
+fn adopted_daemon_survives_creator_failure_before_readiness_proof() {
+    maybe_run_fake_daemon();
+    let ws = Workspace::new();
+    seed_adhoc_launch_chain(&ws.base);
+    let pidfile = ws.dir.path().join("adopted-daemon.pid");
+    let transcript = ws.dir.path().join("adopted-requests.log");
+    let wrapper = write_stateful_fake_daemon_wrapper(
+        ws.dir.path(),
+        &pidfile,
+        &transcript,
+        &ws.dir.path().join("omit-list"),
+    );
+    let barrier = ws.dir.path().join("spawn-barrier");
+    std::fs::create_dir(&barrier).unwrap();
+    let child = Command::new(app_bin())
+        .args(["launch", "--no-run-renderer", "--socket"])
+        .arg(&ws.socket)
+        .arg("--base")
+        .arg(&ws.base)
+        .arg("--daemon")
+        .arg(&wrapper)
+        .env("HYDRA_TEST_DAEMON_SPAWN_BARRIER", &barrier)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut creator = PreStartedDaemon {
+        child,
+        socket: ws.socket.clone(),
+    };
+    wait_until_connectable(&ws.socket);
+    let witness_deadline = Instant::now() + Duration::from_secs(2);
+    while !barrier.join("spawned.pid").is_file() || !pidfile.is_file() {
+        assert!(
+            Instant::now() < witness_deadline,
+            "spawn witness was not published"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let witnessed_pid: u32 = std::fs::read_to_string(barrier.join("spawned.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_ne!(witnessed_pid, creator.child.id());
+    assert_eq!(
+        witnessed_pid,
+        std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .parse::<u32>()
+            .unwrap()
+    );
+    let adopted = Command::new(app_bin())
+        .args(["launch", "--no-run-renderer", "--socket"])
+        .arg(&ws.socket)
+        .arg("--base")
+        .arg(&ws.base)
+        .arg("--daemon")
+        .arg(&wrapper)
+        .arg("--session-id")
+        .arg("adopted-session")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        adopted.status.success(),
+        "second launcher must adopt: {adopted:?}"
+    );
+    let generation = parse_single_json(&adopted.stdout)["generation"].clone();
+    assert!(generation.as_str().is_some_and(|g| !g.is_empty()));
+    std::fs::write(barrier.join("fail-now"), b"fail creator only").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let exit = loop {
+        if let Some(exit) = creator.child.try_wait().unwrap() {
+            break exit;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "creator did not fail within deadline"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut creator_stderr = Vec::new();
+    creator
+        .child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_end(&mut creator_stderr)
+        .unwrap();
+    let creator_failure = parse_single_json(&creator_stderr);
+    let survived = can_connect(&ws.socket);
+    let retained = if survived {
+        maestro_shell::DaemonClient::connect(&ws.socket)
+            .ok()
+            .and_then(|mut client| {
+                client
+                    .attach_existing(maestro_protocol::SessionId("adopted-session".into()))
+                    .ok()
+                    .map(|attached| attached.generation)
+            })
+    } else {
+        None
+    };
+    kill_kept_daemon(&pidfile, &ws.socket);
+    assert!(
+        !exit.success(),
+        "creator must exercise the injected failure"
+    );
+    assert_eq!(creator_failure["error_kind"], "test_pre_readiness_failure");
+    assert!(
+        survived,
+        "creator failure killed a daemon already adopted by launcher B"
+    );
+    assert_eq!(serde_json::to_value(retained.unwrap()).unwrap(), generation);
+    // This fake is only the deterministic adoption/generation regression. Native qualification
+    // separately uses the real ConPTY daemon and verifies fresh terminal input after this fault.
 }
 
 #[test]
@@ -4097,7 +3790,7 @@ fn reused_daemon_is_not_killed_and_its_socket_is_left_intact() {
 
     // The app must NOT remove a socket it did not own; the pre-started daemon is still serving it.
     assert!(
-        ws.socket.exists(),
+        endpoint_exists(&ws.socket),
         "a reused daemon's socket must be left in place"
     );
     assert!(
@@ -4112,8 +3805,181 @@ fn reused_daemon_is_not_killed_and_its_socket_is_left_intact() {
     );
 
     // Force one more accept-able connection to confirm liveness beyond the stale-socket check.
-    let mut probe = UnixStream::connect(&ws.socket).expect("connect to reused daemon");
+    let mut probe = connect_fixture(&ws.socket).expect("connect to reused daemon");
     let _ = probe.write_all(b"\n");
+}
+
+#[cfg(windows)]
+#[test]
+fn native_fake_daemon_survives_disconnected_readiness_probes() {
+    maybe_run_fake_daemon();
+    let ws = Workspace::new();
+    let wrapper = write_fake_daemon_wrapper(ws.dir.path());
+    let child = Command::new(wrapper)
+        .arg(&ws.socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn native fixture directly");
+    let mut guard = PreStartedDaemon {
+        child,
+        socket: ws.socket.clone(),
+    };
+    wait_until_connectable(&ws.socket);
+    for _ in 0..4 {
+        // Close before the listener can consume this probe; never send an application request.
+        drop(connect_fixture(&ws.socket).expect("connect-only readiness probe"));
+        let mut client = maestro_shell::DaemonClient::connect(&ws.socket)
+            .expect("next authenticated connection remains available");
+        assert_eq!(
+            client.daemon_info().unwrap().0,
+            maestro_protocol::DAEMON_PROTOCOL_VERSION
+        );
+        assert!(client.list_sessions().unwrap().is_empty());
+        assert!(
+            guard.child.try_wait().unwrap().is_none(),
+            "probe retired fixture process"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn captured_app_output_finishes_while_exact_retained_child_stays_alive() {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, SYNCHRONIZATION_SYNCHRONIZE,
+    };
+
+    struct ExactChild(OwnedHandle);
+    impl Drop for ExactChild {
+        fn drop(&mut self) {
+            // The owned kernel handle still identifies this exact process even if its PID recycles.
+            unsafe {
+                if WaitForSingleObject(self.0.as_raw_handle(), 0) == WAIT_TIMEOUT {
+                    TerminateProcess(self.0.as_raw_handle(), 0);
+                    WaitForSingleObject(self.0.as_raw_handle(), 5000);
+                }
+            }
+        }
+    }
+
+    maybe_run_fake_daemon();
+    let ws = Workspace::new();
+    seed_adhoc_launch_chain(&ws.base);
+    let pidfile = ws.dir.path().join("captured-retained-child.pid");
+    let wrapper = write_fake_daemon_wrapper_with_pidfile(ws.dir.path(), Some(&pidfile));
+    let child = Command::new(app_bin())
+        .args(["launch", "--keep-daemon", "--no-run-renderer", "--socket"])
+        .arg(&ws.socket)
+        .arg("--base")
+        .arg(&ws.base)
+        .arg("--daemon")
+        .arg(&wrapper)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn captured app");
+    let mut app = PreStartedDaemon {
+        child,
+        socket: ws.socket.clone(),
+    };
+    let stdout = app.child.stdout.take().unwrap();
+    let stderr = app.child.stderr.take().unwrap();
+    let (out_tx, out_rx) = std::sync::mpsc::channel();
+    let (err_tx, err_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = BufReader::new(stdout)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = out_tx.send(result);
+    });
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = BufReader::new(stderr)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = err_tx.send(result);
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let pid: u32 = loop {
+        if let Ok(text) = std::fs::read_to_string(&pidfile) {
+            if let Ok(pid) = text.trim().parse() {
+                break pid;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "retained fixture did not publish its PID"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZATION_SYNCHRONIZE,
+            0,
+            pid,
+        )
+    };
+    assert!(
+        !handle.is_null(),
+        "open retained process: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: OpenProcess transferred this live process handle exclusively to the test.
+    let process = unsafe { OwnedHandle::from_raw_handle(handle) };
+    let mut image = vec![0u16; 32768];
+    let mut length = image.len() as u32;
+    assert_ne!(
+        unsafe { QueryFullProcessImageNameW(handle, 0, image.as_mut_ptr(), &mut length) },
+        0
+    );
+    let actual = PathBuf::from(std::ffi::OsString::from_wide(&image[..length as usize]));
+    assert_eq!(
+        std::fs::canonicalize(actual).unwrap(),
+        std::fs::canonicalize(&wrapper).unwrap()
+    );
+    // Arm cleanup only after proving this is the private fixture image, never an unrelated PID.
+    let retained = ExactChild(process);
+
+    let exit = loop {
+        if let Some(exit) = app.child.try_wait().unwrap() {
+            break exit;
+        }
+        assert!(Instant::now() < deadline, "captured app did not exit");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(exit.success());
+    let stdout = out_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("app stdout EOF must not wait for retained child exit")
+        .unwrap();
+    let stderr = err_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("app stderr EOF must not wait for retained child exit")
+        .unwrap();
+    assert_stderr_quiet(&stderr);
+    let result = parse_single_json(&stdout);
+    assert_eq!(result["daemon_kept"], true);
+    assert_eq!(
+        unsafe { WaitForSingleObject(handle, 0) },
+        WAIT_TIMEOUT,
+        "retained child died to release output"
+    );
+    assert_ne!(
+        unsafe { TerminateProcess(handle, 0) },
+        0,
+        "exact child cleanup failed"
+    );
+    assert_eq!(unsafe { WaitForSingleObject(handle, 5000) }, WAIT_OBJECT_0);
+    drop(retained);
 }
 
 #[test]
@@ -4208,7 +4074,7 @@ fn retained_v1_explicit_command_never_falls_back() {
 
 /// Run a `maestro-app window <subcommand> ...` against `base`, capturing the full process output.
 fn run_window(base: &Path, args: &[&str]) -> std::process::Output {
-    let mut cmd = Command::new(APP_BIN);
+    let mut cmd = Command::new(app_bin());
     cmd.arg("window");
     for a in args {
         cmd.arg(a);
@@ -4249,7 +4115,7 @@ fn window_create_writes_layout_file_and_emits_empty_tabs() {
 
     // It is local-only: the workspace daemon socket is never created.
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "window create must not create a daemon socket"
     );
 }
@@ -4303,7 +4169,7 @@ fn window_open_tab_then_show_returns_the_persisted_tab() {
     assert_eq!(value["tabs"][0]["session_id"], serde_json::json!("s1"));
 
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "window open-tab/show must not create a daemon socket"
     );
 }
@@ -4376,7 +4242,7 @@ fn window_view_joins_session_and_agent_task_fields() {
     assert_eq!(tab["session_record_missing"], serde_json::json!(false));
 
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "window view must not create a daemon socket"
     );
 }
@@ -4412,7 +4278,7 @@ fn window_open_tab_on_missing_window_fails_with_window_failed() {
 fn window_bad_usage_exits_two_with_single_bad_usage_json() {
     maybe_run_fake_daemon();
     // Missing required --window-id is a parse error: exit 2, one bad_usage JSON on stderr.
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("window")
         .arg("create")
         .stdin(Stdio::null())
@@ -4504,7 +4370,7 @@ fn window_close_tab_removes_tab_and_compacts_indices() {
     );
 
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "window close-tab must not create a daemon socket"
     );
 }
@@ -4543,7 +4409,7 @@ fn window_rename_tab_changes_title_only() {
     assert_eq!(value["tabs"][0]["title"], serde_json::json!("First"));
     assert_eq!(value["tabs"][2]["title"], serde_json::json!("Third"));
 
-    assert!(!ws.socket.exists());
+    assert!(!endpoint_exists(&ws.socket));
 }
 
 #[test]
@@ -4579,7 +4445,7 @@ fn window_pin_tab_changes_pinned_only() {
     assert_eq!(value["tabs"][0]["pinned"], serde_json::json!(false));
     assert_eq!(value["tabs"][2]["pinned"], serde_json::json!(false));
 
-    assert!(!ws.socket.exists());
+    assert!(!endpoint_exists(&ws.socket));
 }
 
 #[test]
@@ -4604,7 +4470,7 @@ fn window_reorder_tabs_changes_order_and_indices() {
         ]
     );
 
-    assert!(!ws.socket.exists());
+    assert!(!endpoint_exists(&ws.socket));
 }
 
 #[test]
@@ -4654,7 +4520,7 @@ fn window_attention_sets_attention_object() {
         serde_json::json!("none")
     );
 
-    assert!(!ws.socket.exists());
+    assert!(!endpoint_exists(&ws.socket));
 }
 
 /// `window attention-clear` resets a tab's persisted unseen non-`none` attention to the
@@ -4715,7 +4581,7 @@ fn window_attention_clear_resets_persisted_attention() {
     assert_eq!(t2["attention"]["attention"], serde_json::json!("none"));
     assert_eq!(t2["needs_attention"], serde_json::json!(false));
 
-    assert!(!ws.socket.exists());
+    assert!(!endpoint_exists(&ws.socket));
 }
 
 #[test]
@@ -4749,7 +4615,7 @@ fn window_reorder_invalid_fails_and_leaves_layout_unchanged() {
         ]
     );
 
-    assert!(!ws.socket.exists());
+    assert!(!endpoint_exists(&ws.socket));
 }
 
 #[test]
@@ -4757,7 +4623,7 @@ fn window_mutation_bad_usage_exits_two() {
     maybe_run_fake_daemon();
     // pin-tab with an invalid --pinned value is a parse error: exit 2, one bad_usage JSON stamped
     // with the attempted subcommand on stderr.
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("window")
         .arg("pin-tab")
         .arg("--window-id")
@@ -5013,7 +4879,7 @@ fn run_agent_start_record(ws: &Workspace, extra: &[&str], cwd: &Path) -> AgentSt
     let pidfile = ws.dir.path().join("daemon.pid");
     let wrapper = write_fake_daemon_wrapper_with_pidfile(ws.dir.path(), Some(&pidfile));
 
-    let mut cmd = Command::new(APP_BIN);
+    let mut cmd = Command::new(app_bin());
     cmd.arg("agent-start")
         .arg("--agent-task-id")
         .arg("t-rec")
@@ -5038,7 +4904,7 @@ fn run_agent_start_record(ws: &Workspace, extra: &[&str], cwd: &Path) -> AgentSt
     }
     let out = cmd
         .arg("--")
-        .arg("/bin/cat")
+        .arg(fixture_child_program())
         .stdin(Stdio::null())
         .output()
         .expect("run agent-start");
@@ -5186,7 +5052,7 @@ fn run_agent_resume_record(ws: &Workspace, extra: &[&str], cwd: &Path) -> AgentS
     let pidfile = ws.dir.path().join("daemon.pid");
     let wrapper = write_fake_daemon_wrapper_with_pidfile(ws.dir.path(), Some(&pidfile));
 
-    let mut cmd = Command::new(APP_BIN);
+    let mut cmd = Command::new(app_bin());
     cmd.arg("agent-resume")
         .arg("--agent-task-id")
         .arg("t-resume")
@@ -5207,7 +5073,7 @@ fn run_agent_resume_record(ws: &Workspace, extra: &[&str], cwd: &Path) -> AgentS
     }
     let out = cmd
         .arg("--")
-        .arg("/bin/cat")
+        .arg(fixture_child_program())
         .stdin(Stdio::null())
         .output()
         .expect("run agent-resume");
@@ -5488,7 +5354,7 @@ fn attach_tab_retained_v2_no_run_lists_once_then_plain_exact_attaches_selected()
         requests
     });
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("attach-tab")
         .arg("--window-id")
         .arg("w1")
@@ -5534,7 +5400,7 @@ fn attach_tab_missing_window_fails_before_daemon_spawn() {
     let ws = Workspace::new();
     let daemon = write_fake_daemon_wrapper(ws.dir.path());
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("attach-tab")
         .arg("--window-id")
         .arg("no-such-window")
@@ -5558,7 +5424,7 @@ fn attach_tab_missing_window_fails_before_daemon_spawn() {
     assert_eq!(value["command"], serde_json::json!("attach-tab"));
     assert_eq!(value["error_kind"], serde_json::json!("window_failed"));
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "no daemon should be spawned -> no socket created"
     );
 }
@@ -5572,7 +5438,7 @@ fn attach_tab_missing_tab_fails_before_daemon_spawn() {
     let daemon = write_fake_daemon_wrapper(ws.dir.path());
     write_session_with_window(&ws.base, "s-1", "w1", "t1");
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("attach-tab")
         .arg("--window-id")
         .arg("w1")
@@ -5599,7 +5465,7 @@ fn attach_tab_missing_tab_fails_before_daemon_spawn() {
         serde_json::json!("tab_selection_failed")
     );
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "no daemon should be spawned -> no socket created"
     );
 }
@@ -5620,7 +5486,7 @@ fn attach_tab_no_run_succeeds_for_live_session() {
     let before = run_window(&ws.base, &["show", "--window-id", "w1"]).stdout;
     let sessions_before = count_session_records(&ws.base);
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("attach-tab")
         .arg("--window-id")
         .arg("w1")
@@ -5702,7 +5568,7 @@ fn attach_tab_no_run_reports_command_palette() {
     write_session_with_window(&ws.base, "s-live", "w1", "t1");
     spawn_persistent_sessions_stub(ws.socket.clone(), vec!["s-live".into()]);
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("attach-tab")
         .arg("--window-id")
         .arg("w1")
@@ -5754,7 +5620,7 @@ fn attach_tab_no_run_command_palette_query_filters() {
     spawn_persistent_sessions_stub(ws.socket.clone(), vec!["s-live".into()]);
 
     let unfiltered = {
-        let out = Command::new(APP_BIN)
+        let out = Command::new(app_bin())
             .arg("attach-tab")
             .arg("--window-id")
             .arg("w1")
@@ -5776,7 +5642,7 @@ fn attach_tab_no_run_command_palette_query_filters() {
             .len()
     };
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("attach-tab")
         .arg("--window-id")
         .arg("w1")
@@ -5829,7 +5695,7 @@ fn attach_tab_no_run_command_palette_absent_is_null() {
     write_session_with_window(&ws.base, "s-live", "w1", "t1");
     spawn_persistent_sessions_stub(ws.socket.clone(), vec!["s-live".into()]);
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("attach-tab")
         .arg("--window-id")
         .arg("w1")
@@ -5862,7 +5728,7 @@ fn headless_launch_reports_persisted_renderer_font_size() {
     let ws = Workspace::new();
 
     // Persist a non-default font size through the real settings command (writes settings.json).
-    let set_out = Command::new(APP_BIN)
+    let set_out = Command::new(app_bin())
         .arg("settings")
         .arg("set")
         .arg("appearance.font_size_px")
@@ -5923,7 +5789,7 @@ fn attach_tab_no_run_reports_persisted_renderer_font_size() {
     spawn_persistent_sessions_stub(ws.socket.clone(), vec!["s-live".into()]);
 
     // Persist a non-default font size through the real settings command.
-    let set_out = Command::new(APP_BIN)
+    let set_out = Command::new(app_bin())
         .arg("settings")
         .arg("set")
         .arg("appearance.font_size_px")
@@ -5940,7 +5806,7 @@ fn attach_tab_no_run_reports_persisted_renderer_font_size() {
         String::from_utf8_lossy(&set_out.stderr)
     );
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("attach-tab")
         .arg("--window-id")
         .arg("w1")
@@ -6009,7 +5875,7 @@ fn headless_launch_reports_renderer_command_with_font_size() {
     maybe_run_fake_daemon();
     let ws = Workspace::new();
 
-    let set_out = Command::new(APP_BIN)
+    let set_out = Command::new(app_bin())
         .arg("settings")
         .arg("set")
         .arg("appearance.font_size_px")
@@ -6038,7 +5904,7 @@ fn attach_tab_no_run_reports_renderer_command_with_font_size() {
     write_session_with_window(&ws.base, "s-live", "w1", "t1");
     spawn_persistent_sessions_stub(ws.socket.clone(), vec!["s-live".into()]);
 
-    let set_out = Command::new(APP_BIN)
+    let set_out = Command::new(app_bin())
         .arg("settings")
         .arg("set")
         .arg("appearance.font_size_px")
@@ -6050,7 +5916,7 @@ fn attach_tab_no_run_reports_renderer_command_with_font_size() {
         .expect("run maestro-app settings set");
     assert_eq!(set_out.status.code(), Some(0), "settings set should exit 0");
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("attach-tab")
         .arg("--window-id")
         .arg("w1")
@@ -6114,7 +5980,7 @@ fn headless_launch_reports_persisted_renderer_theme() {
     maybe_run_fake_daemon();
     let ws = Workspace::new();
 
-    let set_out = Command::new(APP_BIN)
+    let set_out = Command::new(app_bin())
         .arg("settings")
         .arg("set")
         .arg("appearance.theme")
@@ -6176,7 +6042,7 @@ fn attach_tab_no_run_reports_persisted_renderer_theme() {
     write_session_with_window(&ws.base, "s-live", "w1", "t1");
     spawn_persistent_sessions_stub(ws.socket.clone(), vec!["s-live".into()]);
 
-    let set_out = Command::new(APP_BIN)
+    let set_out = Command::new(app_bin())
         .arg("settings")
         .arg("set")
         .arg("appearance.theme")
@@ -6193,7 +6059,7 @@ fn attach_tab_no_run_reports_persisted_renderer_theme() {
         String::from_utf8_lossy(&set_out.stderr)
     );
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("attach-tab")
         .arg("--window-id")
         .arg("w1")
@@ -6257,7 +6123,7 @@ fn attach_tab_no_run_strip_reflects_task_derived_attention() {
         .expect("write waiting-on-user task");
     spawn_persistent_sessions_stub(ws.socket.clone(), vec!["s-live".into()]);
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("attach-tab")
         .arg("--window-id")
         .arg("w1")
@@ -6309,7 +6175,7 @@ fn attach_tab_top_tab_bar_no_run_reports_flag() {
     write_session_with_window(&ws.base, "s-live", "w1", "t1");
     spawn_persistent_sessions_stub(ws.socket.clone(), vec!["s-live".into()]);
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("attach-tab")
         .arg("--window-id")
         .arg("w1")
@@ -6343,7 +6209,7 @@ fn attach_tab_top_tab_bar_no_run_reports_flag() {
 
 /// Helper: persist one chrome default via the real `settings set` command against `ws.base`.
 fn persist_chrome_default(ws: &Workspace, key: &str, value: &str) {
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("settings")
         .arg("set")
         .arg(key)
@@ -6364,7 +6230,7 @@ fn persist_chrome_default(ws: &Workspace, key: &str, value: &str) {
 /// Helper: run `attach-tab --no-run-renderer` against a seeded live session, returning the success
 /// JSON. `extra` carries any additional flags (e.g. an explicit `--top-tab-bar`).
 fn attach_tab_no_run_value(ws: &Workspace, extra: &[&str]) -> serde_json::Value {
-    let mut cmd = Command::new(APP_BIN);
+    let mut cmd = Command::new(app_bin());
     cmd.arg("attach-tab")
         .arg("--window-id")
         .arg("w1")
@@ -6479,7 +6345,7 @@ fn attach_tab_dashboard_panel_no_run_reports_computed_lines() {
     write_session_with_window(&ws.base, "s-live", "w1", "t1");
     spawn_persistent_sessions_stub(ws.socket.clone(), vec!["s-live".into()]);
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("attach-tab")
         .arg("--window-id")
         .arg("w1")
@@ -6702,7 +6568,7 @@ fn attach_tab_no_run_strip_carries_full_window() {
     // The selected tab's session (`s-live`) must be reported live for the attach to succeed.
     spawn_persistent_sessions_stub(ws.socket.clone(), vec!["s-live".into()]);
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("attach-tab")
         .arg("--window-id")
         .arg("w1")
@@ -6790,7 +6656,7 @@ fn attach_tab_no_run_projects_durable_tab_without_live_admission() {
     // Daemon reports a DIFFERENT id live, so the selected session is absent from the live set.
     spawn_persistent_sessions_stub(ws.socket.clone(), vec!["some-other".into()]);
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("attach-tab")
         .arg("--window-id")
         .arg("w1")
@@ -6816,17 +6682,16 @@ fn attach_tab_no_run_projects_durable_tab_without_live_admission() {
     assert!(can_connect(&ws.socket));
 }
 
-/// A no-run metadata projection may need to spawn a daemon for reconciliation, but it grants no
-/// lifetime admission and does not keep that child. Successful command teardown still kills the
-/// owned daemon and removes its socket.
+/// A no-run metadata projection may spawn a daemon for reconciliation. It grants no PTY admission
+/// or exclusive cleanup ownership; the daemon remains independently retained.
 #[test]
-fn attach_tab_no_run_after_spawn_cleans_owned_socket() {
+fn attach_tab_no_run_after_spawn_preserves_daemon() {
     maybe_run_fake_daemon();
     let ws = Workspace::new();
     write_session_with_window(&ws.base, "s-missing", "w1", "t1");
     let daemon = write_fake_daemon_wrapper(ws.dir.path());
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("attach-tab")
         .arg("--window-id")
         .arg("w1")
@@ -6851,15 +6716,11 @@ fn attach_tab_no_run_after_spawn_cleans_owned_socket() {
     assert_eq!(value["session_id"], serde_json::json!("s-missing"));
     assert_eq!(value["renderer_started"], serde_json::json!(false));
     assert_eq!(value["daemon_started"], serde_json::json!(true));
-    assert_eq!(value["daemon_kept"], serde_json::json!(false));
+    assert_eq!(value["daemon_kept"], serde_json::json!(true));
 
     assert!(
-        !ws.socket.exists(),
-        "successful no-run teardown must remove the unkept owned socket"
-    );
-    assert!(
-        !can_connect(&ws.socket),
-        "no daemon should remain serving after no-run teardown"
+        can_connect(&ws.socket),
+        "no-run teardown must preserve the independently retained daemon"
     );
 }
 
@@ -7041,7 +6902,7 @@ fn seed_worktree_workspace_with_policy(
 }
 
 fn worktree_cleanup_cmd(ws: &Workspace, workspace_id: &str, session_id: &str) -> Command {
-    let mut cmd = Command::new(APP_BIN);
+    let mut cmd = Command::new(app_bin());
     cmd.arg("worktree-cleanup")
         .arg("--workspace-id")
         .arg(workspace_id)
@@ -7078,7 +6939,7 @@ fn worktree_cleanup_dry_run_is_removable_and_deletes_nothing() {
     );
     assert!(target.exists(), "dry-run must not delete the worktree");
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "worktree-cleanup must not create a daemon socket"
     );
 }
@@ -7111,7 +6972,7 @@ fn worktree_cleanup_confirmed_removes_the_worktree() {
         "confirmed removal must delete the target worktree"
     );
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "worktree-cleanup must not create a daemon socket"
     );
 }
@@ -7284,7 +7145,7 @@ fn worktree_cleanup_confirm_refuses_incomplete_session_scan() {
 }
 
 fn worktree_list_cmd(ws: &Workspace, workspace_id: &str) -> Command {
-    let mut cmd = Command::new(APP_BIN);
+    let mut cmd = Command::new(app_bin());
     cmd.arg("worktree-list")
         .arg("--workspace-id")
         .arg(workspace_id)
@@ -7350,7 +7211,7 @@ fn worktree_list_verified_removable_candidate() {
 
     assert!(target.exists(), "listing must not delete the worktree");
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "worktree-list must not create a daemon socket"
     );
 }
@@ -7382,7 +7243,7 @@ fn worktree_list_missing_workspace_is_zero_candidates() {
     );
     assert_eq!(value["counts"]["total"], serde_json::json!(0));
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "worktree-list must not create a daemon socket"
     );
 }
@@ -7391,7 +7252,7 @@ fn worktree_list_missing_workspace_is_zero_candidates() {
 fn worktree_list_bad_usage_exits_two() {
     maybe_run_fake_daemon();
     // Missing required --workspace-id is a usage error.
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("worktree-list")
         .stdin(Stdio::null())
         .output()
@@ -7615,7 +7476,7 @@ fn worktree_list_all_aggregates_record_backed_workspaces() {
     let target_a = seed("wsAllA", "sessAllA");
     let target_b = seed("wsAllB", "sessAllB");
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("worktree-list")
         .arg("--all")
         .arg("--base")
@@ -7659,7 +7520,7 @@ fn worktree_list_all_aggregates_record_backed_workspaces() {
     assert!(target_a.exists(), "listing must not delete a worktree");
     assert!(target_b.exists(), "listing must not delete a worktree");
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "worktree-list --all must not create a daemon socket"
     );
 }
@@ -7696,7 +7557,7 @@ fn worktree_list_all_include_orphans_inventories_fs_without_deleting() {
     let ghost_session = wt_base.join("ghostWs").join("ghostSess");
     std::fs::create_dir_all(&ghost_session).expect("ghost session dir");
 
-    let out = Command::new(APP_BIN)
+    let out = Command::new(app_bin())
         .arg("worktree-list")
         .arg("--all")
         .arg("--include-orphans")
@@ -7806,7 +7667,7 @@ fn worktree_list_all_include_orphans_inventories_fs_without_deleting() {
         "orphan inventory must not delete dirs"
     );
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "worktree-list --all --include-orphans must not create a daemon socket"
     );
 }
@@ -7817,7 +7678,7 @@ fn worktree_list_all_include_orphans_inventories_fs_without_deleting() {
 
 /// Run a `maestro-app layout-preset <subcommand> ...` against `base`, capturing the full output.
 fn run_layout_preset(base: &Path, args: &[&str]) -> std::process::Output {
-    let mut cmd = Command::new(APP_BIN);
+    let mut cmd = Command::new(app_bin());
     cmd.arg("layout-preset");
     for a in args {
         cmd.arg(a);
@@ -7907,7 +7768,7 @@ fn layout_preset_save_list_restore_plan_delete_round_trip() {
     assert_eq!(value["count"], serde_json::json!(0));
 
     assert!(
-        !ws.socket.exists(),
+        !endpoint_exists(&ws.socket),
         "layout-preset commands must not create a daemon socket"
     );
 }
@@ -8142,7 +8003,7 @@ fn layout_preset_restore_live_slot_fails_closed_before_every_effect() {
         "daemon binary path stays untouched"
     );
     assert!(
-        !untouched_socket.exists(),
+        !endpoint_exists(&untouched_socket),
         "preflight refusal must not bind or create a daemon socket"
     );
 }
@@ -8218,7 +8079,7 @@ fn layout_preset_restore_fresh_slot_fails_before_target_log_socket_or_session_ef
         .expect("load absent target")
         .is_none());
     assert!(!untouched_log.exists());
-    assert!(!untouched_socket.exists());
+    assert!(!endpoint_exists(&untouched_socket));
     assert!(!missing_daemon.exists());
     let after = match store::load_one::<SessionRecord>(&paths, RecordKind::Session, "s-exited")
         .expect("reload session")
@@ -8297,7 +8158,7 @@ fn layout_preset_restore_empty_plan_is_an_effect_free_no_op() {
         b"sentinel"
     );
     assert!(
-        !socket.exists(),
+        !endpoint_exists(&socket),
         "empty plan must not touch the daemon socket"
     );
     assert!(!missing_daemon.exists());

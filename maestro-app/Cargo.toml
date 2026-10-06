@@ -1,6 +1,6 @@
 [package]
 name = "maestro-app"
-version = "0.2.15"
+version = "0.2.16"
 publish = false
 edition.workspace = true
 license.workspace = true
@@ -9,6 +9,12 @@ rust-version.workspace = true
 [[bin]]
 name = "maestro-app"
 path = "src/main.rs"
+
+[[test]]
+# Native fixture only: with no endpoint it exits without starting any process or listener.
+name = "binary_smoke_daemon"
+path = "tests/binary_smoke/daemon_main.rs"
+harness = false
 
 [lib]
 name = "maestro_app"
@@ -37,3 +43,21 @@ tempfile = "3"
 # Cargo unifies this only for maestro-app's test targets. It does not alter the production/default
 # maestro-shell build; it bounds idle per-temp-base SQLite handles in the long-lived test process.
 maestro-shell = { path = "../maestro-shell", features = ["test-connection-cache-pruning"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_SystemInformation",
+] }
