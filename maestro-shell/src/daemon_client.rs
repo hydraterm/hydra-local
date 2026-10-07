@@ -2114,6 +2114,16 @@ impl DaemonClient {
         budget: &GenerationKillBudget,
         during: &'static str,
     ) -> Result<(), DeadlineWriteFailure> {
+        self.write_encoded_request_before_using(line, budget, during, Write::write)
+    }
+
+    fn write_encoded_request_before_using(
+        &mut self,
+        line: &[u8],
+        budget: &GenerationKillBudget,
+        during: &'static str,
+        mut write: impl FnMut(&mut UnixStream, &[u8]) -> std::io::Result<usize>,
+    ) -> Result<(), DeadlineWriteFailure> {
         let mut remaining = line;
         let mut write_attempted = false;
         while !remaining.is_empty() {
@@ -2130,13 +2140,18 @@ impl DaemonClient {
                     write_attempted,
                 })?;
             write_attempted = true;
-            let written = self
-                .writer
-                .write(remaining)
-                .map_err(|error| DeadlineWriteFailure {
-                    source: classify_io(error, during),
-                    write_attempted,
-                })?;
+            let written = match write(&mut self.writer, remaining) {
+                Ok(written) => written,
+                // No bytes were written by this syscall. Keep the already-written prefix and
+                // recheck the original deadline before retrying only the remaining suffix.
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(DeadlineWriteFailure {
+                        source: classify_io(error, during),
+                        write_attempted,
+                    });
+                }
+            };
             if written == 0 {
                 return Err(DeadlineWriteFailure {
                     source: DaemonClientError::Io(std::io::Error::new(
@@ -2224,6 +2239,16 @@ impl DaemonClient {
         during: &'static str,
         max_bytes: usize,
     ) -> Result<Option<Vec<u8>>, DaemonClientError> {
+        self.read_frame_before_using(budget, during, max_bytes, BufRead::fill_buf)
+    }
+
+    fn read_frame_before_using(
+        &mut self,
+        budget: &GenerationKillBudget,
+        during: &'static str,
+        max_bytes: usize,
+        mut fill_buf: impl for<'a> FnMut(&'a mut BufReader<UnixStream>) -> std::io::Result<&'a [u8]>,
+    ) -> Result<Option<Vec<u8>>, DaemonClientError> {
         let mut buf = Vec::new();
         loop {
             let timeout = budget.read_timeout(during)?;
@@ -2244,10 +2269,13 @@ impl DaemonClient {
             }
 
             let (consumed, terminated, eof) = {
-                let available = self
-                    .reader
-                    .fill_buf()
-                    .map_err(|error| classify_io(error, during))?;
+                let available = match fill_buf(&mut self.reader) {
+                    Ok(available) => available,
+                    // SIGCHLD (among other signals) may interrupt a healthy retained peer's
+                    // receive. Keep the partial frame and shrink the same deadline on retry.
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(classify_io(error, during)),
+                };
                 if available.is_empty() {
                     (0, false, true)
                 } else {
@@ -5078,6 +5106,9 @@ impl DaemonClient {
         })
     }
 }
+
+#[cfg(all(test, unix))]
+mod interrupted_io_tests;
 
 #[cfg(all(test, unix))]
 mod tests {
